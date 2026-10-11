@@ -11,10 +11,10 @@ use filament_bindings::{
     },
     filament::{
         Bounds, Camera, ClearOptions, Engine, IndexBuffer, IndexBufferBuilder, LightBuilder,
-        IndexType, LightType, LinearColor, Material, MaterialInstance, Projection,
-        RenderableBuilder, Renderer, Scene, SwapChain, SwapChainConfig, Texture, TextureBuilder,
-        TextureSampler, VertexAttribute,
-        VertexBuffer, VertexBufferBuilder, View, Viewport,
+        IndexType, LightType, LinearColor, Material, MaterialBuilder, MaterialInstance,
+        Projection, RenderableBuilder, Renderer, Scene, SwapChain, SwapChainConfig, Texture,
+        TextureBuilder, TextureSampler, VertexAttribute, VertexBuffer, VertexBufferBuilder, View,
+        Viewport,
     },
     math::{Float3, Float4},
     utils::Entity,
@@ -51,7 +51,7 @@ pub struct FilamentRuntime {
 impl FilamentRuntime {
     pub fn new(width: u32, height: u32) -> Result<Self, FilamentError> {
         let size = bounded_size(width, height)?;
-        let engine = unsafe { Engine::create(Backend::VULKAN) }
+        let engine = unsafe { Engine::create(Backend::OPENGL) }
             .ok_or(FilamentError::EngineUnavailable)?;
         let mut runtime = Self {
             engine,
@@ -64,20 +64,6 @@ impl FilamentRuntime {
             light_entity: None,
             material: None,
             material_instance: None,
-            base_color_texture: None,
-            texture_sampler: TextureSampler::new(
-                SamplerMagFilter::LINEAR,
-                SamplerMinFilter::LINEAR,
-                SamplerWrapMode::CLAMP_TO_EDGE,
-                SamplerWrapMode::CLAMP_TO_EDGE,
-                SamplerWrapMode::CLAMP_TO_EDGE,
-                0,
-                SamplerCompareMode::NONE,
-                0,
-                SamplerCompareFunc::LE,
-                0,
-                0,
-            ),
             base_color_map_key: None,
             mesh_entity: None,
             vertex_buffer: None,
@@ -131,10 +117,13 @@ impl FilamentRuntime {
         }
         self.light_entity = Some(light_entity);
 
-        let default_material = unsafe { self.engine.get_default_material() };
-        self.material = Material::try_from_native(default_material.cast_mut())
-            .ok_or(FilamentError::MaterialUnavailable)?
-            .into();
+        let mut material_builder = unsafe { MaterialBuilder::new() }
+            .ok_or(FilamentError::MaterialUnavailable)?;
+        unsafe { material_builder.package(include_bytes!("../assets/aiDefaultMat_ogl.filament")) };
+        self.material = Some(
+            unsafe { material_builder.build(&mut self.engine) }
+                .ok_or(FilamentError::MaterialUnavailable)?,
+        );
         let material_instance = unsafe {
             self.material
                 .as_ref()
@@ -302,7 +291,11 @@ impl FilamentRuntime {
     }
 
     fn configure_camera(
-        &mut self,
+                .set_rgb_parameter(
+                    "baseColor",
+                    filament_bindings::filament::RgbType::LINEAR,
+                    Float3::new(color.x, color.y, color.z),
+                )
         camera: ViewportCamera,
         width: u32,
         height: u32,
@@ -606,7 +599,7 @@ fn flip_rows(pixels: &mut [u8], width: u32, height: u32) {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FilamentError {
-    #[error("Filament could not initialize its Vulkan backend")]
+    #[error("Filament could not initialize its OpenGL backend")]
     EngineUnavailable,
     #[error("Filament could not create the offscreen swap chain")]
     SwapChainUnavailable,
@@ -634,4 +627,55 @@ pub enum FilamentError {
     TextureUnavailable,
     #[error("Base Color texture data has invalid dimensions or byte length")]
     InvalidTexture,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    use substancecraft_core::{PrimitivePreset, ViewportCamera};
+
+    use super::{FilamentRuntime, build_mesh_buffers, flip_rows};
+
+    #[test]
+    fn mesh_buffer_generation_preserves_topology_and_emits_finite_tangent_frames() {
+        let geometry = PrimitivePreset::Cube.build_mesh();
+        let buffers = build_mesh_buffers(&geometry).expect("valid cube buffers");
+
+        assert_eq!(buffers.vertex_data.len(), geometry.vertices.len() * 9);
+        assert_eq!(buffers.indices.len(), geometry.triangles.len() * 3);
+        assert_eq!(buffers.bounds.0.to_array(), [0.0; 3]);
+        assert_eq!(buffers.bounds.1.to_array(), [0.5; 3]);
+        assert!(buffers.vertex_data.iter().all(|value| value.is_finite()));
+        assert_eq!(buffers.indices[0..3], geometry.triangles[0]);
+    }
+
+    #[test]
+    fn readback_rows_are_flipped_for_egui_texture_coordinates() {
+        let mut pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        flip_rows(&mut pixels, 1, 2);
+        assert_eq!(pixels, vec![5, 6, 7, 8, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[ignore = "requires the Filament OpenGL backend and headless readback support"]
+    fn headless_filament_render_returns_an_rgba_frame() {
+        let mut renderer = FilamentRuntime::new(32, 32).expect("Filament runtime");
+        let geometry = PrimitivePreset::Cube.build_mesh();
+        renderer.set_mesh(&geometry).expect("cube mesh upload");
+        let (sender, receiver) = sync_channel(1);
+        let rendered = renderer
+            .render(ViewportCamera::default(), 32, 32, 1.0, move |pixels| {
+                let _ = sender.send(pixels);
+            })
+            .expect("Filament frame submission");
+
+        assert!(rendered);
+        let pixels = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Filament readback callback");
+        assert_eq!(pixels.len(), 32 * 32 * 4);
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0..3] != [0, 0, 0]));
+    }
 }
