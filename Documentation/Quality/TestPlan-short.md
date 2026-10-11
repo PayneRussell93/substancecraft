@@ -25,5 +25,8 @@
 | TC-0013 | Generate a minimal binary FBX 7.4 triangle, import it, and inspect the returned mesh. | One named mesh, one valid triangle, finite positions, and planar UVs are returned. | Import / automated | Passed 2026-10-10 |
 | TC-0014 | Generate a binary FBX triangle with ByPolygonVertex/Direct UVs and import it. | Imported corners preserve the source UV values and do not report generated UVs. | Import / automated | Passed 2026-10-10 |
 | TC-0015 | Feed the binary preflight a declared decoded-attribute size above its configured budget. | Reject the input before the FBX parser allocates decoded attributes. | Security / automated | Passed 2026-10-10 |
+| TC-0016 | Encode a project with a texture set, layer, and named pose, then decode it. | All serialized project data round-trips unchanged. | Persistence / automated | Passed 2026-10-10 |
+| TC-0017 | Decode a project with an unsupported schema version. | Return a validation error without constructing an accepted project. | Compatibility / automated | Pending final run |
+| TC-0018 | Save a valid project to a temporary file and load it back. | The atomic file operation succeeds and preserves project data. | Persistence / automated | Passed 2026-10-10 |
 
-All 21 workspace tests passed on 2026-10-10. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` also passed. MCP client interoperability has not yet been manually verified; raw command output is not archived separately.
+The 21 tests before project persistence passed on 2026-10-10. TC-0016 and TC-0018 passed individually; TC-0017 and full workspace gates are pending. Desktop Open/Save has compile coverage but no automated UI interaction test yet. Mesh assets remain external references rather than embedded resources.

@@ -10,6 +10,8 @@ description = "Stable headless API for SubstanceCraft domain operations"
 fbxcel-dom.workspace = true
 glam.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 substancecraft-core = { path = "../core" }
 thiserror.workspace = true
 

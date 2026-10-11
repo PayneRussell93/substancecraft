@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use eframe::egui;
-use substancecraft_api::{ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes};
+use substancecraft_api::{
+    ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes, load_project_file, save_project_file,
+};
 use substancecraft_core::{
     BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshAsset, MeshGeometry, MeshId,
     NamedPose, PoseId, PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
@@ -49,11 +51,12 @@ struct SubstanceCraftApp {
     imported_meshes: Vec<ImportedFbxMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
+    project_path: Option<std::path::PathBuf>,
+    project_error: Option<String>,
     active_channel: MaterialChannel,
     next_texture_set_id: u64,
     current_pose: NamedPose,
-    saved_poses: Vec<NamedPose>,
-    selected_pose: Option<usize>,
+    selected_pose: Option<PoseId>,
     pose_name: String,
     pose_transition: Option<PoseTransition>,
 }
@@ -64,16 +67,31 @@ struct PoseTransition {
     started_at: f64,
 }
 
+struct RestoredMeshScene {
+    selected_primitive: Option<PrimitivePreset>,
+    imported_meshes: Vec<ImportedFbxMesh>,
+    selected_imported_mesh: Option<usize>,
+    geometry: Option<MeshGeometry>,
+}
+
 impl Default for SubstanceCraftApp {
     fn default() -> Self {
         Self {
-            project: MaterialProject::empty(),
+            project: MaterialProject {
+                mesh: Some(MeshAsset {
+                    id: MeshId(1),
+                    source: "builtin:Cube".to_owned(),
+                }),
+                ..MaterialProject::empty()
+            },
             selected_texture_set: None,
             selected_primitive: Some(PrimitivePreset::Cube),
             mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
             import_error: None,
+            project_path: None,
+            project_error: None,
             active_channel: MaterialChannel::BaseColor,
             next_texture_set_id: 1,
             current_pose: NamedPose {
@@ -81,7 +99,6 @@ impl Default for SubstanceCraftApp {
                 name: "Current Pose".to_owned(),
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             },
-            saved_poses: Vec::new(),
             selected_pose: None,
             pose_name: "Pose 1".to_owned(),
             pose_transition: None,
@@ -90,6 +107,123 @@ impl Default for SubstanceCraftApp {
 }
 
 impl SubstanceCraftApp {
+    fn save_project(&mut self) {
+        let path = self.project_path.clone().or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("SubstanceCraft Project", &["sproject"])
+                .set_file_name("Untitled.sproject")
+                .save_file()
+        });
+        let Some(path) = path else {
+            return;
+        };
+
+        match save_project_file(&path, &self.project) {
+            Ok(()) => {
+                self.project_path = Some(path);
+                self.project_error = None;
+            }
+            Err(error) => self.project_error = Some(error.to_string()),
+        }
+    }
+
+    fn open_project(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SubstanceCraft Project", &["sproject"])
+            .pick_file()
+        else {
+            return;
+        };
+        let project = match load_project_file(&path) {
+            Ok(project) => project,
+            Err(error) => {
+                self.project_error = Some(error.to_string());
+                return;
+            }
+        };
+        let scene = match Self::restore_project_mesh(&project) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.project_error = Some(error);
+                return;
+            }
+        };
+
+        self.project = project;
+        self.project_path = Some(path);
+        self.selected_primitive = scene.selected_primitive;
+        self.imported_meshes = scene.imported_meshes;
+        self.selected_imported_mesh = scene.selected_imported_mesh;
+        self.mesh_geometry = scene.geometry;
+        self.selected_texture_set = self.project.active_texture_set;
+        self.next_texture_set_id = self
+            .project
+            .texture_sets
+            .iter()
+            .map(|set| set.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.current_pose = self
+            .project
+            .saved_poses
+            .first()
+            .cloned()
+            .unwrap_or_else(|| NamedPose {
+                id: PoseId(0),
+                name: "Current Pose".to_owned(),
+                bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
+            });
+        self.selected_pose = self.project.saved_poses.first().map(|pose| pose.id);
+        self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
+        self.pose_transition = None;
+        self.import_error = None;
+        self.project_error = None;
+    }
+
+    fn restore_project_mesh(project: &MaterialProject) -> Result<RestoredMeshScene, String> {
+        let Some(mesh_asset) = &project.mesh else {
+            return Ok(RestoredMeshScene {
+                selected_primitive: None,
+                imported_meshes: Vec::new(),
+                selected_imported_mesh: None,
+                geometry: None,
+            });
+        };
+        if let Some(name) = mesh_asset.source.strip_prefix("builtin:") {
+            let preset = PrimitivePreset::ALL
+                .into_iter()
+                .find(|preset| preset.name() == name)
+                .ok_or_else(|| format!("unknown built-in mesh `{name}` in project"))?;
+            return Ok(RestoredMeshScene {
+                selected_primitive: Some(preset),
+                imported_meshes: Vec::new(),
+                selected_imported_mesh: None,
+                geometry: Some(preset.build_mesh()),
+            });
+        }
+
+        let path = std::path::PathBuf::from(&mesh_asset.source);
+        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        let file_size = usize::try_from(metadata.len())
+            .map_err(|_| "referenced FBX file is too large for this platform".to_owned())?;
+        if file_size > MAX_FBX_BYTES {
+            return Err("referenced FBX exceeds the 64 MiB import limit".to_owned());
+        }
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let meshes = import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())?;
+        let Some(first_mesh) = meshes.first() else {
+            return Err("referenced FBX contains no mesh geometry".to_owned());
+        };
+        let first_geometry = first_mesh.geometry.clone();
+        Ok(RestoredMeshScene {
+            selected_primitive: None,
+            imported_meshes: meshes,
+            selected_imported_mesh: Some(0),
+            geometry: Some(first_geometry),
+        })
+    }
+
     fn import_fbx(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("FBX mesh", &["fbx"])
@@ -167,8 +301,23 @@ impl SubstanceCraftApp {
             ui.horizontal_centered(|ui| {
                 ui.strong("SubstanceCraft");
                 ui.separator();
-                ui.label("Untitled Project");
+                let project_name = self
+                    .project_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Untitled Project".to_owned());
+                ui.label(project_name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_project();
+                    }
+                    if ui.button("Open").clicked() {
+                        self.open_project();
+                    }
+                    if let Some(error) = &self.project_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
                     ui.label(self.selected_mesh_name().unwrap_or("No mesh loaded"));
                 });
             });
@@ -215,11 +364,17 @@ impl SubstanceCraftApp {
         }
     }
 
-    fn select_pose(&mut self, index: usize, context: &egui::Context) {
-        let Some(target) = self.saved_poses.get(index).cloned() else {
+    fn select_pose(&mut self, pose_id: PoseId, context: &egui::Context) {
+        let Some(target) = self
+            .project
+            .saved_poses
+            .iter()
+            .find(|pose| pose.id == pose_id)
+            .cloned()
+        else {
             return;
         };
-        self.selected_pose = Some(index);
+        self.selected_pose = Some(pose_id);
         self.pose_transition = Some(PoseTransition {
             from: self.current_pose.clone(),
             to: target,
@@ -228,16 +383,34 @@ impl SubstanceCraftApp {
     }
 
     fn save_pose(&mut self) {
-        if self.saved_poses.len() >= MAX_SAVED_POSES {
+        if self.project.saved_poses.len() >= MAX_SAVED_POSES
+            || self.current_pose.validate().is_err()
+        {
             return;
         }
+        let Some(next_id) = self
+            .project
+            .saved_poses
+            .iter()
+            .map(|pose| pose.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+        else {
+            return;
+        };
         let base_name = self.pose_name.trim();
         if base_name.is_empty() {
             return;
         }
         let mut name = base_name.to_owned();
         let mut suffix = 2_u32;
-        while self.saved_poses.iter().any(|pose| pose.name == name) {
+        while self
+            .project
+            .saved_poses
+            .iter()
+            .any(|pose| pose.name.eq_ignore_ascii_case(&name))
+        {
             name = format!("{base_name} {suffix}");
             let Some(next_suffix) = suffix.checked_add(1) else {
                 return;
@@ -245,10 +418,11 @@ impl SubstanceCraftApp {
             suffix = next_suffix;
         }
         let mut pose = self.current_pose.clone();
+        pose.id = PoseId(next_id);
         pose.name.clone_from(&name);
-        self.saved_poses.push(pose);
-        self.selected_pose = Some(self.saved_poses.len() - 1);
-        self.pose_name = format!("Pose {}", self.saved_poses.len() + 1);
+        self.project.saved_poses.push(pose);
+        self.selected_pose = Some(PoseId(next_id));
+        self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
     }
 
     fn update_pose_shelf(&mut self, ui: &mut egui::Ui) {
@@ -263,7 +437,7 @@ impl SubstanceCraftApp {
                             .hint_text("Pose name"),
                     );
                     let can_save = !self.pose_name.trim().is_empty()
-                        && self.saved_poses.len() < MAX_SAVED_POSES;
+                        && self.project.saved_poses.len() < MAX_SAVED_POSES;
                     if ui
                         .add_enabled(can_save, egui::Button::new("Save Pose"))
                         .clicked()
@@ -273,14 +447,18 @@ impl SubstanceCraftApp {
                 });
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    if self.saved_poses.is_empty() {
+                    if self.project.saved_poses.is_empty() {
                         ui.weak("Save a pose to add it to this shelf");
                     }
-                    for index in 0..self.saved_poses.len() {
-                        let name = self.saved_poses[index].name.clone();
-                        let selected = self.selected_pose == Some(index);
+                    for index in 0..self.project.saved_poses.len() {
+                        let Some(pose) = self.project.saved_poses.get(index) else {
+                            continue;
+                        };
+                        let pose_id = pose.id;
+                        let name = pose.name.clone();
+                        let selected = self.selected_pose == Some(pose_id);
                         if ui.selectable_label(selected, name).clicked() {
-                            self.select_pose(index, ui.ctx());
+                            self.select_pose(pose_id, ui.ctx());
                         }
                     }
                 });
@@ -323,6 +501,10 @@ impl SubstanceCraftApp {
                         self.selected_primitive = Some(preset);
                         self.selected_imported_mesh = None;
                         self.mesh_geometry = Some(preset.build_mesh());
+                        self.project.mesh = Some(MeshAsset {
+                            id: MeshId(1),
+                            source: format!("builtin:{}", preset.name()),
+                        });
                     }
                 }
                 ui.add_space(8.0);

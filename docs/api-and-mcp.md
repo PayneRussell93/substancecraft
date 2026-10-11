@@ -7,8 +7,12 @@
 - `list_primitive_presets()` for the supported starter-mesh names.
 - `inspect_primitive_preset(name)` for indexed topology counts, local-space bounds, and UV bounds.
 - `import_binary_fbx_meshes(bytes)` for static mesh geometry from binary FBX 7.4+ files.
+- `encode_project_json(project)` and `decode_project_json(bytes)` for validated, size-bounded project serialization.
+- `save_project_file(path, project)` and `load_project_file(path)` for atomic `.sproject` file persistence.
 
 The result types use Serde and plain numeric arrays at the API boundary, so clients do not need to depend on the renderer's math or UI types. Invalid preset names return a typed error. This facade is intentionally narrow today; the planned stable command API will grow to project, import, layer, paint, bake, and export operations as those commands are implemented.
+
+The desktop Open/Save controls use the same project file API. Texture sets and saved named poses are serialized and validated on both save and load. Imported FBX geometry is currently referenced by its original file path and reimported on open; it is not embedded in the project package yet.
 
 ## MCP server
 
