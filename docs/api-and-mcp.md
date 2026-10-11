@@ -7,10 +7,12 @@
 - `list_primitive_presets()` for the supported starter-mesh names.
 - `inspect_primitive_preset(name)` for indexed topology counts, local-space bounds, and UV bounds.
 - `import_binary_fbx_meshes(bytes)` for static mesh geometry from binary FBX 7.4+ files.
+- `bake_texture_set_base_color(texture_set)` for a bounded RGBA8 composite respecting layer opacity, grayscale masks, and optional ID-color clipping.
+- `bake_texture_set_id_mask(texture_set)` for the discrete color-coded ID map painted into UV layers.
 - `encode_project_json(project)` and `decode_project_json(bytes)` for validated, size-bounded project serialization.
 - `save_project_file(path, project)` and `load_project_file(path)` for atomic `.sproject` file persistence.
 
-The result types use Serde and plain numeric arrays at the API boundary, so clients do not need to depend on the renderer's math or UI types. Invalid preset names return a typed error. This facade is intentionally narrow today; the planned stable command API will grow to project, import, layer, paint, bake, and export operations as those commands are implemented.
+The result types use Serde and plain numeric arrays at the API boundary, so clients do not need to depend on the renderer's math or UI types. Invalid preset names and over-budget texture bakes return typed errors. The desktop currently exports the baked RGBA8 buffers as 32-bit TGA; geometry-derived normal/AO maps and import-derived ID maps are not implemented.
 
 The desktop Open/Save controls use the same project file API. Texture sets and saved named poses are serialized and validated on both save and load. Imported FBX geometry is currently referenced by its original file path and reimported on open; it is not embedded in the project package yet.
 

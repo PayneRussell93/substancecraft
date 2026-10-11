@@ -22,7 +22,7 @@ Mesh + material slots
 - Use stable typed IDs, schema versions, and validation at project-load boundaries.
 - Keep channel compositing specific to channel semantics; normal maps and scalar maps are not color images.
 - Add tile-level storage and dirty-region recomputation before production texture sizes make full-surface updates expensive.
-- Start with GLB/glTF, UV-space base-color painting, undo, and PNG export. Defer projection painting, UDIM, baking, and procedural materials until that loop is correct.
+- Continue from the initial UV-space paint/mask/bake loop with stroke history and richer channel compositing. Defer projection painting, UDIM, geometric mesh-map baking, and procedural materials until those paths are validated.
 
 ## Research use and clean-room boundary
 
@@ -32,6 +32,6 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 
 ## Current implementation
 
-`substancecraft-core` provides serializable project, mesh reference, texture set, saved pose, layer, channel, mesh geometry, and resolution types. `MaterialProject::validate` rejects invalid texture dimensions, duplicate IDs, dangling active texture-set references, invalid poses, and non-finite or out-of-range layer opacity. `substancecraft-api` offers bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project.
+`substancecraft-core` provides serializable project, mesh reference, texture set, saved pose, layer, channel, mesh geometry, and resolution types. Layers own UV-space Base Color, grayscale-mask, and discrete ID-color strokes; a bounded CPU compositor bakes Base Color with grayscale and optional ID-color clipping, and emits a separate ID map. `substancecraft-api` exposes both bake operations alongside bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project.
 
-The core generates UV-mapped indexed triangle meshes for cube, sphere, cylinder, and plane presets. The desktop shell can import binary FBX 7.4+ static meshes, select imported meshes, and display them in a projected preview. The preview supports orbit, pan, zoom, a rotating directional key light, and ambient fill. It uses per-face approximate shading; it is not yet a real-time 3D PBR renderer or global-illumination system.
+The core generates UV-mapped indexed triangle meshes for cube, sphere, cylinder, and plane presets. The desktop shell can import binary FBX 7.4+ static meshes, select imported meshes, paint on interpolated face UVs, preview baked Base Color or ID maps, and export either as TGA. The layer panel exposes grayscale masks and ID-color clipping. The projected preview also supports orbit, pan, zoom, a rotating directional key light, and ambient fill. FBX material-derived ID maps, geometric mesh-map baking, a real-time 3D PBR renderer, and global illumination are not implemented.

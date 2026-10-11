@@ -9,6 +9,9 @@ use thiserror::Error;
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
+pub const MAX_BAKE_PIXELS: usize = 4_194_304;
+const MAX_LAYER_STROKES: usize = 8_192;
+const MAX_STROKE_POINTS: usize = 4_096;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -465,6 +468,7 @@ pub enum PoseError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MaterialChannel {
     BaseColor,
+    Id,
     Roughness,
     Metallic,
     Normal,
@@ -515,6 +519,349 @@ pub struct MaterialLayer {
     pub visible: bool,
     pub opacity: f32,
     pub channels: BTreeSet<MaterialChannel>,
+    #[serde(default)]
+    pub paint_strokes: Vec<PaintStroke>,
+    #[serde(default)]
+    pub mask_strokes: Vec<MaskStroke>,
+    #[serde(default)]
+    pub id_strokes: Vec<IdStroke>,
+    #[serde(default)]
+    pub id_mask_color: Option<[u8; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaintStroke {
+    pub points: Vec<glam::Vec2>,
+    pub radius_pixels: f32,
+    pub color: [u8; 4],
+    pub opacity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MaskStroke {
+    pub points: Vec<glam::Vec2>,
+    pub radius_pixels: f32,
+    pub value: f32,
+    pub opacity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IdStroke {
+    pub points: Vec<glam::Vec2>,
+    pub radius_pixels: f32,
+    pub color: [u8; 3],
+    pub opacity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BakedTexture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
+}
+
+impl BakedTexture {
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = ((y as usize * self.width as usize) + x as usize) * 4;
+        let rgba = self.rgba8.get(index..index + 4)?;
+        Some([rgba[0], rgba[1], rgba[2], rgba[3]])
+    }
+
+    pub fn sample_uv(&self, uv: glam::Vec2) -> Option<[u8; 4]> {
+        if !uv.is_finite() || !(0.0..=1.0).contains(&uv.x) || !(0.0..=1.0).contains(&uv.y) {
+            return None;
+        }
+        let x = (uv.x * self.width.saturating_sub(1) as f32).round() as u32;
+        let y = ((1.0 - uv.y) * self.height.saturating_sub(1) as f32).round() as u32;
+        self.pixel(x, y)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BakeError {
+    #[error("texture bake resolution {width}x{height} exceeds the pixel budget")]
+    ResolutionExceedsBudget { width: u32, height: u32 },
+    #[error("unable to allocate texture bake buffer")]
+    AllocationFailed,
+    #[error("texture set contains invalid or excessive paint strokes")]
+    InvalidStrokeData,
+}
+
+impl TextureSet {
+    pub fn bake_base_color(&self) -> Result<BakedTexture, BakeError> {
+        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
+            return Err(BakeError::InvalidStrokeData);
+        }
+        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let id_map = self
+            .layers
+            .iter()
+            .any(|layer| layer.id_mask_color.is_some())
+            .then(|| self.bake_id_mask())
+            .transpose()?;
+        let byte_count = pixel_count
+            .checked_mul(4)
+            .ok_or(BakeError::AllocationFailed)?;
+        let mut rgba8 = Vec::new();
+        rgba8
+            .try_reserve_exact(byte_count)
+            .map_err(|_| BakeError::AllocationFailed)?;
+        rgba8.resize(byte_count, 0);
+
+        for layer in &self.layers {
+            if !layer.visible || !layer.channels.contains(&MaterialChannel::BaseColor) {
+                continue;
+            }
+            let mut mask = if layer.mask_strokes.is_empty() {
+                None
+            } else {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(pixel_count)
+                    .map_err(|_| BakeError::AllocationFailed)?;
+                values.resize(pixel_count, 1.0_f32);
+                for stroke in &layer.mask_strokes {
+                    rasterize_stroke(
+                        &stroke.points,
+                        stroke.radius_pixels,
+                        self.resolution.width,
+                        self.resolution.height,
+                        |index, coverage| {
+                            let alpha = (stroke.opacity * coverage).clamp(0.0, 1.0);
+                            values[index] += (stroke.value - values[index]) * alpha;
+                        },
+                    );
+                }
+                Some(values)
+            };
+
+            for stroke in &layer.paint_strokes {
+                rasterize_stroke(
+                    &stroke.points,
+                    stroke.radius_pixels,
+                    self.resolution.width,
+                    self.resolution.height,
+                    |index, coverage| {
+                        let mask_value = mask.as_mut().map_or(1.0, |values| values[index]);
+                        let id_matches = layer.id_mask_color.is_none_or(|target| {
+                            id_map
+                                .as_ref()
+                                .and_then(|map| map.rgba8.get(index * 4..index * 4 + 4))
+                                .is_some_and(|pixel| pixel[0..3] == target && pixel[3] > 0)
+                        });
+                        let opacity = layer.opacity
+                            * stroke.opacity
+                            * coverage
+                            * mask_value.clamp(0.0, 1.0)
+                            * f32::from(id_matches);
+                        blend_rgba8(&mut rgba8[index * 4..index * 4 + 4], stroke.color, opacity);
+                    },
+                );
+            }
+        }
+
+        Ok(BakedTexture {
+            width: self.resolution.width,
+            height: self.resolution.height,
+            rgba8,
+        })
+    }
+
+    pub fn bake_id_mask(&self) -> Result<BakedTexture, BakeError> {
+        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
+            return Err(BakeError::InvalidStrokeData);
+        }
+        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let byte_count = pixel_count
+            .checked_mul(4)
+            .ok_or(BakeError::AllocationFailed)?;
+        let mut rgba8 = Vec::new();
+        rgba8
+            .try_reserve_exact(byte_count)
+            .map_err(|_| BakeError::AllocationFailed)?;
+        rgba8.resize(byte_count, 0);
+
+        for layer in &self.layers {
+            if !layer.visible || !layer.channels.contains(&MaterialChannel::Id) {
+                continue;
+            }
+            for stroke in &layer.id_strokes {
+                rasterize_stroke(
+                    &stroke.points,
+                    stroke.radius_pixels,
+                    self.resolution.width,
+                    self.resolution.height,
+                    |index, coverage| {
+                        if coverage * stroke.opacity * layer.opacity >= 0.5 {
+                            let offset = index * 4;
+                            rgba8[offset..offset + 4].copy_from_slice(&[
+                                stroke.color[0],
+                                stroke.color[1],
+                                stroke.color[2],
+                                255,
+                            ]);
+                        }
+                    },
+                );
+            }
+        }
+
+        Ok(BakedTexture {
+            width: self.resolution.width,
+            height: self.resolution.height,
+            rgba8,
+        })
+    }
+}
+
+fn checked_bake_pixel_count(resolution: TextureResolution) -> Result<usize, BakeError> {
+    if resolution.width == 0
+        || resolution.height == 0
+        || resolution.width > MAX_TEXTURE_DIMENSION
+        || resolution.height > MAX_TEXTURE_DIMENSION
+    {
+        return Err(BakeError::ResolutionExceedsBudget {
+            width: resolution.width,
+            height: resolution.height,
+        });
+    }
+    (resolution.width as usize)
+        .checked_mul(resolution.height as usize)
+        .filter(|count| *count <= MAX_BAKE_PIXELS)
+        .ok_or(BakeError::ResolutionExceedsBudget {
+            width: resolution.width,
+            height: resolution.height,
+        })
+}
+
+fn rasterize_stroke(
+    points: &[glam::Vec2],
+    radius_pixels: f32,
+    width: u32,
+    height: u32,
+    mut apply: impl FnMut(usize, f32),
+) {
+    let Some(first_point) = points.first().copied() else {
+        return;
+    };
+    let to_pixel = |point: glam::Vec2| {
+        glam::Vec2::new(
+            point.x * width.saturating_sub(1) as f32,
+            (1.0 - point.y) * height.saturating_sub(1) as f32,
+        )
+    };
+    let mut segments = points
+        .windows(2)
+        .map(|pair| (to_pixel(pair[0]), to_pixel(pair[1])));
+    let first = to_pixel(first_point);
+    let Some(first_segment) = segments.next() else {
+        rasterize_segment(first, first, radius_pixels, width, height, &mut apply);
+        return;
+    };
+    rasterize_segment(
+        first_segment.0,
+        first_segment.1,
+        radius_pixels,
+        width,
+        height,
+        &mut apply,
+    );
+    for (start, end) in segments {
+        rasterize_segment(start, end, radius_pixels, width, height, &mut apply);
+    }
+}
+
+fn rasterize_segment(
+    start: glam::Vec2,
+    end: glam::Vec2,
+    radius: f32,
+    width: u32,
+    height: u32,
+    apply: &mut impl FnMut(usize, f32),
+) {
+    let min_x = ((start.x.min(end.x) - radius).floor() as i32).max(0);
+    let max_x = ((start.x.max(end.x) + radius).ceil() as i32).min(width as i32 - 1);
+    let min_y = ((start.y.min(end.y) - radius).floor() as i32).max(0);
+    let max_y = ((start.y.max(end.y) + radius).ceil() as i32).min(height as i32 - 1);
+    let segment = end - start;
+    let segment_length_squared = segment.length_squared();
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let pixel = glam::Vec2::new(x as f32, y as f32);
+            let amount = if segment_length_squared > f32::EPSILON {
+                ((pixel - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let distance = pixel.distance(start + segment * amount);
+            if distance < radius {
+                let coverage = 1.0 - distance / radius;
+                let index = y as usize * width as usize + x as usize;
+                apply(index, coverage);
+            }
+        }
+    }
+}
+
+fn blend_rgba8(destination: &mut [u8], color: [u8; 4], opacity: f32) {
+    let source_alpha = (color[3] as f32 / 255.0 * opacity).clamp(0.0, 1.0);
+    if source_alpha <= 0.0 {
+        return;
+    }
+    let destination_alpha = destination[3] as f32 / 255.0;
+    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    let output_alpha_byte = (output_alpha * 255.0).round() as u8;
+    if output_alpha_byte == 0 {
+        destination.fill(0);
+        return;
+    }
+    for channel in 0..3 {
+        let source = color[channel] as f32 / 255.0;
+        let existing = destination[channel] as f32 / 255.0;
+        let blended = (source * source_alpha + existing * destination_alpha * (1.0 - source_alpha))
+            / output_alpha;
+        destination[channel] = (blended * 255.0).round() as u8;
+    }
+    destination[3] = output_alpha_byte;
+}
+
+fn valid_stroke(points: &[glam::Vec2], radius_pixels: f32, opacity: f32) -> bool {
+    !points.is_empty()
+        && points.len() <= MAX_STROKE_POINTS
+        && radius_pixels.is_finite()
+        && radius_pixels > 0.0
+        && radius_pixels <= MAX_TEXTURE_DIMENSION as f32
+        && opacity.is_finite()
+        && (0.0..=1.0).contains(&opacity)
+        && points.iter().all(|point| {
+            point.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y)
+        })
+}
+
+fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
+    layer
+        .paint_strokes
+        .len()
+        .saturating_add(layer.mask_strokes.len())
+        .saturating_add(layer.id_strokes.len())
+        <= MAX_LAYER_STROKES
+        && layer
+            .paint_strokes
+            .iter()
+            .all(|stroke| valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity))
+        && layer.mask_strokes.iter().all(|stroke| {
+            valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
+                && stroke.value.is_finite()
+                && (0.0..=1.0).contains(&stroke.value)
+        })
+        && layer
+            .id_strokes
+            .iter()
+            .all(|stroke| valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -572,6 +919,26 @@ impl MaterialProject {
                         opacity: layer.opacity,
                     });
                 }
+                if layer
+                    .paint_strokes
+                    .len()
+                    .saturating_add(layer.mask_strokes.len())
+                    .saturating_add(layer.id_strokes.len())
+                    > MAX_LAYER_STROKES
+                    || layer.paint_strokes.iter().any(|stroke| {
+                        !valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
+                    })
+                    || layer.mask_strokes.iter().any(|stroke| {
+                        !valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
+                            || !stroke.value.is_finite()
+                            || !(0.0..=1.0).contains(&stroke.value)
+                    })
+                    || layer.id_strokes.iter().any(|stroke| {
+                        !valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
+                    })
+                {
+                    return Err(ProjectError::InvalidLayerPaintData(layer.id));
+                }
             }
         }
 
@@ -617,6 +984,8 @@ pub enum ProjectError {
     ActiveTextureSetMissing(TextureSetId),
     #[error("layer {layer:?} has invalid opacity {opacity}")]
     InvalidLayerOpacity { layer: LayerId, opacity: f32 },
+    #[error("layer {0:?} has invalid or excessive paint data")]
+    InvalidLayerPaintData(LayerId),
     #[error("pose id {0:?} is duplicated")]
     DuplicatePoseId(PoseId),
     #[error("pose name `{0}` is duplicated")]
@@ -647,6 +1016,108 @@ mod tests {
     #[test]
     fn tc_0001_empty_project_is_valid() {
         assert!(MaterialProject::empty().validate().is_ok());
+    }
+
+    #[test]
+    fn tc_0022_layer_paint_is_clipped_by_its_mask_during_bake() {
+        let mut set = texture_set(1);
+        set.resolution = TextureResolution {
+            width: 16,
+            height: 16,
+        };
+        set.layers.push(MaterialLayer {
+            id: LayerId(1),
+            name: "Paint".to_owned(),
+            visible: true,
+            opacity: 1.0,
+            channels: BTreeSet::from([MaterialChannel::BaseColor]),
+            paint_strokes: vec![PaintStroke {
+                points: vec![glam::Vec2::new(7.0 / 15.0, 8.0 / 15.0)],
+                radius_pixels: 4.0,
+                color: [255, 24, 16, 255],
+                opacity: 1.0,
+            }],
+            mask_strokes: vec![MaskStroke {
+                points: vec![glam::Vec2::new(7.0 / 15.0, 8.0 / 15.0)],
+                radius_pixels: 2.0,
+                value: 0.0,
+                opacity: 1.0,
+            }],
+            id_strokes: Vec::new(),
+            id_mask_color: None,
+        });
+
+        let baked = set.bake_base_color().unwrap();
+
+        assert_eq!(baked.pixel(7, 7), Some([0, 0, 0, 0]));
+        assert_eq!(baked.pixel(10, 7), Some([255, 24, 16, 64]));
+    }
+
+    #[test]
+    fn tc_0023_id_mask_bake_keeps_discrete_colors_and_transparent_background() {
+        let mut set = texture_set(1);
+        set.resolution = TextureResolution {
+            width: 8,
+            height: 8,
+        };
+        set.channels.insert(MaterialChannel::Id);
+        set.layers.push(MaterialLayer {
+            id: LayerId(1),
+            name: "ID Paint".to_owned(),
+            visible: true,
+            opacity: 1.0,
+            channels: BTreeSet::from([MaterialChannel::Id]),
+            paint_strokes: Vec::new(),
+            mask_strokes: Vec::new(),
+            id_strokes: vec![IdStroke {
+                points: vec![glam::Vec2::new(3.0 / 7.0, 4.0 / 7.0)],
+                radius_pixels: 2.0,
+                color: [16, 180, 240],
+                opacity: 1.0,
+            }],
+            id_mask_color: None,
+        });
+
+        let baked = set.bake_id_mask().unwrap();
+
+        assert_eq!(baked.pixel(3, 3), Some([16, 180, 240, 255]));
+        assert_eq!(baked.pixel(0, 0), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn tc_0024_id_mask_color_clips_base_color_paint() {
+        let mut set = texture_set(1);
+        set.resolution = TextureResolution {
+            width: 8,
+            height: 8,
+        };
+        set.channels.insert(MaterialChannel::Id);
+        set.layers.push(MaterialLayer {
+            id: LayerId(1),
+            name: "Masked Paint".to_owned(),
+            visible: true,
+            opacity: 1.0,
+            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+            paint_strokes: vec![PaintStroke {
+                points: vec![glam::Vec2::new(3.0 / 7.0, 4.0 / 7.0)],
+                radius_pixels: 4.0,
+                color: [240, 30, 12, 255],
+                opacity: 1.0,
+            }],
+            mask_strokes: Vec::new(),
+            id_strokes: vec![IdStroke {
+                points: vec![glam::Vec2::new(3.0 / 7.0, 4.0 / 7.0)],
+                radius_pixels: 1.0,
+                color: [12, 180, 220],
+                opacity: 1.0,
+            }],
+            id_mask_color: Some([12, 180, 220]),
+        });
+
+        let baked = set.bake_base_color().unwrap();
+
+        assert_eq!(baked.pixel(3, 3), Some([240, 30, 12, 255]));
+        assert_eq!(baked.pixel(6, 3), Some([0, 0, 0, 0]));
     }
 
     #[test]
@@ -696,6 +1167,10 @@ mod tests {
             visible: true,
             opacity: f32::NAN,
             channels: BTreeSet::from([MaterialChannel::BaseColor]),
+            paint_strokes: Vec::new(),
+            mask_strokes: Vec::new(),
+            id_strokes: Vec::new(),
+            id_mask_color: None,
         });
         let project = MaterialProject {
             texture_sets: vec![set],
@@ -720,6 +1195,10 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 channels: BTreeSet::new(),
+                paint_strokes: Vec::new(),
+                mask_strokes: Vec::new(),
+                id_strokes: Vec::new(),
+                id_mask_color: None,
             },
             MaterialLayer {
                 id: LayerId(4),
@@ -727,6 +1206,10 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 channels: BTreeSet::new(),
+                paint_strokes: Vec::new(),
+                mask_strokes: Vec::new(),
+                id_strokes: Vec::new(),
+                id_mask_color: None,
             },
         ];
         let project = MaterialProject {

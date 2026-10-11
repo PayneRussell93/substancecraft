@@ -2,7 +2,7 @@
 
 - **Version:** 0.1.0
 - **Status:** Active
-- **Scope:** Project model and persistence, primitive/FBX mesh handling, viewport camera/lighting math, and starter MCP/API behavior (`REQ-0001` through `REQ-0006`).
+- **Scope:** Project model and persistence, primitive/FBX mesh handling, viewport camera/lighting, UV painting/masking/baking, and starter MCP/API behavior (`REQ-0001` through `REQ-0007`).
 - **Environment:** Windows x86_64, Rust stable MSVC toolchain.
 - **Approach:** Automated unit tests across `crates/core`, `crates/api`, and `crates/mcp`; run with `cargo test --workspace`.
 - **Entry criteria:** The workspace resolves and the core crate compiles.
@@ -31,5 +31,11 @@
 | TC-0019 | Orbit and pan the camera, zoom in, then submit non-finite camera input. | Camera state changes, zoom remains clamped, and non-finite deltas are ignored. | Functional / automated | Passed 2026-10-10 |
 | TC-0020 | Rotate the environment light around a face normal. | Face intensity changes while remaining in the valid range. | Functional / automated | Passed 2026-10-10 |
 | TC-0021 | With a mesh visible, drag to orbit, Shift-drag to pan, scroll to zoom, adjust Environment Rotation/Ambient Fill, then choose Reset View. | The mesh stays visible, view interactions update, lighting changes face shading, and reset restores the default camera. | Usability / manual | Pending manual verification |
+| TC-0022 | Paint a UV stroke and apply a grayscale mask, then bake Base Color. | Masked texels are transparent and unmasked texels retain the stroke color. | Bake / automated | Passed 2026-10-10 |
+| TC-0023 | Paint a discrete ID color in UV space and bake the ID channel. | Painted texels preserve the ID color; untouched texels are transparent. | Bake / automated | Passed 2026-10-10 |
+| TC-0024 | Set a layer's Clip by ID color and bake Base Color. | Paint appears only where the baked ID map matches the selected color. | Mask / automated | Passed 2026-10-10 |
+| TC-0025 | Map an interior screen point on a projected triangle to UV and test a point outside it. | UV interpolation is correct and outside points are rejected. | Geometry / automated | Passed 2026-10-10 |
+| TC-0026 | In the desktop app, create a layer, paint Base Color, mask it, paint an ID color, enable Clip by ID, save/reopen, and export both maps. | Strokes and mask selection persist; exported TGA maps open with expected colors and dimensions. | Workflow / manual | Pending manual verification |
+| TC-0027 | Decode a schema-v1 project whose layers predate paint and ID fields. | Missing stroke and ID-mask fields default to empty without rejecting the project. | Compatibility / automated | Passed 2026-10-10 |
 
-All 26 automated workspace tests passed on 2026-10-10. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed. TC-0021 and desktop Open/Save interaction remain manual checks. Mesh assets remain external references rather than embedded resources; viewport shading is approximate rather than PBR/GI.
+All 32 automated workspace tests passed on 2026-10-10. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed. TC-0021, TC-0026, and desktop Open/Save interaction require manual verification. Mesh assets remain external references; the viewport is projected with approximate shading, and geometric normal/AO/curvature baking is not implemented.

@@ -6,16 +6,18 @@ use std::time::Duration;
 
 use eframe::egui;
 use substancecraft_api::{
-    ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes, load_project_file, save_project_file,
+    ImportedFbxMesh, MAX_FBX_BYTES, bake_texture_set_base_color, bake_texture_set_id_mask,
+    import_binary_fbx_meshes, load_project_file, save_project_file,
 };
 use substancecraft_core::{
-    BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshAsset, MeshGeometry, MeshId,
-    NamedPose, PoseId, PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
-    ViewportCamera, ViewportLighting,
+    BakedTexture, BoneId, BoneTransform, IdStroke, MaskStroke, MaterialChannel, MaterialLayer,
+    MaterialProject, MeshAsset, MeshGeometry, MeshId, NamedPose, PaintStroke, PoseId,
+    PrimitivePreset, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
 };
 
-const CHANNELS: [MaterialChannel; 8] = [
+const CHANNELS: [MaterialChannel; 9] = [
     MaterialChannel::BaseColor,
+    MaterialChannel::Id,
     MaterialChannel::Roughness,
     MaterialChannel::Metallic,
     MaterialChannel::Normal,
@@ -47,6 +49,7 @@ fn main() -> eframe::Result {
 struct SubstanceCraftApp {
     project: MaterialProject,
     selected_texture_set: Option<TextureSetId>,
+    selected_layer: Option<substancecraft_core::LayerId>,
     selected_primitive: Option<PrimitivePreset>,
     mesh_geometry: Option<MeshGeometry>,
     imported_meshes: Vec<ImportedFbxMesh>,
@@ -56,12 +59,28 @@ struct SubstanceCraftApp {
     project_error: Option<String>,
     active_channel: MaterialChannel,
     next_texture_set_id: u64,
+    next_layer_id: u64,
     current_pose: NamedPose,
     viewport_camera: ViewportCamera,
     viewport_lighting: ViewportLighting,
+    paint_mode: PaintMode,
+    brush_radius: f32,
+    brush_color: egui::Color32,
+    mask_value: f32,
+    active_stroke: Option<(TextureSetId, substancecraft_core::LayerId, PaintMode)>,
+    baked_preview: Option<(TextureSetId, MaterialChannel, BakedTexture)>,
+    bake_error: Option<String>,
     selected_pose: Option<PoseId>,
     pose_name: String,
     pose_transition: Option<PoseTransition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintMode {
+    View,
+    Paint,
+    Mask,
+    Id,
 }
 
 struct PoseTransition {
@@ -88,6 +107,7 @@ impl Default for SubstanceCraftApp {
                 ..MaterialProject::empty()
             },
             selected_texture_set: None,
+            selected_layer: None,
             selected_primitive: Some(PrimitivePreset::Cube),
             mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
             imported_meshes: Vec::new(),
@@ -97,6 +117,7 @@ impl Default for SubstanceCraftApp {
             project_error: None,
             active_channel: MaterialChannel::BaseColor,
             next_texture_set_id: 1,
+            next_layer_id: 1,
             current_pose: NamedPose {
                 id: PoseId(0),
                 name: "Current Pose".to_owned(),
@@ -104,6 +125,13 @@ impl Default for SubstanceCraftApp {
             },
             viewport_camera: ViewportCamera::default(),
             viewport_lighting: ViewportLighting::default(),
+            paint_mode: PaintMode::View,
+            brush_radius: 16.0,
+            brush_color: egui::Color32::from_rgb(214, 108, 66),
+            mask_value: 0.0,
+            active_stroke: None,
+            baked_preview: None,
+            bake_error: None,
             selected_pose: None,
             pose_name: "Pose 1".to_owned(),
             pose_transition: None,
@@ -161,11 +189,26 @@ impl SubstanceCraftApp {
         self.selected_imported_mesh = scene.selected_imported_mesh;
         self.mesh_geometry = scene.geometry;
         self.selected_texture_set = self.project.active_texture_set;
+        self.selected_layer = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| Some(set.id) == self.selected_texture_set)
+            .and_then(|set| set.layers.first())
+            .map(|layer| layer.id);
         self.next_texture_set_id = self
             .project
             .texture_sets
             .iter()
             .map(|set| set.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_layer_id = self
+            .project
+            .texture_sets
+            .iter()
+            .flat_map(|set| set.layers.iter().map(|layer| layer.id.0))
             .max()
             .unwrap_or(0)
             .saturating_add(1);
@@ -184,6 +227,9 @@ impl SubstanceCraftApp {
         self.selected_pose = self.project.saved_poses.first().map(|pose| pose.id);
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
+        self.active_stroke = None;
+        self.baked_preview = None;
+        self.bake_error = None;
         self.import_error = None;
         self.project_error = None;
     }
@@ -276,6 +322,9 @@ impl SubstanceCraftApp {
                 self.project.texture_sets.clear();
                 self.project.active_texture_set = None;
                 self.selected_texture_set = None;
+                self.selected_layer = None;
+                self.active_stroke = None;
+                self.baked_preview = None;
                 self.current_pose.name = display_name;
             }
             Err(error) => self.import_error = Some(error),
@@ -296,11 +345,200 @@ impl SubstanceCraftApp {
                 width: 2048,
                 height: 2048,
             },
-            channels: BTreeSet::from([MaterialChannel::BaseColor]),
+            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
             layers: Vec::new(),
         });
         self.project.active_texture_set = Some(id);
         self.selected_texture_set = Some(id);
+        self.selected_layer = None;
+        self.baked_preview = None;
+    }
+
+    fn add_paint_layer(&mut self) {
+        let Some(texture_set_id) = self.selected_texture_set else {
+            return;
+        };
+        let Some(next_id) = self.next_layer_id.checked_add(1) else {
+            return;
+        };
+        let id = substancecraft_core::LayerId(self.next_layer_id);
+        let Some(texture_set) = self
+            .project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == texture_set_id)
+        else {
+            return;
+        };
+        texture_set.layers.push(MaterialLayer {
+            id,
+            name: format!("Paint Layer {}", id.0),
+            visible: true,
+            opacity: 1.0,
+            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+            paint_strokes: Vec::new(),
+            mask_strokes: Vec::new(),
+            id_strokes: Vec::new(),
+            id_mask_color: None,
+        });
+        self.next_layer_id = next_id;
+        self.selected_layer = Some(id);
+        self.baked_preview = None;
+    }
+
+    fn append_stroke_point(&mut self, uv: glam::Vec2) {
+        let (Some(texture_set_id), Some(layer_id)) =
+            (self.selected_texture_set, self.selected_layer)
+        else {
+            return;
+        };
+        if self.paint_mode == PaintMode::View {
+            return;
+        }
+        let stroke_key = (texture_set_id, layer_id, self.paint_mode);
+        let starts_stroke = self.active_stroke != Some(stroke_key);
+        let color = self.brush_color.to_array();
+        let Some(layer) = self
+            .project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == texture_set_id)
+            .and_then(|set| set.layers.iter_mut().find(|layer| layer.id == layer_id))
+        else {
+            return;
+        };
+
+        if starts_stroke {
+            match self.paint_mode {
+                PaintMode::View => return,
+                PaintMode::Paint => layer.paint_strokes.push(PaintStroke {
+                    points: vec![uv],
+                    radius_pixels: self.brush_radius,
+                    color,
+                    opacity: 1.0,
+                }),
+                PaintMode::Mask => layer.mask_strokes.push(MaskStroke {
+                    points: vec![uv],
+                    radius_pixels: self.brush_radius,
+                    value: self.mask_value,
+                    opacity: 1.0,
+                }),
+                PaintMode::Id => layer.id_strokes.push(IdStroke {
+                    points: vec![uv],
+                    radius_pixels: self.brush_radius,
+                    color: [color[0], color[1], color[2]],
+                    opacity: 1.0,
+                }),
+            }
+            self.active_stroke = Some(stroke_key);
+            return;
+        }
+
+        let points = match self.paint_mode {
+            PaintMode::View => return,
+            PaintMode::Paint => layer
+                .paint_strokes
+                .last_mut()
+                .map(|stroke| &mut stroke.points),
+            PaintMode::Mask => layer
+                .mask_strokes
+                .last_mut()
+                .map(|stroke| &mut stroke.points),
+            PaintMode::Id => layer.id_strokes.last_mut().map(|stroke| &mut stroke.points),
+        };
+        if let Some(points) = points
+            && points
+                .last()
+                .is_none_or(|last| last.distance_squared(uv) >= 0.000_001)
+        {
+            points.push(uv);
+        }
+    }
+
+    fn refresh_baked_preview(&mut self) {
+        let Some(texture_set_id) = self.selected_texture_set else {
+            self.baked_preview = None;
+            return;
+        };
+        if !matches!(
+            self.active_channel,
+            MaterialChannel::BaseColor | MaterialChannel::Id
+        ) {
+            return;
+        }
+        if self
+            .baked_preview
+            .as_ref()
+            .is_some_and(|(set_id, channel, _)| {
+                *set_id == texture_set_id && *channel == self.active_channel
+            })
+        {
+            return;
+        }
+        let Some(texture_set) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)
+        else {
+            self.baked_preview = None;
+            return;
+        };
+        let baked = match self.active_channel {
+            MaterialChannel::BaseColor => bake_texture_set_base_color(texture_set),
+            MaterialChannel::Id => bake_texture_set_id_mask(texture_set),
+            _ => return,
+        };
+        match baked {
+            Ok(texture) => {
+                self.baked_preview = Some((texture_set_id, self.active_channel, texture));
+                self.bake_error = None;
+            }
+            Err(error) => {
+                self.baked_preview = None;
+                self.bake_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn export_baked_map(&mut self, channel: MaterialChannel) {
+        let Some(texture_set) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| Some(set.id) == self.selected_texture_set)
+            .cloned()
+        else {
+            return;
+        };
+        let map_name = if channel == MaterialChannel::Id {
+            "ID Mask"
+        } else {
+            "Base Color"
+        };
+        let path = rfd::FileDialog::new()
+            .add_filter("Targa texture", &["tga"])
+            .set_file_name(format!("{}.tga", map_name.replace(' ', "_")))
+            .save_file();
+        let Some(path) = path else {
+            return;
+        };
+        let result = match channel {
+            MaterialChannel::BaseColor => bake_texture_set_base_color(&texture_set),
+            MaterialChannel::Id => bake_texture_set_id_mask(&texture_set),
+            _ => return,
+        }
+        .map_err(|error| error.to_string())
+        .and_then(|texture| write_tga(&path, &texture));
+        match result {
+            Ok(()) => {
+                self.bake_error = None;
+                self.active_channel = channel;
+                self.baked_preview = None;
+                self.refresh_baked_preview();
+            }
+            Err(error) => self.bake_error = Some(error),
+        }
     }
 
     fn update_header(&mut self, ui: &mut egui::Ui) {
@@ -523,12 +761,72 @@ impl SubstanceCraftApp {
                 if self.project.texture_sets.is_empty() {
                     ui.label("No texture sets");
                 } else {
-                    for texture_set in &self.project.texture_sets {
-                        let selected = self.selected_texture_set == Some(texture_set.id);
-                        if ui.selectable_label(selected, &texture_set.name).clicked() {
-                            self.selected_texture_set = Some(texture_set.id);
-                            self.project.active_texture_set = Some(texture_set.id);
+                    let texture_sets = self
+                        .project
+                        .texture_sets
+                        .iter()
+                        .map(|set| (set.id, set.name.clone()))
+                        .collect::<Vec<_>>();
+                    for (set_id, name) in texture_sets {
+                        let selected = self.selected_texture_set == Some(set_id);
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.selected_texture_set = Some(set_id);
+                            self.project.active_texture_set = Some(set_id);
+                            self.selected_layer = self
+                                .project
+                                .texture_sets
+                                .iter()
+                                .find(|set| set.id == set_id)
+                                .and_then(|set| set.layers.first())
+                                .map(|layer| layer.id);
+                            self.baked_preview = None;
                         }
+                    }
+                }
+
+                if let Some(texture_set_id) = self.selected_texture_set {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.heading("Layers");
+                        if ui.small_button("+").clicked() {
+                            self.add_paint_layer();
+                        }
+                    });
+                    let layers = self
+                        .project
+                        .texture_sets
+                        .iter()
+                        .find(|set| set.id == texture_set_id)
+                        .map(|set| {
+                            set.layers
+                                .iter()
+                                .map(|layer| (layer.id, layer.name.clone(), layer.visible))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    for (layer_id, name, mut visible) in layers {
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut visible, "").changed()
+                                && let Some(layer) = self
+                                    .project
+                                    .texture_sets
+                                    .iter_mut()
+                                    .find(|set| set.id == texture_set_id)
+                                    .and_then(|set| {
+                                        set.layers.iter_mut().find(|layer| layer.id == layer_id)
+                                    })
+                            {
+                                layer.visible = visible;
+                                self.baked_preview = None;
+                            }
+                            if ui
+                                .selectable_label(self.selected_layer == Some(layer_id), name)
+                                .clicked()
+                            {
+                                self.selected_layer = Some(layer_id);
+                            }
+                        });
                     }
                 }
 
@@ -546,101 +844,195 @@ impl SubstanceCraftApp {
         egui::Panel::right("properties")
             .exact_size(250.0)
             .show(ui, |ui| {
-                ui.heading("Properties");
-                ui.add_space(12.0);
-                if let Some(texture_set) = self
-                    .project
-                    .texture_sets
-                    .iter()
-                    .find(|set| Some(set.id) == self.selected_texture_set)
-                {
-                    ui.label("Texture Set");
-                    ui.strong(&texture_set.name);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Properties");
+                    ui.add_space(12.0);
+                    let mut mode_changed = false;
+                    ui.horizontal(|ui| {
+                        mode_changed |= ui
+                            .selectable_value(&mut self.paint_mode, PaintMode::View, "View")
+                            .changed();
+                        mode_changed |= ui
+                            .selectable_value(&mut self.paint_mode, PaintMode::Paint, "Paint")
+                            .changed();
+                        mode_changed |= ui
+                            .selectable_value(&mut self.paint_mode, PaintMode::Mask, "Mask")
+                            .changed();
+                        mode_changed |= ui
+                            .selectable_value(&mut self.paint_mode, PaintMode::Id, "ID")
+                            .changed();
+                    });
+                    if mode_changed {
+                        self.active_stroke = None;
+                        self.baked_preview = None;
+                        self.active_channel = match self.paint_mode {
+                            PaintMode::Id => MaterialChannel::Id,
+                            PaintMode::Paint | PaintMode::Mask => MaterialChannel::BaseColor,
+                            PaintMode::View => self.active_channel,
+                        };
+                    }
+                    if self.paint_mode != PaintMode::View {
+                        ui.add(
+                            egui::Slider::new(&mut self.brush_radius, 1.0..=128.0).text("Brush"),
+                        );
+                        if matches!(self.paint_mode, PaintMode::Paint | PaintMode::Id) {
+                            ui.horizontal(|ui| {
+                                ui.label("Color");
+                                ui.color_edit_button_srgba(&mut self.brush_color);
+                            });
+                        }
+                        if self.paint_mode == PaintMode::Mask {
+                            ui.add(
+                                egui::Slider::new(&mut self.mask_value, 0.0..=1.0)
+                                    .text("Mask Value"),
+                            );
+                        }
+                    }
+                    if let Some(texture_set) = self
+                        .project
+                        .texture_sets
+                        .iter()
+                        .find(|set| Some(set.id) == self.selected_texture_set)
+                    {
+                        ui.label("Texture Set");
+                        ui.strong(&texture_set.name);
+                        ui.add_space(8.0);
+                        ui.label("Material Slot");
+                        ui.label(&texture_set.material_slot);
+                        ui.add_space(8.0);
+                        ui.label("Resolution");
+                        ui.label(format!(
+                            "{} x {}",
+                            texture_set.resolution.width, texture_set.resolution.height
+                        ));
+                        ui.add_space(8.0);
+                        ui.label("Layers");
+                        ui.label(texture_set.layers.len().to_string());
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Bake Base Color").clicked() {
+                                self.export_baked_map(MaterialChannel::BaseColor);
+                            }
+                            if ui.button("Bake ID Mask").clicked() {
+                                self.export_baked_map(MaterialChannel::Id);
+                            }
+                        });
+                    } else {
+                        ui.label("Nothing selected");
+                    }
+                    if let (Some(texture_set_id), Some(layer_id)) =
+                        (self.selected_texture_set, self.selected_layer)
+                    {
+                        let existing_mask = self
+                            .project
+                            .texture_sets
+                            .iter()
+                            .find(|set| set.id == texture_set_id)
+                            .and_then(|set| set.layers.iter().find(|layer| layer.id == layer_id))
+                            .and_then(|layer| layer.id_mask_color);
+                        let mut enabled = existing_mask.is_some();
+                        let color = existing_mask.unwrap_or_else(|| {
+                            let brush = self.brush_color.to_array();
+                            [brush[0], brush[1], brush[2]]
+                        });
+                        let mut color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                        let mut changed = ui.checkbox(&mut enabled, "Clip by ID").changed();
+                        if enabled {
+                            changed |= ui.color_edit_button_srgba(&mut color).changed();
+                        }
+                        if changed
+                            && let Some(layer) = self
+                                .project
+                                .texture_sets
+                                .iter_mut()
+                                .find(|set| set.id == texture_set_id)
+                                .and_then(|set| {
+                                    set.layers.iter_mut().find(|layer| layer.id == layer_id)
+                                })
+                        {
+                            let channels = color.to_array();
+                            layer.id_mask_color =
+                                enabled.then_some([channels[0], channels[1], channels[2]]);
+                            self.baked_preview = None;
+                        }
+                    }
+                    if let Some(error) = &self.bake_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    ui.add_space(16.0);
+                    ui.separator();
                     ui.add_space(8.0);
-                    ui.label("Material Slot");
-                    ui.label(&texture_set.material_slot);
+                    ui.heading("Pose Transform");
+                    ui.label("Root translation");
+                    let transform = self
+                        .current_pose
+                        .bones
+                        .entry(BoneId(0))
+                        .or_insert(BoneTransform::IDENTITY);
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut transform.translation.x)
+                                    .prefix("X ")
+                                    .speed(0.05),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut transform.translation.y)
+                                    .prefix("Y ")
+                                    .speed(0.05),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut transform.translation.z)
+                                    .prefix("Z ")
+                                    .speed(0.05),
+                            )
+                            .changed();
+                    });
+                    if changed {
+                        self.pose_transition = None;
+                        self.selected_pose = None;
+                    }
+                    ui.add_space(16.0);
+                    ui.separator();
                     ui.add_space(8.0);
-                    ui.label("Resolution");
-                    ui.label(format!(
-                        "{} x {}",
-                        texture_set.resolution.width, texture_set.resolution.height
-                    ));
-                    ui.add_space(8.0);
-                    ui.label("Layers");
-                    ui.label(texture_set.layers.len().to_string());
-                } else {
-                    ui.label("Nothing selected");
-                }
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.heading("Pose Transform");
-                ui.label("Root translation");
-                let transform = self
-                    .current_pose
-                    .bones
-                    .entry(BoneId(0))
-                    .or_insert(BoneTransform::IDENTITY);
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut transform.translation.x)
-                                .prefix("X ")
-                                .speed(0.05),
+                    ui.heading("Viewport");
+                    if ui.button("Reset View").clicked() {
+                        self.viewport_camera = ViewportCamera::default();
+                    }
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.viewport_camera.yaw,
+                            0.0..=std::f32::consts::TAU,
                         )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut transform.translation.y)
-                                .prefix("Y ")
-                                .speed(0.05),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut transform.translation.z)
-                                .prefix("Z ")
-                                .speed(0.05),
-                        )
-                        .changed();
-                });
-                if changed {
-                    self.pose_transition = None;
-                    self.selected_pose = None;
-                }
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.heading("Viewport");
-                if ui.button("Reset View").clicked() {
-                    self.viewport_camera = ViewportCamera::default();
-                }
-                ui.add(
-                    egui::Slider::new(&mut self.viewport_camera.yaw, 0.0..=std::f32::consts::TAU)
                         .text("Orbit"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.viewport_camera.pitch, -1.55..=1.55).text("Tilt"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.viewport_camera.zoom, 0.1..=20.0)
-                        .logarithmic(true)
-                        .text("Zoom"),
-                );
-                ui.add_space(10.0);
-                ui.heading("Environment Light");
-                ui.add(
-                    egui::Slider::new(
-                        &mut self.viewport_lighting.rotation,
-                        0.0..=std::f32::consts::TAU,
-                    )
-                    .text("Rotation"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.viewport_lighting.ambient_fill, 0.0..=1.0)
-                        .text("Ambient Fill"),
-                );
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.viewport_camera.pitch, -1.55..=1.55)
+                            .text("Tilt"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.viewport_camera.zoom, 0.1..=20.0)
+                            .logarithmic(true)
+                            .text("Zoom"),
+                    );
+                    ui.add_space(10.0);
+                    ui.heading("Environment Light");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.viewport_lighting.rotation,
+                            0.0..=std::f32::consts::TAU,
+                        )
+                        .text("Rotation"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.viewport_lighting.ambient_fill, 0.0..=1.0)
+                            .text("Ambient Fill"),
+                    );
+                });
             });
     }
 
@@ -652,7 +1044,9 @@ impl SubstanceCraftApp {
                 ui.id().with("model_viewport"),
                 egui::Sense::click_and_drag(),
             );
-            if response.dragged() {
+            let was_stroke_active = self.active_stroke.is_some();
+            let pointer_position = ui.input(|input| input.pointer.interact_pos());
+            if response.dragged() && self.paint_mode == PaintMode::View {
                 let delta = ui.input(|input| input.pointer.delta());
                 let delta = glam::Vec2::new(delta.x, delta.y);
                 if ui.input(|input| input.modifiers.shift) {
@@ -660,8 +1054,14 @@ impl SubstanceCraftApp {
                 } else {
                     self.viewport_camera.orbit(delta);
                 }
+            } else if !response.dragged() {
+                self.active_stroke = None;
+                if was_stroke_active {
+                    self.baked_preview = None;
+                }
+                self.refresh_baked_preview();
             }
-            if response.hovered() {
+            if response.hovered() && self.paint_mode == PaintMode::View {
                 let scroll = ui.input(|input| input.smooth_scroll_delta.y);
                 self.viewport_camera.zoom_by(scroll);
             }
@@ -714,21 +1114,53 @@ impl SubstanceCraftApp {
                     .triangles
                     .iter()
                     .filter_map(|triangle| {
+                        let vertex_a = mesh.vertices.get(triangle[0] as usize)?;
+                        let vertex_b = mesh.vertices.get(triangle[1] as usize)?;
+                        let vertex_c = mesh.vertices.get(triangle[2] as usize)?;
                         let a = project(triangle[0])?;
                         let b = project(triangle[1])?;
                         let c = project(triangle[2])?;
                         let normal = (b.1 - a.1).cross(c.1 - a.1).normalize_or_zero();
                         let intensity = self.viewport_lighting.face_intensity(normal);
-                        let color = egui::Color32::from_rgb(
-                            (92.0 * intensity).clamp(0.0, 255.0) as u8,
-                            (132.0 * intensity).clamp(0.0, 255.0) as u8,
-                            (151.0 * intensity).clamp(0.0, 255.0) as u8,
-                        );
-                        Some(((a.1.z + b.1.z + c.1.z) / 3.0, [a.0, b.0, c.0], color))
+                        Some((
+                            (a.1.z + b.1.z + c.1.z) / 3.0,
+                            [a.0, b.0, c.0],
+                            [vertex_a.uv, vertex_b.uv, vertex_c.uv],
+                            intensity,
+                        ))
                     })
                     .collect::<Vec<_>>();
                 faces.sort_by(|left, right| left.0.total_cmp(&right.0));
-                for (_, points, color) in faces {
+
+                if response.dragged() && self.paint_mode != PaintMode::View {
+                    let hit_uv = pointer_position.and_then(|pointer| {
+                        let mut candidates = faces.iter().filter_map(|(_, points, uvs, _)| {
+                            barycentric_uv(pointer, *points, *uvs)
+                        });
+                        candidates.next_back()
+                    });
+                    if let Some(uv) = hit_uv {
+                        self.append_stroke_point(uv);
+                    }
+                }
+
+                for (_, points, uvs, intensity) in faces {
+                    let uv_center = (uvs[0] + uvs[1] + uvs[2]) / 3.0;
+                    let map_color = self
+                        .baked_preview
+                        .as_ref()
+                        .filter(|(set_id, channel, _)| {
+                            Some(*set_id) == self.selected_texture_set
+                                && *channel == self.active_channel
+                        })
+                        .and_then(|(_, _, texture)| texture.sample_uv(uv_center))
+                        .filter(|color| color[3] > 0)
+                        .unwrap_or([92, 132, 151, 255]);
+                    let color = egui::Color32::from_rgb(
+                        (map_color[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                        (map_color[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                        (map_color[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                    );
                     painter.add(egui::Shape::convex_polygon(
                         points.to_vec(),
                         color,
@@ -742,6 +1174,21 @@ impl SubstanceCraftApp {
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_rgb(190, 194, 199),
                 );
+                if self.paint_mode != PaintMode::View
+                    && response.hovered()
+                    && let Some(pointer) = pointer_position
+                {
+                    let cursor_color = if self.paint_mode == PaintMode::Mask {
+                        egui::Color32::WHITE
+                    } else {
+                        self.brush_color
+                    };
+                    painter.circle_stroke(
+                        pointer,
+                        (self.brush_radius * self.viewport_camera.zoom * 0.35).clamp(3.0, 36.0),
+                        egui::Stroke::new(1.5, cursor_color),
+                    );
+                }
             } else {
                 painter.text(
                     center,
@@ -762,6 +1209,28 @@ impl SubstanceCraftApp {
     }
 }
 
+fn barycentric_uv(
+    point: egui::Pos2,
+    screen: [egui::Pos2; 3],
+    uvs: [glam::Vec2; 3],
+) -> Option<glam::Vec2> {
+    let edge_a = glam::Vec2::new(screen[1].x - screen[0].x, screen[1].y - screen[0].y);
+    let edge_b = glam::Vec2::new(screen[2].x - screen[0].x, screen[2].y - screen[0].y);
+    let relative = glam::Vec2::new(point.x - screen[0].x, point.y - screen[0].y);
+    let denominator = edge_a.perp_dot(edge_b);
+    if denominator.abs() <= f32::EPSILON {
+        return None;
+    }
+    let weight_b = relative.perp_dot(edge_b) / denominator;
+    let weight_c = edge_a.perp_dot(relative) / denominator;
+    let weight_a = 1.0 - weight_b - weight_c;
+    if weight_a < -0.001 || weight_b < -0.001 || weight_c < -0.001 {
+        return None;
+    }
+    let uv = uvs[0] * weight_a + uvs[1] * weight_b + uvs[2] * weight_c;
+    (uv.is_finite() && (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)).then_some(uv)
+}
+
 impl eframe::App for SubstanceCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.update_pose_transition(ui.ctx());
@@ -776,6 +1245,7 @@ impl eframe::App for SubstanceCraftApp {
 fn channel_label(channel: MaterialChannel) -> &'static str {
     match channel {
         MaterialChannel::BaseColor => "Base Color",
+        MaterialChannel::Id => "ID Mask",
         MaterialChannel::Roughness => "Roughness",
         MaterialChannel::Metallic => "Metallic",
         MaterialChannel::Normal => "Normal",
@@ -783,5 +1253,88 @@ fn channel_label(channel: MaterialChannel) -> &'static str {
         MaterialChannel::AmbientOcclusion => "Ambient Occlusion",
         MaterialChannel::Emissive => "Emissive",
         MaterialChannel::Opacity => "Opacity",
+    }
+}
+
+fn write_tga(path: &std::path::Path, texture: &BakedTexture) -> Result<(), String> {
+    let bytes = encode_tga(texture)?;
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
+fn encode_tga(texture: &BakedTexture) -> Result<Vec<u8>, String> {
+    let width = u16::try_from(texture.width)
+        .map_err(|_| "TGA width exceeds the format limit".to_owned())?;
+    let height = u16::try_from(texture.height)
+        .map_err(|_| "TGA height exceeds the format limit".to_owned())?;
+    let expected_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "TGA pixel count overflow".to_owned())?;
+    if texture.rgba8.len() != expected_bytes {
+        return Err("TGA RGBA buffer does not match its dimensions".to_owned());
+    }
+    let capacity = 18_usize
+        .checked_add(texture.rgba8.len())
+        .ok_or_else(|| "TGA output size overflow".to_owned())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|error| error.to_string())?;
+    let mut header = [0_u8; 18];
+    header[2] = 2;
+    header[12..14].copy_from_slice(&width.to_le_bytes());
+    header[14..16].copy_from_slice(&height.to_le_bytes());
+    header[16] = 32;
+    header[17] = 0x28;
+    bytes.extend_from_slice(&header);
+    let (pixels, remainder) = texture.rgba8.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("TGA RGBA buffer has an incomplete pixel".to_owned());
+    }
+    for [red, green, blue, alpha] in pixels {
+        bytes.extend_from_slice(&[*blue, *green, *red, *alpha]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_point_maps_to_triangle_uv_and_rejects_outside_points() {
+        let screen = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(0.0, 100.0),
+        ];
+        let uvs = [
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(0.0, 1.0),
+        ];
+
+        assert_eq!(
+            barycentric_uv(egui::pos2(25.0, 25.0), screen, uvs),
+            Some(glam::Vec2::new(0.25, 0.25))
+        );
+        assert_eq!(barycentric_uv(egui::pos2(75.0, 75.0), screen, uvs), None);
+    }
+
+    #[test]
+    fn tga_export_writes_top_origin_rgba_as_bgra() {
+        let texture = BakedTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![10, 20, 30, 40],
+        };
+
+        let encoded = encode_tga(&texture).unwrap();
+
+        assert_eq!(encoded[2], 2);
+        assert_eq!(&encoded[12..16], &[1, 0, 1, 0]);
+        assert_eq!(&encoded[16..18], &[32, 0x28]);
+        assert_eq!(&encoded[18..], &[30, 20, 10, 40]);
     }
 }

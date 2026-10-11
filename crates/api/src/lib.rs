@@ -11,7 +11,9 @@ use std::{
     io::{self, Read, Write},
     path::Path,
 };
-use substancecraft_core::{MaterialProject, MeshError, PrimitivePreset};
+use substancecraft_core::{
+    BakeError, BakedTexture, MaterialProject, MeshError, PrimitivePreset, TextureSet,
+};
 use thiserror::Error;
 
 pub const MAX_PROJECT_JSON_BYTES: usize = 128 * 1024 * 1024;
@@ -171,12 +173,22 @@ pub fn inspect_primitive_preset(name: &str) -> Result<PrimitiveSummary, ApiError
     })
 }
 
+pub fn bake_texture_set_base_color(texture_set: &TextureSet) -> Result<BakedTexture, ApiError> {
+    Ok(texture_set.bake_base_color()?)
+}
+
+pub fn bake_texture_set_id_mask(texture_set: &TextureSet) -> Result<BakedTexture, ApiError> {
+    Ok(texture_set.bake_id_mask()?)
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ApiError {
     #[error("unknown mesh preset `{0}`")]
     UnknownPrimitivePreset(String),
     #[error(transparent)]
     InvalidGeneratedMesh(#[from] MeshError),
+    #[error(transparent)]
+    TextureBake(#[from] BakeError),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -231,10 +243,10 @@ mod tests {
     fn tc_0016_project_json_round_trip_preserves_saved_poses_and_texture_sets() {
         use std::collections::{BTreeMap, BTreeSet};
 
-        use glam::{Quat, Vec3};
+        use glam::{Quat, Vec2, Vec3};
         use substancecraft_core::{
-            BoneId, BoneTransform, LayerId, MaterialChannel, MaterialLayer, NamedPose, PoseId,
-            TextureResolution, TextureSet, TextureSetId,
+            BoneId, BoneTransform, IdStroke, LayerId, MaskStroke, MaterialChannel, MaterialLayer,
+            NamedPose, PaintStroke, PoseId, TextureResolution, TextureSet, TextureSetId,
         };
 
         let project = MaterialProject {
@@ -252,7 +264,26 @@ mod tests {
                     name: "Paint".to_owned(),
                     visible: true,
                     opacity: 0.75,
-                    channels: BTreeSet::from([MaterialChannel::BaseColor]),
+                    channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+                    paint_strokes: vec![PaintStroke {
+                        points: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
+                        radius_pixels: 8.0,
+                        color: [32, 64, 128, 255],
+                        opacity: 0.8,
+                    }],
+                    mask_strokes: vec![MaskStroke {
+                        points: vec![Vec2::new(0.5, 0.5)],
+                        radius_pixels: 4.0,
+                        value: 0.25,
+                        opacity: 0.5,
+                    }],
+                    id_strokes: vec![IdStroke {
+                        points: vec![Vec2::new(0.5, 0.5)],
+                        radius_pixels: 4.0,
+                        color: [1, 2, 3],
+                        opacity: 1.0,
+                    }],
+                    id_mask_color: Some([1, 2, 3]),
                 }],
             }],
             saved_poses: vec![NamedPose {
@@ -275,6 +306,39 @@ mod tests {
         let decoded = decode_project_json(&encoded).unwrap();
 
         assert_eq!(decoded, project);
+    }
+
+    #[test]
+    fn tc_0027_legacy_layers_default_to_empty_paint_and_mask_data() {
+        let encoded = serde_json::json!({
+            "schema_version": substancecraft_core::PROJECT_SCHEMA_VERSION,
+            "mesh": null,
+            "texture_sets": [{
+                "id": 1,
+                "name": "Legacy",
+                "material_slot": "Body",
+                "resolution": { "width": 16, "height": 16 },
+                "channels": ["BaseColor"],
+                "layers": [{
+                    "id": 2,
+                    "name": "Paint",
+                    "visible": true,
+                    "opacity": 1.0,
+                    "channels": ["BaseColor"]
+                }]
+            }],
+            "saved_poses": [],
+            "active_texture_set": 1
+        })
+        .to_string();
+
+        let project = decode_project_json(encoded.as_bytes()).unwrap();
+        let layer = &project.texture_sets[0].layers[0];
+
+        assert!(layer.paint_strokes.is_empty());
+        assert!(layer.mask_strokes.is_empty());
+        assert!(layer.id_strokes.is_empty());
+        assert_eq!(layer.id_mask_color, None);
     }
 
     #[test]

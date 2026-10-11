@@ -15,16 +15,16 @@ This is the product capability map derived from the supplied Painter feature inv
 | 02 | Mesh importing and preparation | Partial | Binary FBX 7.4+ static mesh geometry imports through the API and desktop picker, with native UVs or planar fallback; ASCII FBX, glTF/GLB, material slots, model transforms, and skeletal animation remain open. |
 | 03 | Texture Sets | Partial | Derive independent sets from material slots with per-set channels, resolution, maps, and export. |
 | 04 | Material channels | Partial | Channel-aware composition for color, scalar, normal, height, opacity, and emissive data. |
-| 05 | Painting tools | Planned | Paint, erase, path, projection, polygon fill, smudge, clone, picker, and quick mask commands. |
-| 06 | Brush and stroke systems | Planned | Deterministic stamps, dynamics, alphas, tablet input, smoothing, and reusable presets. |
+| 05 | Painting tools | Partial | UV-space Base Color, grayscale-mask, and ID-color freehand brushes operate on projected mesh hits; erase, path, projection, polygon fill, smudge, clone, picker, and quick mask remain open. |
+| 06 | Brush and stroke systems | Partial | Persistent interpolated UV strokes with a soft circular brush; dynamics, alphas, tablet input, stabilization, and reusable presets remain open. |
 | 07 | Symmetry | Planned | Previewed geometric symmetry applied consistently across enabled channels. |
 | 08 | Stroke assistance and precision | Planned | Stabilization, straight lines, surface alignment, cursor preview, and seam-aware painting. |
 | 09 | Projection systems | Planned | Camera, planar, UV, triplanar, decal, and geometry-conforming projection. |
 | 10 | Fill layers | Planned | Nondestructive channel fills with texture resources and projection controls. |
-| 11 | Paint layers | Partial | Layer stack model exists; editable raster paint content and per-channel data remain open. |
-| 12 | Layer stack | Partial | Stable layer model; groups, effects, masks, ordering, and complete commands remain open. |
+| 11 | Paint layers | Partial | Persistent UV Base Color and ID strokes with visibility, opacity, and CPU compositing; groups, effects, undo/redo, and other channel painting remain open. |
+| 12 | Layer stack | Partial | Stable ordered layers with grayscale masks and optional ID-color clipping; groups, effects, and complete commands remain open. |
 | 13 | Layer flattening | Planned | Flatten selected layers/groups while preserving or exporting source structure. |
-| 14 | Masks | Planned | Painted, bitmap, procedural, geometry, and UV-tile masks with effect stacks. |
+| 14 | Masks | Partial | Painted grayscale masks and color-selected ID clipping are implemented; bitmap, procedural, geometry, UV-tile masks, and effect stacks remain open. |
 | 15 | Smart Masks | Planned | Reusable, parameterized masks driven by mesh maps. |
 | 16 | Generators | Planned | Mesh-map generators for wear, dirt, cavities, position, orientation, and IDs. |
 | 17 | Texture generators and procedural resources | Planned | Seeded, parameterized noise, pattern, grunge, and alpha generation. |
@@ -35,12 +35,12 @@ This is the product capability map derived from the supplied Painter feature inv
 | 22 | Decals, atlases, and surface details | Planned | Reusable projected details with transforms and geometry conformance. |
 | 23 | Spline and path-based details | Planned | Editable surface paths that drive brush, erase, blur, and repeated details. |
 | 24 | Vector graphics and text | Planned | Licensed SVG and text resources for alphas, fills, and projection. |
-| 25 | Baking Mode | Planned | Separate bake workflow with settings, preview, progress, and diagnostics. |
-| 26 | Mesh-map baking | Planned | Normal, world normal, AO, curvature, position, thickness, and ID outputs. |
+| 25 | Baking Mode | Partial | Selected texture sets can bake and export Base Color and manually painted ID maps as TGA; dedicated bake settings, progress, and diagnostics remain open. |
+| 26 | Mesh-map baking | Partial | Manual UV ID-map baking exists; geometry-derived normal, world normal, AO, curvature, position, and thickness maps remain open. |
 | 27 | Skew correction and baking correction | Planned | Inspect and paint bake correction maps with edge protection. |
 | 28 | Automatic rebaking and baking iteration | Planned | Track dependencies and rebake affected maps on relevant mesh/settings edits. |
 | 29 | UV Tile and UDIM workflows | Planned | Multi-tile storage, painting, baking, caching, and export. |
-| 30 | 2D and 3D viewports | Partial | Projected mesh preview has orbit, pan, and zoom; actual 3D and UV viewports, layouts, and channel-linked painting remain open. |
+| 30 | 2D and 3D viewports | Partial | Projected mesh preview supports UV-space paint/mask/ID gestures and baked-map preview; actual 3D and UV viewports and channel-linked painting remain open. |
 | 31 | Real-time PBR viewport | Partial | Preview has rotating directional lighting and ambient fill; physically based material shading, image-based lighting, and global illumination remain open. |
 | 32 | Rendering | Planned | Interactive and export rendering with camera, lighting, and color-managed output. |
 | 33 | Shader system | Planned | Built-in metallic/roughness and extensible shader definitions. |
@@ -49,7 +49,7 @@ This is the product capability map derived from the supplied Painter feature inv
 | 36 | Asset management | Planned | Searchable, typed project and library resources with provenance and licensing. |
 | 37 | Supported resource categories | Planned | Materials, masks, brushes, alphas, textures, filters, generators, decals, and environments. |
 | 38 | Texture importing | Planned | Bounded, color-aware import for channel textures, masks, sequences, and environments. |
-| 39 | Texture exporting | Planned | Export sets, channels, UDIMs, maps, and flattened selections. |
+| 39 | Texture exporting | Partial | Base Color and ID maps export as 32-bit TGA; other channels, formats, UDIMs, and export presets remain open. |
 | 40 | Export presets and channel packing | Planned | Serializable output graphs for routing, packing, inversion, formats, and naming. |
 | 41 | Pipeline-targeted exporting | Planned | Documented, tested profiles for glTF, game engines, renderers, and custom pipelines. |
 | 42 | History and nondestructive editing | Partial | Named pose interpolation exists; project-wide commands, undo/redo, and snapshots remain open. |
