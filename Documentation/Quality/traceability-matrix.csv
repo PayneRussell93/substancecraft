@@ -26,3 +26,4 @@ REQ-0024,Assist strokes with symmetry stabilization lines seam splitting paths a
 REQ-0025,Bake and export UDIM tiles and apply skew correction in high-to-low bakes,docs/feature-map.md,docs/architecture.md,,TC-0170;TC-0171;TC-0192,Documentation/Quality/TestPlan-short.md,Project owner,In progress
 REQ-0026,Use SVG and text as resources and interchange materials as OpenPBR MaterialX and glTF,docs/feature-map.md,docs/architecture.md,,TC-0180;TC-0181;TC-0190;TC-0191;TC-0192,Documentation/Quality/TestPlan-short.md,Project owner,In progress
 REQ-0027,Run deterministic headless export jobs and render still images,docs/feature-map.md,docs/architecture.md,,TC-0200;TC-0201;TC-0210;TC-0211,Documentation/Quality/TestPlan-short.md,Project owner,In progress
+REQ-0028,Blend layers with standard blend modes and remember export choices per texture set,docs/feature-map.md,docs/architecture.md,,TC-0157;TC-0202;TC-0203,Documentation/Quality/TestPlan-short.md,Project owner,In progress

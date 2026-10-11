@@ -1708,7 +1708,8 @@ impl SubstanceCraftApp {
                 widgets::property_row(ui, "Format", |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for format in TextureFormat::ALL {
-                        if widgets::chip(ui, format.name(), self.selected_format() == format).clicked()
+                        if widgets::chip(ui, format.name(), self.selected_format() == format)
+                            .clicked()
                         {
                             self.set_format_choice(format);
                         }
@@ -2661,6 +2662,25 @@ impl SubstanceCraftApp {
     /// Preset picker, the files the preset writes, the Export button, and
     /// the custom-preset editor.
     fn export_preset_controls(&mut self, ui: &mut Ui) {
+        let remembered = self
+            .selected_texture_set_ref()
+            .is_some_and(|set| set.export.is_some());
+        let mut remember = remembered;
+        widgets::property_row(ui, "This set", |ui| {
+            widgets::toggle(ui, &mut remember).on_hover_text(
+                "Remember the preset, format, and UDIM choice for this texture set; \n                 Export all sets and the command line use it",
+            );
+        });
+        if remember != remembered {
+            self.remember_export_for_selected(remember);
+        }
+        if let Some(export) = self.selected_export_settings_mut() {
+            let mut udim = export.udim;
+            widgets::property_row(ui, "UDIM tiles", |ui| {
+                widgets::toggle(ui, &mut udim).on_hover_text("Export one file set per UV tile");
+            });
+            export.udim = udim;
+        }
         let presets = self.export_presets();
         let selected = self.selected_export_preset();
         widgets::property_row(ui, "Preset", |ui| {
@@ -2786,6 +2806,12 @@ impl SubstanceCraftApp {
                 .clicked()
             {
                 self.export_gltf();
+            }
+            if widgets::chip(ui, "All sets…", false)
+                .on_hover_text("Export every texture set with its own preset and format")
+                .clicked()
+            {
+                self.export_all_sets();
             }
             if widgets::chip(ui, "UDIM tiles…", false)
                 .on_hover_text("This preset once per UV tile ( in names, else .1001)")

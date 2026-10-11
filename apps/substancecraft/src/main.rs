@@ -2805,6 +2805,136 @@ impl SubstanceCraftApp {
         }
     }
 
+    /// File format a texture set exports in: its saved choice, else the
+    /// app-wide one.
+    fn format_for(&self, texture_set: &TextureSet) -> TextureFormat {
+        texture_set
+            .export
+            .as_ref()
+            .and_then(|export| TextureFormat::from_extension(&export.format))
+            .unwrap_or(self.export_format)
+    }
+
+    fn preset_name_for(&self, texture_set: &TextureSet) -> String {
+        texture_set.export.as_ref().map_or_else(
+            || self.export_preset.clone(),
+            |export| export.preset.clone(),
+        )
+    }
+
+    fn selected_format(&self) -> TextureFormat {
+        self.selected_texture_set_ref()
+            .map_or(self.export_format, |set| self.format_for(set))
+    }
+
+    fn selected_preset_name(&self) -> String {
+        self.selected_texture_set_ref().map_or_else(
+            || self.export_preset.clone(),
+            |set| self.preset_name_for(set),
+        )
+    }
+
+    fn selected_export_settings_mut(
+        &mut self,
+    ) -> Option<&mut substancecraft_core::TextureSetExport> {
+        let id = self.selected_texture_set?;
+        self.project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == id)?
+            .export
+            .as_mut()
+    }
+
+    /// Changes the selected set's saved format when it has one, else the
+    /// app-wide format.
+    fn set_format_choice(&mut self, format: TextureFormat) {
+        match self.selected_export_settings_mut() {
+            Some(export) => export.format = format.extension().to_owned(),
+            None => self.export_format = format,
+        }
+    }
+
+    fn set_preset_choice(&mut self, name: String) {
+        match self.selected_export_settings_mut() {
+            Some(export) => export.preset = name,
+            None => self.export_preset = name,
+        }
+    }
+
+    /// Whether the selected set keeps its own export choice; turning it on
+    /// captures the current one.
+    fn remember_export_for_selected(&mut self, remember: bool) {
+        let preset = self.selected_preset_name();
+        let format = self.selected_format();
+        let Some(id) = self.selected_texture_set else {
+            return;
+        };
+        if let Some(set) = self
+            .project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == id)
+        {
+            set.export = remember.then(|| substancecraft_core::TextureSetExport {
+                preset,
+                format: format.extension().to_owned(),
+                udim: set.export.as_ref().is_some_and(|export| export.udim),
+            });
+        }
+    }
+
+    /// Exports every texture set into `folder` with its own preset, format,
+    /// and UDIM choice. Stops at the first set preflight blocks.
+    fn export_all_sets_into(
+        &self,
+        folder: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        let presets = self.export_presets();
+        let mut written = Vec::new();
+        for texture_set in &self.project.texture_sets {
+            let name = self.preset_name_for(texture_set);
+            let preset = presets
+                .iter()
+                .find(|preset| preset.name == name)
+                .ok_or_else(|| format!("{}: unknown preset `{name}`", texture_set.name))?;
+            if let Some(error) = blocking_export_error(&self.export_issues(texture_set, preset)) {
+                return Err(format!("{}: {error}", texture_set.name));
+            }
+            let udim = texture_set
+                .export
+                .as_ref()
+                .is_some_and(|export| export.udim);
+            let files = if udim {
+                self.write_udim_tiles(texture_set, preset, folder)
+            } else {
+                self.write_export(texture_set, preset, folder)
+            }
+            .map_err(|error| format!("{}: {error}", texture_set.name))?;
+            written.extend(files);
+        }
+        Ok(written)
+    }
+
+    fn export_all_sets(&mut self) {
+        if self
+            .project
+            .texture_sets
+            .iter()
+            .any(TextureSet::requires_mesh_maps)
+            && !self.mesh_maps_fresh()
+        {
+            self.ensure_mesh_maps();
+            self.bake_error =
+                Some("Mesh maps are still baking; export again when they finish.".to_owned());
+            return;
+        }
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.bake_error = self.export_all_sets_into(&folder).err();
+    }
+
     /// Built-in presets followed by the project's custom ones.
     fn export_presets(&self) -> Vec<ExportPreset> {
         let mut presets = ExportPreset::built_in();
@@ -2876,7 +3006,12 @@ impl SubstanceCraftApp {
         preset: ExportPreset,
         folder: std::path::PathBuf,
     ) {
-        let existing = existing_export_files(&folder, &texture_set, &preset, self.format_for(&texture_set));
+        let existing = existing_export_files(
+            &folder,
+            &texture_set,
+            &preset,
+            self.format_for(&texture_set),
+        );
         if existing.is_empty() {
             self.finish_export(&texture_set, &preset, &folder);
         } else {
@@ -4920,6 +5055,67 @@ mod tests {
         let image = &app.resource_images[&id];
         assert!(image.width > image.height);
         assert!(image.rgba8.chunks(4).any(|texel| texel[3] == 255));
+    }
+
+    #[test]
+    fn tc_0203_texture_sets_remember_their_own_export_choices() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        let body = app.selected_texture_set.unwrap();
+        app.add_texture_set();
+        app.add_fill_layer();
+        let trim = app.selected_texture_set.unwrap();
+        small_sets(&mut app, 8);
+
+        // Trim remembers Unreal as TGA; Body keeps following the app-wide
+        // choice.
+        app.set_preset_choice("Unreal Engine".to_owned());
+        app.set_format_choice(TextureFormat::Tga);
+        app.remember_export_for_selected(true);
+        app.set_preset_choice(DEFAULT_EXPORT_PRESET.to_owned());
+        app.set_format_choice(TextureFormat::Png);
+        let saved = app
+            .selected_texture_set_ref()
+            .unwrap()
+            .export
+            .clone()
+            .unwrap();
+        assert_eq!(
+            saved.preset, DEFAULT_EXPORT_PRESET,
+            "edits go to the remembered set"
+        );
+        assert_eq!(
+            app.export_preset, "Unreal Engine",
+            "app-wide choice untouched"
+        );
+        app.set_preset_choice("Unreal Engine".to_owned());
+        app.set_format_choice(TextureFormat::Tga);
+
+        app.selected_texture_set = Some(body);
+        app.set_preset_choice(DEFAULT_EXPORT_PRESET.to_owned());
+        app.set_format_choice(TextureFormat::Png);
+        assert_eq!(app.selected_preset_name(), DEFAULT_EXPORT_PRESET);
+        app.selected_texture_set = Some(trim);
+        assert_eq!(app.selected_preset_name(), "Unreal Engine");
+        assert_eq!(app.selected_format(), TextureFormat::Tga);
+        app.project.validate().unwrap();
+
+        let written = app.export_all_sets_into(folder.path()).unwrap();
+        let names: Vec<String> = written
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.ends_with("_ORM.png")));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("T_") && name.ends_with("_N.tga"))
+        );
+
+        // Forgetting falls back to the app-wide choice.
+        app.remember_export_for_selected(false);
+        assert_eq!(app.selected_format(), TextureFormat::Png);
     }
 
     #[test]
