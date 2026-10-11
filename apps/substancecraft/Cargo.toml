@@ -10,6 +10,7 @@ description = "A Rust-native 3D material authoring application"
 eframe.workspace = true
 glam.workspace = true
 rfd.workspace = true
+substancecraft-filament = { path = "../../crates/filament" }
 substancecraft-api = { path = "../../crates/api" }
 substancecraft-core = { path = "../../crates/core" }
 

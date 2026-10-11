@@ -1,0 +1,24 @@
+[package]
+name = "substancecraft-filament"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Isolated Filament runtime adapter for the SubstanceCraft viewport"
+
+[dependencies]
+glam.workspace = true
+filament-bindings = { version = "0.2.2", default-features = false, features = ["prebuilt"] }
+substancecraft-core = { path = "../core" }
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
