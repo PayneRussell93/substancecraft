@@ -226,8 +226,10 @@ mod tests {
             };
             assert_eq!(summary.bounds_min, expected_bounds.0);
             assert_eq!(summary.bounds_max, expected_bounds.1);
-            assert_eq!(summary.uv_bounds_min, [0.0, 0.0]);
-            assert_eq!(summary.uv_bounds_max, [1.0, 1.0]);
+            assert!(summary.uv_bounds_min.iter().all(|value| *value >= 0.0));
+            assert!(summary.uv_bounds_max.iter().all(|value| *value <= 1.0));
+            assert!(summary.uv_bounds_min[0] < summary.uv_bounds_max[0]);
+            assert!(summary.uv_bounds_min[1] < summary.uv_bounds_max[1]);
         }
     }
 

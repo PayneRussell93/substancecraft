@@ -182,12 +182,25 @@ impl ViewportLighting {
 }
 
 fn push_quad(mesh: &mut MeshGeometry, positions: [Vec3; 4]) {
+    push_quad_in_uv_rect(mesh, positions, glam::Vec2::ZERO, glam::Vec2::ONE);
+}
+
+/// Gap kept between UV charts of built-in primitives so brush strokes and
+/// texture filtering near one face do not bleed into another.
+const PRIMITIVE_UV_PADDING: f32 = 0.01;
+
+fn push_quad_in_uv_rect(
+    mesh: &mut MeshGeometry,
+    positions: [Vec3; 4],
+    uv_min: glam::Vec2,
+    uv_max: glam::Vec2,
+) {
     let base = mesh.vertices.len() as u32;
     let uvs = [
-        glam::Vec2::new(0.0, 0.0),
-        glam::Vec2::new(1.0, 0.0),
-        glam::Vec2::new(1.0, 1.0),
-        glam::Vec2::new(0.0, 1.0),
+        glam::Vec2::new(uv_min.x, uv_min.y),
+        glam::Vec2::new(uv_max.x, uv_min.y),
+        glam::Vec2::new(uv_max.x, uv_max.y),
+        glam::Vec2::new(uv_min.x, uv_max.y),
     ];
     mesh.vertices.extend(
         positions
@@ -206,7 +219,7 @@ fn cube_mesh() -> MeshGeometry {
     };
     let n = -0.5;
     let p = 0.5;
-    for face in [
+    for (face_index, face) in [
         [
             Vec3::new(n, n, p),
             Vec3::new(p, n, p),
@@ -243,8 +256,17 @@ fn cube_mesh() -> MeshGeometry {
             Vec3::new(p, n, p),
             Vec3::new(n, n, p),
         ],
-    ] {
-        push_quad(&mut mesh, face);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Lay the six faces out as a 3x2 atlas so every face owns its texels.
+        let column = (face_index % 3) as f32;
+        let row = (face_index / 3) as f32;
+        let cell = glam::Vec2::new(1.0 / 3.0, 0.5);
+        let uv_min = glam::Vec2::new(column, row) * cell + PRIMITIVE_UV_PADDING;
+        let uv_max = glam::Vec2::new(column + 1.0, row + 1.0) * cell - PRIMITIVE_UV_PADDING;
+        push_quad_in_uv_rect(&mut mesh, face, uv_min, uv_max);
     }
     mesh
 }
@@ -257,10 +279,10 @@ fn plane_mesh() -> MeshGeometry {
     push_quad(
         &mut mesh,
         [
-            Vec3::new(-0.5, 0.0, -0.5),
-            Vec3::new(0.5, 0.0, -0.5),
-            Vec3::new(0.5, 0.0, 0.5),
             Vec3::new(-0.5, 0.0, 0.5),
+            Vec3::new(0.5, 0.0, 0.5),
+            Vec3::new(0.5, 0.0, -0.5),
+            Vec3::new(-0.5, 0.0, -0.5),
         ],
     );
     mesh
@@ -325,8 +347,12 @@ fn sphere_mesh() -> MeshGeometry {
 
 fn cylinder_mesh() -> MeshGeometry {
     const SEGMENTS: usize = 16;
+    // The side wraps the upper half of UV space; each cap is a disc in the
+    // lower half so caps and side never share texels.
+    const CAP_RADIUS: f32 = 0.25 - PRIMITIVE_UV_PADDING * 2.0;
+    let side_v = (0.5 + PRIMITIVE_UV_PADDING, 1.0 - PRIMITIVE_UV_PADDING);
     let mut mesh = MeshGeometry {
-        vertices: Vec::with_capacity((SEGMENTS + 1) * 2 + 2),
+        vertices: Vec::with_capacity((SEGMENTS + 1) * 2 + (SEGMENTS + 1) * 2),
         triangles: Vec::with_capacity(SEGMENTS * 4),
     };
     for segment in 0..=SEGMENTS {
@@ -336,34 +362,50 @@ fn cylinder_mesh() -> MeshGeometry {
         let u = segment as f32 / SEGMENTS as f32;
         mesh.vertices.push(MeshVertex {
             position: Vec3::new(x, -0.5, z),
-            uv: glam::Vec2::new(u, 0.0),
+            uv: glam::Vec2::new(u, side_v.0),
         });
         mesh.vertices.push(MeshVertex {
             position: Vec3::new(x, 0.5, z),
-            uv: glam::Vec2::new(u, 1.0),
+            uv: glam::Vec2::new(u, side_v.1),
         });
     }
-    let bottom_center = mesh.vertices.len() as u32;
-    mesh.vertices.push(MeshVertex {
-        position: Vec3::new(0.0, -0.5, 0.0),
-        uv: glam::Vec2::splat(0.5),
-    });
-    let top_center = mesh.vertices.len() as u32;
-    mesh.vertices.push(MeshVertex {
-        position: Vec3::new(0.0, 0.5, 0.0),
-        uv: glam::Vec2::splat(0.5),
-    });
     for segment in 0..SEGMENTS {
         let bottom = (segment * 2) as u32;
         let top = bottom + 1;
         let next_bottom = bottom + 2;
         let next_top = top + 2;
-        mesh.triangles.extend([
-            [bottom, next_bottom, top],
-            [top, next_bottom, next_top],
-            [bottom_center, next_bottom, bottom],
-            [top_center, top, next_top],
-        ]);
+        // Counter-clockwise seen from outside, like the other primitives.
+        mesh.triangles
+            .extend([[bottom, top, next_bottom], [top, next_top, next_bottom]]);
+    }
+
+    for (y, uv_center) in [
+        (-0.5_f32, glam::Vec2::new(0.25, 0.25)),
+        (0.5_f32, glam::Vec2::new(0.75, 0.25)),
+    ] {
+        let center = mesh.vertices.len() as u32;
+        mesh.vertices.push(MeshVertex {
+            position: Vec3::new(0.0, y, 0.0),
+            uv: uv_center,
+        });
+        let ring = mesh.vertices.len() as u32;
+        for segment in 0..SEGMENTS {
+            let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+            let (sin, cos) = angle.sin_cos();
+            mesh.vertices.push(MeshVertex {
+                position: Vec3::new(cos * 0.5, y, sin * 0.5),
+                uv: uv_center + glam::Vec2::new(cos, sin) * CAP_RADIUS,
+            });
+        }
+        for segment in 0..SEGMENTS as u32 {
+            let current = ring + segment;
+            let next = ring + (segment + 1) % SEGMENTS as u32;
+            if y < 0.0 {
+                mesh.triangles.push([center, current, next]);
+            } else {
+                mesh.triangles.push([center, next, current]);
+            }
+        }
     }
     mesh
 }
@@ -1566,7 +1608,7 @@ mod tests {
             let expected_counts = match preset {
                 PrimitivePreset::Cube => (24, 12),
                 PrimitivePreset::Sphere => (121, 224),
-                PrimitivePreset::Cylinder => (36, 64),
+                PrimitivePreset::Cylinder => (68, 64),
                 PrimitivePreset::Plane => (4, 2),
             };
             assert_eq!(
@@ -1580,6 +1622,41 @@ mod tests {
                     .iter()
                     .all(|vertex| { vertex.position.is_finite() && vertex.uv.is_finite() })
             );
+        }
+    }
+
+    #[test]
+    fn tc_0032_primitives_face_outward_with_non_overlapping_uv_charts() {
+        for preset in PrimitivePreset::ALL {
+            let mesh = preset.build_mesh();
+            for triangle in &mesh.triangles {
+                let [a, b, c] = triangle.map(|index| mesh.vertices[index as usize]);
+                let normal = (b.position - a.position).cross(c.position - a.position);
+                let centroid = (a.position + b.position + c.position) / 3.0;
+                let outward = if preset == PrimitivePreset::Plane {
+                    Vec3::Y
+                } else {
+                    centroid
+                };
+                assert!(
+                    normal.dot(outward) > 0.0,
+                    "{} triangle {triangle:?} faces inward",
+                    preset.name()
+                );
+            }
+        }
+
+        // Rasterising every cube face into one map must never write a texel
+        // twice: each face owns a separate chart.
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let mut owner = vec![None; 64 * 64];
+        for (triangle_index, triangle) in cube.triangles.iter().enumerate() {
+            let face = triangle_index / 2;
+            let uvs = triangle.map(|index| cube.vertices[index as usize].uv);
+            raster::rasterize_uv_triangle(uvs, 64, 64, 0.0, |index, _, _| {
+                assert!(owner[index].is_none_or(|existing| existing == face));
+                owner[index] = Some(face);
+            });
         }
     }
 
