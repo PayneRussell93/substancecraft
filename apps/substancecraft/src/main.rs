@@ -2,6 +2,11 @@
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, SyncSender, sync_channel},
+};
 use std::time::Duration;
 
 use eframe::egui;
@@ -15,6 +20,7 @@ use substancecraft_core::{
     PrimitivePreset, StrokeCommand, StrokeHistory, TextureResolution, TextureSet, TextureSetId,
     ViewportCamera, ViewportLighting,
 };
+use substancecraft_filament::FilamentRuntime;
 
 const CHANNELS: [MaterialChannel; 9] = [
     MaterialChannel::BaseColor,
@@ -43,7 +49,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "SubstanceCraft",
         options,
-        Box::new(|_creation_context| Ok(Box::<SubstanceCraftApp>::default())),
+        Box::new(|_creation_context| {
+            let mut app = SubstanceCraftApp::default();
+            match FilamentRuntime::new(64, 64) {
+                Ok(renderer) => app.filament_renderer = Some(renderer),
+                Err(error) => app.filament_error = Some(error.to_string()),
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -53,6 +66,14 @@ struct SubstanceCraftApp {
     selected_layer: Option<substancecraft_core::LayerId>,
     selected_primitive: Option<PrimitivePreset>,
     mesh_geometry: Option<MeshGeometry>,
+    mesh_revision: u64,
+    filament_mesh_revision: Option<u64>,
+    filament_renderer: Option<FilamentRuntime>,
+    filament_error: Option<String>,
+    filament_frame_texture: Option<egui::TextureHandle>,
+    filament_frames_tx: SyncSender<FilamentFrame>,
+    filament_frames_rx: Receiver<FilamentFrame>,
+    filament_render_pending: Arc<AtomicBool>,
     imported_meshes: Vec<ImportedFbxMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
@@ -75,6 +96,12 @@ struct SubstanceCraftApp {
     selected_pose: Option<PoseId>,
     pose_name: String,
     pose_transition: Option<PoseTransition>,
+}
+
+struct FilamentFrame {
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +127,7 @@ struct RestoredMeshScene {
 
 impl Default for SubstanceCraftApp {
     fn default() -> Self {
+        let (filament_frames_tx, filament_frames_rx) = sync_channel(1);
         Self {
             project: MaterialProject {
                 mesh: Some(MeshAsset {
@@ -112,6 +140,14 @@ impl Default for SubstanceCraftApp {
             selected_layer: None,
             selected_primitive: Some(PrimitivePreset::Cube),
             mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
+            mesh_revision: 1,
+            filament_mesh_revision: None,
+            filament_renderer: None,
+            filament_error: None,
+            filament_frame_texture: None,
+            filament_frames_tx,
+            filament_frames_rx,
+            filament_render_pending: Arc::new(AtomicBool::new(false)),
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
             import_error: None,
@@ -143,6 +179,110 @@ impl Default for SubstanceCraftApp {
 }
 
 impl SubstanceCraftApp {
+    fn mark_mesh_changed(&mut self) {
+        self.mesh_revision = self.mesh_revision.wrapping_add(1);
+        self.filament_frame_texture = None;
+    }
+
+    fn update_filament_frame(&mut self, context: &egui::Context, viewport: egui::Rect) {
+        while let Ok(frame) = self.filament_frames_rx.try_recv() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba8,
+            );
+            if let Some(texture) = self.filament_frame_texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.filament_frame_texture = Some(context.load_texture(
+                    "filament-viewport",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
+        let Some(mesh) = self.mesh_geometry.as_ref() else {
+            self.filament_frame_texture = None;
+            return;
+        };
+        let Some(renderer) = self.filament_renderer.as_mut() else {
+            return;
+        };
+        if self.filament_mesh_revision != Some(self.mesh_revision) {
+            match renderer.set_mesh(mesh) {
+                Ok(()) => self.filament_mesh_revision = Some(self.mesh_revision),
+                Err(error) => {
+                    self.filament_error = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+
+        let preview = self
+            .baked_preview
+            .as_ref()
+            .filter(|(set_id, channel, _)| {
+                Some(*set_id) == self.selected_texture_set
+                    && *channel == self.active_channel
+                    && matches!(channel, MaterialChannel::BaseColor | MaterialChannel::Id)
+            })
+            .map(|(_, _, texture)| texture);
+        let texture_result = if let Some(texture) = preview {
+            let key = (texture.rgba8.as_ptr() as usize)
+                ^ (texture.width as usize).rotate_left(7)
+                ^ (texture.height as usize).rotate_left(17);
+            renderer.set_base_color_map(key, texture.width, texture.height, &texture.rgba8)
+        } else {
+            renderer.set_base_color_map(0, 1, 1, &[168, 173, 179, 255])
+        };
+        if let Err(error) = texture_result {
+            self.filament_error = Some(error.to_string());
+            return;
+        }
+
+        if self
+            .filament_render_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+        let scale = context.pixels_per_point();
+        let width = (viewport.width() * scale).ceil().clamp(1.0, 2048.0) as u32;
+        let height = (viewport.height() * scale).ceil().clamp(1.0, 2048.0) as u32;
+        let sender = self.filament_frames_tx.clone();
+        let pending = Arc::clone(&self.filament_render_pending);
+        match renderer.render(
+            self.viewport_camera,
+            width,
+            height,
+            move |rgba8| {
+                pending.store(false, Ordering::Release);
+                let _ = sender.try_send(FilamentFrame {
+                    width,
+                    height,
+                    rgba8,
+                });
+            },
+        ) {
+            Ok(true) => {
+                self.filament_error = None;
+                context.request_repaint_after(Duration::from_millis(16));
+            }
+            Ok(false) => {
+                self.filament_render_pending
+                    .store(false, Ordering::Release);
+                context.request_repaint_after(Duration::from_millis(16));
+            }
+            Err(error) => {
+                self.filament_render_pending
+                    .store(false, Ordering::Release);
+                self.filament_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn save_project(&mut self) {
         let path = self.project_path.clone().or_else(|| {
             rfd::FileDialog::new()

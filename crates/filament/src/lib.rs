@@ -6,13 +6,14 @@ use std::mem::size_of;
 use filament_bindings::{
     backend::{
         self, Backend, BufferDescriptor, ElementType, PixelBufferDescriptor,
-        PixelDataFormat, PixelDataType,
+        PixelDataFormat, PixelDataType, SamplerCompareFunc, SamplerCompareMode, SamplerMagFilter,
+        SamplerMinFilter, SamplerWrapMode, SamplerType, TextureFormat, TextureUsage,
     },
     filament::{
         Bounds, Camera, ClearOptions, Engine, IndexBuffer, IndexBufferBuilder, LightBuilder,
         IndexType, LightType, LinearColor, Material, MaterialInstance, RenderableBuilder, Renderer,
-        Scene, SwapChain, SwapChainConfig, VertexAttribute, VertexBuffer, VertexBufferBuilder,
-        View, Viewport,
+        Scene, SwapChain, SwapChainConfig, Texture, TextureBuilder, TextureSampler, VertexAttribute,
+        VertexBuffer, VertexBufferBuilder, View, Viewport,
     },
     math::{Float3, Float4},
     utils::Entity,
@@ -36,6 +37,9 @@ pub struct FilamentRuntime {
     light_entity: Option<Entity>,
     material: Option<Material>,
     material_instance: Option<MaterialInstance>,
+    base_color_texture: Option<Texture>,
+    texture_sampler: TextureSampler,
+    base_color_map_key: Option<usize>,
     mesh_entity: Option<Entity>,
     vertex_buffer: Option<VertexBuffer>,
     index_buffer: Option<IndexBuffer>,
@@ -59,6 +63,21 @@ impl FilamentRuntime {
             light_entity: None,
             material: None,
             material_instance: None,
+            base_color_texture: None,
+            texture_sampler: TextureSampler::new(
+                SamplerMagFilter::LINEAR,
+                SamplerMinFilter::LINEAR,
+                SamplerWrapMode::CLAMP_TO_EDGE,
+                SamplerWrapMode::CLAMP_TO_EDGE,
+                SamplerWrapMode::CLAMP_TO_EDGE,
+                0,
+                SamplerCompareMode::NONE,
+                0,
+                SamplerCompareFunc::LE,
+                0,
+                0,
+            ),
+            base_color_map_key: None,
             mesh_entity: None,
             vertex_buffer: None,
             index_buffer: None,
@@ -139,6 +158,7 @@ impl FilamentRuntime {
                     .map_err(|_| FilamentError::MaterialUnavailable)?;
             }
         }
+        self.set_base_color_map(0, 1, 1, &[168, 173, 179, 255])?;
 
         self.configure_viewport(self.target_size[0], self.target_size[1])?;
         let clear_options = ClearOptions {
@@ -149,6 +169,64 @@ impl FilamentRuntime {
         if let Some(renderer) = self.renderer.as_mut() {
             unsafe { renderer.set_clear_options(&clear_options) };
         }
+        Ok(())
+    }
+
+    pub fn set_base_color_map(
+        &mut self,
+        key: usize,
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+    ) -> Result<(), FilamentError> {
+        if self.base_color_map_key == Some(key) {
+            return Ok(());
+        }
+        let byte_count = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|bytes| *bytes <= MAX_VIEWPORT_PIXELS * 4)
+            .ok_or(FilamentError::InvalidViewport)?;
+        if width == 0 || height == 0 || rgba8.len() != byte_count {
+            return Err(FilamentError::InvalidTexture);
+        }
+
+        let mut builder = unsafe { TextureBuilder::new() }
+            .ok_or(FilamentError::TextureUnavailable)?;
+        unsafe {
+            builder
+                .width(width)
+                .height(height)
+                .levels(1)
+                .sampler(SamplerType::SAMPLER_2D)
+                .format(TextureFormat::SRGB8_A8)
+                .usage(TextureUsage::SAMPLEABLE | TextureUsage::UPLOADABLE);
+        }
+        let mut texture = unsafe { builder.build(&mut self.engine) }
+            .ok_or(FilamentError::TextureUnavailable)?;
+        unsafe {
+            texture.set_image(
+                &mut self.engine,
+                0,
+                PixelBufferDescriptor::new(
+                    rgba8.to_vec(),
+                    PixelDataFormat::RGBA,
+                    PixelDataType::UBYTE,
+                ),
+            );
+        }
+        let Some(material_instance) = self.material_instance.as_mut() else {
+            return Err(FilamentError::MaterialUnavailable);
+        };
+        unsafe {
+            material_instance
+                .set_texture_parameter("baseColorMap", &texture, &self.texture_sampler)
+                .map_err(|_| FilamentError::MaterialUnavailable)?;
+        }
+        if let Some(mut old_texture) = self.base_color_texture.replace(texture) {
+            unsafe { self.engine.destroy_texture(&mut old_texture) };
+        }
+        self.base_color_map_key = Some(key);
         Ok(())
     }
 
@@ -519,4 +597,8 @@ pub enum FilamentError {
     InvalidViewport,
     #[error("Filament could not create mesh buffers")]
     MeshBufferUnavailable,
+    #[error("Filament could not create a Base Color texture")]
+    TextureUnavailable,
+    #[error("Base Color texture data has invalid dimensions or byte length")]
+    InvalidTexture,
 }
