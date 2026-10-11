@@ -2,7 +2,7 @@
 
 SubstanceCraft is a clean-room, Rust-native 3D material authoring project. Its target workflow is to import a mesh, paint and composite material channels non-destructively, preview the result with PBR shading, and export textures for real-time and offline renderers.
 
-The project is at its foundation stage. The first crate defines a versioned project model for meshes, material texture sets, channels, and layers, with validation for malformed project state and unsupported schema versions. Mesh import, viewport rendering, painting, undo, and export are not implemented yet.
+The project is in early development. It imports binary FBX meshes, with smoothing and subdivision. It paints Base Color, Roughness, Metallic, and ID channels in nondestructive paint and fill layers, masked by painted, procedural (Edge Wear, Dirt, ...), polygon-selection, and ID masks. It bakes geometry-derived mesh maps, renders with Filament, supports undo/redo, and exports TGA textures. See the roadmap for what remains.
 
 ## Build
 

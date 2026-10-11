@@ -32,6 +32,25 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 
 ## Current implementation
 
-`substancecraft-core` provides serializable project, mesh reference, texture set, saved pose, layer, channel, mesh geometry, and resolution types. Layers own UV-space Base Color, grayscale-mask, and discrete ID-color strokes; a bounded CPU compositor bakes Base Color with grayscale and optional ID-color clipping, and emits a separate ID map. The desktop app records completed strokes in a bounded 128-command in-memory undo/redo history; it resets when a project is opened and is not serialized. `substancecraft-api` exposes both bake operations alongside bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project.
+`substancecraft-core` provides serializable project, mesh reference, texture set, saved pose, layer, channel, mesh geometry, and resolution types, organised as:
 
-The core generates UV-mapped indexed triangle meshes for cube, sphere, cylinder, and plane presets. The desktop shell can import binary FBX 7.4+ static meshes, select imported meshes, paint on interpolated face UVs, preview baked Base Color or ID maps, and export either as TGA. The layer panel exposes grayscale masks and ID-color clipping. The projected preview also supports orbit, pan, zoom, a rotating directional key light, and ambient fill. FBX material-derived ID maps, geometric mesh-map baking, a real-time 3D PBR renderer, and global illumination are not implemented.
+- `lib.rs`: project model, layers, compositing (`TextureSet::bake_channel`), and `EditHistory`.
+- `smoothing.rs`: auto-smoothed corner/vertex normals and crease-aware Loop subdivision. Both weld by position, so unshared per-corner FBX vertices smooth correctly.
+- `topology.rs`: per-triangle connected-element and UV-island membership for polygon selection.
+- `mesh_maps.rs`: multi-threaded, cancellable baking of world normal, position, curvature, AO, and thickness into UV space. A BVH serves the occlusion rays, and a spatial grid of sharp edges gives curvature bands.
+- `generators.rs` and `noise.rs`: Edge Wear, Dirt, Orientation, Gradient, and Noise masks evaluated from mesh-map samples, with seeded object-space noise so breakup never seams.
+- `raster.rs`: shared UV triangle rasterisation.
+
+A layer is a paint layer or a fill layer (`LayerFill`). Its mask is built in order: a generator base (or white), painted mask strokes blended over it, then polygon-mask and ID-colour clipping. Base Color composites as straight-alpha RGBA; Roughness and Metallic composite as scalars from defaults of 0.5 and 0. Polygon masks index triangles of the *smoothed* mesh. Subdivision children of triangle `t` are `4t..4t+4`, so masks are remapped when the subdivision level changes.
+
+Every user edit goes through `EditCommand`: strokes, layer-settings snapshots, and layer insert/remove/move. The desktop keeps a bounded 128-step in-memory history that resets when a project is opened. Inspector edits commit as one step when the pointer is released. `substancecraft-api` exposes channel and mesh-map bakes alongside bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project; scale and smoothing are stored on the mesh asset.
+
+The core generates UV-mapped, outward-wound triangle meshes for cube (3×2 atlas), sphere, cylinder (side plus cap discs), and plane presets, with non-overlapping UV charts. The desktop shell can:
+
+- import binary FBX 7.4+ static meshes, smooth or subdivide them, and paint multi-channel strokes on the nearest picked triangle;
+- build polygon masks by face, element, or UV island;
+- add fill, Edge Wear, and Dirt layers;
+- bake mesh maps in the background, rebaking automatically when the mesh revision changes;
+- preview any bakeable channel or mesh map on the mesh, and export them as TGA.
+
+Filament renders with the smoothed shading normals. Missing pieces: FBX material-derived ID maps, high-to-low baking, tangent-space normal/height compositing, PBR roughness/metallic shading in the viewport (those channels preview as grayscale), and global illumination.
