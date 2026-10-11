@@ -18,7 +18,6 @@ const MAX_VIEWPORT_DIMENSION: u32 = 2048;
 const MAX_VIEWPORT_PIXELS: usize = 4_194_304;
 const MAX_MESH_VERTICES: usize = 3_000_000;
 const FLOATS_PER_VERTEX: usize = 9;
-const DEFAULT_BASE_COLOR: [u8; 4] = [168, 173, 179, 255];
 
 static VIEWPORT_MATERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/viewport.filamat"));
 
@@ -41,12 +40,14 @@ mod ffi {
         ) -> *mut ScRenderer;
         pub fn sc_renderer_destroy(renderer: *mut ScRenderer);
         pub fn sc_renderer_resize(renderer: *mut ScRenderer, width: u32, height: u32) -> bool;
-        pub fn sc_renderer_set_base_color_map(
+        pub fn sc_renderer_set_map(
             renderer: *mut ScRenderer,
+            slot: u32,
             width: u32,
             height: u32,
             rgba8: *const u8,
         ) -> bool;
+        pub fn sc_renderer_set_preview_mode(renderer: *mut ScRenderer, preview: bool);
         pub fn sc_renderer_set_mesh(
             renderer: *mut ScRenderer,
             vertices: *const f32,
@@ -101,9 +102,18 @@ unsafe extern "C" fn readback_trampoline(user: *mut c_void, pixels: *const u8, l
     let _ = catch_unwind(AssertUnwindSafe(move || callback(rgba8)));
 }
 
+/// Material texture slots of the viewport material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterialMap {
+    BaseColor = 0,
+    Orm = 1,
+    Normal = 2,
+}
+
 pub struct FilamentRuntime {
     raw: NonNull<ffi::ScRenderer>,
-    base_color_map_key: Option<usize>,
+    map_keys: [Option<usize>; 3],
+    preview_mode: Option<bool>,
     mesh_bounds: Option<(Vec3, Vec3)>,
     target_size: [u32; 2],
 }
@@ -121,13 +131,13 @@ impl FilamentRuntime {
             )
         };
         let raw = NonNull::new(raw).ok_or(FilamentError::EngineUnavailable)?;
-        let mut runtime = Self {
+        let runtime = Self {
             raw,
-            base_color_map_key: None,
+            map_keys: [None; 3],
+            preview_mode: None,
             mesh_bounds: None,
             target_size: size,
         };
-        runtime.set_base_color_map(0, 1, 1, &DEFAULT_BASE_COLOR)?;
         Ok(runtime)
     }
 
@@ -139,14 +149,19 @@ impl FilamentRuntime {
         unsafe { ffi::sc_renderer_pump(self.raw.as_ptr()) };
     }
 
-    pub fn set_base_color_map(
+    /// Uploads one material map. `key` identifies the content; re-uploading the
+    /// same key is skipped. Base Color is sRGB; ORM (R occlusion, G roughness,
+    /// B metallic) and tangent-space normals (+Y = +V) are linear.
+    pub fn set_map(
         &mut self,
+        map: MaterialMap,
         key: usize,
         width: u32,
         height: u32,
         rgba8: &[u8],
     ) -> Result<(), FilamentError> {
-        if self.base_color_map_key == Some(key) {
+        let slot = map as usize;
+        if self.map_keys[slot] == Some(key) {
             return Ok(());
         }
         let byte_count = (width as usize)
@@ -159,13 +174,34 @@ impl FilamentRuntime {
         }
         // SAFETY: `rgba8` holds exactly width * height * 4 bytes; the shim copies them.
         let uploaded = unsafe {
-            ffi::sc_renderer_set_base_color_map(self.raw.as_ptr(), width, height, rgba8.as_ptr())
+            ffi::sc_renderer_set_map(self.raw.as_ptr(), slot as u32, width, height, rgba8.as_ptr())
         };
         if !uploaded {
             return Err(FilamentError::TextureUnavailable);
         }
-        self.base_color_map_key = Some(key);
+        self.map_keys[slot] = Some(key);
         Ok(())
+    }
+
+    pub fn set_base_color_map(
+        &mut self,
+        key: usize,
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+    ) -> Result<(), FilamentError> {
+        self.set_map(MaterialMap::BaseColor, key, width, height, rgba8)
+    }
+
+    /// Preview mode shows only the base colour map on a neutral dielectric, for
+    /// inspecting single channels or mesh maps.
+    pub fn set_preview_mode(&mut self, preview: bool) {
+        if self.preview_mode == Some(preview) {
+            return;
+        }
+        // SAFETY: `raw` is a live renderer owned by `self`.
+        unsafe { ffi::sc_renderer_set_preview_mode(self.raw.as_ptr(), preview) };
+        self.preview_mode = Some(preview);
     }
 
     /// Renders one frame and schedules an RGBA8 readback (rows top to bottom). Returns
