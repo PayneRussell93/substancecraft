@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 
 use glam::{Mat3, Quat, Vec3};
-use substancecraft_core::{MeshGeometry, ViewportCamera, vertex_normals};
+use substancecraft_core::{MeshGeometry, ViewportCamera, vertex_normals, vertex_tangents};
 use thiserror::Error;
 
 const MAX_VIEWPORT_DIMENSION: u32 = 2048;
@@ -353,51 +353,14 @@ fn build_mesh_buffers(
     {
         return Err(FilamentError::InvalidMesh);
     }
-    let mut tangents = vec![Vec3::ZERO; vertex_count];
-    let mut bitangents = vec![Vec3::ZERO; vertex_count];
-    for triangle in &geometry.triangles {
-        let [index_a, index_b, index_c] = *triangle;
-        let vertex_a = geometry.vertices[index_a as usize];
-        let vertex_b = geometry.vertices[index_b as usize];
-        let vertex_c = geometry.vertices[index_c as usize];
-        let edge_ab = vertex_b.position - vertex_a.position;
-        let edge_ac = vertex_c.position - vertex_a.position;
-        let uv_ab = vertex_b.uv - vertex_a.uv;
-        let uv_ac = vertex_c.uv - vertex_a.uv;
-        let determinant = uv_ab.x * uv_ac.y - uv_ab.y * uv_ac.x;
-        if determinant.abs() > f32::EPSILON {
-            let inverse = determinant.recip();
-            let tangent = (edge_ab * uv_ac.y - edge_ac * uv_ab.y) * inverse;
-            let bitangent = (edge_ac * uv_ab.x - edge_ab * uv_ac.x) * inverse;
-            for index in [index_a, index_b, index_c] {
-                tangents[index as usize] += tangent;
-                bitangents[index as usize] += bitangent;
-            }
-        }
-    }
-
     let normals = vertex_normals(geometry, smoothing_angle_degrees);
+    // Shared with the normal-map baker so baked maps decode in the same frame.
+    let tangents = vertex_tangents(geometry, &normals);
     let mut vertex_data = Vec::with_capacity(vertex_count.saturating_mul(FLOATS_PER_VERTEX));
     for (index, vertex) in geometry.vertices.iter().enumerate() {
-        let mut normal = normals[index].normalize_or_zero();
-        if normal == Vec3::ZERO {
-            normal = Vec3::Z;
-        }
-        let mut tangent = tangents[index] - normal * normal.dot(tangents[index]);
-        if tangent.length_squared() <= f32::EPSILON {
-            let helper = if normal.x.abs() < 0.9 {
-                Vec3::X
-            } else {
-                Vec3::Y
-            };
-            tangent = normal.cross(helper);
-        }
-        tangent = tangent.normalize_or_zero();
-        let orientation = if normal.cross(tangent).dot(bitangents[index]) < 0.0 {
-            -1.0
-        } else {
-            1.0
-        };
+        let normal = normals[index].normalize_or(Vec3::Z);
+        let tangent = tangents[index].truncate();
+        let orientation = tangents[index].w;
         let bitangent = normal.cross(tangent);
         let mut tangent_frame =
             Quat::from_mat3(&Mat3::from_cols(tangent, bitangent, normal)).normalize();

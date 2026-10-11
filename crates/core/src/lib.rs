@@ -24,6 +24,7 @@ pub use mesh_maps::{
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
     MeshSmoothing, corner_normals, remap_subdivided_triangles, subdivide, vertex_normals,
+    vertex_tangents,
 };
 pub use topology::{MeshTopology, SelectionMode};
 

@@ -47,7 +47,8 @@ struct ScRenderer {
     IndirectLight* indirectLight = nullptr;
     Material* material = nullptr;
     MaterialInstance* materialInstance = nullptr;
-    Texture* baseColorMap = nullptr;
+    // Indexed by material map slot: 0 base colour, 1 ORM, 2 normal.
+    Texture* maps[3] = {nullptr, nullptr, nullptr};
     Entity meshEntity;
     VertexBuffer* vertexBuffer = nullptr;
     IndexBuffer* indexBuffer = nullptr;
@@ -79,9 +80,10 @@ uint8_t linearToSrgb(float value) {
     return uint8_t(std::lround(std::fmin(std::fmax(v, 0.0f), 1.0f) * 255.0f));
 }
 
-// 2x2 box filter in linear space (alpha averaged directly). Odd edges clamp to the last texel.
+// 2x2 box filter. sRGB data is averaged in linear space; linear data (ORM, normals) and alpha
+// are averaged directly. Odd edges clamp to the last texel.
 uint8_t* downsample(uint8_t const* source, uint32_t width, uint32_t height, uint32_t outWidth,
-        uint32_t outHeight) {
+        uint32_t outHeight, bool srgb) {
     auto* out = static_cast<uint8_t*>(std::malloc(size_t(outWidth) * outHeight * 4));
     if (!out) {
         return nullptr;
@@ -97,6 +99,12 @@ uint8_t* downsample(uint8_t const* source, uint32_t width, uint32_t height, uint
                     source + (size_t(y1) * width + x0) * 4, source + (size_t(y1) * width + x1) * 4};
             uint8_t* target = out + (size_t(y) * outWidth + x) * 4;
             for (int channel = 0; channel < 3; channel++) {
+                if (!srgb) {
+                    target[channel] = uint8_t((unsigned(texels[0][channel]) + texels[1][channel] +
+                                                      texels[2][channel] + texels[3][channel] + 2) /
+                                              4);
+                    continue;
+                }
                 float sum = 0.0f;
                 for (auto const* texel : texels) {
                     sum += srgbToLinear(texel[channel]);
@@ -134,7 +142,9 @@ void destroyAll(ScRenderer* r) {
     Engine* engine = r->engine;
     destroyMesh(r);
     if (r->materialInstance) engine->destroy(r->materialInstance);
-    if (r->baseColorMap) engine->destroy(r->baseColorMap);
+    for (Texture* map : r->maps) {
+        if (map) engine->destroy(map);
+    }
     if (r->material) engine->destroy(r->material);
     if (r->indirectLight) engine->destroy(r->indirectLight);
     if (!r->sunEntity.isNull()) {
@@ -182,6 +192,66 @@ void readbackCallback(void* buffer, size_t size, void* user) {
     readback->callback(readback->user, static_cast<uint8_t const*>(buffer), size);
     delete readback;
     std::free(buffer);
+}
+
+char const* const MAP_PARAMETERS[3] = {"baseColorMap", "ormMap", "normalMap"};
+
+// Uploads one material map (RGBA8, rows top to bottom) with a CPU-built mip chain and binds it
+// to its sampler. `srgb` selects colour-managed storage and filtering; data maps stay linear.
+bool uploadMap(ScRenderer* r, uint32_t slot, uint32_t width, uint32_t height,
+        uint8_t const* rgba8, bool srgb) {
+    if (slot >= 3 || width == 0 || height == 0) {
+        return false;
+    }
+    uint8_t levels = 1;
+    for (uint32_t extent = width > height ? width : height; extent > 1; extent >>= 1) {
+        levels++;
+    }
+    Texture* texture = Texture::Builder()
+                               .width(width)
+                               .height(height)
+                               .levels(levels)
+                               .sampler(Texture::Sampler::SAMPLER_2D)
+                               .format(srgb ? Texture::InternalFormat::SRGB8_A8
+                                            : Texture::InternalFormat::RGBA8)
+                               .build(*r->engine);
+    if (!texture) {
+        return false;
+    }
+    // Mips are built on the CPU: Texture::generateMipmaps() stalls the frame readback on
+    // the OpenGL backend.
+    uint8_t* level = static_cast<uint8_t*>(copyBytes(rgba8, size_t(width) * height * 4));
+    if (!level) {
+        r->engine->destroy(texture);
+        return false;
+    }
+    uint32_t levelWidth = width;
+    uint32_t levelHeight = height;
+    for (uint8_t index = 0; index < levels && level; index++) {
+        size_t const levelSize = size_t(levelWidth) * levelHeight * 4;
+        uint8_t* next = nullptr;
+        uint32_t nextWidth = levelWidth > 1 ? levelWidth / 2 : 1;
+        uint32_t nextHeight = levelHeight > 1 ? levelHeight / 2 : 1;
+        if (index + 1 < levels) {
+            next = downsample(level, levelWidth, levelHeight, nextWidth, nextHeight, srgb);
+        }
+        // Filament takes ownership of `level` and frees it once uploaded.
+        texture->setImage(*r->engine, index,
+                Texture::PixelBufferDescriptor(level, levelSize, Texture::Format::RGBA,
+                        Texture::Type::UBYTE, freeCallback));
+        level = next;
+        levelWidth = nextWidth;
+        levelHeight = nextHeight;
+    }
+    TextureSampler sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
+            TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::REPEAT);
+    sampler.setAnisotropy(8.0f);
+    r->materialInstance->setParameter(MAP_PARAMETERS[slot], texture, sampler);
+    if (r->maps[slot]) {
+        r->engine->destroy(r->maps[slot]);
+    }
+    r->maps[slot] = texture;
+    return true;
 }
 
 } // namespace
@@ -236,8 +306,17 @@ ScRenderer* sc_renderer_create(uint8_t const* material, size_t material_len, uin
             return nullptr;
         }
         r->materialInstance = r->material->createInstance();
-        r->materialInstance->setParameter("roughness", 0.58f);
-        r->materialInstance->setParameter("metallic", 0.0f);
+        r->materialInstance->setParameter("previewMode", 0.0f);
+        // Every sampler needs a texture before the first frame: neutral grey, AO 1 /
+        // roughness 0.58 / metallic 0, and a flat tangent-space normal.
+        uint8_t const defaults[3][4] = {{168, 173, 179, 255}, {255, 148, 0, 255}, {128, 128, 255, 255}};
+        for (uint32_t slot = 0; slot < 3; slot++) {
+            if (!uploadMap(r, slot, 1, 1, defaults[slot], slot == 0)) {
+                destroyAll(r);
+                delete r;
+                return nullptr;
+            }
+        }
 
         Renderer::ClearOptions clear;
         clear.clearColor = {0.025, 0.03, 0.035, 1.0};
@@ -282,60 +361,21 @@ bool sc_renderer_resize(ScRenderer* r, uint32_t width, uint32_t height) {
     }
 }
 
-// Upload the Base Color map (sRGB RGBA8, rows top to bottom) with a full mip chain.
-bool sc_renderer_set_base_color_map(ScRenderer* r, uint32_t width, uint32_t height,
+// Upload a material map: slot 0 Base Color (sRGB), 1 ORM (linear), 2 tangent normal (linear).
+bool sc_renderer_set_map(ScRenderer* r, uint32_t slot, uint32_t width, uint32_t height,
         uint8_t const* rgba8) {
     try {
-        uint8_t levels = 1;
-        for (uint32_t extent = width > height ? width : height; extent > 1; extent >>= 1) {
-            levels++;
-        }
-        Texture* texture = Texture::Builder()
-                                   .width(width)
-                                   .height(height)
-                                   .levels(levels)
-                                   .sampler(Texture::Sampler::SAMPLER_2D)
-                                   .format(Texture::InternalFormat::SRGB8_A8)
-                                   .build(*r->engine);
-        if (!texture) {
-            return false;
-        }
-        // Mips are built on the CPU: Texture::generateMipmaps() stalls the frame readback on
-        // the OpenGL backend.
-        uint8_t* level = static_cast<uint8_t*>(copyBytes(rgba8, size_t(width) * height * 4));
-        if (!level) {
-            r->engine->destroy(texture);
-            return false;
-        }
-        uint32_t levelWidth = width;
-        uint32_t levelHeight = height;
-        for (uint8_t index = 0; index < levels && level; index++) {
-            size_t const levelSize = size_t(levelWidth) * levelHeight * 4;
-            uint8_t* next = nullptr;
-            uint32_t nextWidth = levelWidth > 1 ? levelWidth / 2 : 1;
-            uint32_t nextHeight = levelHeight > 1 ? levelHeight / 2 : 1;
-            if (index + 1 < levels) {
-                next = downsample(level, levelWidth, levelHeight, nextWidth, nextHeight);
-            }
-            // Filament takes ownership of `level` and frees it once uploaded.
-            texture->setImage(*r->engine, index,
-                    Texture::PixelBufferDescriptor(level, levelSize, Texture::Format::RGBA,
-                            Texture::Type::UBYTE, freeCallback));
-            level = next;
-            levelWidth = nextWidth;
-            levelHeight = nextHeight;
-        }
-        TextureSampler sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
-                TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::REPEAT);
-        sampler.setAnisotropy(8.0f);
-        r->materialInstance->setParameter("baseColorMap", texture, sampler);
-        if (r->baseColorMap) {
-            r->engine->destroy(r->baseColorMap);
-        }
-        r->baseColorMap = texture;
-        return true;
+        return uploadMap(r, slot, width, height, rgba8, slot == 0);
     } catch (...) {
         return false;
+    }
+}
+
+// Preview mode shows only the base colour map on a neutral dielectric.
+void sc_renderer_set_preview_mode(ScRenderer* r, bool preview) {
+    try {
+        r->materialInstance->setParameter("previewMode", preview ? 1.0f : 0.0f);
+    } catch (...) {
     }
 }
 

@@ -1,32 +1,53 @@
 // Viewport PBR material for SubstanceCraft. Compiled by build.rs with the matc
 // from the vendored Filament build, so the package always matches the engine version.
+//
+// Material mode: Base Color (sRGB), an ORM map (linear: R ambient occlusion,
+// G roughness, B metallic) and a tangent-space normal map (linear, +Y = +V).
+// Preview mode: only the base colour map is shown, on a neutral dielectric, so
+// single channels and mesh maps can be inspected without PBR interference.
 material {
     name : SubstanceCraftViewport,
     shadingModel : lit,
     doubleSided : true,
-    requires : [ uv0 ],
+    requires : [ uv0, tangents ],
     parameters : [
         {
             type : sampler2d,
             name : baseColorMap
         },
         {
-            type : float,
-            name : roughness
+            type : sampler2d,
+            name : ormMap
+        },
+        {
+            type : sampler2d,
+            name : normalMap
         },
         {
             type : float,
-            name : metallic
+            name : previewMode
         }
     ]
 }
 
 fragment {
     void material(inout MaterialInputs material) {
+        float2 uv = getUV0();
+        bool preview = materialParams.previewMode > 0.5;
+        if (!preview) {
+            material.normal = texture(materialParams_normalMap, uv).xyz * 2.0 - 1.0;
+        }
         prepareMaterial(material);
-        // Base Color rows are uploaded top to bottom, matching BakedTexture::sample_uv.
-        material.baseColor = texture(materialParams_baseColorMap, getUV0());
-        material.roughness = materialParams.roughness;
-        material.metallic = materialParams.metallic;
+        // Rows are uploaded top to bottom, matching BakedTexture::sample_uv.
+        material.baseColor = texture(materialParams_baseColorMap, uv);
+        if (preview) {
+            material.roughness = 0.58;
+            material.metallic = 0.0;
+        } else {
+            float3 orm = texture(materialParams_ormMap, uv).rgb;
+            material.ambientOcclusion = orm.r;
+            material.roughness = orm.g;
+            material.metallic = orm.b;
+        }
     }
 }

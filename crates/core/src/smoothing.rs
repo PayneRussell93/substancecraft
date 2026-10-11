@@ -141,6 +141,63 @@ pub fn vertex_normals(mesh: &MeshGeometry, angle_degrees: f32) -> Vec<Vec3> {
         .collect()
 }
 
+/// Per-vertex tangents for tangent-space normal mapping: `xyz` is the unit
+/// tangent along +U, orthogonalised against `normals`, and `w` is the
+/// bitangent sign so that `bitangent = cross(normal, tangent) * w` points
+/// along +V. The renderer and the normal-map baker both use this, so baked
+/// normal maps decode in exactly the frame they were encoded in.
+pub fn vertex_tangents(mesh: &MeshGeometry, normals: &[Vec3]) -> Vec<glam::Vec4> {
+    let count = mesh.vertices.len();
+    let mut tangents = vec![Vec3::ZERO; count];
+    let mut bitangents = vec![Vec3::ZERO; count];
+    for triangle in &mesh.triangles {
+        let Some([a, b, c]) = triangle
+            .iter()
+            .map(|index| mesh.vertices.get(*index as usize).copied())
+            .collect::<Option<Vec<_>>>()
+            .and_then(|corners| <[MeshVertex; 3]>::try_from(corners).ok())
+        else {
+            continue;
+        };
+        let edge_ab = b.position - a.position;
+        let edge_ac = c.position - a.position;
+        let uv_ab = b.uv - a.uv;
+        let uv_ac = c.uv - a.uv;
+        let determinant = uv_ab.x * uv_ac.y - uv_ab.y * uv_ac.x;
+        if determinant.abs() <= f32::EPSILON {
+            continue;
+        }
+        let inverse = determinant.recip();
+        let tangent = (edge_ab * uv_ac.y - edge_ac * uv_ab.y) * inverse;
+        let bitangent = (edge_ac * uv_ab.x - edge_ab * uv_ac.x) * inverse;
+        for index in triangle {
+            tangents[*index as usize] += tangent;
+            bitangents[*index as usize] += bitangent;
+        }
+    }
+    (0..count)
+        .map(|index| {
+            let normal = normals
+                .get(index)
+                .copied()
+                .unwrap_or(Vec3::Z)
+                .normalize_or(Vec3::Z);
+            let mut tangent = tangents[index] - normal * normal.dot(tangents[index]);
+            if tangent.length_squared() <= f32::EPSILON {
+                let helper = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+                tangent = normal.cross(helper);
+            }
+            let tangent = tangent.normalize_or(Vec3::X);
+            let sign = if normal.cross(tangent).dot(bitangents[index]) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            tangent.extend(sign)
+        })
+        .collect()
+}
+
 /// Crease-aware Loop subdivision. Child triangles of input triangle `t` are
 /// `4t..4t + 4`, so per-triangle data can be remapped between levels.
 /// UVs are interpolated linearly and UV seams are preserved.
