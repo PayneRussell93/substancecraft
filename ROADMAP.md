@@ -5,7 +5,7 @@
 ## Milestones
 
 1. **Project foundation:** Rust workspace, versioned material project model, model validation. Complete.
-2. **Mesh inspection:** starter presets (cube, sphere, cylinder, plane) are available with a shaded preview; import GLB/glTF, render an existing PBR material, orbit/pan/zoom, and inspect channels remain open.
+2. **Mesh inspection:** starter presets and binary FBX 7.4+ static mesh import with UV preservation/fallback and selectable imported meshes are implemented; ASCII FBX, animation, glTF, imported materials, a true 3D viewport, and camera navigation remain open.
 3. **First paint loop:** create a texture set and paint base color in UV space; see the result on the mesh.
 4. **History and export:** undo/redo a stroke and export a PNG texture.
 5. **Multi-channel materials:** roughness, metallic, normal, height, channel-aware compositing, masks.

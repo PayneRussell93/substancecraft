@@ -22,5 +22,8 @@
 | TC-0010 | Inspect an unsupported preset name. | Return a typed recoverable API error. | API boundary / automated | Passed 2026-10-10 |
 | TC-0011 | Construct the MCP server metadata. | Advertise tool capability and the SubstanceCraft server identity. | Integration / automated | Passed 2026-10-10 |
 | TC-0012 | Invoke the mesh inspection tool for Sphere. | Return a JSON summary with Sphere name and expected triangle count. | MCP tool / automated | Passed 2026-10-10 |
+| TC-0013 | Generate a minimal binary FBX 7.4 triangle, import it, and inspect the returned mesh. | One named mesh, one valid triangle, finite positions, and planar UVs are returned. | Import / automated | Passed 2026-10-10 |
+| TC-0014 | Generate a binary FBX triangle with ByPolygonVertex/Direct UVs and import it. | Imported corners preserve the source UV values and do not report generated UVs. | Import / automated | Passed 2026-10-10 |
+| TC-0015 | Feed the binary preflight a declared decoded-attribute size above its configured budget. | Reject the input before the FBX parser allocates decoded attributes. | Security / automated | Passed 2026-10-10 |
 
-TC-0001 through TC-0008 passed with `cargo test --workspace` on 2026-10-10. TC-0011 and TC-0012 passed with `cargo test -p substancecraft-mcp`; API test cases are included in the final workspace run. Formatting and strict Clippy checks are required before release. MCP client interoperability has not yet been manually verified; raw command output is not archived separately.
+All 21 workspace tests passed on 2026-10-10. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` also passed. MCP client interoperability has not yet been manually verified; raw command output is not archived separately.

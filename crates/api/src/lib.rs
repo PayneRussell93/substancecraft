@@ -1,6 +1,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
+mod fbx;
+
+pub use fbx::{FbxImportError, ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes};
+
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{MeshError, PrimitivePreset};
 use thiserror::Error;

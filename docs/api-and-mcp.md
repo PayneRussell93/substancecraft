@@ -6,6 +6,7 @@
 
 - `list_primitive_presets()` for the supported starter-mesh names.
 - `inspect_primitive_preset(name)` for indexed topology counts, local-space bounds, and UV bounds.
+- `import_binary_fbx_meshes(bytes)` for static mesh geometry from binary FBX 7.4+ files.
 
 The result types use Serde and plain numeric arrays at the API boundary, so clients do not need to depend on the renderer's math or UI types. Invalid preset names return a typed error. This facade is intentionally narrow today; the planned stable command API will grow to project, import, layer, paint, bake, and export operations as those commands are implemented.
 
@@ -20,8 +21,8 @@ The `substancecraft-mcp` binary uses the official `rmcp` Rust SDK and stdio tran
 
 Run it with `cargo run -p substancecraft-mcp`. Configure an MCP client to launch that command from the SubstanceCraft workspace directory. Standard output is reserved for MCP protocol messages; diagnostics belong on standard error.
 
-The current MCP tools inspect generated presets only; they do not read arbitrary files or mutate a project. Future tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
+The current MCP tools inspect generated presets only; they do not read arbitrary files or mutate a project. The desktop uses the Rust API for local file import after checking the file-size limit. Binary FBX import preserves supported FBX UV mappings, creates a planar UV fallback when a mesh has no UV layer, and preflights declared decoded data against a memory budget. ASCII FBX, materials, model transforms, skins, and animation curves are not imported yet. Future MCP tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
 
 ## Verification
 
-Run `cargo test -p substancecraft-api -p substancecraft-mcp` for the API and MCP tests, `cargo clippy --workspace --all-targets -- -D warnings` for lints, and `cargo fmt --all --check` for formatting.
+Run `cargo test --workspace` for all tests, `cargo clippy --workspace --all-targets -- -D warnings` for lints, and `cargo fmt --all --check` for formatting.

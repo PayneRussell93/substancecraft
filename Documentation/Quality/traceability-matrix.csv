@@ -2,3 +2,4 @@ RequirementID,ShortDescription,SourceDocPath,DesignDocPath,ImplementationCommits
 REQ-0001,Represent and validate the initial material project model,README.md,docs/architecture.md,,TC-0001;TC-0002;TC-0003;TC-0004;TC-0005;TC-0006;TC-0007,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0002,Create and select starter meshes with valid indexed geometry and UVs,README.md,docs/architecture.md,,TC-0008,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0003,Expose starter mesh inspection through a Rust API and MCP stdio tools,docs/api-and-mcp.md,docs/architecture.md,,TC-0009;TC-0010;TC-0011;TC-0012,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0004,Import and preview static mesh geometry from binary FBX 7.4+ files,docs/api-and-mcp.md,docs/architecture.md,,TC-0013;TC-0014;TC-0015,Documentation/Quality/TestPlan-short.md,Project owner,Verified

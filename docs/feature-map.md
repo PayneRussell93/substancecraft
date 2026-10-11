@@ -12,7 +12,7 @@ This is the product capability map derived from the supplied Painter feature inv
 | # | Area | Status | Initial acceptance target |
 | --- | --- | --- | --- |
 | 01 | Project and document management | Partial | Versioned project model, validation, load/save, recovery, migration, and replacement workflows. |
-| 02 | Mesh importing and preparation | Partial | Import FBX and glTF/GLB geometry, UVs, material slots, normals, and supported skeletal animation. |
+| 02 | Mesh importing and preparation | Partial | Binary FBX 7.4+ static mesh geometry imports through the API and desktop picker, with native UVs or planar fallback; ASCII FBX, glTF/GLB, material slots, model transforms, and skeletal animation remain open. |
 | 03 | Texture Sets | Partial | Derive independent sets from material slots with per-set channels, resolution, maps, and export. |
 | 04 | Material channels | Partial | Channel-aware composition for color, scalar, normal, height, opacity, and emissive data. |
 | 05 | Painting tools | Planned | Paint, erase, path, projection, polygon fill, smudge, clone, picker, and quick mask commands. |

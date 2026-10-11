@@ -8,6 +8,8 @@ description = "A Rust-native 3D material authoring application"
 
 [dependencies]
 eframe.workspace = true
+rfd.workspace = true
+substancecraft-api = { path = "../../crates/api" }
 substancecraft-core = { path = "../../crates/core" }
 
 [lints]

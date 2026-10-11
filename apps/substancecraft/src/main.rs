@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use eframe::egui;
+use substancecraft_api::{ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes};
 use substancecraft_core::{
-    BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshGeometry, NamedPose, PoseId,
-    PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
+    BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshAsset, MeshGeometry, MeshId,
+    NamedPose, PoseId, PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
 };
 
 const CHANNELS: [MaterialChannel; 8] = [
@@ -45,6 +46,9 @@ struct SubstanceCraftApp {
     selected_texture_set: Option<TextureSetId>,
     selected_primitive: Option<PrimitivePreset>,
     mesh_geometry: Option<MeshGeometry>,
+    imported_meshes: Vec<ImportedFbxMesh>,
+    selected_imported_mesh: Option<usize>,
+    import_error: Option<String>,
     active_channel: MaterialChannel,
     next_texture_set_id: u64,
     current_pose: NamedPose,
@@ -67,6 +71,9 @@ impl Default for SubstanceCraftApp {
             selected_texture_set: None,
             selected_primitive: Some(PrimitivePreset::Cube),
             mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
+            imported_meshes: Vec::new(),
+            selected_imported_mesh: None,
+            import_error: None,
             active_channel: MaterialChannel::BaseColor,
             next_texture_set_id: 1,
             current_pose: NamedPose {
@@ -83,6 +90,57 @@ impl Default for SubstanceCraftApp {
 }
 
 impl SubstanceCraftApp {
+    fn import_fbx(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("FBX mesh", &["fbx"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let result = (|| {
+            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            let file_size = usize::try_from(metadata.len())
+                .map_err(|_| "FBX file is too large for this platform".to_owned())?;
+            if file_size > MAX_FBX_BYTES {
+                return Err(format!(
+                    "FBX file exceeds the {} MiB import limit",
+                    MAX_FBX_BYTES / (1024 * 1024)
+                ));
+            }
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())
+        })();
+
+        match result {
+            Ok(meshes) => {
+                let Some(first_mesh) = meshes.first() else {
+                    self.import_error = Some("FBX contains no mesh geometry".to_owned());
+                    return;
+                };
+                let first_geometry = first_mesh.geometry.clone();
+                let display_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Imported FBX".to_owned());
+                self.project.mesh = Some(MeshAsset {
+                    id: MeshId(1),
+                    source: path.to_string_lossy().into_owned(),
+                });
+                self.imported_meshes = meshes;
+                self.selected_imported_mesh = Some(0);
+                self.selected_primitive = None;
+                self.mesh_geometry = Some(first_geometry);
+                self.import_error = None;
+                self.project.texture_sets.clear();
+                self.project.active_texture_set = None;
+                self.selected_texture_set = None;
+                self.current_pose.name = display_name;
+            }
+            Err(error) => self.import_error = Some(error),
+        }
+    }
+
     fn add_texture_set(&mut self) {
         let Some(next_id) = self.next_texture_set_id.checked_add(1) else {
             return;
@@ -111,14 +169,29 @@ impl SubstanceCraftApp {
                 ui.separator();
                 ui.label("Untitled Project");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        self.selected_primitive
-                            .map(PrimitivePreset::name)
-                            .unwrap_or("No mesh loaded"),
-                    );
+                    ui.label(self.selected_mesh_name().unwrap_or("No mesh loaded"));
                 });
             });
         });
+    }
+
+    fn selected_mesh_name(&self) -> Option<&str> {
+        if let Some(index) = self.selected_imported_mesh {
+            return self
+                .imported_meshes
+                .get(index)
+                .map(|mesh| mesh.name.as_str());
+        }
+        self.selected_primitive.map(PrimitivePreset::name)
+    }
+
+    fn select_imported_mesh(&mut self, index: usize) {
+        let Some(mesh) = self.imported_meshes.get(index) else {
+            return;
+        };
+        self.mesh_geometry = Some(mesh.geometry.clone());
+        self.selected_imported_mesh = Some(index);
+        self.selected_primitive = None;
     }
 
     fn update_pose_transition(&mut self, context: &egui::Context) {
@@ -220,6 +293,27 @@ impl SubstanceCraftApp {
             .show(ui, |ui| {
                 ui.heading("Texture Sets");
                 ui.add_space(12.0);
+                if ui.button("Import FBX...").clicked() {
+                    self.import_fbx();
+                }
+                if let Some(error) = &self.import_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if !self.imported_meshes.is_empty() {
+                    ui.add_space(8.0);
+                    ui.heading("Imported Meshes");
+                    for index in 0..self.imported_meshes.len() {
+                        let Some(mesh) = self.imported_meshes.get(index) else {
+                            continue;
+                        };
+                        let name = mesh.name.clone();
+                        let selected = self.selected_imported_mesh == Some(index);
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.select_imported_mesh(index);
+                        }
+                    }
+                }
+                ui.add_space(12.0);
                 ui.heading("Mesh Presets");
                 for preset in PrimitivePreset::ALL {
                     if ui
@@ -227,6 +321,7 @@ impl SubstanceCraftApp {
                         .clicked()
                     {
                         self.selected_primitive = Some(preset);
+                        self.selected_imported_mesh = None;
                         self.mesh_geometry = Some(preset.build_mesh());
                     }
                 }
@@ -395,9 +490,7 @@ impl SubstanceCraftApp {
                 painter.text(
                     egui::pos2(viewport.left() + 16.0, viewport.top() + 16.0),
                     egui::Align2::LEFT_TOP,
-                    self.selected_primitive
-                        .map(PrimitivePreset::name)
-                        .unwrap_or("Mesh"),
+                    self.selected_mesh_name().unwrap_or("Mesh"),
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_rgb(190, 194, 199),
                 );
