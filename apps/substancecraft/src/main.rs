@@ -1,0 +1,446 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use eframe::egui;
+use substancecraft_core::{
+    BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshGeometry, NamedPose, PoseId,
+    PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
+};
+
+const CHANNELS: [MaterialChannel; 8] = [
+    MaterialChannel::BaseColor,
+    MaterialChannel::Roughness,
+    MaterialChannel::Metallic,
+    MaterialChannel::Normal,
+    MaterialChannel::Height,
+    MaterialChannel::AmbientOcclusion,
+    MaterialChannel::Emissive,
+    MaterialChannel::Opacity,
+];
+const POSE_TRANSITION_SECONDS: f64 = 0.35;
+const MAX_SAVED_POSES: usize = 256;
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SubstanceCraft")
+            .with_app_id("com.substancecraft.desktop")
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([900.0, 600.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "SubstanceCraft",
+        options,
+        Box::new(|_creation_context| Ok(Box::<SubstanceCraftApp>::default())),
+    )
+}
+
+struct SubstanceCraftApp {
+    project: MaterialProject,
+    selected_texture_set: Option<TextureSetId>,
+    selected_primitive: Option<PrimitivePreset>,
+    mesh_geometry: Option<MeshGeometry>,
+    active_channel: MaterialChannel,
+    next_texture_set_id: u64,
+    current_pose: NamedPose,
+    saved_poses: Vec<NamedPose>,
+    selected_pose: Option<usize>,
+    pose_name: String,
+    pose_transition: Option<PoseTransition>,
+}
+
+struct PoseTransition {
+    from: NamedPose,
+    to: NamedPose,
+    started_at: f64,
+}
+
+impl Default for SubstanceCraftApp {
+    fn default() -> Self {
+        Self {
+            project: MaterialProject::empty(),
+            selected_texture_set: None,
+            selected_primitive: Some(PrimitivePreset::Cube),
+            mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
+            active_channel: MaterialChannel::BaseColor,
+            next_texture_set_id: 1,
+            current_pose: NamedPose {
+                id: PoseId(0),
+                name: "Current Pose".to_owned(),
+                bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
+            },
+            saved_poses: Vec::new(),
+            selected_pose: None,
+            pose_name: "Pose 1".to_owned(),
+            pose_transition: None,
+        }
+    }
+}
+
+impl SubstanceCraftApp {
+    fn add_texture_set(&mut self) {
+        let Some(next_id) = self.next_texture_set_id.checked_add(1) else {
+            return;
+        };
+        let id = TextureSetId(self.next_texture_set_id);
+        self.next_texture_set_id = next_id;
+        self.project.texture_sets.push(TextureSet {
+            id,
+            name: format!("Texture Set {}", id.0),
+            material_slot: format!("Material {}", id.0),
+            resolution: TextureResolution {
+                width: 2048,
+                height: 2048,
+            },
+            channels: BTreeSet::from([MaterialChannel::BaseColor]),
+            layers: Vec::new(),
+        });
+        self.project.active_texture_set = Some(id);
+        self.selected_texture_set = Some(id);
+    }
+
+    fn update_header(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("header").exact_size(42.0).show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.strong("SubstanceCraft");
+                ui.separator();
+                ui.label("Untitled Project");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        self.selected_primitive
+                            .map(PrimitivePreset::name)
+                            .unwrap_or("No mesh loaded"),
+                    );
+                });
+            });
+        });
+    }
+
+    fn update_pose_transition(&mut self, context: &egui::Context) {
+        let Some(transition) = &self.pose_transition else {
+            return;
+        };
+        let now = context.input(|input| input.time);
+        let amount =
+            ((now - transition.started_at) / POSE_TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+        match transition.from.interpolate(&transition.to, amount) {
+            Ok(pose) => self.current_pose = pose,
+            Err(_) => {
+                self.pose_transition = None;
+                return;
+            }
+        }
+        if amount >= 1.0 {
+            self.pose_transition = None;
+        } else {
+            context.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn select_pose(&mut self, index: usize, context: &egui::Context) {
+        let Some(target) = self.saved_poses.get(index).cloned() else {
+            return;
+        };
+        self.selected_pose = Some(index);
+        self.pose_transition = Some(PoseTransition {
+            from: self.current_pose.clone(),
+            to: target,
+            started_at: context.input(|input| input.time),
+        });
+    }
+
+    fn save_pose(&mut self) {
+        if self.saved_poses.len() >= MAX_SAVED_POSES {
+            return;
+        }
+        let base_name = self.pose_name.trim();
+        if base_name.is_empty() {
+            return;
+        }
+        let mut name = base_name.to_owned();
+        let mut suffix = 2_u32;
+        while self.saved_poses.iter().any(|pose| pose.name == name) {
+            name = format!("{base_name} {suffix}");
+            let Some(next_suffix) = suffix.checked_add(1) else {
+                return;
+            };
+            suffix = next_suffix;
+        }
+        let mut pose = self.current_pose.clone();
+        pose.name.clone_from(&name);
+        self.saved_poses.push(pose);
+        self.selected_pose = Some(self.saved_poses.len() - 1);
+        self.pose_name = format!("Pose {}", self.saved_poses.len() + 1);
+    }
+
+    fn update_pose_shelf(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("pose_shelf")
+            .exact_size(92.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Saved Poses");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pose_name)
+                            .desired_width(150.0)
+                            .hint_text("Pose name"),
+                    );
+                    let can_save = !self.pose_name.trim().is_empty()
+                        && self.saved_poses.len() < MAX_SAVED_POSES;
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save Pose"))
+                        .clicked()
+                    {
+                        self.save_pose();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if self.saved_poses.is_empty() {
+                        ui.weak("Save a pose to add it to this shelf");
+                    }
+                    for index in 0..self.saved_poses.len() {
+                        let name = self.saved_poses[index].name.clone();
+                        let selected = self.selected_pose == Some(index);
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.select_pose(index, ui.ctx());
+                        }
+                    }
+                });
+            });
+    }
+
+    fn update_texture_sets(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("texture_sets")
+            .exact_size(230.0)
+            .show(ui, |ui| {
+                ui.heading("Texture Sets");
+                ui.add_space(12.0);
+                ui.heading("Mesh Presets");
+                for preset in PrimitivePreset::ALL {
+                    if ui
+                        .selectable_label(self.selected_primitive == Some(preset), preset.name())
+                        .clicked()
+                    {
+                        self.selected_primitive = Some(preset);
+                        self.mesh_geometry = Some(preset.build_mesh());
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.button("+  Add Texture Set").clicked() {
+                    self.add_texture_set();
+                }
+                ui.add_space(8.0);
+
+                if self.project.texture_sets.is_empty() {
+                    ui.label("No texture sets");
+                } else {
+                    for texture_set in &self.project.texture_sets {
+                        let selected = self.selected_texture_set == Some(texture_set.id);
+                        if ui.selectable_label(selected, &texture_set.name).clicked() {
+                            self.selected_texture_set = Some(texture_set.id);
+                            self.project.active_texture_set = Some(texture_set.id);
+                        }
+                    }
+                }
+
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.heading("Channels");
+                for channel in CHANNELS {
+                    ui.selectable_value(&mut self.active_channel, channel, channel_label(channel));
+                }
+            });
+    }
+
+    fn update_properties(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::right("properties")
+            .exact_size(250.0)
+            .show(ui, |ui| {
+                ui.heading("Properties");
+                ui.add_space(12.0);
+                if let Some(texture_set) = self
+                    .project
+                    .texture_sets
+                    .iter()
+                    .find(|set| Some(set.id) == self.selected_texture_set)
+                {
+                    ui.label("Texture Set");
+                    ui.strong(&texture_set.name);
+                    ui.add_space(8.0);
+                    ui.label("Material Slot");
+                    ui.label(&texture_set.material_slot);
+                    ui.add_space(8.0);
+                    ui.label("Resolution");
+                    ui.label(format!(
+                        "{} x {}",
+                        texture_set.resolution.width, texture_set.resolution.height
+                    ));
+                    ui.add_space(8.0);
+                    ui.label("Layers");
+                    ui.label(texture_set.layers.len().to_string());
+                } else {
+                    ui.label("Nothing selected");
+                }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.heading("Pose Transform");
+                ui.label("Root translation");
+                let transform = self
+                    .current_pose
+                    .bones
+                    .entry(BoneId(0))
+                    .or_insert(BoneTransform::IDENTITY);
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut transform.translation.x)
+                                .prefix("X ")
+                                .speed(0.05),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut transform.translation.y)
+                                .prefix("Y ")
+                                .speed(0.05),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut transform.translation.z)
+                                .prefix("Z ")
+                                .speed(0.05),
+                        )
+                        .changed();
+                });
+                if changed {
+                    self.pose_transition = None;
+                    self.selected_pose = None;
+                }
+            });
+    }
+
+    fn update_viewport(&self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            let viewport = ui.max_rect();
+            let painter = ui.painter_at(viewport);
+            painter.rect_filled(viewport, 0.0, egui::Color32::from_rgb(29, 31, 34));
+
+            let center = viewport.center();
+            let axis = egui::Color32::from_rgb(70, 74, 79);
+            painter.line_segment(
+                [
+                    egui::pos2(viewport.left(), center.y),
+                    egui::pos2(viewport.right(), center.y),
+                ],
+                egui::Stroke::new(1.0, axis),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, viewport.top()),
+                    egui::pos2(center.x, viewport.bottom()),
+                ],
+                egui::Stroke::new(1.0, axis),
+            );
+
+            if let Some(mesh) = &self.mesh_geometry {
+                let pose_transform = self
+                    .current_pose
+                    .bones
+                    .get(&BoneId(0))
+                    .copied()
+                    .unwrap_or(BoneTransform::IDENTITY);
+                let scale = viewport.width().min(viewport.height()) * 0.42;
+                let project = |vertex_index: u32| {
+                    let vertex = mesh.vertices.get(vertex_index as usize)?;
+                    let transformed = pose_transform
+                        .rotation
+                        .mul_vec3(vertex.position * pose_transform.scale)
+                        + pose_transform.translation;
+                    Some((
+                        egui::pos2(
+                            center.x + (transformed.x - transformed.z) * scale * 0.72,
+                            center.y
+                                + (-transformed.y + (transformed.x + transformed.z) * 0.38) * scale,
+                        ),
+                        transformed.x + transformed.y + transformed.z,
+                    ))
+                };
+                let mut faces = mesh
+                    .triangles
+                    .iter()
+                    .filter_map(|triangle| {
+                        let a = project(triangle[0])?;
+                        let b = project(triangle[1])?;
+                        let c = project(triangle[2])?;
+                        Some(((a.1 + b.1 + c.1) / 3.0, [a.0, b.0, c.0]))
+                    })
+                    .collect::<Vec<_>>();
+                faces.sort_by(|left, right| left.0.total_cmp(&right.0));
+                for (_, points) in faces {
+                    painter.add(egui::Shape::convex_polygon(
+                        points.to_vec(),
+                        egui::Color32::from_rgb(95, 109, 120),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
+                    ));
+                }
+                painter.text(
+                    egui::pos2(viewport.left() + 16.0, viewport.top() + 16.0),
+                    egui::Align2::LEFT_TOP,
+                    self.selected_primitive
+                        .map(PrimitivePreset::name)
+                        .unwrap_or("Mesh"),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(190, 194, 199),
+                );
+            } else {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "Choose a mesh preset to begin",
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::from_rgb(190, 194, 199),
+                );
+            }
+            painter.text(
+                egui::pos2(viewport.left() + 16.0, viewport.bottom() - 18.0),
+                egui::Align2::LEFT_BOTTOM,
+                channel_label(self.active_channel),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(148, 153, 159),
+            );
+        });
+    }
+}
+
+impl eframe::App for SubstanceCraftApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_pose_transition(ui.ctx());
+        self.update_header(ui);
+        self.update_texture_sets(ui);
+        self.update_properties(ui);
+        self.update_pose_shelf(ui);
+        self.update_viewport(ui);
+    }
+}
+
+fn channel_label(channel: MaterialChannel) -> &'static str {
+    match channel {
+        MaterialChannel::BaseColor => "Base Color",
+        MaterialChannel::Roughness => "Roughness",
+        MaterialChannel::Metallic => "Metallic",
+        MaterialChannel::Normal => "Normal",
+        MaterialChannel::Height => "Height",
+        MaterialChannel::AmbientOcclusion => "Ambient Occlusion",
+        MaterialChannel::Emissive => "Emissive",
+        MaterialChannel::Opacity => "Opacity",
+    }
+}

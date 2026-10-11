@@ -1,0 +1,4 @@
+RiskID,Title,Description,Category,Likelihood(1-5),Impact(1-5),RiskScore,Mitigation,Owner,Status,ReviewDate
+R-001,Scope growth,Attempting advanced Painter features before the mesh-to-export loop is dependable,Delivery,4,4,16,Deliver and verify roadmap milestones in order,Project owner,Active,2026-10-10
+R-002,Channel-blind compositing,Using color blending for scalar or normal data can corrupt material output,Technical,3,5,15,Define channel-specific compositing contracts and tests before implementing the compositor,Project owner,Active,2026-10-10
+R-003,Untrusted project data,Malformed files or oversized dimensions could cause invalid state or excessive allocation,Security and reliability,3,5,15,Validate schema and bound resource sizes before allocation or rendering,Project owner,Active,2026-10-10

@@ -1,0 +1,14 @@
+[package]
+name = "substancecraft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A Rust-native 3D material authoring application"
+
+[dependencies]
+eframe.workspace = true
+substancecraft-core = { path = "../../crates/core" }
+
+[lints]
+workspace = true

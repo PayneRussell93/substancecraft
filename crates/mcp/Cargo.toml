@@ -1,0 +1,18 @@
+[package]
+name = "substancecraft-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model Context Protocol server for SubstanceCraft"
+
+[dependencies]
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+substancecraft-api = { path = "../api" }
+tokio.workspace = true
+
+[lints]
+workspace = true
