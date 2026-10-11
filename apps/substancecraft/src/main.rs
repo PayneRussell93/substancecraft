@@ -83,6 +83,7 @@ struct SubstanceCraftApp {
     imported_meshes: Vec<ImportedFbxMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
+    import_scale: f32,
     project_path: Option<std::path::PathBuf>,
     project_error: Option<String>,
     active_channel: MaterialChannel,
@@ -133,6 +134,7 @@ struct RestoredMeshScene {
     imported_meshes: Vec<ImportedFbxMesh>,
     selected_imported_mesh: Option<usize>,
     geometry: Option<MeshGeometry>,
+    scale: f32,
 }
 
 impl Default for SubstanceCraftApp {
@@ -143,6 +145,7 @@ impl Default for SubstanceCraftApp {
                 mesh: Some(MeshAsset {
                     id: MeshId(1),
                     source: "builtin:Cube".to_owned(),
+                    scale: 1.0,
                 }),
                 ..MaterialProject::empty()
             },
@@ -161,6 +164,7 @@ impl Default for SubstanceCraftApp {
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
             import_error: None,
+            import_scale: 1.0,
             project_path: None,
             project_error: None,
             active_channel: MaterialChannel::BaseColor,
@@ -340,6 +344,7 @@ impl SubstanceCraftApp {
         self.selected_primitive = scene.selected_primitive;
         self.imported_meshes = scene.imported_meshes;
         self.selected_imported_mesh = scene.selected_imported_mesh;
+        self.import_scale = scene.scale;
         self.mesh_geometry = scene.geometry;
         self.mark_mesh_changed();
         self.selected_texture_set = self.project.active_texture_set;
@@ -396,6 +401,7 @@ impl SubstanceCraftApp {
                 imported_meshes: Vec::new(),
                 selected_imported_mesh: None,
                 geometry: None,
+                scale: 1.0,
             });
         };
         if let Some(name) = mesh_asset.source.strip_prefix("builtin:") {
@@ -408,6 +414,7 @@ impl SubstanceCraftApp {
                 imported_meshes: Vec::new(),
                 selected_imported_mesh: None,
                 geometry: Some(preset.build_mesh()),
+                scale: 1.0,
             });
         }
 
@@ -423,12 +430,14 @@ impl SubstanceCraftApp {
         let Some(first_mesh) = meshes.first() else {
             return Err("referenced FBX contains no mesh geometry".to_owned());
         };
-        let first_geometry = first_mesh.geometry.clone();
+        let scale = sanitize_mesh_scale(mesh_asset.scale);
+        let first_geometry = scaled_geometry(&first_mesh.geometry, scale);
         Ok(RestoredMeshScene {
             selected_primitive: None,
             imported_meshes: meshes,
             selected_imported_mesh: Some(0),
             geometry: Some(first_geometry),
+            scale,
         })
     }
 
@@ -460,7 +469,7 @@ impl SubstanceCraftApp {
                     self.import_error = Some("FBX contains no mesh geometry".to_owned());
                     return;
                 };
-                let first_geometry = first_mesh.geometry.clone();
+                let first_geometry = scaled_geometry(&first_mesh.geometry, self.import_scale);
                 let display_name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -468,6 +477,7 @@ impl SubstanceCraftApp {
                 self.project.mesh = Some(MeshAsset {
                     id: MeshId(1),
                     source: path.to_string_lossy().into_owned(),
+                    scale: self.import_scale,
                 });
                 self.imported_meshes = meshes;
                 self.selected_imported_mesh = Some(0);
@@ -779,10 +789,22 @@ impl SubstanceCraftApp {
         let Some(mesh) = self.imported_meshes.get(index) else {
             return;
         };
-        self.mesh_geometry = Some(mesh.geometry.clone());
+        self.mesh_geometry = Some(scaled_geometry(&mesh.geometry, self.import_scale));
         self.mark_mesh_changed();
         self.selected_imported_mesh = Some(index);
         self.selected_primitive = None;
+    }
+
+    fn set_import_scale(&mut self, scale: f32) {
+        self.import_scale = sanitize_mesh_scale(scale);
+        if let Some(mesh_asset) = self.project.mesh.as_mut()
+            && !mesh_asset.source.starts_with("builtin:")
+        {
+            mesh_asset.scale = self.import_scale;
+        }
+        if let Some(index) = self.selected_imported_mesh {
+            self.select_imported_mesh(index);
+        }
     }
 
     fn update_pose_transition(&mut self, context: &egui::Context) {
@@ -1085,6 +1107,27 @@ fn mesh_bounds_center(mesh: &MeshGeometry) -> glam::Vec3 {
         maximum = maximum.max(vertex.position);
     }
     (minimum + maximum) * 0.5
+}
+
+const MIN_MESH_SCALE: f32 = 0.0001;
+const MAX_MESH_SCALE: f32 = 1000.0;
+
+fn sanitize_mesh_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(MIN_MESH_SCALE, MAX_MESH_SCALE)
+    } else {
+        1.0
+    }
+}
+
+fn scaled_geometry(mesh: &MeshGeometry, scale: f32) -> MeshGeometry {
+    let mut geometry = mesh.clone();
+    if scale != 1.0 {
+        for vertex in &mut geometry.vertices {
+            vertex.position *= scale;
+        }
+    }
+    geometry
 }
 
 impl eframe::App for SubstanceCraftApp {

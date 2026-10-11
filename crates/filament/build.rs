@@ -45,7 +45,10 @@ fn main() {
             filament_dir.display()
         ));
     }
-    println!("cargo:rerun-if-changed={}", lib_dir.join("filament.lib").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        lib_dir.join("filament.lib").display()
+    );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap_or_default());
     compile_material(
@@ -69,7 +72,8 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     for lib in FILAMENT_LIBS {
-        if lib_dir.join(format!("{lib}.lib")).is_file() || lib_dir.join(format!("lib{lib}.a")).is_file()
+        if lib_dir.join(format!("{lib}.lib")).is_file()
+            || lib_dir.join(format!("lib{lib}.a")).is_file()
         {
             println!("cargo:rustc-link-lib=static={lib}");
         }
@@ -89,7 +93,10 @@ fn compile_material(matc: &Path, source: &Path, output: &Path) {
         .status();
     match status {
         Ok(status) if status.success() => {}
-        Ok(status) => fail(&format!("matc failed with {status} compiling {}", source.display())),
+        Ok(status) => fail(&format!(
+            "matc failed with {status} compiling {}",
+            source.display()
+        )),
         Err(error) => fail(&format!("could not run {}: {error}", matc.display())),
     }
 }

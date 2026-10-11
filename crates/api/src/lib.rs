@@ -364,6 +364,7 @@ mod tests {
             mesh: Some(substancecraft_core::MeshAsset {
                 id: substancecraft_core::MeshId(9),
                 source: "builtin:Sphere".to_owned(),
+                scale: 1.0,
             }),
             ..MaterialProject::empty()
         };

@@ -13,7 +13,10 @@ use substancecraft_core::{
     ViewportCamera,
 };
 
-use super::{CHANNELS, MAX_SAVED_POSES, PaintMode, SubstanceCraftApp, channel_label};
+use super::{
+    CHANNELS, MAX_MESH_SCALE, MAX_SAVED_POSES, MIN_MESH_SCALE, PaintMode, SubstanceCraftApp,
+    channel_label,
+};
 use crate::icons::{self, Icon};
 use crate::theme;
 use crate::widgets;
@@ -131,6 +134,7 @@ impl SubstanceCraftApp {
         self.project.mesh = Some(MeshAsset {
             id: MeshId(1),
             source: format!("builtin:{}", preset.name()),
+            scale: 1.0,
         });
     }
 
@@ -374,6 +378,27 @@ impl SubstanceCraftApp {
         if widgets::pill_button(ui, Some(Icon::Import), "Import FBX…", true, true).clicked() {
             self.import_fbx();
         }
+
+        let mut import_scale = self.import_scale;
+        if slider_row(
+            ui,
+            "Scale",
+            &mut import_scale,
+            MIN_MESH_SCALE..=MAX_MESH_SCALE,
+            true,
+            4,
+        ) {
+            self.set_import_scale(import_scale);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for (label, scale) in [("×0.01", 0.01), ("×0.1", 0.1), ("×1", 1.0), ("×100", 100.0)]
+            {
+                if widgets::chip(ui, label, self.import_scale == scale).clicked() {
+                    self.set_import_scale(scale);
+                }
+            }
+        });
 
         if !self.imported_meshes.is_empty() {
             widgets::caption(ui, "Imported meshes");

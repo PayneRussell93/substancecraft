@@ -198,9 +198,8 @@ impl FilamentRuntime {
             callback: Box::new(readback),
         }));
         // SAFETY: ownership of `user` passes to the shim only when it returns true.
-        let rendered = unsafe {
-            ffi::sc_renderer_render(self.raw.as_ptr(), readback_trampoline, user.cast())
-        };
+        let rendered =
+            unsafe { ffi::sc_renderer_render(self.raw.as_ptr(), readback_trampoline, user.cast()) };
         if !rendered {
             // SAFETY: the shim did not take ownership, so reclaim the box here.
             drop(unsafe { Box::from_raw(user) });
@@ -303,7 +302,10 @@ impl Drop for FilamentRuntime {
 }
 
 fn bounded_size(width: u32, height: u32) -> Result<[u32; 2], FilamentError> {
-    if width == 0 || height == 0 || width > MAX_VIEWPORT_DIMENSION || height > MAX_VIEWPORT_DIMENSION
+    if width == 0
+        || height == 0
+        || width > MAX_VIEWPORT_DIMENSION
+        || height > MAX_VIEWPORT_DIMENSION
     {
         return Err(FilamentError::InvalidViewport);
     }
@@ -378,7 +380,11 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
         }
         let mut tangent = tangents[index] - normal * normal.dot(tangents[index]);
         if tangent.length_squared() <= f32::EPSILON {
-            let helper = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+            let helper = if normal.x.abs() < 0.9 {
+                Vec3::X
+            } else {
+                Vec3::Y
+            };
             tangent = normal.cross(helper);
         }
         tangent = tangent.normalize_or_zero();
@@ -455,7 +461,10 @@ mod tests {
         let geometry = PrimitivePreset::Cube.build_mesh();
         let buffers = build_mesh_buffers(&geometry).expect("valid cube buffers");
 
-        assert_eq!(buffers.vertex_data.len(), geometry.vertices.len() * FLOATS_PER_VERTEX);
+        assert_eq!(
+            buffers.vertex_data.len(),
+            geometry.vertices.len() * FLOATS_PER_VERTEX
+        );
         assert_eq!(buffers.indices.len(), geometry.triangles.len() * 3);
         assert_eq!(buffers.bounds.0.to_array(), [0.0; 3]);
         assert_eq!(buffers.bounds.1.to_array(), [0.5; 3]);
@@ -489,6 +498,10 @@ mod tests {
         assert_eq!(pixels.len(), 64 * 64 * 4);
         let center = (32 * 64 + 32) * 4;
         let background = &pixels[0..3];
-        assert_ne!(&pixels[center..center + 3], background, "cube should cover the center");
+        assert_ne!(
+            &pixels[center..center + 3],
+            background,
+            "cube should cover the center"
+        );
     }
 }

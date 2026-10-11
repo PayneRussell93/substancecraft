@@ -507,10 +507,17 @@ impl TextureResolution {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshAsset {
     pub id: MeshId,
     pub source: String,
+    /// Uniform scale applied to imported geometry; built-in primitives ignore it.
+    #[serde(default = "default_mesh_scale")]
+    pub scale: f32,
+}
+
+fn default_mesh_scale() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
