@@ -12,7 +12,8 @@ use substancecraft_api::{
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, IdStroke, MaskStroke, MaterialChannel, MaterialLayer,
     MaterialProject, MeshAsset, MeshGeometry, MeshId, NamedPose, PaintStroke, PoseId,
-    PrimitivePreset, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
+    PrimitivePreset, StrokeCommand, StrokeHistory, TextureResolution, TextureSet, TextureSetId,
+    ViewportCamera, ViewportLighting,
 };
 
 const CHANNELS: [MaterialChannel; 9] = [
@@ -68,6 +69,7 @@ struct SubstanceCraftApp {
     brush_color: egui::Color32,
     mask_value: f32,
     active_stroke: Option<(TextureSetId, substancecraft_core::LayerId, PaintMode)>,
+    stroke_history: StrokeHistory,
     baked_preview: Option<(TextureSetId, MaterialChannel, BakedTexture)>,
     bake_error: Option<String>,
     selected_pose: Option<PoseId>,
@@ -130,6 +132,7 @@ impl Default for SubstanceCraftApp {
             brush_color: egui::Color32::from_rgb(214, 108, 66),
             mask_value: 0.0,
             active_stroke: None,
+            stroke_history: StrokeHistory::default(),
             baked_preview: None,
             bake_error: None,
             selected_pose: None,
@@ -228,6 +231,7 @@ impl SubstanceCraftApp {
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
         self.active_stroke = None;
+        self.stroke_history = StrokeHistory::default();
         self.baked_preview = None;
         self.bake_error = None;
         self.import_error = None;
@@ -455,6 +459,74 @@ impl SubstanceCraftApp {
         }
     }
 
+    fn finish_active_stroke(&mut self) {
+        let Some((texture_set_id, layer_id, mode)) = self.active_stroke.take() else {
+            return;
+        };
+        let Some(layer) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)
+            .and_then(|set| set.layers.iter().find(|layer| layer.id == layer_id))
+        else {
+            return;
+        };
+        let command = match mode {
+            PaintMode::View => None,
+            PaintMode::Paint => {
+                layer
+                    .paint_strokes
+                    .last()
+                    .cloned()
+                    .map(|stroke| StrokeCommand::Paint {
+                        texture_set_id,
+                        layer_id,
+                        stroke,
+                    })
+            }
+            PaintMode::Mask => {
+                layer
+                    .mask_strokes
+                    .last()
+                    .cloned()
+                    .map(|stroke| StrokeCommand::Mask {
+                        texture_set_id,
+                        layer_id,
+                        stroke,
+                    })
+            }
+            PaintMode::Id => layer
+                .id_strokes
+                .last()
+                .cloned()
+                .map(|stroke| StrokeCommand::Id {
+                    texture_set_id,
+                    layer_id,
+                    stroke,
+                }),
+        };
+        if let Some(command) = command {
+            self.stroke_history.record(command);
+        }
+    }
+
+    fn undo_stroke(&mut self) {
+        self.finish_active_stroke();
+        if self.stroke_history.undo(&mut self.project) {
+            self.baked_preview = None;
+            self.refresh_baked_preview();
+        }
+    }
+
+    fn redo_stroke(&mut self) {
+        self.finish_active_stroke();
+        if self.stroke_history.redo(&mut self.project) {
+            self.baked_preview = None;
+            self.refresh_baked_preview();
+        }
+    }
+
     fn refresh_baked_preview(&mut self) {
         let Some(texture_set_id) = self.selected_texture_set else {
             self.baked_preview = None;
@@ -554,6 +626,18 @@ impl SubstanceCraftApp {
                     .unwrap_or_else(|| "Untitled Project".to_owned());
                 ui.label(project_name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.stroke_history.can_redo(), egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        self.redo_stroke();
+                    }
+                    if ui
+                        .add_enabled(self.stroke_history.can_undo(), egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        self.undo_stroke();
+                    }
                     if ui.button("Save").clicked() {
                         self.save_project();
                     }
@@ -863,7 +947,7 @@ impl SubstanceCraftApp {
                             .changed();
                     });
                     if mode_changed {
-                        self.active_stroke = None;
+                        self.finish_active_stroke();
                         self.baked_preview = None;
                         self.active_channel = match self.paint_mode {
                             PaintMode::Id => MaterialChannel::Id,
@@ -1055,7 +1139,7 @@ impl SubstanceCraftApp {
                     self.viewport_camera.orbit(delta);
                 }
             } else if !response.dragged() {
-                self.active_stroke = None;
+                self.finish_active_stroke();
                 if was_stroke_active {
                     self.baked_preview = None;
                 }

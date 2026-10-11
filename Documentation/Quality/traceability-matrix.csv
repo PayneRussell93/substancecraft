@@ -6,3 +6,4 @@ REQ-0004,Import and preview static mesh geometry from binary FBX 7.4+ files,docs
 REQ-0005,Save and reload validated project data including texture sets and poses,docs/api-and-mcp.md,docs/architecture.md,,TC-0016;TC-0017;TC-0018;TC-0027,Documentation/Quality/TestPlan-short.md,Project owner,In progress
 REQ-0006,Control projected model viewport camera and preview lighting,docs/architecture.md,docs/architecture.md,,TC-0019;TC-0020;TC-0021,Documentation/Quality/TestPlan-short.md,Project owner,In progress
 REQ-0007,Paint UV-space Base Color and ID maps with grayscale and ID-color masks and bake TGA textures,docs/feature-map.md,docs/architecture.md,,TC-0016;TC-0022;TC-0023;TC-0024;TC-0025;TC-0026;TC-0027,Documentation/Quality/TestPlan-short.md,Project owner,In progress
+REQ-0008,Undo and redo completed UV paint mask and ID strokes,docs/feature-map.md,docs/architecture.md,,TC-0028,Documentation/Quality/TestPlan-short.md,Project owner,In progress

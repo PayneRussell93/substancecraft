@@ -1,13 +1,13 @@
 # Roadmap
 
-**Status:** project foundation, JSON project save/load, binary FBX static-mesh import, and projected viewport controls are in place; no painting workflow is implemented.
+**Status:** project foundation, JSON project save/load, binary FBX static-mesh import, projected viewport controls, UV paint/mask/ID strokes, TGA baking/export, and bounded stroke undo/redo are implemented.
 
 ## Milestones
 
 1. **Project foundation:** Rust workspace, versioned material project model, model validation. Complete.
 2. **Mesh inspection:** starter presets, binary FBX 7.4+ static mesh import, UV preservation/fallback, selectable meshes, and projected-preview orbit/pan/zoom are implemented; ASCII FBX, animation, glTF, imported materials, and a true 3D viewport remain open.
-3. **First paint loop:** create a texture set and paint base color in UV space; see the result on the mesh.
-4. **History and export:** undo/redo a stroke and export a PNG texture.
+3. **First paint loop:** create a texture set, paint Base Color/ID in UV space, apply grayscale masks, and preview the result on the mesh. Implemented; broader channel painting remains open.
+4. **History and export:** undo/redo completed paint, mask, and ID strokes and export baked TGA maps. Implemented; PNG export and project-wide history remain open.
 5. **Multi-channel materials:** roughness, metallic, normal, height, channel-aware compositing, masks.
 6. **3D painting and baking:** mesh picking, continuous projection, initial mesh maps and generators.
 7. **Automation foundation:** Rust API facade includes preset inspection, FBX mesh import, and project serialization; MCP currently exposes read-only preset tools. In progress.

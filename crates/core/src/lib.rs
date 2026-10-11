@@ -12,6 +12,7 @@ pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
 pub const MAX_BAKE_PIXELS: usize = 4_194_304;
 const MAX_LAYER_STROKES: usize = 8_192;
 const MAX_STROKE_POINTS: usize = 4_096;
+const MAX_STROKE_HISTORY: usize = 128;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -551,6 +552,155 @@ pub struct IdStroke {
     pub radius_pixels: f32,
     pub color: [u8; 3],
     pub opacity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrokeCommand {
+    Paint {
+        texture_set_id: TextureSetId,
+        layer_id: LayerId,
+        stroke: PaintStroke,
+    },
+    Mask {
+        texture_set_id: TextureSetId,
+        layer_id: LayerId,
+        stroke: MaskStroke,
+    },
+    Id {
+        texture_set_id: TextureSetId,
+        layer_id: LayerId,
+        stroke: IdStroke,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StrokeHistory {
+    undo_stack: Vec<StrokeCommand>,
+    redo_stack: Vec<StrokeCommand>,
+}
+
+impl StrokeHistory {
+    pub fn record(&mut self, command: StrokeCommand) {
+        if self.undo_stack.len() == MAX_STROKE_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn undo(&mut self, project: &mut MaterialProject) -> bool {
+        let Some(command) = self.undo_stack.pop() else {
+            return false;
+        };
+        if !remove_stroke(project, &command) {
+            self.undo_stack.push(command);
+            return false;
+        }
+        self.redo_stack.push(command);
+        true
+    }
+
+    pub fn redo(&mut self, project: &mut MaterialProject) -> bool {
+        let Some(command) = self.redo_stack.pop() else {
+            return false;
+        };
+        if !restore_stroke(project, &command) {
+            self.redo_stack.push(command);
+            return false;
+        }
+        if self.undo_stack.len() == MAX_STROKE_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(command);
+        true
+    }
+}
+
+fn remove_stroke(project: &mut MaterialProject, command: &StrokeCommand) -> bool {
+    let (texture_set_id, layer_id) = match command {
+        StrokeCommand::Paint {
+            texture_set_id,
+            layer_id,
+            ..
+        }
+        | StrokeCommand::Mask {
+            texture_set_id,
+            layer_id,
+            ..
+        }
+        | StrokeCommand::Id {
+            texture_set_id,
+            layer_id,
+            ..
+        } => (*texture_set_id, *layer_id),
+    };
+    let Some(layer) = project
+        .texture_sets
+        .iter_mut()
+        .find(|set| set.id == texture_set_id)
+        .and_then(|set| set.layers.iter_mut().find(|layer| layer.id == layer_id))
+    else {
+        return false;
+    };
+
+    match command {
+        StrokeCommand::Paint { stroke, .. } if layer.paint_strokes.last() == Some(stroke) => {
+            layer.paint_strokes.pop();
+            true
+        }
+        StrokeCommand::Mask { stroke, .. } if layer.mask_strokes.last() == Some(stroke) => {
+            layer.mask_strokes.pop();
+            true
+        }
+        StrokeCommand::Id { stroke, .. } if layer.id_strokes.last() == Some(stroke) => {
+            layer.id_strokes.pop();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn restore_stroke(project: &mut MaterialProject, command: &StrokeCommand) -> bool {
+    let (texture_set_id, layer_id) = match command {
+        StrokeCommand::Paint {
+            texture_set_id,
+            layer_id,
+            ..
+        }
+        | StrokeCommand::Mask {
+            texture_set_id,
+            layer_id,
+            ..
+        }
+        | StrokeCommand::Id {
+            texture_set_id,
+            layer_id,
+            ..
+        } => (*texture_set_id, *layer_id),
+    };
+    let Some(layer) = project
+        .texture_sets
+        .iter_mut()
+        .find(|set| set.id == texture_set_id)
+        .and_then(|set| set.layers.iter_mut().find(|layer| layer.id == layer_id))
+    else {
+        return false;
+    };
+
+    match command {
+        StrokeCommand::Paint { stroke, .. } => layer.paint_strokes.push(stroke.clone()),
+        StrokeCommand::Mask { stroke, .. } => layer.mask_strokes.push(stroke.clone()),
+        StrokeCommand::Id { stroke, .. } => layer.id_strokes.push(stroke.clone()),
+    }
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1118,6 +1268,88 @@ mod tests {
 
         assert_eq!(baked.pixel(3, 3), Some([240, 30, 12, 255]));
         assert_eq!(baked.pixel(6, 3), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn tc_0028_stroke_history_undoes_redoes_and_branches_all_stroke_types() {
+        let paint = PaintStroke {
+            points: vec![glam::Vec2::new(0.25, 0.75)],
+            radius_pixels: 2.0,
+            color: [240, 30, 12, 255],
+            opacity: 1.0,
+        };
+        let mask = MaskStroke {
+            points: vec![glam::Vec2::new(0.5, 0.5)],
+            radius_pixels: 3.0,
+            value: 0.25,
+            opacity: 1.0,
+        };
+        let id = IdStroke {
+            points: vec![glam::Vec2::new(0.75, 0.25)],
+            radius_pixels: 4.0,
+            color: [12, 180, 220],
+            opacity: 1.0,
+        };
+        let mut set = texture_set(1);
+        set.layers.push(MaterialLayer {
+            id: LayerId(2),
+            name: "Paint".to_owned(),
+            visible: true,
+            opacity: 1.0,
+            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+            paint_strokes: vec![paint.clone()],
+            mask_strokes: vec![mask.clone()],
+            id_strokes: vec![id.clone()],
+            id_mask_color: None,
+        });
+        let mut project = MaterialProject {
+            texture_sets: vec![set],
+            ..MaterialProject::empty()
+        };
+        let mut history = StrokeHistory::default();
+        history.record(StrokeCommand::Paint {
+            texture_set_id: TextureSetId(1),
+            layer_id: LayerId(2),
+            stroke: paint.clone(),
+        });
+        history.record(StrokeCommand::Mask {
+            texture_set_id: TextureSetId(1),
+            layer_id: LayerId(2),
+            stroke: mask.clone(),
+        });
+        history.record(StrokeCommand::Id {
+            texture_set_id: TextureSetId(1),
+            layer_id: LayerId(2),
+            stroke: id.clone(),
+        });
+
+        assert!(history.undo(&mut project));
+        assert!(history.undo(&mut project));
+        assert!(history.undo(&mut project));
+        let layer = &project.texture_sets[0].layers[0];
+        assert!(layer.paint_strokes.is_empty());
+        assert!(layer.mask_strokes.is_empty());
+        assert!(layer.id_strokes.is_empty());
+        assert!(history.redo(&mut project));
+        assert!(history.redo(&mut project));
+        assert!(history.redo(&mut project));
+        let layer = &project.texture_sets[0].layers[0];
+        assert_eq!(layer.paint_strokes, vec![paint]);
+        assert_eq!(layer.mask_strokes, vec![mask]);
+        assert_eq!(layer.id_strokes, vec![id]);
+
+        assert!(history.undo(&mut project));
+        history.record(StrokeCommand::Paint {
+            texture_set_id: TextureSetId(1),
+            layer_id: LayerId(2),
+            stroke: PaintStroke {
+                points: vec![glam::Vec2::new(0.1, 0.1)],
+                radius_pixels: 1.0,
+                color: [1, 2, 3, 255],
+                opacity: 1.0,
+            },
+        });
+        assert!(!history.can_redo());
     }
 
     #[test]

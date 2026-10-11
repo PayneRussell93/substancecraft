@@ -52,7 +52,7 @@ This is the product capability map derived from the supplied Painter feature inv
 | 39 | Texture exporting | Partial | Base Color and ID maps export as 32-bit TGA; other channels, formats, UDIMs, and export presets remain open. |
 | 40 | Export presets and channel packing | Planned | Serializable output graphs for routing, packing, inversion, formats, and naming. |
 | 41 | Pipeline-targeted exporting | Planned | Documented, tested profiles for glTF, game engines, renderers, and custom pipelines. |
-| 42 | History and nondestructive editing | Partial | Named pose interpolation exists; project-wide commands, undo/redo, and snapshots remain open. |
+| 42 | History and nondestructive editing | Partial | Bounded undo/redo for completed paint, mask, and ID strokes is implemented; project-wide commands, snapshots, and persisted history remain open. |
 | 43 | Selection and isolation | Planned | Texture Set, polygon, element, UV island, layer, and mask selection. |
 | 44 | Interface customization | Partial | Initial dock-like panels exist; saved layouts and complete workspace controls remain open. |
 | 45 | Color selection | Planned | Managed color picker and multi-channel material sampling. |
