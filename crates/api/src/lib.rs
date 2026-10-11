@@ -24,7 +24,8 @@ use std::{
 use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
     MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
-    MeshMaps, MeshSmoothing, PrimitivePreset, ResourceId, ResourceImages, TextureSet,
+    MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ResourceId, ResourceImages,
+    TextureSet,
 };
 use thiserror::Error;
 
@@ -290,6 +291,46 @@ pub fn bake_texture_set_export(
             resources,
         },
     )?)
+}
+
+/// Checks an export without baking; see [`TextureSet::export_preflight`].
+pub fn export_preflight(
+    texture_set: &TextureSet,
+    preset: &ExportPreset,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+) -> Vec<PreflightIssue> {
+    texture_set.export_preflight(
+        preset,
+        BakeContext {
+            mesh,
+            mesh_maps,
+            resources,
+        },
+    )
+}
+
+/// Files in `folder` that exporting `preset` for `texture_set` as `format`
+/// would overwrite.
+pub fn existing_export_files(
+    folder: &Path,
+    texture_set: &TextureSet,
+    preset: &ExportPreset,
+    format: TextureFormat,
+) -> Vec<std::path::PathBuf> {
+    preset
+        .outputs
+        .iter()
+        .map(|output| {
+            folder.join(format!(
+                "{}.{}",
+                output.resolved_file_name(&texture_set.name),
+                format.extension()
+            ))
+        })
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// Loads every bitmap the project lists. Unreadable files are reported per

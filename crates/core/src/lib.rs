@@ -24,7 +24,7 @@ pub use compositing::{BakeContext, BakeError, BakedTexture, MaterialTextures};
 pub use export::{
     ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource, ExportedTexture,
     MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS, OutputLayout,
-    SourceComponent, TEXTURE_SET_TOKEN,
+    PreflightIssue, PreflightSeverity, SourceComponent, TEXTURE_SET_TOKEN,
 };
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{

@@ -12,7 +12,10 @@ use crate::compositing::{
     BakeContext, BakeError, BakedTexture, LayerMasks, base_texel, checked_bake_pixel_count,
     contributes, parallel_fill, rgb_unit, try_filled, unit_to_byte,
 };
-use crate::{DEFAULT_BASE_COLOR, MaterialChannel, MeshMapKind, TextureSet};
+use crate::{
+    DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_ROUGHNESS, MaterialChannel,
+    MeshMapKind, MeshMaps, TextureSet,
+};
 
 /// Upper bound on files one preset writes.
 pub const MAX_EXPORT_OUTPUTS: usize = 32;
@@ -667,6 +670,179 @@ impl TextureSet {
     }
 }
 
+/// How serious a preflight finding is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreflightSeverity {
+    /// The export would succeed but probably not as intended.
+    Warning,
+    /// The export cannot run.
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreflightIssue {
+    pub severity: PreflightSeverity,
+    pub message: String,
+}
+
+impl PreflightIssue {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: PreflightSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: PreflightSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+impl TextureSet {
+    /// Checks an export without baking: errors are problems that would make
+    /// [`TextureSet::bake_export`] fail, warnings are outputs that would be
+    /// written but are probably not what the artist wants (a channel left at
+    /// its default, a flat normal, white occlusion). Errors come first.
+    pub fn export_preflight(
+        &self,
+        preset: &ExportPreset,
+        context: BakeContext<'_>,
+    ) -> Vec<PreflightIssue> {
+        if let Err(error) = preset.validate() {
+            return vec![PreflightIssue::error(format!(
+                "The preset is invalid: {error}"
+            ))];
+        }
+        let mut issues = Vec::new();
+        let (width, height) = (self.resolution.width, self.resolution.height);
+        if checked_bake_pixel_count(self.resolution).is_err() {
+            issues.push(PreflightIssue::error(format!(
+                "{width} × {height} exceeds the texture bake budget."
+            )));
+        } else if !width.is_power_of_two() || !height.is_power_of_two() {
+            issues.push(PreflightIssue::warning(format!(
+                "{width} × {height} is not a power of two; engines may not mip-map or \
+                 compress it."
+            )));
+        }
+
+        let maps = context.mesh_maps;
+        if maps.is_none() && self.requires_mesh_maps() {
+            issues.push(PreflightIssue::error(
+                "Layers use generators or triplanar projection, but mesh maps are not baked.",
+            ));
+        }
+        if context.mesh.is_none()
+            && self
+                .walk_layers()
+                .iter()
+                .any(|layer| layer.visible && layer.polygon_mask.is_some())
+        {
+            issues.push(PreflightIssue::error(
+                "A layer uses a polygon mask, but no mesh is loaded.",
+            ));
+        }
+        for id in self.referenced_resources() {
+            if context
+                .resources
+                .is_none_or(|images| !images.contains_key(&id))
+            {
+                issues.push(PreflightIssue::error(format!(
+                    "Bitmap resource {} is used by a layer but is not loaded.",
+                    id.0
+                )));
+            }
+        }
+
+        let mut seen = BTreeMap::new();
+        for output in &preset.outputs {
+            let name = output.resolved_file_name(&self.name);
+            if let Some(first) = seen.insert(name.to_lowercase(), output.file_name.clone()) {
+                issues.push(PreflightIssue::error(format!(
+                    "`{}` and `{}` both resolve to `{name}`.",
+                    first, output.file_name
+                )));
+            }
+        }
+
+        // Group the outputs reading each source so a source is reported once.
+        let mut readers: BTreeMap<ExportSource, Vec<String>> = BTreeMap::new();
+        for output in &preset.outputs {
+            for source in output.used_slots().iter().filter_map(|slot| slot.source()) {
+                let files = readers.entry(source).or_default();
+                let name = output.resolved_file_name(&self.name);
+                if !files.contains(&name) {
+                    files.push(name);
+                }
+            }
+        }
+        let painted = |channels: &[MaterialChannel]| {
+            self.layers.iter().any(|layer| contributes(layer, channels))
+        };
+        for (source, files) in readers {
+            let problem = match source {
+                ExportSource::MeshMap(kind) if maps.is_none() => {
+                    issues.push(PreflightIssue::error(format!(
+                        "{} reads the {} mesh map, which is not baked.",
+                        files.join(", "),
+                        kind.name()
+                    )));
+                    continue;
+                }
+                ExportSource::MeshMap(_) => None,
+                ExportSource::Channel(channel) => match channel {
+                    MaterialChannel::BaseColor if !painted(&[channel]) => {
+                        Some("Base Color is the neutral default grey".to_owned())
+                    }
+                    MaterialChannel::Roughness if !painted(&[channel]) => {
+                        Some(format!("Roughness is a uniform {DEFAULT_ROUGHNESS:.2}"))
+                    }
+                    MaterialChannel::Metallic if !painted(&[channel]) => {
+                        Some(format!("Metallic is a uniform {DEFAULT_METALLIC:.2}"))
+                    }
+                    MaterialChannel::Height if !painted(&[channel]) => {
+                        Some(format!("Height is a uniform {DEFAULT_HEIGHT:.2}"))
+                    }
+                    MaterialChannel::Normal
+                        if !painted(&[MaterialChannel::Normal])
+                            && !(painted(&[MaterialChannel::Height])
+                                && self.height_strength > 0.0)
+                            && !maps.is_some_and(MeshMaps::from_high_poly) =>
+                    {
+                        Some(
+                            "Normal is flat: no high-poly bake, normal, or height detail"
+                                .to_owned(),
+                        )
+                    }
+                    MaterialChannel::AmbientOcclusion if maps.is_none() => {
+                        Some("Occlusion is white because mesh maps are not baked".to_owned())
+                    }
+                    MaterialChannel::Id
+                        if !self
+                            .walk_layers()
+                            .iter()
+                            .any(|layer| !layer.id_strokes.is_empty()) =>
+                    {
+                        Some("The ID map is empty".to_owned())
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(problem) = problem {
+                issues.push(PreflightIssue::warning(format!(
+                    "{problem} in {}.",
+                    files.join(", ")
+                )));
+            }
+        }
+        issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
+        issues
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -935,6 +1111,98 @@ mod tests {
             Err(ProjectError::DuplicateExportPresetName(
                 "unreal engine".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn tc_0122_preflight_flags_blocking_errors_and_default_channel_outputs() {
+        use crate::{FillTextures, ResourceId};
+
+        let messages = |issues: &[PreflightIssue], severity| -> Vec<String> {
+            issues
+                .iter()
+                .filter(|issue| issue.severity == severity)
+                .map(|issue| issue.message.clone())
+                .collect()
+        };
+        let orm = built_in("Metal/Rough (ORM)");
+        let set = set_with(16, metal_layer([0, 0, 0]));
+
+        // No mesh maps: the normal is flat and occlusion white, but nothing
+        // blocks the export.
+        let issues = set.export_preflight(&orm, BakeContext::default());
+        assert!(messages(&issues, PreflightSeverity::Error).is_empty());
+        assert_eq!(
+            messages(&issues, PreflightSeverity::Warning),
+            [
+                "Normal is flat: no high-poly bake, normal, or height detail in \
+                 Hull_Plate_Normal.",
+                "Occlusion is white because mesh maps are not baked in Hull_Plate_ORM.",
+            ]
+        );
+        let maps = cube_maps();
+        let with_maps = BakeContext {
+            mesh_maps: Some(&maps),
+            ..BakeContext::default()
+        };
+        assert_eq!(
+            set.export_preflight(&orm, with_maps).len(),
+            1,
+            "only flat normal"
+        );
+
+        // Unpainted channels are reported once per source, listing files.
+        let separate = set_with(12, MaterialLayer::new_paint(LayerId(1), "Empty"));
+        let issues = separate.export_preflight(&built_in("Separate channels"), with_maps);
+        let warnings = messages(&issues, PreflightSeverity::Warning);
+        assert!(warnings[0].contains("12 × 12 is not a power of two"));
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message == "Roughness is a uniform 0.50 in Hull_Plate_Roughness.")
+        );
+        assert!(!warnings.iter().any(|message| message.contains("Occlusion")));
+
+        // Blocking problems come first.
+        let mut textured = metal_layer([0, 0, 0]);
+        if let Some(fill) = &mut textured.fill {
+            fill.textures = FillTextures {
+                base_color: Some(ResourceId(9)),
+                ..FillTextures::default()
+            };
+        }
+        let clashing = ExportPreset {
+            name: "Clash".to_owned(),
+            outputs: vec![
+                gray_output(
+                    "$textureSet_A",
+                    ChannelSlot::Source {
+                        source: ExportSource::MeshMap(MeshMapKind::Thickness),
+                        component: SourceComponent::Red,
+                        invert: false,
+                    },
+                ),
+                gray_output("Hull Plate_A", ChannelSlot::ONE),
+            ],
+        };
+        let issues = set_with(16, textured).export_preflight(&clashing, BakeContext::default());
+        assert_eq!(
+            messages(&issues, PreflightSeverity::Error),
+            [
+                "Bitmap resource 9 is used by a layer but is not loaded.",
+                "`$textureSet_A` and `Hull Plate_A` both resolve to `Hull_Plate_A`.",
+                "Hull_Plate_A reads the Thickness mesh map, which is not baked.",
+            ]
+        );
+        assert_eq!(issues[0].severity, PreflightSeverity::Error);
+
+        let invalid = ExportPreset {
+            name: String::new(),
+            outputs: Vec::new(),
+        };
+        assert_eq!(
+            set.export_preflight(&invalid, BakeContext::default()).len(),
+            1
         );
     }
 }

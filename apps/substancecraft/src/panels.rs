@@ -14,10 +14,11 @@ use substancecraft_core::{
     ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS, MAX_BRUSH_SPACING,
     MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS, MIN_BRUSH_SPACING,
     MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer, MeshAsset, MeshId,
-    MeshMapKind, MeshSmoothing, OutputLayout, PrimitivePreset, ProjectionMode, ResourceId,
-    SelectionMode, SourceComponent, TextureProjection, TextureSetId, ViewportCamera,
+    MeshMapKind, MeshSmoothing, OutputLayout, PreflightSeverity, PrimitivePreset, ProjectionMode,
+    ResourceId, SelectionMode, SourceComponent, TextureProjection, TextureSetId, ViewportCamera,
 };
 
+use super::resource_watch::ReloadMode;
 use super::{
     BAKEABLE_CHANNELS, CHANNELS, MAX_MESH_SCALE, MAX_SAVED_POSES, MIN_MESH_SCALE, PaintMode,
     SubstanceCraftApp, ViewMode, channel_label,
@@ -137,6 +138,52 @@ impl SubstanceCraftApp {
         }
         self.show_status(context, screen);
         self.show_toasts(context, screen);
+        self.show_overwrite_prompt(context);
+    }
+
+    /// Asks before an export replaces files already in its folder.
+    fn show_overwrite_prompt(&mut self, context: &egui::Context) {
+        let Some(prompt) = &self.overwrite_prompt else {
+            return;
+        };
+        let names: Vec<String> = prompt
+            .existing
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        let folder = prompt.folder.display().to_string();
+        let mut answer = None;
+        let modal = egui::Modal::new(Id::new("export_overwrite")).show(context, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(
+                RichText::new(format!("Replace {} existing file(s)?", names.len()))
+                    .size(15.0)
+                    .color(theme::TEXT),
+            );
+            ui.add(
+                egui::Label::new(RichText::new(folder).size(11.5).color(theme::TEXT_FAINT)).wrap(),
+            );
+            ui.add_space(4.0);
+            for name in &names {
+                ui.label(RichText::new(name).size(12.0).color(theme::TEXT_WEAK));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if widgets::pill_button(ui, None, "Replace", true, false).clicked() {
+                    answer = Some(true);
+                }
+                if widgets::pill_button(ui, None, "Cancel", false, false).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if modal.should_close() && answer.is_none() {
+            answer = Some(false);
+        }
+        if let Some(overwrite) = answer {
+            self.resolve_overwrite_prompt(overwrite);
+        }
     }
 
     pub(super) fn set_paint_mode(&mut self, mode: PaintMode) {
@@ -791,6 +838,27 @@ impl SubstanceCraftApp {
             empty_state(ui, "Imported bitmaps appear here.");
             return;
         }
+        let mode_changed = widgets::property_row(ui, "Auto-reload", |ui| {
+            widgets::segmented(
+                ui,
+                Id::new("resource_reload_mode"),
+                &mut self.resource_watcher.mode,
+                &ReloadMode::ALL,
+            )
+        });
+        if mode_changed {
+            let pending: Vec<ResourceId> = std::mem::take(&mut self.resource_watcher.pending)
+                .into_iter()
+                .collect();
+            if self.resource_watcher.mode == ReloadMode::Auto {
+                self.reload_changed_resources(&pending);
+            }
+        }
+        hint(
+            ui,
+            "When a bitmap is saved by another app, the layers using it update. \
+             Ask waits for confirmation.",
+        );
         widgets::caption(ui, "Bitmaps");
         let resources = self
             .project
@@ -1865,10 +1933,12 @@ impl SubstanceCraftApp {
         .into_iter()
         .filter_map(|(slot, error)| error.clone().map(|error| (slot, error)))
         .collect::<Vec<_>>();
-        if errors.is_empty() {
+        let pending_reloads = self.pending_reload_names();
+        if errors.is_empty() && pending_reloads.is_empty() {
             return;
         }
 
+        let (mut reload, mut ignore) = (false, false);
         let mut dismissed = Vec::new();
         egui::Area::new(Id::new("overlay_toasts"))
             .order(Order::Foreground)
@@ -1880,6 +1950,35 @@ impl SubstanceCraftApp {
             .show(context, |ui| {
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
+                    if !pending_reloads.is_empty() {
+                        egui::Frame::new()
+                            .fill(theme::ACCENT_SOFT)
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.45)))
+                            .corner_radius(theme::PILL)
+                            .shadow(theme::panel_shadow())
+                            .inner_margin(Margin {
+                                left: 14,
+                                right: 6,
+                                top: 5,
+                                bottom: 5,
+                            })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.set_max_width(560.0);
+                                    small_icon(ui, Icon::Image, theme::ACCENT);
+                                    let text =
+                                        format!("{} changed on disk", pending_reloads.join(", "));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(text).size(12.5).color(theme::TEXT),
+                                        )
+                                        .wrap(),
+                                    );
+                                    reload = widgets::chip(ui, "Reload", true).clicked();
+                                    ignore = widgets::chip(ui, "Ignore", false).clicked();
+                                });
+                            });
+                    }
                     for (slot, error) in errors {
                         egui::Frame::new()
                             .fill(theme::DANGER_SOFT)
@@ -1913,6 +2012,12 @@ impl SubstanceCraftApp {
                 });
             });
 
+        if reload {
+            let pending: Vec<ResourceId> = self.resource_watcher.pending.iter().copied().collect();
+            self.reload_changed_resources(&pending);
+        } else if ignore {
+            self.resource_watcher.pending.clear();
+        }
         for slot in dismissed {
             match slot {
                 ErrorSlot::Project => self.project_error = None,
@@ -2437,6 +2542,35 @@ impl SubstanceCraftApp {
                 .color(theme::TEXT),
             );
             ui.label(RichText::new(routing).size(11.0).color(theme::TEXT_FAINT));
+        }
+        if let Some(texture_set) = self.selected_texture_set_ref().cloned() {
+            ui.add_space(4.0);
+            let issues = self.export_issues(&texture_set, &selected);
+            if issues.is_empty() {
+                ui.label(
+                    RichText::new("Preflight: ready to export")
+                        .size(11.5)
+                        .color(theme::ACCENT),
+                );
+            }
+            for issue in issues {
+                let color = match issue.severity {
+                    PreflightSeverity::Error => theme::DANGER,
+                    PreflightSeverity::Warning => WARNING,
+                };
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    small_icon(ui, Icon::Alert, color);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(issue.message)
+                                .size(11.5)
+                                .color(theme::TEXT_WEAK),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
         }
         ui.add_space(4.0);
         let custom = self.is_custom_preset(&selected.name);

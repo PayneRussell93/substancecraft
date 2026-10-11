@@ -12,9 +12,9 @@ use std::time::Duration;
 use eframe::egui;
 use substancecraft_api::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
-    bake_texture_set_material, import_binary_fbx_meshes, import_gltf_file, load_project_file,
-    load_project_resources, load_texture_image, save_project_file, write_exported_textures,
-    write_texture,
+    bake_texture_set_material, existing_export_files, export_preflight, import_binary_fbx_meshes,
+    import_gltf_file, load_project_file, load_project_resources, load_texture_image,
+    save_project_file, write_exported_textures, write_texture,
 };
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
@@ -22,15 +22,16 @@ use substancecraft_core::{
     ExportPreset, ExportedTexture, IdStroke, LayerFill, LayerId, LayerSettings, LayerSlot,
     MAX_STROKE_POINTS, MaskGenerator, MaskStroke, MaterialChannel, MaterialLayer, MaterialProject,
     MaterialTextures, MeshAsset, MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings,
-    MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PrimitivePreset,
-    ProjectResource, ResourceId, ResourceImages, SelectionMode, TextureResolution, TextureSet,
-    TextureSetId, ViewportCamera, ViewportLighting, bake_mesh_maps_from,
-    remap_subdivided_triangles,
+    MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PreflightIssue,
+    PreflightSeverity, PrimitivePreset, ProjectResource, ResourceId, ResourceImages, SelectionMode,
+    TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
+    bake_mesh_maps_from, remap_subdivided_triangles,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
 mod icons;
 mod panels;
+mod resource_watch;
 mod theme;
 mod uv_view;
 mod widgets;
@@ -144,11 +145,15 @@ struct SubstanceCraftApp {
     resource_images: ResourceImages,
     /// Per-resource egui thumbnails for the assets drawer.
     resource_thumbnails: BTreeMap<ResourceId, egui::TextureHandle>,
+    /// Notices bitmap files edited outside the app.
+    resource_watcher: resource_watch::ResourceWatcher,
     export_format: TextureFormat,
     /// Name of the export preset the Export button uses.
     export_preset: String,
     /// Custom preset being edited; applied to the project only when valid.
     preset_draft: Option<PresetDraft>,
+    /// Export waiting for permission to replace existing files.
+    overwrite_prompt: Option<OverwritePrompt>,
     view_mode: ViewMode,
     uv_view: uv_view::UvView,
     /// Content revision of each texture set; compared against caches.
@@ -271,6 +276,28 @@ struct PreviewJob {
 /// Shared inputs of a background texture-set bake.
 /// Preset the Export button starts with: the viewport's own metal/rough layout.
 const DEFAULT_EXPORT_PRESET: &str = "Metal/Rough (ORM)";
+
+/// An export that would replace files, held until the user confirms.
+struct OverwritePrompt {
+    texture_set: TextureSet,
+    preset: ExportPreset,
+    folder: std::path::PathBuf,
+    existing: Vec<std::path::PathBuf>,
+}
+
+/// The first preflight error (and how many more), if any blocks the export.
+fn blocking_export_error(issues: &[PreflightIssue]) -> Option<String> {
+    let errors: Vec<&PreflightIssue> = issues
+        .iter()
+        .filter(|issue| issue.severity == PreflightSeverity::Error)
+        .collect();
+    let first = errors.first()?;
+    let more = match errors.len() {
+        1 => String::new(),
+        count => format!(" (and {} more)", count - 1),
+    };
+    Some(format!("Export blocked: {}{more}", first.message))
+}
 
 /// A custom export preset being edited.
 #[derive(Clone, Debug, PartialEq)]
@@ -452,9 +479,11 @@ impl Default for SubstanceCraftApp {
             pen_pressure: None,
             resource_images: ResourceImages::new(),
             resource_thumbnails: BTreeMap::new(),
+            resource_watcher: resource_watch::ResourceWatcher::default(),
             export_format: TextureFormat::Png,
             export_preset: DEFAULT_EXPORT_PRESET.to_owned(),
             preset_draft: None,
+            overwrite_prompt: None,
             view_mode: ViewMode::Model,
             uv_view: uv_view::UvView::default(),
             set_revisions: BTreeMap::new(),
@@ -518,6 +547,39 @@ impl SubstanceCraftApp {
         self.preview_failed = false;
         if let Some(set_id) = self.selected_texture_set {
             self.set_revisions.insert(set_id, self.preview_revision);
+        }
+    }
+
+    /// Marks only `set_ids` out of date. When the selected set is not among
+    /// them its current preview stays valid and is carried forward to the
+    /// new revision instead of being rebaked.
+    fn invalidate_sets(&mut self, set_ids: &BTreeSet<TextureSetId>) {
+        if set_ids.is_empty() {
+            return;
+        }
+        let selected_affected = self
+            .selected_texture_set
+            .is_some_and(|id| set_ids.contains(&id));
+        let previous = self.preview_key();
+        if selected_affected {
+            self.invalidate_preview();
+        } else {
+            self.preview_revision = self.preview_revision.wrapping_add(1);
+            let current = self.preview_key();
+            if let Some(preview) = self
+                .baked_preview
+                .as_mut()
+                .filter(|preview| preview.key == previous)
+            {
+                preview.key = current;
+            }
+            if let Some(job) = self.preview_job.as_mut().filter(|job| job.key == previous) {
+                job.key = current;
+            }
+        }
+        let revision = self.preview_revision;
+        for id in set_ids {
+            self.set_revisions.insert(*id, revision);
         }
     }
 
@@ -2104,10 +2166,69 @@ impl SubstanceCraftApp {
         let Some(texture_set) = self.exportable_texture_set(preset.reads_mesh_maps()) else {
             return;
         };
+        if let Some(error) = blocking_export_error(&self.export_issues(&texture_set, &preset)) {
+            self.bake_error = Some(error);
+            return;
+        }
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        match self.write_export(&texture_set, &preset, &folder) {
+        self.begin_export(texture_set, preset, folder);
+    }
+
+    /// Preflight findings for exporting `texture_set` with `preset` now.
+    fn export_issues(
+        &self,
+        texture_set: &TextureSet,
+        preset: &ExportPreset,
+    ) -> Vec<PreflightIssue> {
+        let inputs = self.bake_inputs(texture_set.id);
+        export_preflight(
+            texture_set,
+            preset,
+            inputs.mesh.as_deref(),
+            inputs.maps(),
+            Some(&inputs.resources),
+        )
+    }
+
+    /// Writes the export, first asking for confirmation when it would
+    /// replace files already in `folder`.
+    fn begin_export(
+        &mut self,
+        texture_set: TextureSet,
+        preset: ExportPreset,
+        folder: std::path::PathBuf,
+    ) {
+        let existing = existing_export_files(&folder, &texture_set, &preset, self.export_format);
+        if existing.is_empty() {
+            self.finish_export(&texture_set, &preset, &folder);
+        } else {
+            self.overwrite_prompt = Some(OverwritePrompt {
+                texture_set,
+                preset,
+                folder,
+                existing,
+            });
+        }
+    }
+
+    /// Answers the overwrite prompt: writes the export when confirmed.
+    fn resolve_overwrite_prompt(&mut self, overwrite: bool) {
+        if let Some(prompt) = self.overwrite_prompt.take()
+            && overwrite
+        {
+            self.finish_export(&prompt.texture_set, &prompt.preset, &prompt.folder);
+        }
+    }
+
+    fn finish_export(
+        &mut self,
+        texture_set: &TextureSet,
+        preset: &ExportPreset,
+        folder: &std::path::Path,
+    ) {
+        match self.write_export(texture_set, preset, folder) {
             Ok(_) => self.bake_error = None,
             Err(error) => self.bake_error = Some(error),
         }
@@ -2220,6 +2341,11 @@ impl SubstanceCraftApp {
         let (images, failures) = load_project_resources(&self.project);
         self.resource_images = images;
         self.resource_thumbnails.clear();
+        self.resource_watcher.reset();
+        for resource in &self.project.resources {
+            self.resource_watcher
+                .remember(resource.id, std::path::Path::new(&resource.source));
+        }
         if let Some((id, error)) = failures.first() {
             let name = self
                 .project
@@ -2274,7 +2400,84 @@ impl SubstanceCraftApp {
             source: path.to_string_lossy().into_owned(),
         });
         self.resource_images.insert(id, Arc::new(image));
+        self.resource_watcher.remember(id, path);
         Ok(id)
+    }
+
+    /// Checks bitmap files for outside edits about once a second and reloads
+    /// (or, in Ask mode, queues) the ones that changed.
+    fn poll_resource_files(&mut self, context: &egui::Context) {
+        use resource_watch::{ReloadMode, SCAN_INTERVAL};
+
+        if self.project.resources.is_empty() || self.resource_watcher.mode == ReloadMode::Off {
+            return;
+        }
+        // Keep polling while the window is idle.
+        context.request_repaint_after(SCAN_INTERVAL);
+        let now = std::time::Instant::now();
+        if !self.resource_watcher.due(now) {
+            return;
+        }
+        let changed = self.resource_watcher.scan(&self.project.resources, now);
+        match self.resource_watcher.mode {
+            ReloadMode::Auto => self.reload_changed_resources(&changed),
+            ReloadMode::Ask => self.resource_watcher.pending.extend(changed),
+            ReloadMode::Off => {}
+        }
+    }
+
+    /// Re-reads the given bitmaps and rebakes only the texture sets using
+    /// them. A file that cannot be decoded (missing, or caught mid-save)
+    /// keeps its previous pixels and is reported.
+    fn reload_changed_resources(&mut self, ids: &[ResourceId]) {
+        let mut reloaded = BTreeSet::new();
+        let mut failures = Vec::new();
+        for id in ids {
+            self.resource_watcher.pending.remove(id);
+            let Some(resource) = self
+                .project
+                .resources
+                .iter()
+                .find(|resource| resource.id == *id)
+            else {
+                continue;
+            };
+            match load_texture_image(&resource.source) {
+                Ok(image) => {
+                    self.resource_images.insert(*id, Arc::new(image));
+                    self.resource_thumbnails.remove(id);
+                    reloaded.insert(*id);
+                }
+                Err(error) => failures.push(format!("`{}`: {error}", resource.name)),
+            }
+        }
+        if let Some(first) = failures.first() {
+            let more = match failures.len() {
+                1 => String::new(),
+                count => format!(" (and {} more)", count - 1),
+            };
+            self.project_error = Some(format!(
+                "Could not reload {first}{more}; keeping the previous pixels."
+            ));
+        }
+        let affected = self
+            .project
+            .texture_sets
+            .iter()
+            .filter(|set| !set.referenced_resources().is_disjoint(&reloaded))
+            .map(|set| set.id)
+            .collect();
+        self.invalidate_sets(&affected);
+    }
+
+    /// Names of resources waiting for a reload confirmation.
+    fn pending_reload_names(&self) -> Vec<String> {
+        self.project
+            .resources
+            .iter()
+            .filter(|resource| self.resource_watcher.pending.contains(&resource.id))
+            .map(|resource| resource.name.clone())
+            .collect()
     }
 
     /// True when a layer or the current brush uses `id`.
@@ -2295,6 +2498,7 @@ impl SubstanceCraftApp {
         self.project.resources.retain(|resource| resource.id != id);
         self.resource_images.remove(&id);
         self.resource_thumbnails.remove(&id);
+        self.resource_watcher.forget(id);
     }
 
     /// egui thumbnail of a resource, created on first use.
@@ -3016,6 +3220,7 @@ impl eframe::App for SubstanceCraftApp {
         self.poll_mesh_map_job(ui.ctx());
         self.poll_preview_job(ui.ctx());
         self.poll_set_bake_job(ui.ctx());
+        self.poll_resource_files(ui.ctx());
         self.refresh_set_caches();
         self.update_pose_transition(ui.ctx());
         self.update_viewport(ui);
@@ -3457,5 +3662,148 @@ mod tests {
         app.delete_export_preset("Unreal Engine copy");
         assert!(app.project.export_presets.is_empty());
         assert_eq!(app.selected_export_preset().name, DEFAULT_EXPORT_PRESET);
+    }
+
+    #[test]
+    fn tc_0121_edited_bitmaps_reload_into_only_the_sets_that_use_them() {
+        let context = egui::Context::default();
+        let folder = tempfile::tempdir().unwrap();
+        let bitmap = folder.path().join("grunge.png");
+        let save = |width: u32, rgba: [u8; 4]| {
+            write_texture(
+                &bitmap,
+                &BakedTexture {
+                    width,
+                    height: 1,
+                    rgba8: rgba.repeat(width as usize),
+                },
+            )
+            .unwrap();
+        };
+        let first_pixel =
+            |app: &SubstanceCraftApp, id| app.resource_images[&id].rgba8[..4].to_vec();
+        save(2, [0, 255, 0, 255]);
+
+        // Set A fills with the bitmap; set B (selected) does not use it.
+        let mut app = SubstanceCraftApp::default();
+        let resource = app.add_resource(&bitmap).unwrap();
+        app.add_fill_layer();
+        let set_a = app.selected_texture_set.unwrap();
+        if let Some(layer) = app.selected_layer_mut() {
+            layer
+                .fill
+                .get_or_insert_with(LayerFill::default)
+                .textures
+                .base_color = Some(resource);
+        }
+        app.add_texture_set();
+        app.add_fill_layer();
+        let set_b = app.selected_texture_set.unwrap();
+        let (revision_a, revision_b) = (app.set_revision(set_a), app.set_revision(set_b));
+        app.baked_preview = Some(BakedPreview {
+            key: app.preview_key(),
+            textures: PreviewTextures::Single(Arc::new(BakedTexture {
+                width: 1,
+                height: 1,
+                rgba8: vec![0; 4],
+            })),
+        });
+
+        // Auto: an outside save reloads the pixels and dirties only set A;
+        // set B's shown preview stays current instead of rebaking.
+        save(3, [255, 0, 0, 255]);
+        app.poll_resource_files(&context);
+        assert_eq!(first_pixel(&app, resource), [255, 0, 0, 255]);
+        assert_ne!(app.set_revision(set_a), revision_a);
+        assert_eq!(app.set_revision(set_b), revision_b);
+        assert_eq!(
+            app.baked_preview.as_ref().map(|preview| preview.key),
+            Some(app.preview_key())
+        );
+        assert_eq!(app.project_error, None);
+        app.invalidate_sets(&BTreeSet::from([set_b]));
+        assert_ne!(
+            app.baked_preview.as_ref().map(|preview| preview.key),
+            Some(app.preview_key()),
+            "a change to the selected set does rebake"
+        );
+
+        // A file caught mid-save keeps the last good pixels and is reported.
+        std::fs::write(&bitmap, b"half-written").unwrap();
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_eq!(first_pixel(&app, resource), [255, 0, 0, 255]);
+        assert!(app.project_error.as_deref().unwrap().contains("grunge"));
+
+        // Ask: changes wait for confirmation, then reload.
+        app.resource_watcher.mode = resource_watch::ReloadMode::Ask;
+        save(4, [0, 0, 255, 255]);
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_eq!(first_pixel(&app, resource), [255, 0, 0, 255]);
+        assert_eq!(app.pending_reload_names(), ["grunge"]);
+        app.reload_changed_resources(&[resource]);
+        assert_eq!(first_pixel(&app, resource), [0, 0, 255, 255]);
+        assert!(app.pending_reload_names().is_empty());
+
+        // Off: nothing is checked.
+        app.resource_watcher.mode = resource_watch::ReloadMode::Off;
+        save(5, [9, 9, 9, 255]);
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_eq!(first_pixel(&app, resource), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn tc_0123_export_preflight_blocks_errors_and_asks_before_overwriting() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        small_sets(&mut app, 8);
+        let preset = app.selected_export_preset();
+
+        // A missing bitmap blocks the export before any folder is chosen.
+        let mut broken = app.selected_texture_set_ref().unwrap().clone();
+        if let Some(fill) = broken.layers[0].fill.as_mut() {
+            fill.textures.base_color = Some(ResourceId(42));
+        }
+        let error = blocking_export_error(&app.export_issues(&broken, &preset)).unwrap();
+        assert!(
+            error.starts_with("Export blocked: Bitmap resource 42"),
+            "{error}"
+        );
+
+        // A fill with no mesh maps only warns (flat normal, white AO).
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let issues = app.export_issues(&set, &preset);
+        assert!(!issues.is_empty());
+        assert_eq!(blocking_export_error(&issues), None);
+
+        // First export writes straight away; a second asks first.
+        app.begin_export(set.clone(), preset.clone(), folder.path().to_path_buf());
+        assert!(app.overwrite_prompt.is_none());
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 3);
+        let base = folder
+            .path()
+            .join(format!("{}_BaseColor.png", set.name.replace(' ', "_")));
+        std::fs::write(&base, b"stale").unwrap();
+
+        app.begin_export(set.clone(), preset.clone(), folder.path().to_path_buf());
+        assert_eq!(app.overwrite_prompt.as_ref().unwrap().existing.len(), 3);
+        app.resolve_overwrite_prompt(false);
+        assert!(app.overwrite_prompt.is_none());
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            b"stale",
+            "cancel leaves files"
+        );
+
+        app.begin_export(set, preset, folder.path().to_path_buf());
+        app.resolve_overwrite_prompt(true);
+        assert!(
+            load_texture_image(&base).is_ok(),
+            "replaced with a real image"
+        );
+        assert_eq!(app.bake_error, None);
     }
 }
