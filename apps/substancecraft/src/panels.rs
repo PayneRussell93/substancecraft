@@ -9,6 +9,7 @@ use eframe::egui::{
     RichText, Sense, Ui, pos2, vec2,
 };
 use substancecraft_api::TextureFormat;
+use substancecraft_core::MIN_TILE_SIZE;
 use substancecraft_core::{
     Axis, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction, ExportOutput,
     ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS, MAX_BRUSH_SPACING,
@@ -665,6 +666,7 @@ impl SubstanceCraftApp {
             _ => {}
         }
 
+        self.stroke_assist(ui);
         widgets::caption(ui, "Brush");
         self.brush_preview(ui);
         slider_row(ui, "Size", &mut self.brush_radius, 1.0..=256.0, true, 0);
@@ -824,11 +826,22 @@ impl SubstanceCraftApp {
 
     fn assets_drawer(&mut self, ui: &mut Ui) {
         if widgets::pill_button(ui, Some(Icon::Import), "Import bitmaps…", true, true)
-            .on_hover_text("PNG, JPEG, or TGA for fill textures, masks, and brush alphas")
+            .on_hover_text(
+                "PNG, JPEG, TGA, SVG, or text resources for fills, masks, and brush alphas",
+            )
             .clicked()
         {
             self.import_resources();
         }
+        if widgets::pill_button(ui, None, "New text resource…", false, true)
+            .on_hover_text(
+                "Write a .sctext file (text and size) and use the rendered text like a bitmap",
+            )
+            .clicked()
+        {
+            self.new_text_resource();
+        }
+        self.asset_search(ui);
         hint(
             ui,
             "Bitmaps are referenced by path, like the mesh. Assign them to fill channels \
@@ -860,6 +873,7 @@ impl SubstanceCraftApp {
              Ask waits for confirmation.",
         );
         widgets::caption(ui, "Bitmaps");
+        self.resource_details(ui);
         let resources = self
             .project
             .resources
@@ -1063,6 +1077,42 @@ impl SubstanceCraftApp {
             true,
             3,
         );
+        if self.high_poly.is_some() {
+            slider_row(
+                ui,
+                "Skew fix",
+                &mut self.mesh_map_settings.skew,
+                0.0..=1.0,
+                false,
+                2,
+            );
+            slider_row(
+                ui,
+                "Edge guard°",
+                &mut self.mesh_map_settings.skew_edge_degrees,
+                1.0..=90.0,
+                false,
+                0,
+            );
+            let resources = self
+                .project
+                .resources
+                .iter()
+                .map(|resource| (resource.id, resource.name.clone()))
+                .collect::<Vec<_>>();
+            let mut skew_map = self.skew_map;
+            widgets::property_row(ui, "Skew map", |ui| {
+                resource_picker(ui, Id::new("skew_map"), &mut skew_map, &resources);
+            });
+            self.skew_map = skew_map;
+            hint(
+                ui,
+                "Skew fix sends cage rays straight out of flat faces so details beside \
+                 bevels are not skewed; a skew map (white = full) limits it to painted \
+                 areas, and the edge guard keeps bevels themselves smooth. Inspect the \
+                 result with the Skew map preview, then bake again.",
+            );
+        }
 
         widgets::caption(ui, "Settings");
         widgets::property_row(ui, "Resolution", |ui| {
@@ -1651,6 +1701,7 @@ impl SubstanceCraftApp {
 
                 if self.selected_layer().is_some() {
                     self.layer_properties(ui);
+                    self.layer_actions(ui);
                 }
 
                 widgets::caption(ui, "Bake & export");
@@ -1689,10 +1740,10 @@ impl SubstanceCraftApp {
             layer.mask_generator.is_some()
                 || layer
                     .fill
-                    .is_some_and(|fill| fill.projection.mode == ProjectionMode::Triplanar)
+                    .is_some_and(|fill| fill.projection.needs_mesh_maps())
                 || layer
                     .mask_bitmap
-                    .is_some_and(|mask| mask.projection.mode == ProjectionMode::Triplanar)
+                    .is_some_and(|mask| mask.projection.needs_mesh_maps())
         });
         let maps_state = if self.mesh_map_job_running() {
             Some(("Baking mesh maps…", theme::ACCENT))
@@ -1712,6 +1763,17 @@ impl SubstanceCraftApp {
             .iter()
             .map(|resource| (resource.id, resource.name.clone()))
             .collect::<Vec<_>>();
+        let anchor_candidates: Vec<(LayerId, String)> = self
+            .selected_texture_set_ref()
+            .zip(self.selected_layer)
+            .map(|(set, selected)| {
+                set.walk_layers()
+                    .into_iter()
+                    .filter(|candidate| set.anchor_is_valid(selected, candidate.id))
+                    .map(|candidate| (candidate.id, candidate.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let Some(layer) = self.selected_layer_mut() else {
             return;
         };
@@ -1828,8 +1890,10 @@ impl SubstanceCraftApp {
         }
         if let Some(mask) = layer.mask_bitmap.as_mut() {
             widgets::property_row(ui, "Invert", |ui| widgets::toggle(ui, &mut mask.invert));
-            projection_controls(ui, &mut mask.projection);
+            projection_controls(ui, &mut mask.projection, 1);
         }
+
+        anchor_controls(ui, layer.id, &mut layer.mask_anchor, &anchor_candidates);
 
         widgets::caption(ui, "Mask filters");
         filter_stack(
@@ -2350,9 +2414,7 @@ fn fill_controls(
             );
         });
     }
-    if fill.textures.all().next().is_some() {
-        projection_controls(ui, &mut fill.projection);
-    }
+    projection_controls(ui, &mut fill.projection, 0);
 }
 
 /// Combo box choosing a bitmap resource or none. Returns true on change.
@@ -2384,23 +2446,92 @@ fn resource_picker(
     changed
 }
 
-fn projection_controls(ui: &mut Ui, projection: &mut TextureProjection) {
+/// egui memory key holding which decal (0 = fill, 1 = bitmap mask) the
+/// next viewport click places.
+pub(super) const PLACE_DECAL_KEY: &str = "place_decal_target";
+
+fn projection_controls(ui: &mut Ui, projection: &mut TextureProjection, decal_target: u8) {
     widgets::property_row(ui, "Projection", |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for mode in ProjectionMode::ALL {
-            if widgets::chip(ui, mode.name(), projection.mode == mode).clicked() {
-                projection.mode = mode;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for mode in ProjectionMode::ALL {
+                if widgets::chip(ui, mode.name(), projection.mode == mode).clicked() {
+                    projection.mode = mode;
+                }
             }
-        }
+        });
     });
-    slider_row(
-        ui,
-        "Tiling",
-        &mut projection.scale,
-        MIN_PROJECTION_SCALE..=MAX_PROJECTION_SCALE,
-        true,
-        2,
-    );
+    if matches!(
+        projection.mode,
+        ProjectionMode::Planar | ProjectionMode::Cylindrical | ProjectionMode::Spherical
+    ) {
+        widgets::property_row(ui, "Axis", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for axis in Axis::ALL {
+                if widgets::chip(ui, axis.name(), projection.axis == axis).clicked() {
+                    projection.axis = axis;
+                }
+            }
+        });
+    }
+    if projection.mode == ProjectionMode::Decal {
+        let decal = &mut projection.decal;
+        if widgets::pill_button(ui, None, "Place on surface", true, true)
+            .on_hover_text("Click the mesh to centre the decal there, facing out of the surface")
+            .clicked()
+        {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(Id::new(PLACE_DECAL_KEY), decal_target));
+        }
+        slider_row(ui, "Width", &mut decal.size.x, 0.01..=4.0, true, 3);
+        slider_row(ui, "Height", &mut decal.size.y, 0.01..=4.0, true, 3);
+        slider_row(ui, "Depth", &mut decal.depth, 0.001..=1.0, true, 3);
+        widgets::property_row(ui, "Atlas cell", |ui| {
+            // A 2 x 2 atlas: pick a quadrant, or the whole image.
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (label, min) in [
+                ("All", None),
+                ("1", Some(glam::Vec2::new(0.0, 0.5))),
+                ("2", Some(glam::Vec2::new(0.5, 0.5))),
+                ("3", Some(glam::Vec2::ZERO)),
+                ("4", Some(glam::Vec2::new(0.5, 0.0))),
+            ] {
+                let (region_min, region_max) = match min {
+                    Some(min) => (min, min + glam::Vec2::splat(0.5)),
+                    None => (glam::Vec2::ZERO, glam::Vec2::ONE),
+                };
+                let selected = decal.region_min == region_min && decal.region_max == region_max;
+                if widgets::chip(ui, label, selected).clicked() {
+                    decal.region_min = region_min;
+                    decal.region_max = region_max;
+                }
+            }
+        });
+        return;
+    }
+    if projection.mode != ProjectionMode::Uv {
+        let mut physical = projection.tile_size.is_some();
+        widgets::property_row(ui, "Real size", |ui| {
+            widgets::toggle(ui, &mut physical)
+                .on_hover_text("Size one repetition in scene units (metres) instead of tiling");
+        });
+        if physical != projection.tile_size.is_some() {
+            projection.tile_size = physical.then_some(0.5);
+        }
+        if let Some(size) = &mut projection.tile_size {
+            slider_row(ui, "Tile size m", size, MIN_TILE_SIZE..=10.0, true, 3);
+        }
+    }
+    if projection.tile_size.is_none() || projection.mode == ProjectionMode::Uv {
+        slider_row(
+            ui,
+            "Tiling",
+            &mut projection.scale,
+            MIN_PROJECTION_SCALE..=MAX_PROJECTION_SCALE,
+            true,
+            2,
+        );
+    }
     slider_row(
         ui,
         "Rotation°",
@@ -2630,6 +2761,27 @@ impl SubstanceCraftApp {
         {
             self.export_with_preset();
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            if widgets::chip(ui, "OpenPBR…", false)
+                .on_hover_text("MaterialX document with an OpenPBR surface and its textures")
+                .clicked()
+            {
+                self.export_openpbr();
+            }
+            if widgets::chip(ui, "glTF…", false)
+                .on_hover_text("The mesh as glTF 2.0 with every texture set as a material")
+                .clicked()
+            {
+                self.export_gltf();
+            }
+            if widgets::chip(ui, "UDIM tiles…", false)
+                .on_hover_text("This preset once per UV tile ( in names, else .1001)")
+                .clicked()
+            {
+                self.export_udim_tiles();
+            }
+        });
     }
 
     fn preset_editor(&mut self, ui: &mut Ui) {
@@ -2847,6 +2999,400 @@ fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
             {
                 *invert = !*invert;
             }
+        }
+    }
+}
+
+impl SubstanceCraftApp {
+    /// Symmetry, stabilization, path placement, and the eyedropper.
+    fn stroke_assist(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Assist");
+        widgets::property_row(ui, "Symmetry", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if widgets::chip(ui, "Off", self.symmetry.is_none()).clicked() {
+                self.symmetry = None;
+            }
+            for axis in Axis::ALL {
+                let selected = self.symmetry.is_some_and(|symmetry| symmetry.axis == axis);
+                if widgets::chip(ui, axis.name(), selected)
+                    .on_hover_text(format!(
+                        "Mirror strokes across the {} = 0 plane",
+                        axis.name()
+                    ))
+                    .clicked()
+                {
+                    self.symmetry = Some(substancecraft_core::Symmetry::new(axis));
+                }
+            }
+        });
+        if let Some(symmetry) = &mut self.symmetry {
+            slider_row(
+                ui,
+                "Mirror offset",
+                &mut symmetry.offset,
+                -2.0..=2.0,
+                false,
+                3,
+            );
+        }
+        slider_row(
+            ui,
+            "Lazy radius",
+            &mut self.stroke_stabilizer.radius,
+            0.0..=80.0,
+            false,
+            0,
+        );
+        if matches!(self.paint_mode, PaintMode::Paint | PaintMode::Erase) {
+            match self.path_controls.as_ref().map(Vec::len) {
+                None => {
+                    if widgets::pill_button(ui, None, "Draw path", false, true)
+                        .on_hover_text(
+                            "Click points on the mesh; the stroke follows a smooth curve \
+                             through them",
+                        )
+                        .clicked()
+                    {
+                        self.path_controls = Some(Vec::new());
+                    }
+                }
+                Some(count) => {
+                    hint(
+                        ui,
+                        &format!(
+                            "{count} path points. Click the mesh to add, Enter to finish, Esc to cancel."
+                        ),
+                    );
+                    ui.horizontal(|ui| {
+                        if widgets::pill_button(ui, None, "Finish", true, false).clicked() {
+                            self.commit_path(false);
+                        }
+                        if widgets::pill_button(ui, None, "Close loop", false, false).clicked() {
+                            self.commit_path(true);
+                        }
+                        if widgets::pill_button(ui, None, "Cancel", false, false).clicked() {
+                            self.path_controls = None;
+                        }
+                    });
+                }
+            }
+        }
+        let picking = self.picking_material;
+        if widgets::pill_button(
+            ui,
+            None,
+            if picking {
+                "Click the mesh to pick…"
+            } else {
+                "Pick material"
+            },
+            picking,
+            true,
+        )
+        .on_hover_text("Copy colour, roughness, metallic, opacity, and emission from the surface")
+        .clicked()
+        {
+            self.picking_material = !picking;
+        }
+        hint(
+            ui,
+            "Shift-click draws a straight line from the last dab. Strokes restart at UV seams.",
+        );
+    }
+}
+
+/// Anchor-point mask: pick an earlier layer and the channel to read.
+fn anchor_controls(
+    ui: &mut Ui,
+    layer_id: LayerId,
+    anchor: &mut Option<substancecraft_core::AnchorMask>,
+    candidates: &[(LayerId, String)],
+) {
+    widgets::caption(ui, "Anchor mask");
+    let current = anchor.map(|anchor| anchor.layer);
+    let label = current
+        .and_then(|id| candidates.iter().find(|(candidate, _)| *candidate == id))
+        .map_or("None", |(_, name)| name.as_str());
+    let mut chosen = current;
+    widgets::property_row(ui, "Read from", |ui| {
+        egui::ComboBox::from_id_salt(("anchor_layer", layer_id.0))
+            .width(ui.available_width() - 8.0)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "None").clicked() {
+                    chosen = None;
+                }
+                for (id, name) in candidates {
+                    if ui.selectable_label(current == Some(*id), name).clicked() {
+                        chosen = Some(*id);
+                    }
+                }
+            });
+    });
+    if chosen != current {
+        *anchor = chosen.map(|id| match anchor {
+            Some(existing) => substancecraft_core::AnchorMask {
+                layer: id,
+                ..*existing
+            },
+            None => substancecraft_core::AnchorMask::new(id, MaterialChannel::BaseColor),
+        });
+    }
+    let Some(anchor) = anchor else {
+        hint(
+            ui,
+            "Mask this layer by what the stack looks like at an earlier layer, e.g. gloss \
+             only where scratches were painted.",
+        );
+        return;
+    };
+    widgets::property_row(ui, "Channel", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for channel in substancecraft_core::AnchorMask::CHANNELS {
+                if widgets::chip(ui, channel_label(channel), anchor.channel == channel).clicked() {
+                    anchor.channel = channel;
+                }
+            }
+        });
+    });
+    slider_row(ui, "Low", &mut anchor.low, 0.0..=0.99, false, 2);
+    slider_row(ui, "High", &mut anchor.high, 0.01..=1.0, false, 2);
+    if anchor.high <= anchor.low {
+        anchor.high = (anchor.low + 0.01).min(1.0);
+    }
+    widgets::property_row(ui, "Invert", |ui| widgets::toggle(ui, &mut anchor.invert));
+}
+
+impl SubstanceCraftApp {
+    /// Flatten, materials, and smart materials for the selected layer.
+    fn layer_actions(&mut self, ui: &mut Ui) {
+        let Some(layer) = self.selected_layer().cloned() else {
+            return;
+        };
+        widgets::caption(ui, "Layer actions");
+        if widgets::pill_button(ui, None, "Flatten to bitmaps", false, true)
+            .on_hover_text(
+                "Bake this layer (with its mask, opacity, and filters) into one fill layer; \
+                 the original stays below, hidden",
+            )
+            .clicked()
+        {
+            self.flatten_selected_layer();
+        }
+
+        if !layer.is_group() {
+            let materials = self.material_library();
+            let mut applied = None;
+            widgets::property_row(ui, "Material", |ui| {
+                egui::ComboBox::from_id_salt("apply_material")
+                    .width(ui.available_width() - 8.0)
+                    .selected_text("Apply…")
+                    .show_ui(ui, |ui| {
+                        for material in &materials {
+                            if ui.selectable_label(false, &material.name).clicked() {
+                                applied = Some(material.clone());
+                            }
+                        }
+                    });
+            });
+            if let Some(material) = applied {
+                self.apply_material(&material);
+            }
+            if layer.fill.is_some()
+                && widgets::pill_button(ui, None, "Save as material", false, true)
+                    .on_hover_text("Keep this fill's values in the project's material library")
+                    .clicked()
+            {
+                self.save_layer_as_material();
+            }
+        }
+
+        let smart = self.smart_material_library();
+        let mut insert = None;
+        widgets::property_row(ui, "Smart", |ui| {
+            egui::ComboBox::from_id_salt("insert_smart_material")
+                .width(ui.available_width() - 8.0)
+                .selected_text("Insert…")
+                .show_ui(ui, |ui| {
+                    for material in &smart {
+                        if ui
+                            .selectable_label(false, &material.name)
+                            .on_hover_text(&material.description)
+                            .clicked()
+                        {
+                            insert = Some(material.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(material) = insert {
+            self.insert_smart_material(&material);
+        }
+        ui.horizontal(|ui| {
+            if widgets::pill_button(ui, None, "Save smart", false, false)
+                .on_hover_text("Save this layer tree as a smart material in the project")
+                .clicked()
+            {
+                self.save_layer_as_smart_material();
+            }
+            if widgets::pill_button(ui, None, "Export…", false, false)
+                .on_hover_text("Write this layer tree to a .scsmart file")
+                .clicked()
+            {
+                let material =
+                    substancecraft_core::SmartMaterial::from_layer(&layer, layer.name.clone());
+                self.export_smart_material_file(&material);
+            }
+            if widgets::pill_button(ui, None, "Import…", false, false)
+                .on_hover_text("Insert a smart material from a .scsmart file")
+                .clicked()
+            {
+                self.import_smart_material_file();
+            }
+        });
+    }
+}
+
+impl SubstanceCraftApp {
+    /// Search over every asset (project and built-in) by name, kind, tag,
+    /// author, or licence.
+    fn asset_search(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.asset_query)
+                .desired_width(ui.available_width())
+                .margin(vec2(10.0, 5.0))
+                .hint_text("Search assets: name, tag, licence…"),
+        );
+        if self.asset_query.trim().is_empty() {
+            return;
+        }
+        let results = self.project.search_assets(&self.asset_query, None);
+        if results.is_empty() {
+            hint(ui, "No assets match.");
+        }
+        for asset in results.iter().take(24) {
+            let origin = if asset.built_in {
+                "built-in"
+            } else {
+                "project"
+            };
+            let license = if asset.provenance.license.is_empty() {
+                "no licence recorded".to_owned()
+            } else {
+                asset.provenance.license.clone()
+            };
+            ui.label(RichText::new(&asset.name).size(12.5).color(theme::TEXT));
+            ui.label(
+                RichText::new(format!("{} · {origin} · {license}", asset.kind.name()))
+                    .size(11.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+        if results.len() > 24 {
+            hint(ui, &format!("…and {} more", results.len() - 24));
+        }
+    }
+
+    /// Colour space, provenance, and (for text resources) content of each
+    /// bitmap.
+    fn resource_details(&mut self, ui: &mut Ui) {
+        let mut reload = Vec::new();
+        let mut rewrite_text = None;
+        for resource in &mut self.project.resources {
+            egui::CollapsingHeader::new(RichText::new(&resource.name).size(12.0))
+                .id_salt(("resource_details", resource.id.0))
+                .show(ui, |ui| {
+                    widgets::property_row(ui, "Colour", |ui| {
+                        egui::ComboBox::from_id_salt(("color_space", resource.id.0))
+                            .width(ui.available_width() - 8.0)
+                            .selected_text(resource.color_space.name())
+                            .show_ui(ui, |ui| {
+                                for space in substancecraft_core::ColorSpace::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            resource.color_space == space,
+                                            space.name(),
+                                        )
+                                        .clicked()
+                                        && resource.color_space != space
+                                    {
+                                        resource.color_space = space;
+                                        reload.push(resource.id);
+                                    }
+                                }
+                            });
+                    });
+                    for (label, value) in [
+                        ("Licence", &mut resource.provenance.license),
+                        ("Author", &mut resource.provenance.author),
+                        ("Origin", &mut resource.provenance.origin),
+                    ] {
+                        widgets::property_row(ui, label, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(value)
+                                    .desired_width(ui.available_width())
+                                    .margin(vec2(6.0, 2.0)),
+                            );
+                        });
+                    }
+                    let mut tags = resource.tags.join(", ");
+                    widgets::property_row(ui, "Tags", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut tags)
+                                .desired_width(ui.available_width())
+                                .margin(vec2(6.0, 2.0))
+                                .hint_text("comma separated"),
+                        );
+                    });
+                    resource.tags = tags
+                        .split(',')
+                        .map(|tag| tag.trim().to_owned())
+                        .filter(|tag| !tag.is_empty())
+                        .collect();
+                    if resource.source.to_ascii_lowercase().ends_with(".sctext") {
+                        let key = Id::new(("text_edit", resource.id.0));
+                        let mut text = ui.ctx().data_mut(|data| {
+                            data.get_temp::<String>(key).unwrap_or_else(|| {
+                                substancecraft_api::read_text_resource(std::path::Path::new(
+                                    &resource.source,
+                                ))
+                                .ok()
+                                .map(|spec| spec.text)
+                                .unwrap_or_default()
+                            })
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .desired_width(ui.available_width())
+                                .desired_rows(2),
+                        );
+                        if widgets::pill_button(ui, None, "Update text", false, true).clicked() {
+                            rewrite_text =
+                                Some((resource.id, resource.source.clone(), text.clone()));
+                        }
+                        ui.ctx().data_mut(|data| data.insert_temp(key, text));
+                    }
+                });
+        }
+        if let Some((id, source, text)) = rewrite_text {
+            let path = std::path::Path::new(&source);
+            let mut spec = substancecraft_api::read_text_resource(path).ok().unwrap_or(
+                substancecraft_api::TextSpec {
+                    text: String::new(),
+                    size_px: 128.0,
+                    font: None,
+                },
+            );
+            spec.text = text;
+            match substancecraft_api::save_text_resource(path, &spec) {
+                Ok(()) => reload.push(id),
+                Err(error) => self.import_error = Some(error.to_string()),
+            }
+        }
+        if !reload.is_empty() {
+            self.reload_changed_resources(&reload);
         }
     }
 }

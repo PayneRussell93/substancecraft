@@ -40,6 +40,12 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 - `mesh_maps.rs`: multi-threaded, cancellable baking of world normal, position, curvature, AO, and thickness into UV space. A BVH serves the occlusion rays, and a spatial grid of sharp edges gives curvature bands.
 - `generators.rs` and `noise.rs`: Edge Wear, Dirt, Orientation, Gradient, and Noise masks evaluated from mesh-map samples, with seeded object-space noise so breakup never seams.
 - `raster.rs`: shared UV triangle rasterisation.
+- `compositing.rs`, `export.rs`, and `filters.rs`: the layer compositor (including anchor masks and flattening), export presets and preflight, and layer filters.
+- `resources.rs` and `color.rs`: bitmap resources with colour-space tags and provenance, and UV, triplanar, planar, cylindrical, spherical, and decal projections with physical tile sizes.
+- `library.rs`: material resources, smart materials, and the searchable asset index.
+- `painting.rs` and `udim.rs`: symmetry, stabilization, lines, seam detection, spline paths, and UDIM tile shifting.
+
+`substancecraft-api` adds file I/O (projects, textures, SVG and text resources, smart-material files), FBX and glTF import, OpenPBR MaterialX and glTF export, and headless export jobs. `substancecraft-cli` runs those jobs from the command line for pipelines; `substancecraft-mcp` exposes read-only tools.
 
 A layer is a paint layer or a fill layer (`LayerFill`). Its mask is built in order: a generator base (or white), painted mask strokes blended over it, then polygon-mask and ID-colour clipping. Base Color composites as straight-alpha RGBA; Roughness and Metallic composite as scalars from defaults of 0.5 and 0. Polygon masks index triangles of the *smoothed* mesh. Subdivision children of triangle `t` are `4t..4t+4`, so masks are remapped when the subdivision level changes.
 

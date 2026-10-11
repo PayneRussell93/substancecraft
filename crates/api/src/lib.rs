@@ -24,7 +24,7 @@ pub use textures::{
 };
 pub use vector::{
     DEFAULT_SVG_EDGE, TEXT_RESOURCE_EXTENSION, TextSpec, load_text_resource, rasterize_svg,
-    render_text, save_text_resource,
+    read_text_resource, render_text, save_text_resource,
 };
 
 use serde::{Deserialize, Serialize};

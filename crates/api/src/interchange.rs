@@ -222,10 +222,8 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
                         shader_inputs.insert(name.clone(), output.clone());
                     }
                 }
-                "surfacematerial" if name == "surfaceshader" => {
-                    if material.is_none() {
-                        material = Some(parent_name);
-                    }
+                "surfacematerial" if name == "surfaceshader" && material.is_none() => {
+                    material = Some(parent_name);
                 }
                 _ => {}
             },

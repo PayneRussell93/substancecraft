@@ -26,7 +26,7 @@ use substancecraft_core::{
     MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PreflightIssue,
     PreflightSeverity, PrimitivePreset, ProjectResource, ResourceId, ResourceImages, SelectionMode,
     TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
-    bake_mesh_maps_from, remap_subdivided_triangles,
+    remap_subdivided_triangles,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
@@ -62,7 +62,7 @@ const BAKEABLE_CHANNELS: [MaterialChannel; 8] = [
 /// Mesh formats the importer reads.
 const MESH_EXTENSIONS: [&str; 3] = ["fbx", "gltf", "glb"];
 /// Bitmap formats the resource importer reads.
-const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "tga"];
+const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "tga", "svg", "sctext"];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
 const MAX_SAVED_POSES: usize = 256;
 /// Selection overlays stop drawing beyond this many triangles to keep the
@@ -177,6 +177,26 @@ struct SubstanceCraftApp {
     selection_mode: SelectionMode,
     hovered_selection: Vec<u32>,
     active_stroke: Option<(TextureSetId, LayerId, PaintMode)>,
+    /// Index in the layer's stroke list of the first stroke this drag made.
+    stroke_first_index: usize,
+    /// Stroke index of each path of the current drag (brush, mirror).
+    stroke_paths: Vec<Option<usize>>,
+    /// Last triangle each path painted, to detect UV seam crossings.
+    stroke_last_triangles: Vec<Option<u32>>,
+    /// Mirror painting plane, when on.
+    symmetry: Option<substancecraft_core::Symmetry>,
+    /// Lazy-mouse brush smoothing (radius 0 is off).
+    stroke_stabilizer: substancecraft_core::LazyStabilizer,
+    /// Screen point where the last brush dab landed, for Shift-click lines.
+    last_paint_screen: Option<egui::Pos2>,
+    /// Control points of a path being placed (UV space).
+    path_controls: Option<Vec<(glam::Vec2, egui::Pos2)>>,
+    /// The next click samples the material into the brush.
+    picking_material: bool,
+    /// Bitmap scaling skew correction per texel in high-to-low bakes.
+    skew_map: Option<ResourceId>,
+    /// Search text of the Assets drawer.
+    asset_query: String,
     history: EditHistory,
     /// Last committed settings of the selected layer; edits made through the
     /// inspector are recorded as one history step once the pointer is up.
@@ -528,6 +548,16 @@ impl Default for SubstanceCraftApp {
             selection_mode: SelectionMode::Element,
             hovered_selection: Vec::new(),
             active_stroke: None,
+            stroke_first_index: 0,
+            stroke_paths: Vec::new(),
+            stroke_last_triangles: Vec::new(),
+            symmetry: None,
+            stroke_stabilizer: substancecraft_core::LazyStabilizer::new(0.0),
+            last_paint_screen: None,
+            path_controls: None,
+            picking_material: false,
+            skew_map: None,
+            asset_query: String::new(),
             history: EditHistory::default(),
             layer_settled: None,
             baked_preview: None,
@@ -1235,6 +1265,243 @@ impl SubstanceCraftApp {
         }
     }
 
+    /// Flattens the selected layer or group into per-channel PNGs in
+    /// `folder`, inserts a fill layer using them just above it, and hides
+    /// the source, as one undoable edit. Returns the new layer.
+    fn flatten_selected_into(&mut self, folder: &std::path::Path) -> Result<LayerId, String> {
+        let (Some(set_id), Some(source_id)) = (self.selected_texture_set, self.selected_layer)
+        else {
+            return Err("Select a layer to flatten.".to_owned());
+        };
+        let set = self
+            .selected_texture_set_ref()
+            .cloned()
+            .ok_or("No texture set is selected.")?;
+        let source = set
+            .layer(source_id)
+            .cloned()
+            .ok_or("The layer no longer exists.")?;
+        let slot = set
+            .slot_of(source_id)
+            .ok_or("The layer no longer exists.")?;
+        let flattened = {
+            let inputs = self.bake_inputs(set_id);
+            set.flatten_layer(
+                source_id,
+                substancecraft_core::BakeContext {
+                    mesh: inputs.mesh.as_deref(),
+                    mesh_maps: inputs.maps(),
+                    resources: Some(&inputs.resources),
+                },
+            )
+            .map_err(|error| error.to_string())?
+        };
+        if flattened.channels.is_empty() {
+            return Err("The layer writes no channels to flatten.".to_owned());
+        }
+        std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+        let stem = format!("{}_{}", set.name, source.name).replace([' ', '/', '\\', ':'], "_");
+        let mut resources = Vec::new();
+        for (channel, image) in &flattened.channels {
+            let path = folder.join(format!(
+                "{stem}_{}.png",
+                channel_label(*channel).replace(' ', "")
+            ));
+            write_texture(
+                &path,
+                &BakedTexture {
+                    width: image.width,
+                    height: image.height,
+                    rgba8: image.rgba8.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            resources.push(self.add_resource(&path)?);
+        }
+        let id = self.allocate_layer_id().ok_or("Out of layer ids.")?;
+        let layer = flattened.to_fill_layer(id, format!("{} (flattened)", source.name), &resources);
+        let before = source.settings();
+        let after = substancecraft_core::LayerSettings {
+            visible: false,
+            ..before.clone()
+        };
+        let applied = self.history.apply(
+            &mut self.project,
+            EditCommand::Batch(vec![
+                EditCommand::LayerSettings {
+                    texture_set_id: set_id,
+                    layer_id: source_id,
+                    before: Box::new(before),
+                    after: Box::new(after),
+                },
+                EditCommand::InsertLayer {
+                    texture_set_id: set_id,
+                    slot: LayerSlot {
+                        parent: slot.parent,
+                        index: slot.index + 1,
+                    },
+                    layer: Box::new(layer),
+                },
+            ]),
+        );
+        if !applied {
+            return Err("The flattened layer could not be inserted.".to_owned());
+        }
+        self.selected_layer = Some(id);
+        self.layer_settled = None;
+        self.invalidate_preview();
+        Ok(id)
+    }
+
+    /// Flattens into a folder beside the saved project, or one the user
+    /// picks when the project has not been saved yet.
+    fn flatten_selected_layer(&mut self) {
+        let folder = match &self.project_path {
+            Some(path) => {
+                let stem = path.file_stem().map_or_else(
+                    || "project".to_owned(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                );
+                path.with_file_name(format!("{stem}_flattened"))
+            }
+            None => match rfd::FileDialog::new()
+                .set_title("Folder for flattened layer bitmaps")
+                .pick_folder()
+            {
+                Some(folder) => folder,
+                None => return,
+            },
+        };
+        if let Err(error) = self.flatten_selected_into(&folder) {
+            self.bake_error = Some(error);
+        }
+    }
+
+    /// Materials offered for fills: the project's, then the built-ins.
+    fn material_library(&self) -> Vec<substancecraft_core::MaterialResource> {
+        let mut materials = self.project.materials.clone();
+        materials.extend(substancecraft_core::MaterialResource::built_in());
+        materials
+    }
+
+    fn smart_material_library(&self) -> Vec<substancecraft_core::SmartMaterial> {
+        let mut materials = self.project.smart_materials.clone();
+        materials.extend(substancecraft_core::SmartMaterial::built_in());
+        materials
+    }
+
+    /// Makes the selected layer a fill of `material` (recorded as a layer
+    /// settings edit).
+    fn apply_material(&mut self, material: &substancecraft_core::MaterialResource) {
+        if let Some(layer) = self.selected_layer_mut()
+            && !layer.is_group()
+        {
+            material.apply_to(layer);
+            self.invalidate_preview();
+        }
+    }
+
+    /// A name not yet used by any entry of `taken`.
+    fn unique_name(base: &str, taken: &[String]) -> String {
+        (1..)
+            .map(|index| match index {
+                1 => base.to_owned(),
+                index => format!("{base} {index}"),
+            })
+            .find(|candidate| {
+                !taken
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(candidate))
+            })
+            .unwrap_or_else(|| base.to_owned())
+    }
+
+    fn save_layer_as_material(&mut self) {
+        let Some(layer) = self.selected_layer() else {
+            return;
+        };
+        let taken: Vec<String> = self
+            .material_library()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let name = Self::unique_name(&layer.name, &taken);
+        if let Some(material) = substancecraft_core::MaterialResource::from_layer(layer, name) {
+            self.project.materials.push(material);
+        }
+    }
+
+    fn save_layer_as_smart_material(&mut self) {
+        let Some(layer) = self.selected_layer() else {
+            return;
+        };
+        let taken: Vec<String> = self
+            .smart_material_library()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let name = Self::unique_name(&layer.name, &taken);
+        let material = substancecraft_core::SmartMaterial::from_layer(layer, name);
+        self.project.smart_materials.push(material);
+    }
+
+    /// Inserts a fresh instance of `material` above the selection.
+    fn insert_smart_material(&mut self, material: &substancecraft_core::SmartMaterial) {
+        let count = material.root.walk().len();
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.allocate_layer_id() {
+                Some(id) => ids.push(id),
+                None => return,
+            }
+        }
+        let mut ids = ids.into_iter();
+        let root = material.instantiate(|| ids.next().unwrap_or(LayerId(u64::MAX)));
+        self.insert_layer(root);
+    }
+
+    fn export_smart_material_file(&mut self, material: &substancecraft_core::SmartMaterial) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SubstanceCraft smart material", &["scsmart"])
+            .set_file_name(format!("{}.scsmart", material.name.replace(' ', "_")))
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(error) = substancecraft_api::save_smart_material(&path, material) {
+            self.project_error = Some(error.to_string());
+        }
+    }
+
+    fn import_smart_material_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SubstanceCraft smart material", &["scsmart"])
+            .pick_file()
+        else {
+            return;
+        };
+        match substancecraft_api::load_smart_material(&path) {
+            Ok(material) => {
+                let requirements = material.requirements();
+                if let Some(missing) = requirements.resources.iter().find(|id| {
+                    !self
+                        .project
+                        .resources
+                        .iter()
+                        .any(|resource| resource.id == **id)
+                }) {
+                    self.project_error = Some(format!(
+                        "`{}` uses bitmap resource {} that this project does not have.",
+                        material.name, missing.0
+                    ));
+                    return;
+                }
+                self.insert_smart_material(&material);
+            }
+            Err(error) => self.project_error = Some(error.to_string()),
+        }
+    }
+
     fn add_paint_layer(&mut self) {
         let Some(id) = self.allocate_layer_id() else {
             return;
@@ -1512,6 +1779,13 @@ impl SubstanceCraftApp {
     /// Adds `uv` to the stroke in progress, starting one when needed. Paint
     /// and ID strokes skip groups; mask strokes work on any layer.
     fn append_stroke_point(&mut self, uv: glam::Vec2) {
+        self.stroke_point(0, uv, false);
+    }
+
+    /// Adds `uv` to stroke path `path` of the current drag (0 is the brush,
+    /// 1 its mirror). `restart` begins a new stroke for that path, e.g. after
+    /// crossing a UV seam. Every stroke a drag creates undoes together.
+    fn stroke_point(&mut self, path: usize, uv: glam::Vec2, restart: bool) {
         let (Some(texture_set_id), Some(layer_id)) =
             (self.selected_texture_set, self.selected_layer)
         else {
@@ -1552,7 +1826,18 @@ impl SubstanceCraftApp {
         let pressures =
             |pressure: Option<f32>| pressure.map(|value| vec![value]).unwrap_or_default();
 
+        let stroke_count = match mode {
+            PaintMode::View | PaintMode::Select => return,
+            PaintMode::Paint | PaintMode::Erase => layer.paint_strokes.len(),
+            PaintMode::Mask => layer.mask_strokes.len(),
+            PaintMode::Id => layer.id_strokes.len(),
+        };
         if starts_stroke {
+            self.stroke_first_index = stroke_count;
+            self.stroke_paths.clear();
+        }
+        let current = self.stroke_paths.get(path).copied().flatten();
+        if restart || current.is_none() {
             match mode {
                 PaintMode::View | PaintMode::Select => return,
                 PaintMode::Paint | PaintMode::Erase => layer.paint_strokes.push(PaintStroke {
@@ -1583,27 +1868,34 @@ impl SubstanceCraftApp {
                     pressures: pressures(pressure),
                 }),
             }
+            if self.stroke_paths.len() <= path {
+                self.stroke_paths.resize(path + 1, None);
+            }
+            self.stroke_paths[path] = Some(stroke_count);
             self.active_stroke = Some(stroke_key);
             self.invalidate_preview();
             return;
         }
 
-        let path = match mode {
+        let Some(index) = current else {
+            return;
+        };
+        let target = match mode {
             PaintMode::View | PaintMode::Select => return,
             PaintMode::Paint | PaintMode::Erase => layer
                 .paint_strokes
-                .last_mut()
+                .get_mut(index)
                 .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
             PaintMode::Mask => layer
                 .mask_strokes
-                .last_mut()
+                .get_mut(index)
                 .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
             PaintMode::Id => layer
                 .id_strokes
-                .last_mut()
+                .get_mut(index)
                 .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
         };
-        if let Some((points, pressures)) = path
+        if let Some((points, pressures)) = target
             && points.len() < MAX_STROKE_POINTS
             && points
                 .last()
@@ -1634,40 +1926,288 @@ impl SubstanceCraftApp {
         else {
             return;
         };
-        let command = match mode {
-            PaintMode::View | PaintMode::Select => None,
-            PaintMode::Paint | PaintMode::Erase => {
-                layer
-                    .paint_strokes
-                    .last()
-                    .cloned()
-                    .map(|stroke| EditCommand::Paint {
-                        texture_set_id,
-                        layer_id,
-                        stroke,
-                    })
-            }
+        let first = self.stroke_first_index;
+        let mut commands: Vec<EditCommand> = match mode {
+            PaintMode::View | PaintMode::Select => Vec::new(),
+            PaintMode::Paint | PaintMode::Erase => layer
+                .paint_strokes
+                .get(first..)
+                .unwrap_or_default()
+                .iter()
+                .map(|stroke| EditCommand::Paint {
+                    texture_set_id,
+                    layer_id,
+                    stroke: stroke.clone(),
+                })
+                .collect(),
             PaintMode::Mask => layer
                 .mask_strokes
-                .last()
-                .cloned()
+                .get(first..)
+                .unwrap_or_default()
+                .iter()
                 .map(|stroke| EditCommand::Mask {
                     texture_set_id,
                     layer_id,
-                    stroke,
-                }),
+                    stroke: stroke.clone(),
+                })
+                .collect(),
             PaintMode::Id => layer
                 .id_strokes
-                .last()
-                .cloned()
+                .get(first..)
+                .unwrap_or_default()
+                .iter()
                 .map(|stroke| EditCommand::Id {
                     texture_set_id,
                     layer_id,
-                    stroke,
-                }),
+                    stroke: stroke.clone(),
+                })
+                .collect(),
         };
-        if let Some(command) = command {
-            self.history.record(command);
+        self.stroke_paths.clear();
+        self.stroke_last_triangles.clear();
+        match commands.len() {
+            0 => {}
+            1 => self.history.record(commands.remove(0)),
+            _ => self.history.record(EditCommand::Batch(commands)),
+        }
+    }
+
+    /// Routes a viewport click or drag: eyedropper, path placement,
+    /// Shift-click straight lines, or stabilized brush strokes.
+    fn handle_paint_input(
+        &mut self,
+        response: &egui::Response,
+        points: &[ProjectedVertex],
+        mesh: &MeshGeometry,
+        pointer: Option<egui::Pos2>,
+        shift: bool,
+    ) {
+        let pick = |app: &Self, at: egui::Pos2| {
+            pick_triangle(mesh, points, at).filter(|hit| app.triangle_in_selected_set(hit.triangle))
+        };
+        let Some(pointer) = pointer else {
+            return;
+        };
+        let decal_key = egui::Id::new(panels::PLACE_DECAL_KEY);
+        if let Some(target) = response.ctx.data(|data| data.get_temp::<u8>(decal_key)) {
+            if response.clicked()
+                && let Some(hit) = pick(self, pointer)
+            {
+                response.ctx.data_mut(|data| data.remove::<u8>(decal_key));
+                self.place_decal(target, mesh, hit);
+            }
+            return;
+        }
+        if self.picking_material {
+            if response.clicked()
+                && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
+            {
+                self.pick_material_at(uv);
+            }
+            return;
+        }
+        if !self.paint_mode.paints() {
+            return;
+        }
+        if self.path_controls.is_some() {
+            if response.clicked()
+                && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
+                && let Some(controls) = &mut self.path_controls
+            {
+                controls.push((uv, pointer));
+            }
+            return;
+        }
+        if shift
+            && response.clicked()
+            && let Some(from) = self.last_paint_screen
+        {
+            let from = glam::Vec2::new(from.x, from.y);
+            let to = glam::Vec2::new(pointer.x, pointer.y);
+            for point in substancecraft_core::line_points(from, to, 2.0) {
+                if let Some(hit) = pick(self, egui::pos2(point.x, point.y)) {
+                    self.paint_hit(hit);
+                }
+            }
+            self.finish_active_stroke();
+            self.invalidate_preview();
+            self.last_paint_screen = Some(pointer);
+            return;
+        }
+        if response.dragged() {
+            if response.drag_started() {
+                self.stroke_stabilizer.reset();
+            }
+            let Some(point) = self
+                .stroke_stabilizer
+                .update(glam::Vec2::new(pointer.x, pointer.y))
+            else {
+                return;
+            };
+            let at = egui::pos2(point.x, point.y);
+            if let Some(hit) = pick(self, at) {
+                self.paint_hit(hit);
+                self.last_paint_screen = Some(at);
+            }
+        }
+    }
+
+    /// Centres the selected layer's decal (0 = fill, 1 = bitmap mask) on a
+    /// surface point, facing out of the clicked face.
+    fn place_decal(&mut self, target: u8, mesh: &MeshGeometry, hit: TriangleHit) {
+        let Some(corners) = mesh.triangles.get(hit.triangle as usize) else {
+            return;
+        };
+        let [a, b, c] = corners.map(|corner| mesh.vertices[corner as usize].position);
+        let normal = (b - a).cross(c - a).normalize_or(glam::Vec3::Z);
+        let up = if normal.dot(glam::Vec3::Y).abs() > 0.9 {
+            glam::Vec3::NEG_Z
+        } else {
+            glam::Vec3::Y
+        };
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+        let projection = match target {
+            0 => layer.fill.as_mut().map(|fill| &mut fill.projection),
+            _ => layer.mask_bitmap.as_mut().map(|mask| &mut mask.projection),
+        };
+        if let Some(projection) = projection {
+            projection.mode = substancecraft_core::ProjectionMode::Decal;
+            projection.decal.center = hit.position;
+            projection.decal.normal = normal;
+            projection.decal.up = up;
+            self.invalidate_preview();
+        }
+    }
+
+    /// Turns the placed path into one undoable stroke on the selected
+    /// layer, using the current brush.
+    fn commit_path(&mut self, closed: bool) {
+        let Some(controls) = self.path_controls.take() else {
+            return;
+        };
+        let (Some(texture_set_id), Some(layer_id)) =
+            (self.selected_texture_set, self.selected_layer)
+        else {
+            return;
+        };
+        if controls.len() < 2 || !matches!(self.paint_mode, PaintMode::Paint | PaintMode::Erase) {
+            return;
+        }
+        let path = substancecraft_core::PathSpec {
+            controls: controls.into_iter().map(|(uv, _)| uv).collect(),
+            closed,
+        };
+        let template = self.brush_paint_stroke(self.paint_mode == PaintMode::Erase);
+        let stroke = PaintStroke::along_path(path, &template);
+        if self.history.apply(
+            &mut self.project,
+            EditCommand::Paint {
+                texture_set_id,
+                layer_id,
+                stroke,
+            },
+        ) {
+            self.invalidate_preview();
+        }
+    }
+
+    /// A stroke carrying the current brush material and tip, with no points.
+    fn brush_paint_stroke(&self, erase: bool) -> PaintStroke {
+        let color = self.brush_color.to_array();
+        let emissive = self.brush_emissive.to_array();
+        PaintStroke {
+            roughness: self.brush_roughness,
+            metallic: self.brush_metallic,
+            height: self.brush_height,
+            emissive: [emissive[0], emissive[1], emissive[2]],
+            material_opacity: self.brush_material_opacity,
+            erase,
+            tip: self.brush_tip,
+            ..PaintStroke::new(Vec::new(), self.brush_radius, color)
+        }
+    }
+
+    /// Eyedropper: copies every material channel at `uv` of the selected
+    /// texture set into the brush.
+    fn pick_material_at(&mut self, uv: glam::Vec2) {
+        self.picking_material = false;
+        let Some(texture_set) = self.selected_texture_set_ref().cloned() else {
+            return;
+        };
+        let shown = match self.displayed_preview() {
+            Some(PreviewTextures::Material(material)) => Some(Arc::clone(material)),
+            _ => None,
+        };
+        let material = match shown {
+            Some(material) => material,
+            None => match self.bake_inputs(texture_set.id).bake_material(&texture_set) {
+                Ok(material) => Arc::new(material),
+                Err(error) => {
+                    self.bake_error = Some(error);
+                    return;
+                }
+            },
+        };
+        if let Some(sample) = material.sample(uv) {
+            self.apply_material_sample(sample);
+        }
+    }
+
+    fn apply_material_sample(&mut self, sample: substancecraft_core::MaterialSample) {
+        let [r, g, b] = sample.color;
+        self.brush_color = egui::Color32::from_rgb(r, g, b);
+        self.brush_roughness = sample.roughness;
+        self.brush_metallic = sample.metallic;
+        self.brush_material_opacity = sample.opacity;
+        let [r, g, b] = sample.emissive;
+        self.brush_emissive = egui::Color32::from_rgb(r, g, b);
+    }
+
+    /// Paints at a picked surface point: continues the brush stroke
+    /// (restarting it when the pointer crosses into another UV island) and,
+    /// with symmetry on, the mirrored stroke on the other side.
+    fn paint_hit(&mut self, hit: TriangleHit) {
+        let Some(uv) = hit
+            .uv
+            .filter(|uv| uv.cmpge(glam::Vec2::ZERO).all() && uv.cmple(glam::Vec2::ONE).all())
+        else {
+            return;
+        };
+        if self.active_stroke.is_none() {
+            self.stroke_last_triangles.clear();
+        }
+        let mut targets = vec![(0, hit.triangle, uv)];
+        if let (Some(symmetry), Some(mesh)) = (self.symmetry, self.mesh_geometry.as_deref())
+            && let Some(mirrored) = symmetry.mirror_hit(
+                mesh,
+                &substancecraft_core::SurfaceHit {
+                    triangle: hit.triangle,
+                    position: hit.position,
+                    normal: glam::Vec3::Z,
+                    uv,
+                },
+            )
+            && self.triangle_in_selected_set(mirrored.triangle)
+            && mirrored.uv.cmpge(glam::Vec2::ZERO).all()
+            && mirrored.uv.cmple(glam::Vec2::ONE).all()
+        {
+            targets.push((1, mirrored.triangle, mirrored.uv));
+        }
+        for (path, triangle, uv) in targets {
+            let previous = self.stroke_last_triangles.get(path).copied().flatten();
+            let restart = match (previous, &self.mesh_topology) {
+                (Some(previous), Some(topology)) => {
+                    substancecraft_core::crosses_uv_seam(topology, previous, triangle)
+                }
+                _ => false,
+            };
+            self.stroke_point(path, uv, restart);
+            if self.stroke_last_triangles.len() <= path {
+                self.stroke_last_triangles.resize(path + 1, None);
+            }
+            self.stroke_last_triangles[path] = Some(triangle);
         }
     }
 
@@ -1768,6 +2308,9 @@ impl SubstanceCraftApp {
             .high_poly
             .as_ref()
             .map(|source| source.geometry.clone());
+        let skew_map = self
+            .skew_map
+            .and_then(|id| self.resource_images.get(&id).cloned());
         let settings = self.effective_mesh_map_settings();
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = sync_channel(1);
@@ -1779,6 +2322,7 @@ impl SubstanceCraftApp {
                     &mesh,
                     high.as_ref(),
                     &settings,
+                    skew_map.as_deref(),
                     &worker_cancel,
                 ));
             });
@@ -2378,6 +2922,177 @@ impl SubstanceCraftApp {
             .map_err(|error| error.to_string())
     }
 
+    /// Writes `texture_set`'s OpenPBR textures and a MaterialX document
+    /// binding them into `folder`; returns the document path.
+    fn write_openpbr(
+        &self,
+        texture_set: &TextureSet,
+        folder: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        let preset = substancecraft_api::openpbr_preset();
+        let written = self.write_export(texture_set, &preset, folder)?;
+        let mut files = BTreeMap::new();
+        for ((input, _, _, _), path) in substancecraft_api::OPENPBR_INPUTS.iter().zip(&written) {
+            if let Some(name) = path.file_name() {
+                files.insert((*input).to_owned(), name.to_string_lossy().into_owned());
+            }
+        }
+        let document = folder.join(format!("{}.mtlx", texture_set.name.replace(' ', "_")));
+        substancecraft_api::write_openpbr_materialx(&document, &texture_set.name, &files)
+            .map_err(|error| error.to_string())?;
+        Ok(document)
+    }
+
+    /// Writes the mesh as glTF with every texture set's metal/rough
+    /// textures beside it; returns the glTF path.
+    fn write_gltf_scene(&self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let mesh = self.mesh_geometry.as_deref().ok_or("Load a mesh first.")?;
+        let folder = path.parent().ok_or("Choose a file inside a folder.")?;
+        let preset = ExportPreset::built_in()
+            .into_iter()
+            .find(|preset| preset.name == DEFAULT_EXPORT_PRESET)
+            .ok_or("The metal/rough preset is missing.")?;
+        let slot_count = mesh.material_slot_count().max(1);
+        let mut materials = Vec::with_capacity(slot_count);
+        for slot in 0..slot_count as u32 {
+            let Some(texture_set) = self
+                .slot_texture_set(slot)
+                .and_then(|id| self.project.texture_sets.iter().find(|set| set.id == id))
+            else {
+                materials.push(substancecraft_api::GltfMaterialFiles::default());
+                continue;
+            };
+            let files = self
+                .bake_inputs(texture_set.id)
+                .bake_export(texture_set, &preset)?;
+            let blend = files.first().is_some_and(|file| {
+                file.texture
+                    .rgba8
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|texel| texel[3] < 255)
+            });
+            let written = write_exported_textures(folder, &files, self.export_format)
+                .map_err(|error| error.to_string())?;
+            let name_of = |suffix: &str| {
+                written
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .find(|name| name.contains(suffix))
+            };
+            materials.push(substancecraft_api::GltfMaterialFiles {
+                name: texture_set.name.clone(),
+                base_color: name_of("_BaseColor"),
+                orm: name_of("_ORM"),
+                normal: name_of("_Normal"),
+                emissive: name_of("_Emissive"),
+                blend,
+            });
+        }
+        substancecraft_api::write_gltf(path, mesh, self.mesh_smoothing.angle_degrees, &materials)
+            .map_err(|error| error.to_string())?;
+        Ok(path.to_path_buf())
+    }
+
+    /// Exports `preset` once per UDIM tile the set's mesh slot uses, baking
+    /// mesh maps per tile when the export needs them.
+    fn write_udim_tiles(
+        &self,
+        texture_set: &TextureSet,
+        preset: &ExportPreset,
+        folder: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        let mesh = self.mesh_geometry.as_deref().ok_or("Load a mesh first.")?;
+        let slot = self.set_slot(texture_set.id);
+        let geometry = if mesh.material_slot_count() > 1 {
+            mesh.submesh(slot)
+        } else {
+            mesh.clone()
+        };
+        let tiles = geometry.udim_tiles();
+        if tiles.is_empty() {
+            return Err("The mesh has no UVs in the UDIM range.".to_owned());
+        }
+        let needs_maps = texture_set.requires_mesh_maps() || preset.reads_mesh_maps();
+        let resources = self.resource_images.clone();
+        let mut written = Vec::new();
+        for tile in tiles {
+            let shifted = geometry.shifted_uvs(tile.offset());
+            let maps = needs_maps
+                .then(|| {
+                    substancecraft_api::bake_mesh_maps(
+                        &shifted,
+                        &self.mesh_smoothing,
+                        &self.effective_mesh_map_settings(),
+                    )
+                })
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let files = texture_set
+                .bake_export_tile(
+                    preset,
+                    tile,
+                    substancecraft_core::BakeContext {
+                        mesh: Some(&shifted),
+                        mesh_maps: maps.as_ref(),
+                        resources: Some(&resources),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            written.extend(
+                write_exported_textures(folder, &files, self.export_format)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(written)
+    }
+
+    fn export_openpbr(&mut self) {
+        let Some(texture_set) = self.exportable_texture_set(false) else {
+            return;
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.bake_error = self.write_openpbr(&texture_set, &folder).err();
+    }
+
+    fn export_gltf(&mut self) {
+        if self
+            .project
+            .texture_sets
+            .iter()
+            .any(TextureSet::requires_mesh_maps)
+            && !self.mesh_maps_fresh()
+        {
+            self.ensure_mesh_maps();
+            self.bake_error =
+                Some("Mesh maps are still baking; export again when they finish.".to_owned());
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("glTF 2.0", &["gltf"])
+            .set_file_name("scene.gltf")
+            .save_file()
+        else {
+            return;
+        };
+        self.bake_error = self.write_gltf_scene(&path).err();
+    }
+
+    fn export_udim_tiles(&mut self) {
+        let preset = self.selected_export_preset();
+        let Some(texture_set) = self.selected_texture_set_ref().cloned() else {
+            return;
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.bake_error = self.write_udim_tiles(&texture_set, &preset, &folder).err();
+    }
+
     /// Starts editing a copy of `name` as a new custom preset.
     fn duplicate_export_preset(&mut self, name: &str) {
         let Some(mut preset) = self
@@ -2495,7 +3210,10 @@ impl SubstanceCraftApp {
 
     fn import_resources(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Bitmap (PNG, JPEG, TGA)", &IMAGE_EXTENSIONS)
+            .add_filter(
+                "Bitmap, SVG, or text (PNG, JPEG, TGA, SVG, SCTEXT)",
+                &IMAGE_EXTENSIONS,
+            )
             .pick_files()
         else {
             return;
@@ -2505,6 +3223,36 @@ impl SubstanceCraftApp {
                 self.import_error = Some(error);
             }
         }
+    }
+
+    /// Writes a starter `.sctext` file where the user chooses and imports
+    /// it; its text is edited in the Assets drawer.
+    fn new_text_resource(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SubstanceCraft text", &["sctext"])
+            .set_file_name("label.sctext")
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(error) = self.create_text_resource(&path, "Text", 128.0) {
+            self.import_error = Some(error);
+        }
+    }
+
+    fn create_text_resource(
+        &mut self,
+        path: &std::path::Path,
+        text: &str,
+        size_px: f32,
+    ) -> Result<ResourceId, String> {
+        let spec = substancecraft_api::TextSpec {
+            text: text.to_owned(),
+            size_px,
+            font: None,
+        };
+        substancecraft_api::save_text_resource(path, &spec).map_err(|error| error.to_string())?;
+        self.add_resource(path)
     }
 
     /// Loads a bitmap and lists it as a project resource.
@@ -2910,8 +3658,10 @@ impl SubstanceCraftApp {
 
         let selecting = self.paint_mode == PaintMode::Select;
         let projection = self.view_projection(viewport);
-        let needs_projection =
-            software || (painting && response.dragged()) || (selecting && response.hovered());
+        let needs_projection = software
+            || (painting && response.dragged())
+            || response.clicked()
+            || (selecting && response.hovered());
         let projected = needs_projection
             .then(|| {
                 self.mesh_geometry
@@ -2920,17 +3670,31 @@ impl SubstanceCraftApp {
             })
             .flatten();
 
-        if painting
-            && response.dragged()
-            && let (Some(points), Some(pointer), Some(mesh)) =
-                (&projected, pointer_position, &self.mesh_geometry)
-            && let Some(hit) = pick_triangle(mesh, points, pointer)
-            && self.triangle_in_selected_set(hit.triangle)
-            && let Some(uv) = hit
-                .uv
-                .filter(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y))
-        {
-            self.append_stroke_point(uv);
+        if let (Some(points), Some(mesh)) = (&projected, self.mesh_geometry.clone()) {
+            self.handle_paint_input(&response, points, &mesh, pointer_position, shift);
+        }
+        if self.path_controls.is_some() {
+            let (enter, escape) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::Escape),
+                )
+            });
+            if enter {
+                self.commit_path(false);
+            } else if escape {
+                self.path_controls = None;
+            }
+        }
+        if let Some(controls) = &self.path_controls {
+            let screen: Vec<egui::Pos2> = controls.iter().map(|(_, screen)| *screen).collect();
+            painter.add(egui::Shape::line(
+                screen.clone(),
+                egui::Stroke::new(1.5, theme::ACCENT),
+            ));
+            for point in screen {
+                painter.circle_filled(point, 4.0, theme::ACCENT);
+            }
         }
 
         if selecting {
@@ -3133,6 +3897,8 @@ struct TriangleHit {
     triangle: u32,
     /// Interpolated UV, when the triangle's UVs are usable.
     uv: Option<glam::Vec2>,
+    /// Object-space surface point.
+    position: glam::Vec3,
 }
 
 /// Nearest triangle under `pointer`.
@@ -3162,12 +3928,16 @@ fn pick_triangle(
             continue;
         }
         let uvs = triangle.map(|vertex| mesh.vertices[vertex as usize].uv);
+        let positions = triangle.map(|vertex| mesh.vertices[vertex as usize].position);
         let uv = uvs[0] * weights.x + uvs[1] * weights.y + uvs[2] * weights.z;
         best = Some((
             depth,
             TriangleHit {
                 triangle: index as u32,
                 uv: uv.is_finite().then_some(uv),
+                position: positions[0] * weights.x
+                    + positions[1] * weights.y
+                    + positions[2] * weights.z,
             },
         ));
     }
@@ -3308,14 +4078,16 @@ fn bake_slot_mesh_maps(
     mesh: &MeshGeometry,
     high: Option<&MeshGeometry>,
     settings: &MeshMapSettings,
+    skew_map: Option<&substancecraft_core::TextureImage>,
     cancel: &AtomicBool,
 ) -> Result<Vec<MeshMaps>, MeshMapError> {
     let slot_count = mesh.material_slot_count();
     if slot_count <= 1 {
-        return Ok(vec![bake_mesh_maps_from(
+        return Ok(vec![substancecraft_core::bake_mesh_maps_corrected(
             mesh,
             high,
             settings,
+            skew_map,
             Some(cancel),
         )?]);
     }
@@ -3327,7 +4099,13 @@ fn bake_slot_mesh_maps(
             } else {
                 &submesh
             };
-            bake_mesh_maps_from(source, high, settings, Some(cancel))
+            substancecraft_core::bake_mesh_maps_corrected(
+                source,
+                high,
+                settings,
+                skew_map,
+                Some(cancel),
+            )
         })
         .collect()
 }
@@ -3933,5 +4711,258 @@ mod tests {
             "replaced with a real image"
         );
         assert_eq!(app.bake_error, None);
+    }
+
+    #[test]
+    fn tc_0163_symmetry_seams_paths_and_eyedropper_work_through_the_app() {
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.add_paint_layer();
+        small_sets(&mut app, 16);
+        app.set_paint_mode(PaintMode::Paint);
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let hit_at = |point: glam::Vec3| {
+            let hit = cube.closest_surface_point(point).unwrap();
+            TriangleHit {
+                triangle: hit.triangle,
+                uv: Some(hit.uv),
+                position: hit.position,
+            }
+        };
+        let strokes = |app: &SubstanceCraftApp| app.selected_layer().unwrap().paint_strokes.len();
+
+        // Mirror across X: one drag makes a stroke on each side, undone
+        // together.
+        app.symmetry = Some(substancecraft_core::Symmetry::new(
+            substancecraft_core::Axis::X,
+        ));
+        app.paint_hit(hit_at(glam::Vec3::new(0.3, 0.0, 0.5)));
+        app.paint_hit(hit_at(glam::Vec3::new(0.35, 0.05, 0.5)));
+        app.finish_active_stroke();
+        assert_eq!(strokes(&app), 2);
+        let layer = app.selected_layer().unwrap();
+        assert!(layer.paint_strokes[1].points[0].x < layer.paint_strokes[0].points[0].x);
+        app.undo();
+        assert_eq!(strokes(&app), 0);
+
+        // Crossing from the front face onto the top face restarts the
+        // stroke in the new UV island; still one undo step.
+        app.symmetry = None;
+        app.paint_hit(hit_at(glam::Vec3::new(0.0, 0.4, 0.5)));
+        app.paint_hit(hit_at(glam::Vec3::new(0.0, 0.5, 0.4)));
+        app.finish_active_stroke();
+        assert_eq!(strokes(&app), 2);
+        app.undo();
+        assert_eq!(strokes(&app), 0);
+        app.redo();
+        assert_eq!(strokes(&app), 2);
+
+        // A placed path commits as one stroke that keeps its control points.
+        app.path_controls = Some(vec![
+            (glam::Vec2::new(0.1, 0.6), egui::Pos2::ZERO),
+            (glam::Vec2::new(0.2, 0.8), egui::Pos2::ZERO),
+            (glam::Vec2::new(0.3, 0.6), egui::Pos2::ZERO),
+        ]);
+        app.commit_path(false);
+        assert!(app.path_controls.is_none());
+        let path_stroke = app
+            .selected_layer()
+            .unwrap()
+            .paint_strokes
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(path_stroke.path.as_ref().unwrap().controls.len(), 3);
+        assert_eq!(
+            path_stroke.points.len(),
+            2 * substancecraft_core::PATH_SAMPLES_PER_SEGMENT + 1
+        );
+        app.undo();
+        assert_eq!(strokes(&app), 2);
+
+        // The eyedropper copies every channel of a fill into the brush.
+        app.add_fill_layer();
+        if let Some(fill) = app
+            .selected_layer_mut()
+            .and_then(|layer| layer.fill.as_mut())
+        {
+            fill.color = [10, 200, 30, 255];
+            fill.roughness = 0.9;
+            fill.metallic = 1.0;
+        }
+        app.picking_material = true;
+        app.pick_material_at(glam::Vec2::new(0.5, 0.5));
+        assert!(!app.picking_material);
+        assert_eq!(app.brush_color, egui::Color32::from_rgb(10, 200, 30));
+        assert!((app.brush_roughness - 0.9).abs() < 0.01);
+        assert_eq!(app.brush_metallic, 1.0);
+    }
+
+    #[test]
+    fn tc_0156_flatten_materials_and_smart_materials_work_through_the_app() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        small_sets(&mut app, 8);
+        let source = app.selected_layer.unwrap();
+        if let Some(layer) = app.selected_layer_mut() {
+            layer.opacity = 0.5;
+        }
+        app.sync_layer_history(&egui::Context::default());
+        let set_id = app.selected_texture_set.unwrap();
+        let before = app.selected_texture_set_ref().unwrap().clone();
+        let original = before
+            .bake_channel(
+                MaterialChannel::BaseColor,
+                substancecraft_core::BakeContext::default(),
+            )
+            .unwrap();
+
+        // Flatten: bitmaps on disk, a fill above, the source hidden.
+        let flattened = app.flatten_selected_into(folder.path()).unwrap();
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        assert_eq!(set.layers.len(), 2);
+        assert_eq!(set.layers[1].id, flattened);
+        assert!(!set.layer(source).unwrap().visible);
+        assert_eq!(app.project.resources.len(), 3, "color, roughness, metallic");
+        let rebuilt = app
+            .bake_inputs(set_id)
+            .bake_channel(&set, MaterialChannel::BaseColor)
+            .unwrap();
+        assert_eq!(rebuilt, original, "flattened layer composites identically");
+        app.undo();
+        assert_eq!(
+            app.selected_texture_set_ref().unwrap().layers,
+            before.layers
+        );
+
+        // Materials apply to the selected layer and can be saved back.
+        app.selected_layer = Some(source);
+        let gold = substancecraft_core::MaterialResource::built_in()
+            .into_iter()
+            .find(|material| material.name == "Gold")
+            .unwrap();
+        app.apply_material(&gold);
+        assert_eq!(app.selected_layer().unwrap().fill, Some(gold.fill));
+        app.save_layer_as_material();
+        app.save_layer_as_material();
+        let names: Vec<&str> = app
+            .project
+            .materials
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "saved names are unique");
+
+        // Smart materials insert with fresh ids and save to the project.
+        let worn = substancecraft_core::SmartMaterial::built_in().remove(0);
+        app.insert_smart_material(&worn);
+        let inserted = app.selected_layer().unwrap().clone();
+        assert!(inserted.is_group());
+        assert_eq!(inserted.walk().len(), 4);
+        app.project.validate().unwrap();
+        app.save_layer_as_smart_material();
+        assert_eq!(app.project.smart_materials.len(), 1);
+        app.project.validate().unwrap();
+        let file = folder.path().join("worn.scsmart");
+        substancecraft_api::save_smart_material(&file, &app.project.smart_materials[0]).unwrap();
+        assert_eq!(
+            substancecraft_api::load_smart_material(&file).unwrap(),
+            app.project.smart_materials[0]
+        );
+    }
+
+    #[test]
+    fn tc_0192_openpbr_gltf_udim_and_text_resources_export_through_the_app() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.add_fill_layer();
+        small_sets(&mut app, 8);
+        let set = app.selected_texture_set_ref().unwrap().clone();
+
+        // OpenPBR: textures plus a MaterialX document that reads back.
+        let document = app.write_openpbr(&set, folder.path()).unwrap();
+        let material = substancecraft_api::read_openpbr_materialx(&document).unwrap();
+        assert_eq!(
+            material.textures.len(),
+            substancecraft_api::OPENPBR_INPUTS.len()
+        );
+        for file in material.textures.values() {
+            assert!(folder.path().join(file).exists(), "{file}");
+        }
+
+        // glTF: the mesh re-imports with its texture set as the material.
+        let gltf = folder.path().join("scene.gltf");
+        app.write_gltf_scene(&gltf).unwrap();
+        let imported = substancecraft_api::import_gltf_file(&gltf).unwrap();
+        assert_eq!(imported.geometry.triangles.len(), 12);
+
+        // UDIM: the cube sits in tile 1001.
+        let tiles = folder.path().join("tiles");
+        std::fs::create_dir(&tiles).unwrap();
+        let written = app
+            .write_udim_tiles(&set, &app.selected_export_preset(), &tiles)
+            .unwrap();
+        assert!(!written.is_empty());
+        assert!(
+            written
+                .iter()
+                .all(|path| path.to_string_lossy().ends_with(".1001.png"))
+        );
+
+        // Text resources render into ordinary bitmaps.
+        let label = folder.path().join("label.sctext");
+        let id = app.create_text_resource(&label, "HELLO", 64.0).unwrap();
+        let image = &app.resource_images[&id];
+        assert!(image.width > image.height);
+        assert!(image.rgba8.chunks(4).any(|texel| texel[3] == 255));
+    }
+
+    #[test]
+    fn tc_0210_still_renders_keep_the_viewport_aspect_at_the_requested_size() {
+        assert_eq!(render_size(800.0, 600.0, 2048), (2048, 1536, 2.56));
+        let (width, height, factor) = render_size(300.0, 900.0, 1024);
+        assert_eq!((width, height), (341, 1024));
+        assert!((factor - 1024.0 / 900.0).abs() < 1e-6);
+        // Requests beyond the renderer's limit are clamped.
+        assert_eq!(render_size(1000.0, 1000.0, 9000).0, MAX_RENDER_EDGE);
+    }
+
+    /// Needs a GPU: run with `cargo test -p substancecraft -- --ignored`.
+    #[test]
+    #[ignore]
+    fn tc_0211_still_render_saves_an_opaque_png_of_the_material() {
+        let folder = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp {
+            filament_renderer: Some(FilamentRuntime::new(64, 64).unwrap()),
+            ..SubstanceCraftApp::default()
+        };
+        app.add_fill_layer();
+        small_sets(&mut app, 16);
+        let path = folder.path().join("render.png");
+        app.queue_render(path.clone(), 256);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        for _ in 0..600 {
+            app.update_filament_frame(&context, viewport);
+            if app.render_request.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = app.render_status.clone().unwrap_or_default();
+        assert!(status.starts_with("Saved 256 × 192"), "{status}");
+        let image = load_texture_image(&path).unwrap();
+        assert_eq!((image.width, image.height), (256, 192));
+        assert!(image.rgba8.chunks(4).all(|texel| texel[3] == 255));
+        assert!(
+            image
+                .rgba8
+                .chunks(4)
+                .any(|texel| texel[..3] != image.rgba8[..3]),
+            "the mesh is visible against the background"
+        );
     }
 }

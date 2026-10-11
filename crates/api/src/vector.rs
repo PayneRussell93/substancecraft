@@ -166,6 +166,14 @@ pub fn load_text_resource(path: &Path) -> Result<TextureImage, TextureIoError> {
     render_text(&spec, font.as_deref())
 }
 
+/// Reads a `.sctext` file's settings without rendering it.
+pub fn read_text_resource(path: &Path) -> Result<TextSpec, TextureIoError> {
+    let json =
+        std::fs::read_to_string(path).map_err(|error| TextureIoError::Io(error.to_string()))?;
+    serde_json::from_str(&json)
+        .map_err(|error| TextureIoError::Decode(format!("text resource: {error}")))
+}
+
 /// Writes a `.sctext` file.
 pub fn save_text_resource(path: &Path, spec: &TextSpec) -> Result<(), TextureIoError> {
     let json = serde_json::to_string_pretty(spec)
@@ -225,10 +233,7 @@ mod tests {
         let image = render_text(&spec, None).unwrap();
         assert!(image.width > 48 && image.height > 96, "two lines tall");
         let alphas: Vec<u8> = image.rgba8.chunks(4).map(|texel| texel[3]).collect();
-        assert!(
-            alphas.iter().any(|alpha| *alpha == 255),
-            "solid glyph interiors"
-        );
+        assert!(alphas.contains(&255), "solid glyph interiors");
         assert!(alphas[0] == 0, "transparent margin");
         assert!(
             image
