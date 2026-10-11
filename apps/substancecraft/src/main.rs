@@ -119,6 +119,11 @@ struct SubstanceCraftApp {
     filament_frames_tx: SyncSender<FilamentFrame>,
     filament_frames_rx: Receiver<FilamentFrame>,
     filament_render_pending: Arc<AtomicBool>,
+    render_request: Option<RenderRequest>,
+    /// Pixels of the finished still render, filled by the renderer.
+    render_result: Arc<std::sync::Mutex<Option<FilamentFrame>>>,
+    /// Outcome of the last still render, for the Light drawer.
+    render_status: Option<String>,
     imported_meshes: Vec<ImportedMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
@@ -204,6 +209,30 @@ struct FilamentFrame {
     height: u32,
     rgba8: Vec<u8>,
 }
+
+/// A still render of the viewport waiting to be drawn and saved.
+struct RenderRequest {
+    path: std::path::PathBuf,
+    /// Longest edge of the image in pixels.
+    long_edge: u32,
+    issued: bool,
+}
+
+/// Pixel size of a still render with the viewport's aspect and the given
+/// longest edge, and the factor by which it outscales the viewport (so
+/// framing matches what is on screen).
+fn render_size(viewport_width: f32, viewport_height: f32, long_edge: u32) -> (u32, u32, f32) {
+    let (width, height) = (viewport_width.max(1.0), viewport_height.max(1.0));
+    let factor = long_edge.clamp(16, MAX_RENDER_EDGE) as f32 / width.max(height);
+    (
+        ((width * factor).round() as u32).clamp(1, MAX_RENDER_EDGE),
+        ((height * factor).round() as u32).clamp(1, MAX_RENDER_EDGE),
+        factor,
+    )
+}
+
+/// Largest still render edge the renderer accepts.
+const MAX_RENDER_EDGE: u32 = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaintMode {
@@ -448,6 +477,9 @@ impl Default for SubstanceCraftApp {
             filament_frames_tx,
             filament_frames_rx,
             filament_render_pending: Arc::new(AtomicBool::new(false)),
+            render_request: None,
+            render_result: Arc::new(std::sync::Mutex::new(None)),
+            render_status: None,
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
             import_error: None,
@@ -651,6 +683,7 @@ impl SubstanceCraftApp {
         if let Some(renderer) = self.filament_renderer.as_mut() {
             renderer.poll();
         }
+        self.save_finished_render();
         while let Ok(frame) = self.filament_frames_rx.try_recv() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
@@ -759,6 +792,48 @@ impl SubstanceCraftApp {
             return;
         }
         let scale = context.pixels_per_point();
+        if let Some(request) = self
+            .render_request
+            .as_mut()
+            .filter(|request| !request.issued)
+        {
+            // A still render takes this frame: same camera and lighting, at
+            // the requested size.
+            let (width, height, factor) = render_size(
+                viewport.width() * scale,
+                viewport.height() * scale,
+                request.long_edge,
+            );
+            let result = Arc::clone(&self.render_result);
+            let pending = Arc::clone(&self.filament_render_pending);
+            let outcome = renderer.render(
+                self.viewport_camera,
+                width,
+                height,
+                scale * factor,
+                move |rgba8| {
+                    pending.store(false, Ordering::Release);
+                    if let Ok(mut slot) = result.lock() {
+                        *slot = Some(FilamentFrame {
+                            width,
+                            height,
+                            rgba8,
+                        });
+                    }
+                },
+            );
+            match outcome {
+                Ok(true) => request.issued = true,
+                Ok(false) => self.filament_render_pending.store(false, Ordering::Release),
+                Err(error) => {
+                    self.filament_render_pending.store(false, Ordering::Release);
+                    self.render_status = Some(format!("Render failed: {error}"));
+                    self.render_request = None;
+                }
+            }
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
         let width = (viewport.width() * scale).ceil().clamp(1.0, 2048.0) as u32;
         let height = (viewport.height() * scale).ceil().clamp(1.0, 2048.0) as u32;
         let sender = self.filament_frames_tx.clone();
@@ -784,6 +859,60 @@ impl SubstanceCraftApp {
                 self.filament_error = Some(error.to_string());
             }
         }
+    }
+
+    /// Asks where to save a still render of the viewport, then queues it.
+    fn request_render(&mut self, long_edge: u32) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .set_file_name("render.png")
+            .save_file()
+        {
+            self.queue_render(path, long_edge);
+        }
+    }
+
+    fn queue_render(&mut self, path: std::path::PathBuf, long_edge: u32) {
+        self.render_status = Some("Rendering…".to_owned());
+        self.render_request = Some(RenderRequest {
+            path,
+            long_edge,
+            issued: false,
+        });
+    }
+
+    /// Writes the finished still render as an opaque sRGB PNG (the
+    /// renderer outputs display-encoded sRGB).
+    fn save_finished_render(&mut self) {
+        let Some(frame) = self
+            .render_result
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let Some(request) = self.render_request.take() else {
+            return;
+        };
+        let mut rgba8 = frame.rgba8;
+        for texel in rgba8.as_chunks_mut::<4>().0 {
+            texel[3] = 255;
+        }
+        let texture = BakedTexture {
+            width: frame.width,
+            height: frame.height,
+            rgba8,
+        };
+        self.render_status = Some(match write_texture(&request.path, &texture) {
+            Ok(()) => format!(
+                "Saved {} × {} render to {}",
+                frame.width,
+                frame.height,
+                request.path.display()
+            ),
+            Err(error) => format!("Render failed: {error}"),
+        });
     }
 
     fn save_project(&mut self) {

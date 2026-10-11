@@ -2752,6 +2752,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "substancecraft-cli"
+version = "0.1.0"
+dependencies = [
+ "substancecraft-api",
+ "substancecraft-core",
+ "tempfile",
+]
+
+[[package]]
 name = "substancecraft-core"
 version = "0.1.0"
 dependencies = [

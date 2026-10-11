@@ -1265,6 +1265,30 @@ impl SubstanceCraftApp {
             false,
             2,
         );
+
+        widgets::caption(ui, "Render");
+        let mut long_edge = None;
+        widgets::property_row(ui, "Image", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (edge, label) in [(1024, "1K"), (2048, "2K")] {
+                if widgets::chip(ui, label, false)
+                    .on_hover_text(format!("Render a {edge}-pixel PNG of this view"))
+                    .clicked()
+                {
+                    long_edge = Some(edge);
+                }
+            }
+        });
+        if let Some(edge) = long_edge {
+            self.request_render(edge);
+        }
+        if let Some(status) = &self.render_status {
+            hint(ui, status);
+        }
+        hint(
+            ui,
+            "Renders the current material with this camera and lighting as an sRGB PNG.",
+        );
     }
 
     fn show_inspector_column(&mut self, context: &egui::Context, screen: Rect) {

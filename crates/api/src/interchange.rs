@@ -190,7 +190,7 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
         for attribute in element.attributes() {
             let attribute = attribute.map_err(|error| invalid(&error))?;
             let value = attribute
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|error| invalid(&error))?
                 .into_owned();
             attributes.insert(

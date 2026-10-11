@@ -4,6 +4,7 @@
 mod fbx;
 mod gltf_import;
 mod interchange;
+mod jobs;
 mod textures;
 mod vector;
 
@@ -15,6 +16,7 @@ pub use interchange::{
     GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, openpbr_preset,
     read_openpbr_materialx, write_gltf, write_openpbr_materialx,
 };
+pub use jobs::{ExportJob, JobError, load_mesh_file, load_project_mesh, run_export_job};
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
     encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
@@ -31,6 +33,7 @@ use std::{
     io::{self, Read, Write},
     path::Path,
 };
+use substancecraft_core::SmartMaterial;
 use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
     MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
@@ -260,6 +263,78 @@ pub fn bake_mesh_maps_high_to_low(
         &settings,
         None,
     )?)
+}
+
+/// [`bake_mesh_maps_high_to_low`] with a painted skew map scaling
+/// [`MeshMapSettings::skew`] per texel.
+pub fn bake_mesh_maps_high_to_low_corrected(
+    low: &MeshGeometry,
+    high: &MeshGeometry,
+    smoothing: &MeshSmoothing,
+    settings: &MeshMapSettings,
+    skew_map: Option<&TextureImage>,
+) -> Result<MeshMaps, ApiError> {
+    let smoothed = smoothing.apply(low)?;
+    let settings = MeshMapSettings {
+        smoothing_angle_degrees: smoothing.angle_degrees,
+        ..*settings
+    };
+    Ok(substancecraft_core::bake_mesh_maps_corrected(
+        &smoothed,
+        Some(high),
+        &settings,
+        skew_map,
+        None,
+    )?)
+}
+
+/// File format tag of saved smart materials.
+pub const SMART_MATERIAL_FORMAT: &str = "substancecraft-smart-material";
+const SMART_MATERIAL_VERSION: u32 = 1;
+const MAX_SMART_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct SmartMaterialFile {
+    format: String,
+    version: u32,
+    material: SmartMaterial,
+}
+
+/// Writes a smart material as versioned JSON (`.scsmart`).
+pub fn save_smart_material(path: &Path, material: &SmartMaterial) -> Result<(), ProjectFileError> {
+    material
+        .validate()
+        .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
+    let json = serde_json::to_vec_pretty(&SmartMaterialFile {
+        format: SMART_MATERIAL_FORMAT.to_owned(),
+        version: SMART_MATERIAL_VERSION,
+        material: material.clone(),
+    })
+    .map_err(|error| ProjectFileError::Encode(error.to_string()))?;
+    std::fs::write(path, json).map_err(|error| ProjectFileError::Io(error.to_string()))
+}
+
+/// Reads and validates a smart material file.
+pub fn load_smart_material(path: &Path) -> Result<SmartMaterial, ProjectFileError> {
+    let file = File::open(path).map_err(|error| ProjectFileError::Io(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SMART_MATERIAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ProjectFileError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_SMART_MATERIAL_BYTES {
+        return Err(ProjectFileError::TooLarge(bytes.len()));
+    }
+    let file: SmartMaterialFile = serde_json::from_slice(&bytes)
+        .map_err(|error| ProjectFileError::Decode(error.to_string()))?;
+    if file.format != SMART_MATERIAL_FORMAT || file.version != SMART_MATERIAL_VERSION {
+        return Err(ProjectFileError::Decode(format!(
+            "not a version {SMART_MATERIAL_VERSION} {SMART_MATERIAL_FORMAT} file"
+        )));
+    }
+    file.material
+        .validate()
+        .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
+    Ok(file.material)
 }
 
 /// Bakes the viewport/engine textures: Base Color (Opacity in alpha), packed
@@ -632,5 +707,26 @@ mod tests {
         let loaded = load_project_file(&path).unwrap();
 
         assert_eq!(loaded, updated);
+    }
+
+    #[test]
+    fn tc_0155_smart_material_files_round_trip_and_reject_foreign_data() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("worn.scsmart");
+        let mut material = SmartMaterial::built_in().remove(0);
+        assert!(material.set_parameter(0, substancecraft_core::ParameterValue::Color([1, 2, 3])));
+        save_smart_material(&path, &material).unwrap();
+        assert_eq!(load_smart_material(&path).unwrap(), material);
+
+        std::fs::write(&path, br#"{"format":"other","version":1,"material":{}}"#).unwrap();
+        assert!(matches!(
+            load_smart_material(&path),
+            Err(ProjectFileError::Decode(_))
+        ));
+        material.name.clear();
+        assert!(matches!(
+            save_smart_material(&path, &material),
+            Err(ProjectFileError::InvalidProject(_))
+        ));
     }
 }
