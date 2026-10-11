@@ -1133,6 +1133,8 @@ pub struct BakeContext<'a> {
 enum ChannelBuffer {
     Color(Vec<u8>),
     Scalar(Vec<f32>),
+    /// Unit tangent-space normals.
+    Vector(Vec<Vec3>),
 }
 
 impl ChannelBuffer {
@@ -1145,6 +1147,10 @@ impl ChannelBuffer {
                 let alpha = alpha.clamp(0.0, 1.0);
                 values[index] += (value - values[index]) * alpha;
             }
+            (Self::Vector(values), ChannelValue::Vector(value)) => {
+                let alpha = alpha.clamp(0.0, 1.0);
+                values[index] = values[index].lerp(value, alpha).normalize_or(Vec3::Z);
+            }
             _ => {}
         }
     }
@@ -1155,18 +1161,48 @@ impl ChannelBuffer {
             Self::Scalar(values) => values
                 .into_iter()
                 .flat_map(|value| {
-                    let gray = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let gray = unit_to_byte(value);
                     [gray, gray, gray, 255]
                 })
                 .collect(),
+            Self::Vector(values) => values.into_iter().flat_map(encode_normal).collect(),
         }
     }
+}
+
+fn unit_to_byte(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Encodes a unit tangent-space normal as OpenGL-convention RGBA (+Y = +V).
+fn encode_normal(normal: Vec3) -> [u8; 4] {
+    let encoded = normal * 0.5 + 0.5;
+    [
+        unit_to_byte(encoded.x),
+        unit_to_byte(encoded.y),
+        unit_to_byte(encoded.z),
+        255,
+    ]
 }
 
 #[derive(Clone, Copy)]
 enum ChannelValue {
     Color([u8; 4]),
     Scalar(f32),
+    Vector(Vec3),
+}
+
+/// Viewport-ready textures for one texture set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialTextures {
+    /// Straight-alpha sRGB Base Color.
+    pub base_color: BakedTexture,
+    /// Linear packed R = ambient occlusion (from mesh maps), G = roughness,
+    /// B = metallic.
+    pub orm: BakedTexture,
+    /// Tangent-space normal (OpenGL convention): baked detail, Normal-channel
+    /// layers, and height-derived detail combined.
+    pub normal: BakedTexture,
 }
 
 impl TextureSet {
@@ -1181,41 +1217,145 @@ impl TextureSet {
         self.bake_channel(MaterialChannel::BaseColor, BakeContext::default())
     }
 
-    /// Composites every visible layer that enables `channel`. Base Color
-    /// produces straight-alpha RGBA; Roughness and Metallic produce opaque
-    /// grayscale starting from [`DEFAULT_ROUGHNESS`] / [`DEFAULT_METALLIC`].
+    fn validate_for_bake(&self) -> Result<Option<BakedTexture>, BakeError> {
+        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
+            return Err(BakeError::InvalidStrokeData);
+        }
+        if self.layers.iter().any(|layer| !layer.has_valid_settings())
+            || !valid_height_strength(self.height_strength)
+        {
+            return Err(BakeError::InvalidLayerSettings);
+        }
+        checked_bake_pixel_count(self.resolution)?;
+        self.layers
+            .iter()
+            .any(|layer| layer.id_mask_color.is_some())
+            .then(|| self.bake_id_mask())
+            .transpose()
+    }
+
+    /// Composites every visible layer that enables `channel`.
+    ///
+    /// - Base Color: straight-alpha RGBA.
+    /// - Roughness, Metallic, Height: opaque grayscale starting from
+    ///   [`DEFAULT_ROUGHNESS`], [`DEFAULT_METALLIC`], [`DEFAULT_HEIGHT`].
+    /// - Normal: tangent-space normal combining the baked detail normal from
+    ///   the mesh maps, Normal-channel layers (which flatten what is beneath),
+    ///   and detail derived from the Height channel.
+    /// - Id: the discrete ID map.
     pub fn bake_channel(
         &self,
         channel: MaterialChannel,
         context: BakeContext<'_>,
     ) -> Result<BakedTexture, BakeError> {
-        let default_scalar = match channel {
-            MaterialChannel::Id => return self.bake_id_mask(),
-            MaterialChannel::BaseColor => None,
-            MaterialChannel::Roughness => Some(DEFAULT_ROUGHNESS),
-            MaterialChannel::Metallic => Some(DEFAULT_METALLIC),
+        if channel == MaterialChannel::Id {
+            return self.bake_id_mask();
+        }
+        let id_map = self.validate_for_bake()?;
+        let buffer = if channel == MaterialChannel::Normal {
+            ChannelBuffer::Vector(self.normal_buffer(context, id_map.as_ref())?)
+        } else {
+            self.composite(channel, context, id_map.as_ref())?
+        };
+        Ok(self.texture(buffer.into_rgba8()))
+    }
+
+    /// Bakes Base Color, packed ORM, and Normal concurrently for display or
+    /// engine export.
+    pub fn bake_material(&self, context: BakeContext<'_>) -> Result<MaterialTextures, BakeError> {
+        let id_map = self.validate_for_bake()?;
+        let id_map = id_map.as_ref();
+        let (base_color, roughness, metallic, normal) = std::thread::scope(|scope| {
+            let base = scope.spawn(|| self.composite(MaterialChannel::BaseColor, context, id_map));
+            let rough = scope.spawn(|| self.composite(MaterialChannel::Roughness, context, id_map));
+            let metal = scope.spawn(|| self.composite(MaterialChannel::Metallic, context, id_map));
+            let normal = self.normal_buffer(context, id_map);
+            let join = |handle: std::thread::ScopedJoinHandle<'_, Result<ChannelBuffer, BakeError>>| {
+                handle.join().unwrap_or(Err(BakeError::AllocationFailed))
+            };
+            (join(base), join(rough), join(metal), normal)
+        });
+        let (ChannelBuffer::Scalar(roughness), ChannelBuffer::Scalar(metallic)) =
+            (roughness?, metallic?)
+        else {
+            return Err(BakeError::AllocationFailed);
+        };
+        let mut occlusion = try_filled(roughness.len(), 1.0_f32)?;
+        if let Some(maps) = context.mesh_maps {
+            parallel_fill(
+                &mut occlusion,
+                self.resolution.width,
+                self.resolution.height,
+                |uv| {
+                    let sample = maps.sample(uv);
+                    if sample.covered {
+                        sample.ambient_occlusion
+                    } else {
+                        1.0
+                    }
+                },
+            );
+        }
+        let orm = occlusion
+            .iter()
+            .zip(&roughness)
+            .zip(&metallic)
+            .flat_map(|((ao, rough), metal)| {
+                [unit_to_byte(*ao), unit_to_byte(*rough), unit_to_byte(*metal), 255]
+            })
+            .collect();
+        Ok(MaterialTextures {
+            base_color: self.texture(base_color?.into_rgba8()),
+            orm: self.texture(orm),
+            normal: self.texture(ChannelBuffer::Vector(normal?).into_rgba8()),
+        })
+    }
+
+    fn texture(&self, rgba8: Vec<u8>) -> BakedTexture {
+        BakedTexture {
+            width: self.resolution.width,
+            height: self.resolution.height,
+            rgba8,
+        }
+    }
+
+    fn composite(
+        &self,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        id_map: Option<&BakedTexture>,
+    ) -> Result<ChannelBuffer, BakeError> {
+        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let mut output = match channel {
+            MaterialChannel::BaseColor => ChannelBuffer::Color(try_filled(pixel_count * 4, 0_u8)?),
+            MaterialChannel::Roughness => {
+                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_ROUGHNESS)?)
+            }
+            MaterialChannel::Metallic => {
+                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_METALLIC)?)
+            }
+            MaterialChannel::Height => {
+                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_HEIGHT)?)
+            }
+            MaterialChannel::Normal => {
+                let mut normals = try_filled(pixel_count, Vec3::Z)?;
+                if let Some(maps) = context.mesh_maps {
+                    parallel_fill(
+                        &mut normals,
+                        self.resolution.width,
+                        self.resolution.height,
+                        |uv| maps.sample(uv).tangent_normal,
+                    );
+                }
+                ChannelBuffer::Vector(normals)
+            }
             other => return Err(BakeError::UnsupportedChannel(other)),
         };
-        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
-            return Err(BakeError::InvalidStrokeData);
-        }
-        if self.layers.iter().any(|layer| !layer.has_valid_settings()) {
-            return Err(BakeError::InvalidLayerSettings);
-        }
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let id_map = self
-            .layers
-            .iter()
-            .any(|layer| layer.id_mask_color.is_some())
-            .then(|| self.bake_id_mask())
-            .transpose()?;
-        let mut output = match default_scalar {
-            None => ChannelBuffer::Color(try_filled(pixel_count * 4, 0_u8)?),
-            Some(value) => ChannelBuffer::Scalar(try_filled(pixel_count, value)?),
-        };
-        let value_for = |color: [u8; 4], roughness: f32, metallic: f32| match channel {
+        let value_for = |color: [u8; 4], roughness: f32, metallic: f32, height: f32| match channel {
             MaterialChannel::Roughness => ChannelValue::Scalar(roughness),
             MaterialChannel::Metallic => ChannelValue::Scalar(metallic),
+            MaterialChannel::Height => ChannelValue::Scalar(height),
+            MaterialChannel::Normal => ChannelValue::Vector(Vec3::Z),
             _ => ChannelValue::Color(color),
         };
 
@@ -1226,17 +1366,18 @@ impl TextureSet {
             {
                 continue;
             }
-            let mask = self.layer_mask(layer, context, id_map.as_ref())?;
+            let mask = self.layer_mask(layer, context, id_map)?;
             let mask_at = |index: usize| mask.as_ref().map_or(1.0, |values| values[index]);
 
             if let Some(fill) = layer.fill {
-                let value = value_for(fill.color, fill.roughness, fill.metallic);
+                let value = value_for(fill.color, fill.roughness, fill.metallic, fill.height);
                 for index in 0..pixel_count {
                     output.blend(index, value, layer.opacity * mask_at(index));
                 }
             }
             for stroke in &layer.paint_strokes {
-                let value = value_for(stroke.color, stroke.roughness, stroke.metallic);
+                let value =
+                    value_for(stroke.color, stroke.roughness, stroke.metallic, stroke.height);
                 rasterize_stroke(
                     &stroke.points,
                     stroke.radius_pixels,
@@ -1249,12 +1390,54 @@ impl TextureSet {
                 );
             }
         }
+        Ok(output)
+    }
 
-        Ok(BakedTexture {
-            width: self.resolution.width,
-            height: self.resolution.height,
-            rgba8: output.into_rgba8(),
-        })
+    /// Normal-channel composite with Height-derived detail blended on top
+    /// (whiteout blend), so painted bumps and dents shade in the viewport.
+    fn normal_buffer(
+        &self,
+        context: BakeContext<'_>,
+        id_map: Option<&BakedTexture>,
+    ) -> Result<Vec<Vec3>, BakeError> {
+        let ChannelBuffer::Vector(mut normals) =
+            self.composite(MaterialChannel::Normal, context, id_map)?
+        else {
+            return Err(BakeError::AllocationFailed);
+        };
+        let ChannelBuffer::Scalar(height) =
+            self.composite(MaterialChannel::Height, context, id_map)?
+        else {
+            return Err(BakeError::AllocationFailed);
+        };
+        if self.height_strength <= 0.0
+            || height
+                .iter()
+                .all(|value| (value - DEFAULT_HEIGHT).abs() <= f32::EPSILON)
+        {
+            return Ok(normals);
+        }
+        let width = self.resolution.width as usize;
+        let rows = self.resolution.height as usize;
+        let scale = self.height_strength * self.resolution.width.max(self.resolution.height) as f32
+            / HEIGHT_SLOPE_REFERENCE_TEXELS;
+        let at = |x: usize, y: usize| height[y * width + x];
+        for y in 0..rows {
+            for x in 0..width {
+                let du = (at((x + 1).min(width - 1), y) - at(x.saturating_sub(1), y)) * 0.5;
+                // Rows run top to bottom, so +V is toward the previous row.
+                let dv = (at(x, y.saturating_sub(1)) - at(x, (y + 1).min(rows - 1))) * 0.5;
+                if du == 0.0 && dv == 0.0 {
+                    continue;
+                }
+                let detail = Vec3::new(-du * scale, -dv * scale, 1.0).normalize_or(Vec3::Z);
+                let base = normals[y * width + x];
+                normals[y * width + x] =
+                    Vec3::new(base.x + detail.x, base.y + detail.y, base.z * detail.z)
+                        .normalize_or(Vec3::Z);
+            }
+        }
+        Ok(normals)
     }
 
     /// Final per-texel mask of a layer, or `None` when it is fully open. The
@@ -1389,6 +1572,16 @@ fn evaluate_generator(
     width: u32,
     height: u32,
 ) {
+    parallel_fill(values, width, height, |uv| generator.evaluate(&maps.sample(uv)));
+}
+
+/// Sets every texel from `value_at(uv)`, splitting rows across threads.
+fn parallel_fill<T: Send>(
+    values: &mut [T],
+    width: u32,
+    height: u32,
+    value_at: impl Fn(glam::Vec2) -> T + Sync,
+) {
     let row_len = width as usize;
     if row_len == 0 {
         return;
@@ -1399,6 +1592,7 @@ fn evaluate_generator(
         .clamp(1, 32);
     let rows_per_chunk = (height as usize).div_ceil(threads).max(1);
     let chunk_len = rows_per_chunk * row_len;
+    let value_at = &value_at;
     std::thread::scope(|scope| {
         for (chunk_index, chunk) in values.chunks_mut(chunk_len).enumerate() {
             scope.spawn(move || {
@@ -1407,8 +1601,7 @@ fn evaluate_generator(
                     let index = start + offset;
                     let x = (index % row_len) as u32;
                     let y = (index / row_len) as u32;
-                    let uv = raster::pixel_to_uv(x, y, width, height);
-                    *value = generator.evaluate(&maps.sample(uv));
+                    *value = value_at(raster::pixel_to_uv(x, y, width, height));
                 }
             });
         }
