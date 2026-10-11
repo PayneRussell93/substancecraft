@@ -24,6 +24,7 @@
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +65,48 @@ void* copyBytes(void const* source, size_t size) {
         std::memcpy(copy, source, size);
     }
     return copy;
+}
+
+float srgbToLinear(uint8_t value) {
+    float const v = float(value) / 255.0f;
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+
+uint8_t linearToSrgb(float value) {
+    float const v = value <= 0.0031308f ? value * 12.92f
+                                        : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+    return uint8_t(std::lround(std::fmin(std::fmax(v, 0.0f), 1.0f) * 255.0f));
+}
+
+// 2x2 box filter in linear space (alpha averaged directly). Odd edges clamp to the last texel.
+uint8_t* downsample(uint8_t const* source, uint32_t width, uint32_t height, uint32_t outWidth,
+        uint32_t outHeight) {
+    auto* out = static_cast<uint8_t*>(std::malloc(size_t(outWidth) * outHeight * 4));
+    if (!out) {
+        return nullptr;
+    }
+    for (uint32_t y = 0; y < outHeight; y++) {
+        uint32_t const y0 = y * 2 < height ? y * 2 : height - 1;
+        uint32_t const y1 = y * 2 + 1 < height ? y * 2 + 1 : height - 1;
+        for (uint32_t x = 0; x < outWidth; x++) {
+            uint32_t const x0 = x * 2 < width ? x * 2 : width - 1;
+            uint32_t const x1 = x * 2 + 1 < width ? x * 2 + 1 : width - 1;
+            uint8_t const* texels[4] = {
+                    source + (size_t(y0) * width + x0) * 4, source + (size_t(y0) * width + x1) * 4,
+                    source + (size_t(y1) * width + x0) * 4, source + (size_t(y1) * width + x1) * 4};
+            uint8_t* target = out + (size_t(y) * outWidth + x) * 4;
+            for (int channel = 0; channel < 3; channel++) {
+                float sum = 0.0f;
+                for (auto const* texel : texels) {
+                    sum += srgbToLinear(texel[channel]);
+                }
+                target[channel] = linearToSrgb(sum * 0.25f);
+            }
+            target[3] = uint8_t(
+                    (unsigned(texels[0][3]) + texels[1][3] + texels[2][3] + texels[3][3] + 2) / 4);
+        }
+    }
+    return out;
 }
 
 void destroyMesh(ScRenderer* r) {
@@ -240,11 +283,6 @@ bool sc_renderer_resize(ScRenderer* r, uint32_t width, uint32_t height) {
 bool sc_renderer_set_base_color_map(ScRenderer* r, uint32_t width, uint32_t height,
         uint8_t const* rgba8) {
     try {
-        size_t const size = size_t(width) * size_t(height) * 4;
-        void* pixels = copyBytes(rgba8, size);
-        if (!pixels) {
-            return false;
-        }
         uint8_t levels = 1;
         for (uint32_t extent = width > height ? width : height; extent > 1; extent >>= 1) {
             levels++;
@@ -255,17 +293,34 @@ bool sc_renderer_set_base_color_map(ScRenderer* r, uint32_t width, uint32_t heig
                                    .levels(levels)
                                    .sampler(Texture::Sampler::SAMPLER_2D)
                                    .format(Texture::InternalFormat::SRGB8_A8)
-                                   .usage(Texture::Usage::DEFAULT | Texture::Usage::GEN_MIPMAPPABLE)
                                    .build(*r->engine);
         if (!texture) {
-            std::free(pixels);
             return false;
         }
-        texture->setImage(*r->engine, 0,
-                Texture::PixelBufferDescriptor(pixels, size, Texture::Format::RGBA,
-                        Texture::Type::UBYTE, freeCallback));
-        if (levels > 1) {
-            texture->generateMipmaps(*r->engine);
+        // Mips are built on the CPU: Texture::generateMipmaps() stalls the frame readback on
+        // the OpenGL backend.
+        uint8_t* level = static_cast<uint8_t*>(copyBytes(rgba8, size_t(width) * height * 4));
+        if (!level) {
+            r->engine->destroy(texture);
+            return false;
+        }
+        uint32_t levelWidth = width;
+        uint32_t levelHeight = height;
+        for (uint8_t index = 0; index < levels && level; index++) {
+            size_t const levelSize = size_t(levelWidth) * levelHeight * 4;
+            uint8_t* next = nullptr;
+            uint32_t nextWidth = levelWidth > 1 ? levelWidth / 2 : 1;
+            uint32_t nextHeight = levelHeight > 1 ? levelHeight / 2 : 1;
+            if (index + 1 < levels) {
+                next = downsample(level, levelWidth, levelHeight, nextWidth, nextHeight);
+            }
+            // Filament takes ownership of `level` and frees it once uploaded.
+            texture->setImage(*r->engine, index,
+                    Texture::PixelBufferDescriptor(level, levelSize, Texture::Format::RGBA,
+                            Texture::Type::UBYTE, freeCallback));
+            level = next;
+            levelWidth = nextWidth;
+            levelHeight = nextHeight;
         }
         TextureSampler sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
                 TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::REPEAT);
