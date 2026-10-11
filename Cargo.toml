@@ -14,6 +14,8 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 fbxcel = { version = "0.9", features = ["tree", "writer"] }
 fbxcel-dom = "0.0.10"
 glam = { version = "0.30", features = ["serde"] }
+gltf = { version = "1.4.1", default-features = false, features = ["import", "utils", "names"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga"] }
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "schemars"] }
 rfd = "0.17"
 schemars = "1"

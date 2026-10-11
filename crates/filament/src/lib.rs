@@ -174,7 +174,13 @@ impl FilamentRuntime {
         }
         // SAFETY: `rgba8` holds exactly width * height * 4 bytes; the shim copies them.
         let uploaded = unsafe {
-            ffi::sc_renderer_set_map(self.raw.as_ptr(), slot as u32, width, height, rgba8.as_ptr())
+            ffi::sc_renderer_set_map(
+                self.raw.as_ptr(),
+                slot as u32,
+                width,
+                height,
+                rgba8.as_ptr(),
+            )
         };
         if !uploaded {
             return Err(FilamentError::TextureUnavailable);
@@ -458,7 +464,7 @@ mod tests {
 
     use substancecraft_core::{PrimitivePreset, ViewportCamera};
 
-    use super::{FLOATS_PER_VERTEX, FilamentRuntime, build_mesh_buffers};
+    use super::{FLOATS_PER_VERTEX, FilamentRuntime, MaterialMap, build_mesh_buffers};
 
     #[test]
     fn mesh_buffer_generation_preserves_topology_and_emits_finite_tangent_frames() {
@@ -508,6 +514,98 @@ mod tests {
             &pixels[center..center + 3],
             background,
             "cube should cover the center"
+        );
+    }
+
+    fn render_frame(renderer: &mut FilamentRuntime) -> Vec<u8> {
+        let (sender, receiver) = sync_channel(1);
+        // The first frames after a texture change may still show old data.
+        for _ in 0..3 {
+            let sender = sender.clone();
+            let rendered = renderer
+                .render(ViewportCamera::default(), 64, 64, 1.0, move |pixels| {
+                    let _ = sender.try_send(pixels);
+                })
+                .expect("Filament frame submission");
+            assert!(rendered);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                renderer.poll();
+                if receiver.try_recv().is_ok() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "Filament readback timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let rendered = renderer
+            .render(ViewportCamera::default(), 64, 64, 1.0, move |pixels| {
+                let _ = sender.try_send(pixels);
+            })
+            .expect("Filament frame submission");
+        assert!(rendered);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            renderer.poll();
+            if let Ok(pixels) = receiver.try_recv() {
+                return pixels;
+            }
+            assert!(Instant::now() < deadline, "Filament readback timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn mean_difference(left: &[u8], right: &[u8]) -> f32 {
+        let total = left
+            .iter()
+            .zip(right)
+            .map(|(a, b)| f32::from(a.abs_diff(*b)))
+            .sum::<f32>();
+        total / left.len() as f32
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0053_orm_and_normal_maps_shade_in_material_mode_but_not_in_preview() {
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        renderer
+            .set_mesh(&PrimitivePreset::Cube.build_mesh(), 60.0)
+            .expect("cube mesh upload");
+        renderer.set_preview_mode(false);
+        let baseline = render_frame(&mut renderer);
+
+        // Fully metallic, mirror-smooth: a dielectric grey turns very different.
+        renderer
+            .set_map(MaterialMap::Orm, 1, 1, 1, &[255, 10, 255, 255])
+            .expect("ORM upload");
+        let metal = render_frame(&mut renderer);
+        assert!(
+            mean_difference(&baseline, &metal) > 1.0,
+            "ORM map must change shading"
+        );
+
+        // A strongly tilted tangent-space normal changes lighting.
+        renderer
+            .set_map(MaterialMap::Orm, 2, 1, 1, &[255, 148, 0, 255])
+            .expect("ORM reset");
+        renderer
+            .set_map(MaterialMap::Normal, 3, 1, 1, &[240, 128, 140, 255])
+            .expect("normal upload");
+        let tilted = render_frame(&mut renderer);
+        assert!(
+            mean_difference(&baseline, &tilted) > 1.0,
+            "normal map must change shading"
+        );
+
+        // Preview mode ignores ORM and normal maps.
+        renderer
+            .set_map(MaterialMap::Orm, 4, 1, 1, &[255, 10, 255, 255])
+            .expect("ORM upload");
+        renderer.set_preview_mode(true);
+        let preview = render_frame(&mut renderer);
+        assert!(
+            mean_difference(&baseline, &preview) < 0.5,
+            "preview mode shows a neutral dielectric"
         );
     }
 }

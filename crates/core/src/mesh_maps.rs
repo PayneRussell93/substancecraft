@@ -1,5 +1,9 @@
-//! Geometry-derived mesh maps baked into UV space: world-space normal,
-//! position, curvature, ambient occlusion, and thickness.
+//! Geometry-derived mesh maps baked into UV space: tangent-space and
+//! world-space normal, position, curvature, ambient occlusion, and thickness.
+//!
+//! Maps come from the working (low) mesh itself, or — when a high-resolution
+//! source is given — from rays cast from a cage around the low mesh onto the
+//! high mesh, transferring its detail (high-to-low baking).
 //!
 //! These maps feed procedural generators (edge wear, dirt, orientation, ...)
 //! so effects adapt to each mesh. Baking is deterministic for a given mesh,
@@ -7,13 +11,14 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::noise::{lowbias32, unit_float};
+use crate::smoothing::{vertex_normals, vertex_tangents};
 use crate::topology::{mesh_bounds, weld_positions};
 use crate::{BakedTexture, MAX_BAKE_PIXELS, MeshError, MeshGeometry, raster};
 
@@ -47,6 +52,14 @@ pub struct MeshMapSettings {
     /// Faces meeting at less than this angle share smooth normals.
     #[serde(default = "default_smoothing_angle")]
     pub smoothing_angle_degrees: f32,
+    /// High-to-low only: how far outside and inside the low surface rays
+    /// search for the high mesh, as a fraction of the bounds diagonal.
+    #[serde(default = "default_cage_distance")]
+    pub cage_distance: f32,
+}
+
+fn default_cage_distance() -> f32 {
+    0.03
 }
 
 fn default_smoothing_angle() -> f32 {
@@ -64,6 +77,7 @@ impl Default for MeshMapSettings {
             padding: 4,
             seed: 1,
             smoothing_angle_degrees: default_smoothing_angle(),
+            cage_distance: default_cage_distance(),
         }
     }
 }
@@ -93,6 +107,9 @@ impl MeshMapSettings {
         {
             return Err(MeshMapError::InvalidSettings("smoothing_angle_degrees"));
         }
+        if !self.cage_distance.is_finite() || !(0.0001..=0.5).contains(&self.cage_distance) {
+            return Err(MeshMapError::InvalidSettings("cage_distance"));
+        }
         if self.padding > MAX_MESH_MAP_PADDING {
             return Err(MeshMapError::InvalidSettings("padding"));
         }
@@ -102,6 +119,8 @@ impl MeshMapSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MeshMapKind {
+    /// Tangent-space normal (OpenGL, +Y = +V) relative to the low mesh.
+    Normal,
     WorldNormal,
     Position,
     Curvature,
@@ -110,7 +129,8 @@ pub enum MeshMapKind {
 }
 
 impl MeshMapKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
         Self::WorldNormal,
         Self::Position,
         Self::Curvature,
@@ -120,6 +140,7 @@ impl MeshMapKind {
 
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Normal => "Normal",
             Self::WorldNormal => "World Normal",
             Self::Position => "Position",
             Self::Curvature => "Curvature",
@@ -145,6 +166,7 @@ pub enum MeshMapError {
 struct Texel {
     position: Vec3,
     normal: Vec3,
+    tangent_normal: Vec3,
     curvature: f32,
     ambient_occlusion: f32,
     thickness: f32,
@@ -164,6 +186,8 @@ pub struct MeshMapSample {
     pub relative_position: Vec3,
     /// Unit world-space shading normal.
     pub normal: Vec3,
+    /// Unit tangent-space normal relative to the low mesh; `+Z` when flat.
+    pub tangent_normal: Vec3,
     /// `0.5` is flat, above is convex, below is concave.
     pub curvature: f32,
     /// `1` is fully open, `0` fully occluded.
@@ -180,6 +204,7 @@ impl Default for MeshMapSample {
             unit_position: Vec3::ZERO,
             relative_position: Vec3::ZERO,
             normal: Vec3::Y,
+            tangent_normal: Vec3::Z,
             curvature: 0.5,
             ambient_occlusion: 1.0,
             thickness: 1.0,
@@ -199,6 +224,10 @@ pub struct MeshMaps {
     covered: Vec<bool>,
     /// Covered texels plus padding.
     filled: Vec<bool>,
+    /// Whether detail was transferred from a high-resolution mesh.
+    from_high_poly: bool,
+    /// Covered texels whose cage ray found no high-poly surface.
+    misses: usize,
 }
 
 impl MeshMaps {
@@ -212,6 +241,21 @@ impl MeshMaps {
 
     pub fn settings(&self) -> &MeshMapSettings {
         &self.settings
+    }
+
+    pub fn from_high_poly(&self) -> bool {
+        self.from_high_poly
+    }
+
+    /// Fraction of covered texels whose cage ray missed the high mesh; these
+    /// fall back to the low surface. High values mean the cage is too small
+    /// or the meshes do not overlap.
+    pub fn miss_fraction(&self) -> f32 {
+        let covered = self.covered.iter().filter(|value| **value).count();
+        if covered == 0 {
+            return 0.0;
+        }
+        self.misses as f32 / covered as f32
     }
 
     /// Fraction of texels inside a UV triangle (before padding).
@@ -260,6 +304,7 @@ impl MeshMaps {
             };
             accumulated.position += texel.position * weight;
             accumulated.normal += texel.normal * weight;
+            accumulated.tangent_normal += texel.tangent_normal * weight;
             accumulated.curvature += texel.curvature * weight;
             accumulated.ambient_occlusion += texel.ambient_occlusion * weight;
             accumulated.thickness += texel.thickness * weight;
@@ -276,6 +321,7 @@ impl MeshMaps {
             unit_position: ((position - self.bounds_min) / extent).clamp(Vec3::ZERO, Vec3::ONE),
             relative_position: (position - self.bounds_min) / self.diagonal(),
             normal: accumulated.normal.normalize_or(Vec3::Y),
+            tangent_normal: accumulated.tangent_normal.normalize_or(Vec3::Z),
             curvature: accumulated.curvature / total,
             ambient_occlusion: accumulated.ambient_occlusion / total,
             thickness: accumulated.thickness / total,
@@ -294,6 +340,7 @@ impl MeshMaps {
                 continue;
             }
             let rgb = match kind {
+                MeshMapKind::Normal => texel.tangent_normal * 0.5 + 0.5,
                 MeshMapKind::WorldNormal => texel.normal * 0.5 + 0.5,
                 MeshMapKind::Position => (texel.position - self.bounds_min) / extent,
                 MeshMapKind::Curvature => Vec3::splat(texel.curvature),
@@ -310,28 +357,55 @@ impl MeshMaps {
     }
 }
 
-/// Bakes every mesh map for `mesh`. When `cancel` becomes true the bake stops
-/// at the next row and returns [`MeshMapError::Cancelled`].
+/// Bakes every mesh map from `mesh` itself. When `cancel` becomes true the
+/// bake stops at the next row and returns [`MeshMapError::Cancelled`].
 pub fn bake_mesh_maps(
     mesh: &MeshGeometry,
     settings: &MeshMapSettings,
     cancel: Option<&AtomicBool>,
 ) -> Result<MeshMaps, MeshMapError> {
+    bake_mesh_maps_from(mesh, None, settings, cancel)
+}
+
+/// Bakes mesh maps into `low`'s UV layout. With `high`, each texel casts a
+/// ray from a cage `cage_distance` outside the low surface back along its
+/// normal, and every map is evaluated on the high mesh where it hits, so the
+/// tangent-space normal map carries the high mesh's detail. Texels whose ray
+/// misses fall back to the low surface and are counted in
+/// [`MeshMaps::miss_fraction`].
+pub fn bake_mesh_maps_from(
+    low: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    cancel: Option<&AtomicBool>,
+) -> Result<MeshMaps, MeshMapError> {
     settings.validate()?;
-    mesh.validate()?;
+    low.validate()?;
+    if let Some(high) = high {
+        high.validate()?;
+    }
     let is_cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
     let width = settings.resolution;
     let height = settings.resolution;
     let pixel_count = (width as usize) * (height as usize);
-    let (bounds_min, bounds_max) = mesh_bounds(mesh);
+    let (mut bounds_min, mut bounds_max) = mesh_bounds(low);
+    if let Some(high) = high {
+        let (high_min, high_max) = mesh_bounds(high);
+        bounds_min = bounds_min.min(high_min);
+        bounds_max = bounds_max.max(high_max);
+    }
     let diagonal = (bounds_max - bounds_min).length().max(1e-6);
 
-    let geometry = SurfaceGeometry::build(mesh, settings, diagonal);
+    let low_geometry = SurfaceGeometry::build(low, settings, diagonal);
+    let low_normals = vertex_normals(low, settings.smoothing_angle_degrees);
+    let low_tangents = vertex_tangents(low, &low_normals);
     if is_cancelled() {
         return Err(MeshMapError::Cancelled);
     }
-    let bvh = Bvh::build(mesh);
+    let high_geometry = high.map(|high| SurfaceGeometry::build(high, settings, diagonal));
+    // Occlusion and thickness rays always test the detailed surface.
+    let bvh = Bvh::build(high.unwrap_or(low));
     if is_cancelled() {
         return Err(MeshMapError::Cancelled);
     }
@@ -341,11 +415,11 @@ pub fn bake_mesh_maps(
     let mut owner = try_filled_vec(pixel_count, u32::MAX)?;
     let mut weights = try_filled_vec(pixel_count, Vec3::ZERO)?;
     let mut owned_by_interior = try_filled_vec(pixel_count, false)?;
-    for (triangle_index, triangle) in mesh.triangles.iter().enumerate() {
-        if geometry.face_normals[triangle_index] == Vec3::ZERO {
+    for (triangle_index, triangle) in low.triangles.iter().enumerate() {
+        if low_geometry.face_normals[triangle_index] == Vec3::ZERO {
             continue;
         }
-        let uvs = triangle.map(|index| mesh.vertices[index as usize].uv);
+        let uvs = triangle.map(|index| low.vertices[index as usize].uv);
         raster::rasterize_uv_triangle(
             uvs,
             width,
@@ -366,13 +440,30 @@ pub fn bake_mesh_maps(
         .collect::<Vec<_>>();
 
     let mut texels = try_filled_vec(pixel_count, Texel::default())?;
-    let context = TexelContext {
-        mesh,
+    let low_context = TexelContext {
+        mesh: low,
         settings,
-        geometry: &geometry,
+        geometry: &low_geometry,
         bvh: &bvh,
         diagonal,
     };
+    let high_context = high
+        .zip(high_geometry.as_ref())
+        .map(|(mesh, geometry)| TexelContext {
+            mesh,
+            settings,
+            geometry,
+            bvh: &bvh,
+            diagonal,
+        });
+    let cage = settings.cage_distance * diagonal;
+    let frame = LowFrame {
+        mesh: low,
+        normals: &low_normals,
+        tangents: &low_tangents,
+    };
+    let misses = AtomicUsize::new(0);
+
     let rows_per_chunk = 4_usize;
     let chunk_len = rows_per_chunk * width as usize;
     let work = Mutex::new(texels.chunks_mut(chunk_len).enumerate());
@@ -400,9 +491,27 @@ pub fn bake_mesh_maps(
                     for (offset, texel) in chunk.iter_mut().enumerate() {
                         let index = start + offset;
                         let triangle = owner[index];
-                        if triangle != u32::MAX {
-                            *texel = context.evaluate(triangle, weights[index], index as u32);
+                        if triangle == u32::MAX {
+                            continue;
                         }
+                        let basis = frame.at(triangle, weights[index]);
+                        let projected = high_context.as_ref().and_then(|context| {
+                            let origin = basis.position + basis.normal * cage;
+                            context
+                                .bvh
+                                .closest_hit(origin, -basis.normal, 0.0, cage * 2.0)
+                                .map(|hit| {
+                                    context.evaluate(hit.triangle, hit.weights, index as u32)
+                                })
+                        });
+                        if high_context.is_some() && projected.is_none() {
+                            misses.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let mut value = projected.unwrap_or_else(|| {
+                            low_context.evaluate(triangle, weights[index], index as u32)
+                        });
+                        value.tangent_normal = basis.to_tangent(value.normal);
+                        *texel = value;
                     }
                 }
             });
@@ -422,7 +531,58 @@ pub fn bake_mesh_maps(
         texels,
         covered,
         filled,
+        from_high_poly: high.is_some(),
+        misses: misses.into_inner(),
     })
+}
+
+/// Per-vertex normal/tangent frame of the low mesh, interpolated exactly as
+/// the renderer interpolates it, so tangent-space normals decode correctly.
+struct LowFrame<'a> {
+    mesh: &'a MeshGeometry,
+    normals: &'a [Vec3],
+    tangents: &'a [glam::Vec4],
+}
+
+struct TangentBasis {
+    position: Vec3,
+    normal: Vec3,
+    tangent: Vec3,
+    bitangent: Vec3,
+}
+
+impl LowFrame<'_> {
+    fn at(&self, triangle: u32, weights: Vec3) -> TangentBasis {
+        let corners = self.mesh.triangles[triangle as usize];
+        let blend3 = |values: [Vec3; 3]| {
+            values[0] * weights.x + values[1] * weights.y + values[2] * weights.z
+        };
+        let position = blend3(corners.map(|index| self.mesh.vertices[index as usize].position));
+        let normal =
+            blend3(corners.map(|index| self.normals[index as usize])).normalize_or(Vec3::Z);
+        let tangent4 = corners.map(|index| self.tangents[index as usize]);
+        let tangent = blend3(tangent4.map(|tangent| tangent.truncate()));
+        let tangent =
+            (tangent - normal * normal.dot(tangent)).normalize_or(normal.any_orthonormal_vector());
+        let sign = if tangent4[0].w < 0.0 { -1.0 } else { 1.0 };
+        TangentBasis {
+            position,
+            normal,
+            tangent,
+            bitangent: normal.cross(tangent) * sign,
+        }
+    }
+}
+
+impl TangentBasis {
+    fn to_tangent(&self, world: Vec3) -> Vec3 {
+        Vec3::new(
+            world.dot(self.tangent),
+            world.dot(self.bitangent),
+            world.dot(self.normal),
+        )
+        .normalize_or(Vec3::Z)
+    }
 }
 
 fn try_filled_vec<T: Clone>(count: usize, value: T) -> Result<Vec<T>, MeshMapError> {
@@ -800,13 +960,15 @@ impl TexelContext<'_> {
             total += self
                 .bvh
                 .closest_hit(inside, direction, bias, thickness_distance)
-                .unwrap_or(thickness_distance);
+                .map_or(thickness_distance, |hit| hit.distance);
         }
         let thickness = (total / thickness_samples as f32 / thickness_distance).clamp(0.0, 1.0);
 
         Texel {
             position: point,
             normal,
+            // Set by the caller once the low-mesh tangent frame is known.
+            tangent_normal: Vec3::Z,
             curvature,
             ambient_occlusion,
             thickness,
@@ -950,7 +1112,7 @@ impl Bvh {
             .is_some()
     }
 
-    fn closest_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> Option<f32> {
+    fn closest_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> Option<RayHit> {
         self.traverse(origin, direction, t_min, t_max, false)
     }
 
@@ -961,7 +1123,7 @@ impl Bvh {
         t_min: f32,
         mut t_max: f32,
         any: bool,
-    ) -> Option<f32> {
+    ) -> Option<RayHit> {
         if self.order.is_empty() {
             return None;
         }
@@ -979,15 +1141,20 @@ impl Bvh {
                 let first = node.first as usize;
                 for triangle in &self.order[first..first + node.count as usize] {
                     let [a, b, c] = self.triangles[*triangle as usize];
-                    if let Some(distance) = ray_triangle(origin, direction, a, b, c)
+                    if let Some((distance, u, v)) = ray_triangle(origin, direction, a, b, c)
                         && distance > t_min
                         && distance < t_max
                     {
+                        let hit = RayHit {
+                            distance,
+                            triangle: *triangle,
+                            weights: Vec3::new(1.0 - u - v, u, v),
+                        };
                         if any {
-                            return Some(distance);
+                            return Some(hit);
                         }
                         t_max = distance;
-                        closest = Some(distance);
+                        closest = Some(hit);
                     }
                 }
             } else if depth + 2 <= stack.len() {
@@ -1010,8 +1177,23 @@ fn ray_hits_box(origin: Vec3, inverse: Vec3, min: Vec3, max: Vec3, t_min: f32, t
     near <= far
 }
 
-/// Two-sided Möller–Trumbore intersection returning the hit distance.
-fn ray_triangle(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+#[derive(Clone, Copy, Debug)]
+struct RayHit {
+    distance: f32,
+    triangle: u32,
+    /// Barycentric weights of the triangle corners at the hit.
+    weights: Vec3,
+}
+
+/// Two-sided Möller–Trumbore intersection returning the hit distance and
+/// the barycentric `u`, `v` of corners `b` and `c`.
+fn ray_triangle(
+    origin: Vec3,
+    direction: Vec3,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+) -> Option<(f32, f32, f32)> {
     let edge_ab = b - a;
     let edge_ac = c - a;
     let p = direction.cross(edge_ac);
@@ -1031,7 +1213,7 @@ fn ray_triangle(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Opt
         return None;
     }
     let distance = edge_ac.dot(q) * inverse;
-    distance.is_finite().then_some(distance)
+    distance.is_finite().then_some((distance, u, v))
 }
 
 #[cfg(test)]
@@ -1084,6 +1266,7 @@ mod tests {
         let mut mesh = MeshGeometry {
             vertices: Vec::new(),
             triangles: Vec::new(),
+            ..MeshGeometry::default()
         };
         let mut quad = |positions: [Vec3; 4], uv_min: Vec2, uv_max: Vec2| {
             let base = mesh.vertices.len() as u32;
@@ -1176,6 +1359,91 @@ mod tests {
             sample.curvature > 0.55,
             "sphere is convex: {}",
             sample.curvature
+        );
+    }
+
+    /// A 1.2-unit quad tilted about Z so its normal leans `degrees` toward +X,
+    /// raised by `lift`.
+    fn tilted_quad(degrees: f32, lift: f32) -> MeshGeometry {
+        let slope = degrees.to_radians().tan();
+        let point = |x: f32, z: f32| MeshVertex {
+            position: Vec3::new(x, lift - slope * x, z),
+            uv: Vec2::new(x, z),
+        };
+        MeshGeometry {
+            vertices: vec![
+                point(-0.6, 0.6),
+                point(0.6, 0.6),
+                point(0.6, -0.6),
+                point(-0.6, -0.6),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3]],
+        }
+    }
+
+    #[test]
+    fn tc_0051_high_to_low_bake_transfers_high_poly_normals_into_tangent_space() {
+        let low = PrimitivePreset::Plane.build_mesh();
+        let high = tilted_quad(20.0, 0.0);
+        let settings = MeshMapSettings {
+            cage_distance: 0.2,
+            ..fast_settings(32)
+        };
+
+        let maps = bake_mesh_maps_from(&low, Some(&high), &settings, None).unwrap();
+
+        assert!(maps.from_high_poly());
+        assert_eq!(maps.miss_fraction(), 0.0);
+        let expected = 20.0_f32.to_radians().sin();
+        for uv in [Vec2::splat(0.5), Vec2::new(0.8, 0.3)] {
+            let sample = maps.sample(uv);
+            assert!(
+                (sample.tangent_normal.x - expected).abs() < 0.02,
+                "tangent normal {}",
+                sample.tangent_normal
+            );
+            assert!(sample.tangent_normal.y.abs() < 0.02);
+            assert!(
+                sample.normal.x > 0.3,
+                "world normal comes from the high mesh"
+            );
+        }
+        let normal_map = maps.to_texture(MeshMapKind::Normal);
+        let centre = normal_map.sample_uv(Vec2::splat(0.5)).unwrap();
+        assert!(centre[0] > 165 && (125..=131).contains(&centre[1]));
+
+        // Without a high mesh the low surface is its own detail: flat normals.
+        let plain = bake_mesh_maps(&low, &settings, None).unwrap();
+        assert!(!plain.from_high_poly());
+        assert!((plain.sample(Vec2::splat(0.5)).tangent_normal - Vec3::Z).length() < 1e-4);
+    }
+
+    #[test]
+    fn tc_0052_cage_rays_that_miss_the_high_mesh_fall_back_and_are_reported() {
+        let low = PrimitivePreset::Plane.build_mesh();
+        let far_away = tilted_quad(20.0, 5.0);
+        let settings = MeshMapSettings {
+            cage_distance: 0.01,
+            ..fast_settings(16)
+        };
+
+        let maps = bake_mesh_maps_from(&low, Some(&far_away), &settings, None).unwrap();
+
+        assert!(maps.miss_fraction() > 0.99);
+        let sample = maps.sample(Vec2::splat(0.5));
+        assert!((sample.tangent_normal - Vec3::Z).length() < 1e-4);
+        assert!((sample.normal - Vec3::Y).length() < 1e-4);
+        assert_eq!(
+            bake_mesh_maps_from(
+                &low,
+                Some(&far_away),
+                &MeshMapSettings {
+                    cage_distance: 0.0,
+                    ..settings
+                },
+                None
+            ),
+            Err(MeshMapError::InvalidSettings("cage_distance"))
         );
     }
 }

@@ -2,8 +2,17 @@
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
 mod fbx;
+mod gltf_import;
+mod textures;
 
-pub use fbx::{FbxImportError, ImportedFbxMesh, MAX_FBX_BYTES, import_binary_fbx_meshes};
+pub use fbx::{
+    FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
+};
+pub use gltf_import::{GltfImportError, MAX_GLTF_BYTES, import_gltf, import_gltf_file};
+pub use textures::{
+    MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image, encode_texture,
+    load_texture_image, write_texture,
+};
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,9 +21,9 @@ use std::{
     path::Path,
 };
 use substancecraft_core::{
-    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MeshError,
-    MeshGeometry, MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing, PrimitivePreset,
-    TextureSet,
+    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MaterialTextures,
+    MeshError, MeshGeometry, MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing,
+    PrimitivePreset, ResourceId, ResourceImages, TextureSet,
 };
 use thiserror::Error;
 
@@ -183,15 +192,24 @@ pub fn bake_texture_set_id_mask(texture_set: &TextureSet) -> Result<BakedTexture
     Ok(texture_set.bake_id_mask()?)
 }
 
-/// Bakes one channel of a texture set. `mesh` is required by polygon masks and
-/// `mesh_maps` by mask generators; pass `None` when no layer uses them.
+/// Bakes one channel of a texture set. `mesh` is required by polygon masks,
+/// `mesh_maps` by mask generators and triplanar bitmaps, and `resources` by
+/// bitmap fills, masks, and brush alphas; pass `None` when no layer uses them.
 pub fn bake_texture_set_channel(
     texture_set: &TextureSet,
     channel: MaterialChannel,
     mesh: Option<&MeshGeometry>,
     mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
 ) -> Result<BakedTexture, ApiError> {
-    Ok(texture_set.bake_channel(channel, BakeContext { mesh, mesh_maps })?)
+    Ok(texture_set.bake_channel(
+        channel,
+        BakeContext {
+            mesh,
+            mesh_maps,
+            resources,
+        },
+    )?)
 }
 
 /// Applies smoothing/subdivision, then bakes geometry-derived mesh maps.
@@ -208,6 +226,63 @@ pub fn bake_mesh_maps(
     Ok(substancecraft_core::bake_mesh_maps(
         &smoothed, &settings, None,
     )?)
+}
+
+/// High-to-low bake: projects `high`'s surface detail into the smoothed low
+/// mesh's UVs, producing a tangent-space normal map plus the other mesh maps
+/// evaluated on the high surface.
+pub fn bake_mesh_maps_high_to_low(
+    low: &MeshGeometry,
+    high: &MeshGeometry,
+    smoothing: &MeshSmoothing,
+    settings: &MeshMapSettings,
+) -> Result<MeshMaps, ApiError> {
+    let smoothed = smoothing.apply(low)?;
+    let settings = MeshMapSettings {
+        smoothing_angle_degrees: smoothing.angle_degrees,
+        ..*settings
+    };
+    Ok(substancecraft_core::bake_mesh_maps_from(
+        &smoothed,
+        Some(high),
+        &settings,
+        None,
+    )?)
+}
+
+/// Bakes the viewport/engine textures: Base Color (Opacity in alpha), packed
+/// ORM (occlusion, roughness, metallic), the combined tangent-space normal,
+/// and Emissive.
+pub fn bake_texture_set_material(
+    texture_set: &TextureSet,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+) -> Result<MaterialTextures, ApiError> {
+    Ok(texture_set.bake_material(BakeContext {
+        mesh,
+        mesh_maps,
+        resources,
+    })?)
+}
+
+/// Loads every bitmap the project lists. Unreadable files are reported per
+/// resource rather than failing the whole load, so a project with one
+/// missing texture still opens.
+pub fn load_project_resources(
+    project: &MaterialProject,
+) -> (ResourceImages, Vec<(ResourceId, TextureIoError)>) {
+    let mut images = ResourceImages::new();
+    let mut failures = Vec::new();
+    for resource in &project.resources {
+        match load_texture_image(&resource.source) {
+            Ok(image) => {
+                images.insert(resource.id, std::sync::Arc::new(image));
+            }
+            Err(error) => failures.push((resource.id, error)),
+        }
+    }
+    (images, failures)
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -306,6 +381,7 @@ mod tests {
                         opacity: 0.8,
                         roughness: 0.3,
                         metallic: 1.0,
+                        height: 0.7,
                     }],
                     mask_strokes: vec![MaskStroke {
                         points: vec![Vec2::new(0.5, 0.5)],
@@ -327,6 +403,7 @@ mod tests {
                         inverted: true,
                     }),
                 }],
+                height_strength: 2.5,
             }],
             saved_poses: vec![NamedPose {
                 id: PoseId(4),
@@ -411,6 +488,7 @@ mod tests {
                 source: "builtin:Sphere".to_owned(),
                 scale: 1.0,
                 smoothing: MeshSmoothing::default(),
+                high_poly_source: Some("sculpt.fbx".to_owned()),
             }),
             ..MaterialProject::empty()
         };

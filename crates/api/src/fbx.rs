@@ -287,14 +287,18 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, FbxImportError> {
     Ok(u64::from_le_bytes(array))
 }
 
+/// A mesh read from FBX or glTF.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ImportedFbxMesh {
+pub struct ImportedMesh {
     pub name: String,
     pub geometry: MeshGeometry,
     pub generated_uvs: bool,
 }
 
-pub fn import_binary_fbx_meshes(bytes: &[u8]) -> Result<Vec<ImportedFbxMesh>, FbxImportError> {
+/// Former name of [`ImportedMesh`].
+pub type ImportedFbxMesh = ImportedMesh;
+
+pub fn import_binary_fbx_meshes(bytes: &[u8]) -> Result<Vec<ImportedMesh>, FbxImportError> {
     if bytes.is_empty() {
         return Err(FbxImportError::EmptyInput);
     }
@@ -330,7 +334,7 @@ pub fn import_binary_fbx_meshes(bytes: &[u8]) -> Result<Vec<ImportedFbxMesh>, Fb
 
 fn import_mesh(
     mesh: fbxcel_dom::v7400::object::geometry::MeshHandle<'_>,
-) -> Result<ImportedFbxMesh, FbxImportError> {
+) -> Result<ImportedMesh, FbxImportError> {
     let polygon_vertices = mesh
         .polygon_vertices()
         .map_err(|error| FbxImportError::InvalidMesh(error.to_string()))?;
@@ -394,19 +398,20 @@ fn import_mesh(
     let geometry = MeshGeometry {
         vertices,
         triangles,
+        ..MeshGeometry::default()
     };
     geometry
         .validate()
         .map_err(|error| FbxImportError::InvalidMesh(error.to_string()))?;
 
-    Ok(ImportedFbxMesh {
+    Ok(ImportedMesh {
         name: mesh.name().unwrap_or("Mesh").to_owned(),
         geometry,
         generated_uvs,
     })
 }
 
-fn generate_planar_uvs(vertices: &mut [MeshVertex]) -> Result<(), FbxImportError> {
+pub(crate) fn generate_planar_uvs(vertices: &mut [MeshVertex]) -> Result<(), FbxImportError> {
     let Some(first) = vertices.first() else {
         return Err(FbxImportError::NoTriangles);
     };

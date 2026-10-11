@@ -133,13 +133,15 @@ impl SubstanceCraftApp {
         self.hovered_selection.clear();
         let channel = match mode {
             PaintMode::Id => Some(MaterialChannel::Id),
-            PaintMode::Paint | PaintMode::Mask if self.active_channel == MaterialChannel::Id => {
-                Some(MaterialChannel::BaseColor)
-            }
             _ => None,
         };
         if let Some(channel) = channel {
             self.set_preview_channel(channel);
+        } else if matches!(mode, PaintMode::Paint | PaintMode::Mask)
+            && self.channel_preview
+            && self.active_channel == MaterialChannel::Id
+        {
+            self.set_material_preview();
         }
         if mode != PaintMode::View && self.drawer.is_none() {
             self.drawer = Some(Drawer::Brush);
@@ -148,8 +150,23 @@ impl SubstanceCraftApp {
 
     fn set_preview_channel(&mut self, channel: MaterialChannel) {
         self.active_channel = channel;
+        self.channel_preview = true;
         self.mesh_map_preview = None;
         self.invalidate_preview();
+    }
+
+    fn set_material_preview(&mut self) {
+        self.channel_preview = false;
+        self.mesh_map_preview = None;
+        self.invalidate_preview();
+    }
+
+    fn preview_label(&self) -> &'static str {
+        match self.mesh_map_preview {
+            Some(kind) => kind.name(),
+            None if self.channel_preview => channel_label(self.active_channel),
+            None => "Material",
+        }
     }
 
     fn select_primitive(&mut self, preset: PrimitivePreset) {
@@ -160,8 +177,11 @@ impl SubstanceCraftApp {
             source: format!("builtin:{}", preset.name()),
             scale: 1.0,
             smoothing: self.mesh_smoothing,
+            high_poly_source: None,
         });
         self.set_base_geometry(Some(preset.build_mesh()));
+        self.high_poly = None;
+        self.high_poly_changed();
     }
 
     fn select_texture_set(&mut self, set_id: TextureSetId) {
@@ -296,18 +316,26 @@ impl SubstanceCraftApp {
                 }
                 widgets::divider(ui);
                 ui.add_space(2.0);
-                let selected_text = match self.mesh_map_preview {
-                    Some(kind) => kind.name(),
-                    None => channel_label(self.active_channel),
-                };
+                let selected_text = self.preview_label();
                 let mut chosen = None;
+                let mut material = false;
                 egui::ComboBox::from_id_salt("toolbar_channel")
                     .width(118.0)
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
+                        let material_selected =
+                            self.mesh_map_preview.is_none() && !self.channel_preview;
+                        material = ui
+                            .add(egui::Button::selectable(material_selected, "Material"))
+                            .on_hover_text(
+                                "Full PBR material: color, roughness, metallic, normal, AO",
+                            )
+                            .clicked();
+                        ui.separator();
                         for channel in CHANNELS {
-                            let selected =
-                                self.mesh_map_preview.is_none() && self.active_channel == channel;
+                            let selected = self.mesh_map_preview.is_none()
+                                && self.channel_preview
+                                && self.active_channel == channel;
                             if ui
                                 .add_enabled(
                                     BAKEABLE_CHANNELS.contains(&channel),
@@ -320,8 +348,10 @@ impl SubstanceCraftApp {
                         }
                     })
                     .response
-                    .on_hover_text("Preview channel");
-                if let Some(channel) = chosen {
+                    .on_hover_text("Viewport preview");
+                if material {
+                    self.set_material_preview();
+                } else if let Some(channel) = chosen {
                     self.set_preview_channel(channel);
                 }
                 ui.add_space(2.0);
@@ -605,10 +635,11 @@ impl SubstanceCraftApp {
                     false,
                     2,
                 );
+                slider_row(ui, "Height", &mut self.brush_height, 0.0..=1.0, false, 2);
                 hint(
                     ui,
-                    "One stroke paints every channel the layer enables: color, roughness, \
-                     and metallic.",
+                    "One stroke paints every channel the layer enables. Height 0.5 is \
+                     neutral; higher raises and lower dents — enable Hgt on the layer.",
                 );
             }
             _ => {
@@ -697,6 +728,66 @@ impl SubstanceCraftApp {
             ui,
             "Generators such as Edge Wear and Dirt read these maps. They rebake \
              automatically when the mesh or its smoothing changes.",
+        );
+
+        widgets::caption(ui, "High poly source");
+        let high_poly = self.high_poly.as_ref().map(|source| {
+            let name = source
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "High poly".to_owned());
+            (name, source.geometry.triangles.len())
+        });
+        match high_poly {
+            Some((name, triangles)) => {
+                widgets::property_row(ui, "Mesh", |ui| ui.label(name));
+                widgets::property_row(ui, "Triangles", |ui| ui.label(triangles.to_string()));
+                if let Some(maps) = self.fresh_mesh_maps().filter(|maps| maps.from_high_poly()) {
+                    let misses = maps.miss_fraction();
+                    let color = if misses > 0.05 { WARNING } else { theme::TEXT };
+                    widgets::property_row(ui, "Ray misses", |ui| {
+                        ui.label(RichText::new(format!("{:.1}%", misses * 100.0)).color(color))
+                    });
+                    if misses > 0.05 {
+                        hint(
+                            ui,
+                            "Many cage rays miss the high mesh: raise Cage distance.",
+                        );
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if widgets::pill_button(ui, Some(Icon::Import), "Replace…", false, false)
+                        .clicked()
+                    {
+                        self.pick_high_poly();
+                    }
+                    if widgets::pill_button(ui, Some(Icon::Close), "Remove", false, false).clicked()
+                    {
+                        self.clear_high_poly();
+                    }
+                });
+            }
+            None => {
+                if widgets::pill_button(ui, Some(Icon::Import), "Load high poly FBX…", false, true)
+                    .clicked()
+                {
+                    self.pick_high_poly();
+                }
+                hint(
+                    ui,
+                    "Bake a detailed sculpt onto this mesh: its surface becomes the Normal \
+                     map, and AO/curvature come from the high mesh. Same scale as import.",
+                );
+            }
+        }
+        slider_row(
+            ui,
+            "Cage distance",
+            &mut self.mesh_map_settings.cage_distance,
+            0.001..=0.2,
+            true,
+            3,
         );
 
         widgets::caption(ui, "Settings");
@@ -913,11 +1004,16 @@ impl SubstanceCraftApp {
             ))
             .show(context, |ui| {
                 ui.set_width(INSPECTOR_WIDTH);
+                // An Area offers last frame's rect as available space, so the scroll
+                // height must come from the window, not from `ui`; otherwise the column
+                // stays clipped at a stale height after its content grows.
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_scroll")
                     .max_height(max_height)
+                    .min_scrolled_height(max_height)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        ui.set_max_width(INSPECTOR_WIDTH);
                         ui.spacing_mut().item_spacing.y = theme::GAP;
                         self.texture_sets_card(ui);
                         self.layers_card(ui);
@@ -1195,12 +1291,30 @@ impl SubstanceCraftApp {
                 );
                 widgets::property_row(ui, "Texture set", |ui| ui.label(name));
                 widgets::property_row(ui, "Resolution", |ui| ui.label(resolution));
+                let mut strength = texture_set.height_strength;
+                if slider_row(ui, "Height force", &mut strength, 0.0..=8.0, false, 2)
+                    && let Some(set) = self
+                        .project
+                        .texture_sets
+                        .iter_mut()
+                        .find(|set| Some(set.id) == self.selected_texture_set)
+                {
+                    set.height_strength = strength;
+                    self.invalidate_preview();
+                }
 
                 if self.selected_layer().is_some() {
                     self.layer_properties(ui);
                 }
 
                 widgets::caption(ui, "Bake & export");
+                if widgets::pill_button(ui, Some(Icon::Export), "Export material set…", true, true)
+                    .on_hover_text("Base Color, packed ORM, and Normal TGAs into a folder")
+                    .clicked()
+                {
+                    self.export_material_set();
+                }
+                ui.add_space(2.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                     for channel in BAKEABLE_CHANNELS {
@@ -1246,22 +1360,27 @@ impl SubstanceCraftApp {
         });
         slider_row(ui, "Opacity", &mut layer.opacity, 0.0..=1.0, false, 2);
         widgets::property_row(ui, "Channels", |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (channel, label) in [
-                (MaterialChannel::BaseColor, "Color"),
-                (MaterialChannel::Roughness, "Rough"),
-                (MaterialChannel::Metallic, "Metal"),
-                (MaterialChannel::Id, "ID"),
-            ] {
-                let enabled = layer.channels.contains(&channel);
-                if widgets::chip(ui, label, enabled).clicked() {
-                    if enabled {
-                        layer.channels.remove(&channel);
-                    } else {
-                        layer.channels.insert(channel);
+            // Wrap so six chips never widen the inspector column.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (channel, label) in [
+                    (MaterialChannel::BaseColor, "Color"),
+                    (MaterialChannel::Roughness, "Rough"),
+                    (MaterialChannel::Metallic, "Metal"),
+                    (MaterialChannel::Height, "Hgt"),
+                    (MaterialChannel::Normal, "Nrm"),
+                    (MaterialChannel::Id, "ID"),
+                ] {
+                    let enabled = layer.channels.contains(&channel);
+                    if widgets::chip(ui, label, enabled).clicked() {
+                        if enabled {
+                            layer.channels.remove(&channel);
+                        } else {
+                            layer.channels.insert(channel);
+                        }
                     }
                 }
-            }
+            });
         });
 
         if let Some(fill) = layer.fill.as_mut() {
@@ -1279,6 +1398,7 @@ impl SubstanceCraftApp {
             });
             slider_row(ui, "Roughness", &mut fill.roughness, 0.0..=1.0, false, 2);
             slider_row(ui, "Metallic", &mut fill.metallic, 0.0..=1.0, false, 2);
+            slider_row(ui, "Height", &mut fill.height, 0.0..=1.0, false, 2);
         } else {
             ui.add_space(2.0);
             if widgets::pill_button(ui, Some(Icon::Plus), "Add fill", false, true)
@@ -1405,10 +1525,7 @@ impl SubstanceCraftApp {
                                 );
                             }
                             status_separator(ui);
-                            let preview = match self.mesh_map_preview {
-                                Some(kind) => kind.name(),
-                                None => channel_label(self.active_channel),
-                            };
+                            let preview = self.preview_label();
                             status_text(ui, preview, theme::TEXT_WEAK);
                             if self.mesh_map_job_running() {
                                 status_separator(ui);
@@ -1550,14 +1667,16 @@ fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
         }
         MaskGenerator::Orientation(settings) => {
             widgets::property_row(ui, "Direction", |ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                for direction in Direction::ALL {
-                    if widgets::chip(ui, direction.name(), settings.direction == direction)
-                        .clicked()
-                    {
-                        settings.direction = direction;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 4.0);
+                    for direction in Direction::ALL {
+                        if widgets::chip(ui, direction.name(), settings.direction == direction)
+                            .clicked()
+                        {
+                            settings.direction = direction;
+                        }
                     }
-                }
+                });
             });
             slider_row(
                 ui,

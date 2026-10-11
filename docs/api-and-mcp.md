@@ -10,7 +10,9 @@
 - `bake_texture_set_base_color(texture_set)` for a bounded RGBA8 composite respecting layer opacity, grayscale masks, and optional ID-color clipping.
 - `bake_texture_set_id_mask(texture_set)` for the discrete color-coded ID map painted into UV layers.
 - `bake_texture_set_channel(texture_set, channel, mesh, mesh_maps)` for Base Color, Roughness, Metallic, or ID. Fill layers, mask generators (which need `mesh_maps`), polygon masks (which need `mesh`), painted masks, and ID clipping all compose here.
-- `bake_mesh_maps(mesh, smoothing, settings)` for world-normal, position, curvature, ambient-occlusion, and thickness maps after applying mesh smoothing and subdivision.
+- `bake_mesh_maps(mesh, smoothing, settings)` for tangent-normal, world-normal, position, curvature, ambient-occlusion, and thickness maps after applying mesh smoothing and subdivision.
+- `bake_mesh_maps_high_to_low(low, high, smoothing, settings)` for the same maps, projected from a high-resolution mesh through a cage (`settings.cage_distance`); `MeshMaps::miss_fraction()` reports texels whose rays missed.
+- `bake_texture_set_material(texture_set, mesh, mesh_maps)` for the viewport and engine trio: opaque Base Color, packed ORM (R occlusion, G roughness, B metallic), and an OpenGL-convention tangent-space Normal combining baked detail, Normal-channel layers, and Height.
 - `encode_project_json(project)` and `decode_project_json(bytes)` for validated, size-bounded project serialization.
 - `save_project_file(path, project)` and `load_project_file(path)` for atomic `.sproject` file persistence.
 

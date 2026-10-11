@@ -7,19 +7,31 @@ use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod brush;
+mod compositing;
+mod filters;
 mod generators;
 mod mesh_maps;
 pub mod noise;
 mod raster;
+mod resources;
 mod smoothing;
 mod topology;
 
+pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING};
+pub use compositing::{BakeContext, BakeError, BakedTexture, MaterialTextures};
+pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
     Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
     MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
+    bake_mesh_maps_from,
+};
+pub use resources::{
+    BitmapMask, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MIN_PROJECTION_SCALE,
+    ProjectResource, ProjectionMode, ResourceImages, TextureImage, TextureProjection,
 };
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
@@ -34,7 +46,7 @@ pub const MAX_BAKE_PIXELS: usize = 4_194_304;
 /// Upper bound on triangles referenced by one layer's polygon mask.
 pub const MAX_POLYGON_MASK_TRIANGLES: usize = 8_388_608;
 const MAX_LAYER_STROKES: usize = 8_192;
-const MAX_STROKE_POINTS: usize = 4_096;
+pub(crate) const MAX_STROKE_POINTS: usize = 4_096;
 const MAX_EDIT_HISTORY: usize = 128;
 
 macro_rules! id_type {
@@ -51,6 +63,7 @@ id_type!(TextureSetId);
 id_type!(LayerId);
 id_type!(BoneId);
 id_type!(PoseId);
+id_type!(ResourceId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrimitivePreset {
@@ -88,10 +101,17 @@ pub struct MeshVertex {
     pub uv: glam::Vec2,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeshGeometry {
     pub vertices: Vec<MeshVertex>,
     pub triangles: Vec<[u32; 3]>,
+    /// Material slot of each triangle, indexing `material_slots`. Empty when
+    /// the whole mesh uses slot 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triangle_materials: Vec<u32>,
+    /// Material slot names in index order; each slot becomes a texture set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_slots: Vec<String>,
 }
 
 impl MeshGeometry {
@@ -112,6 +132,89 @@ impl MeshGeometry {
                 return Err(MeshError::InvalidTriangle(triangle_index));
             }
         }
+        if !self.triangle_materials.is_empty()
+            && (self.triangle_materials.len() != self.triangles.len()
+                || self
+                    .triangle_materials
+                    .iter()
+                    .any(|slot| *slot as usize >= self.material_slots.len().max(1)))
+        {
+            return Err(MeshError::InvalidMaterialSlots);
+        }
+        Ok(())
+    }
+
+    /// Number of material slots (at least one).
+    pub fn material_slot_count(&self) -> usize {
+        self.material_slots.len().max(1)
+    }
+
+    /// Slot of triangle `triangle`; 0 when the mesh has no per-triangle
+    /// assignment.
+    pub fn material_of(&self, triangle: usize) -> u32 {
+        self.triangle_materials.get(triangle).copied().unwrap_or(0)
+    }
+
+    /// Name of slot `slot`, falling back to a generated name.
+    pub fn material_slot_name(&self, slot: u32) -> String {
+        self.material_slots
+            .get(slot as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("Material {}", slot + 1))
+    }
+
+    /// Triangles of slot `slot` with only the vertices they use. Triangle
+    /// order is preserved; the result has a single slot.
+    pub fn submesh(&self, slot: u32) -> MeshGeometry {
+        let mut remap = vec![u32::MAX; self.vertices.len()];
+        let mut submesh = MeshGeometry::default();
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            if self.material_of(index) != slot {
+                continue;
+            }
+            let corners = triangle.map(|corner| {
+                let slot = &mut remap[corner as usize];
+                if *slot == u32::MAX {
+                    *slot = submesh.vertices.len() as u32;
+                    submesh.vertices.push(self.vertices[corner as usize]);
+                }
+                *slot
+            });
+            submesh.triangles.push(corners);
+        }
+        submesh
+    }
+
+    /// Appends `other`, offsetting its indices and material slots. Slots of
+    /// the same name are shared.
+    pub fn append(&mut self, other: &MeshGeometry) -> Result<(), MeshError> {
+        let offset =
+            u32::try_from(self.vertices.len()).map_err(|_| MeshError::TooManyTriangles)?;
+        if self.triangle_materials.is_empty() && !self.triangles.is_empty() {
+            self.triangle_materials = vec![0; self.triangles.len()];
+        }
+        if self.material_slots.is_empty() && !self.triangles.is_empty() {
+            self.material_slots.push(self.material_slot_name(0));
+        }
+        let mut slot_map = Vec::with_capacity(other.material_slot_count());
+        for slot in 0..other.material_slot_count() as u32 {
+            let name = other.material_slot_name(slot);
+            let index = match self.material_slots.iter().position(|existing| *existing == name) {
+                Some(index) => index,
+                None => {
+                    self.material_slots.push(name);
+                    self.material_slots.len() - 1
+                }
+            };
+            slot_map.push(index as u32);
+        }
+        self.vertices.extend_from_slice(&other.vertices);
+        for (index, triangle) in other.triangles.iter().enumerate() {
+            self.triangles
+                .push(triangle.map(|corner| corner.saturating_add(offset)));
+            self.triangle_materials
+                .push(slot_map[other.material_of(index) as usize]);
+        }
         Ok(())
     }
 }
@@ -126,6 +229,8 @@ pub enum MeshError {
     TooManyTriangles,
     #[error("mesh triangle {0} references an invalid vertex")]
     InvalidTriangle(usize),
+    #[error("mesh material slot assignments do not match its triangles")]
+    InvalidMaterialSlots,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,6 +346,7 @@ fn cube_mesh() -> MeshGeometry {
     let mut mesh = MeshGeometry {
         vertices: Vec::with_capacity(24),
         triangles: Vec::with_capacity(12),
+        ..MeshGeometry::default()
     };
     let n = -0.5;
     let p = 0.5;
@@ -300,6 +406,7 @@ fn plane_mesh() -> MeshGeometry {
     let mut mesh = MeshGeometry {
         vertices: Vec::with_capacity(4),
         triangles: Vec::with_capacity(2),
+        ..MeshGeometry::default()
     };
     push_quad(
         &mut mesh,
@@ -319,6 +426,7 @@ fn sphere_mesh() -> MeshGeometry {
     let mut mesh = MeshGeometry {
         vertices: Vec::with_capacity(2 + (RINGS - 1) * (SEGMENTS + 1)),
         triangles: Vec::with_capacity(SEGMENTS * (RINGS - 1) * 2),
+        ..MeshGeometry::default()
     };
     mesh.vertices.push(MeshVertex {
         position: Vec3::Y * 0.5,
@@ -379,6 +487,7 @@ fn cylinder_mesh() -> MeshGeometry {
     let mut mesh = MeshGeometry {
         vertices: Vec::with_capacity((SEGMENTS + 1) * 2 + (SEGMENTS + 1) * 2),
         triangles: Vec::with_capacity(SEGMENTS * 4),
+        ..MeshGeometry::default()
     };
     for segment in 0..=SEGMENTS {
         let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
@@ -585,11 +694,30 @@ pub struct MeshAsset {
     /// masks index triangles of the subdivided mesh.
     #[serde(default)]
     pub smoothing: MeshSmoothing,
+    /// Optional high-resolution mesh (file path) whose detail mesh-map baking
+    /// projects onto this mesh. Loaded with the same scale.
+    #[serde(default)]
+    pub high_poly_source: Option<String>,
 }
 
 fn default_mesh_scale() -> f32 {
     1.0
 }
+
+/// Deepest allowed nesting of layer groups.
+pub const MAX_GROUP_DEPTH: usize = 16;
+
+/// Channels a group passes through by default: every composited channel.
+pub const GROUP_CHANNELS: [MaterialChannel; 8] = [
+    MaterialChannel::BaseColor,
+    MaterialChannel::Roughness,
+    MaterialChannel::Metallic,
+    MaterialChannel::Height,
+    MaterialChannel::Normal,
+    MaterialChannel::Emissive,
+    MaterialChannel::Opacity,
+    MaterialChannel::Id,
+];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterialLayer {
@@ -606,8 +734,8 @@ pub struct MaterialLayer {
     pub id_strokes: Vec<IdStroke>,
     #[serde(default)]
     pub id_mask_color: Option<[u8; 3]>,
-    /// When set, the layer covers its whole mask with uniform material values
-    /// before any paint strokes are applied.
+    /// When set, the layer covers its whole mask with uniform or textured
+    /// material values before any paint strokes are applied.
     #[serde(default)]
     pub fill: Option<LayerFill>,
     /// Procedural base for the layer mask; painted mask strokes refine it.
@@ -616,6 +744,20 @@ pub struct MaterialLayer {
     /// Restricts the layer to selected mesh triangles.
     #[serde(default)]
     pub polygon_mask: Option<PolygonMask>,
+    /// Multiplies the mask by a grayscale bitmap.
+    #[serde(default)]
+    pub mask_bitmap: Option<BitmapMask>,
+    /// Filters applied, in order, to the layer's content before masking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<LayerFilter>,
+    /// Filters applied, in order, to the layer's mask.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_filters: Vec<LayerFilter>,
+    /// `Some` makes this a group: its children composite together first and
+    /// the result blends through the group's own opacity, mask, and filters.
+    /// Groups ignore fill and paint strokes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<MaterialLayer>>,
 }
 
 impl MaterialLayer {
@@ -638,6 +780,10 @@ impl MaterialLayer {
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         }
     }
 
@@ -653,6 +799,31 @@ impl MaterialLayer {
         }
     }
 
+    pub fn new_group(id: LayerId, name: impl Into<String>) -> Self {
+        Self {
+            channels: GROUP_CHANNELS.into_iter().collect(),
+            children: Some(Vec::new()),
+            ..Self::new_paint(id, name)
+        }
+    }
+
+    pub fn is_group(&self) -> bool {
+        self.children.is_some()
+    }
+
+    /// This layer followed by all its descendants, depth first.
+    pub fn walk(&self) -> Vec<&MaterialLayer> {
+        let mut layers = vec![self];
+        for child in self.children.iter().flatten() {
+            layers.extend(child.walk());
+        }
+        layers
+    }
+
+    fn contains_layer(&self, layer_id: LayerId) -> bool {
+        self.walk().iter().any(|layer| layer.id == layer_id)
+    }
+
     /// Non-stroke state that history can snapshot and restore as one edit.
     pub fn settings(&self) -> LayerSettings {
         LayerSettings {
@@ -664,6 +835,9 @@ impl MaterialLayer {
             fill: self.fill,
             mask_generator: self.mask_generator,
             polygon_mask: self.polygon_mask.clone(),
+            mask_bitmap: self.mask_bitmap,
+            filters: self.filters.clone(),
+            mask_filters: self.mask_filters.clone(),
         }
     }
 
@@ -676,6 +850,9 @@ impl MaterialLayer {
         self.fill = settings.fill;
         self.mask_generator = settings.mask_generator;
         self.polygon_mask = settings.polygon_mask;
+        self.mask_bitmap = settings.mask_bitmap;
+        self.filters = settings.filters;
+        self.mask_filters = settings.mask_filters;
     }
 
     fn has_valid_settings(&self) -> bool {
@@ -687,22 +864,139 @@ impl MaterialLayer {
                 .polygon_mask
                 .as_ref()
                 .is_none_or(|mask| mask.triangles.len() <= MAX_POLYGON_MASK_TRIANGLES)
+            && self
+                .mask_bitmap
+                .is_none_or(|bitmap| bitmap.projection.is_valid())
+            && self.filters.len() <= MAX_LAYER_FILTERS
+            && self.mask_filters.len() <= MAX_LAYER_FILTERS
+            && self
+                .filters
+                .iter()
+                .chain(&self.mask_filters)
+                .all(|filter| filter.is_valid())
+    }
+
+    /// Bitmap resources this layer (not its children) reads.
+    fn own_resources(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        let strokes = self
+            .paint_strokes
+            .iter()
+            .map(|stroke| stroke.tip)
+            .chain(self.mask_strokes.iter().map(|stroke| stroke.tip))
+            .chain(self.id_strokes.iter().map(|stroke| stroke.tip))
+            .filter_map(BrushTip::resource);
+        self.fill
+            .iter()
+            .flat_map(|fill| fill.textures.all())
+            .chain(self.mask_bitmap.map(|bitmap| bitmap.resource))
+            .chain(strokes)
+    }
+
+    /// True when this layer (not its children) projects bitmaps triplanarly
+    /// or uses a generator, so baking needs mesh maps.
+    fn own_needs_mesh_maps(&self) -> bool {
+        self.mask_generator.is_some()
+            || self
+                .mask_bitmap
+                .is_some_and(|bitmap| bitmap.projection.needs_mesh_maps())
+            || self.fill.is_some_and(|fill| {
+                fill.projection.needs_mesh_maps() && fill.textures.all().next().is_some()
+            })
     }
 }
 
-/// Uniform material values written by a fill layer.
+const MAX_LAYER_FILTERS: usize = 32;
+
+/// Bitmaps a fill layer uses instead of its uniform values, per channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FillTextures {
+    pub base_color: Option<ResourceId>,
+    pub roughness: Option<ResourceId>,
+    pub metallic: Option<ResourceId>,
+    pub height: Option<ResourceId>,
+    /// Tangent-space normal map (OpenGL convention, +Y = +V).
+    pub normal: Option<ResourceId>,
+    pub emissive: Option<ResourceId>,
+    pub opacity: Option<ResourceId>,
+}
+
+impl FillTextures {
+    pub fn for_channel(&self, channel: MaterialChannel) -> Option<ResourceId> {
+        match channel {
+            MaterialChannel::BaseColor => self.base_color,
+            MaterialChannel::Roughness => self.roughness,
+            MaterialChannel::Metallic => self.metallic,
+            MaterialChannel::Height => self.height,
+            MaterialChannel::Normal => self.normal,
+            MaterialChannel::Emissive => self.emissive,
+            MaterialChannel::Opacity => self.opacity,
+            MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
+        }
+    }
+
+    pub fn slot_mut(&mut self, channel: MaterialChannel) -> Option<&mut Option<ResourceId>> {
+        match channel {
+            MaterialChannel::BaseColor => Some(&mut self.base_color),
+            MaterialChannel::Roughness => Some(&mut self.roughness),
+            MaterialChannel::Metallic => Some(&mut self.metallic),
+            MaterialChannel::Height => Some(&mut self.height),
+            MaterialChannel::Normal => Some(&mut self.normal),
+            MaterialChannel::Emissive => Some(&mut self.emissive),
+            MaterialChannel::Opacity => Some(&mut self.opacity),
+            MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
+        }
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = ResourceId> {
+        [
+            self.base_color,
+            self.roughness,
+            self.metallic,
+            self.height,
+            self.normal,
+            self.emissive,
+            self.opacity,
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// Material values written by a fill layer: uniform values, or bitmaps
+/// where [`FillTextures`] assigns them.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerFill {
     pub color: [u8; 4],
     pub roughness: f32,
     pub metallic: f32,
+    /// Height written when the layer enables the Height channel; `0.5` is
+    /// neutral, higher raises the surface and lower dents it.
+    #[serde(default = "default_height")]
+    pub height: f32,
+    /// sRGB emitted colour for the Emissive channel.
+    #[serde(default)]
+    pub emissive: [u8; 3],
+    /// Value written to the Opacity channel (`1` is opaque).
+    #[serde(default = "default_material_opacity")]
+    pub material_opacity: f32,
+    #[serde(default)]
+    pub textures: FillTextures,
+    #[serde(default)]
+    pub projection: TextureProjection,
 }
 
 impl LayerFill {
     fn is_valid(self) -> bool {
-        [self.roughness, self.metallic]
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        [
+            self.roughness,
+            self.metallic,
+            self.height,
+            self.material_opacity,
+        ]
+        .iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            && self.projection.is_valid()
     }
 }
 
@@ -712,6 +1006,11 @@ impl Default for LayerFill {
             color: [128, 128, 128, 255],
             roughness: 0.5,
             metallic: 0.0,
+            height: DEFAULT_HEIGHT,
+            emissive: DEFAULT_EMISSIVE,
+            material_opacity: DEFAULT_OPACITY,
+            textures: FillTextures::default(),
+            projection: TextureProjection::default(),
         }
     }
 }
@@ -726,7 +1025,7 @@ pub struct PolygonMask {
     pub inverted: bool,
 }
 
-/// Snapshot of a layer's non-stroke state.
+/// Snapshot of a layer's non-stroke, non-structural state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerSettings {
     pub name: String,
@@ -737,6 +1036,9 @@ pub struct LayerSettings {
     pub fill: Option<LayerFill>,
     pub mask_generator: Option<MaskGenerator>,
     pub polygon_mask: Option<PolygonMask>,
+    pub mask_bitmap: Option<BitmapMask>,
+    pub filters: Vec<LayerFilter>,
+    pub mask_filters: Vec<LayerFilter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -751,16 +1053,76 @@ pub struct PaintStroke {
     /// Value written to the Metallic channel when the layer enables it.
     #[serde(default)]
     pub metallic: f32,
+    /// Value written to the Height channel when the layer enables it.
+    #[serde(default = "default_height")]
+    pub height: f32,
+    /// Colour written to the Emissive channel when the layer enables it.
+    #[serde(default)]
+    pub emissive: [u8; 3],
+    /// Value written to the Opacity channel when the layer enables it.
+    #[serde(default = "default_material_opacity")]
+    pub material_opacity: f32,
+    /// Removes paint from the layer instead of adding it.
+    #[serde(default)]
+    pub erase: bool,
+    #[serde(default)]
+    pub tip: BrushTip,
+    /// Pen pressure per point (`0..=1`); empty means full pressure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pressures: Vec<f32>,
+}
+
+impl PaintStroke {
+    /// A stroke with default material values and a soft round tip.
+    pub fn new(points: Vec<glam::Vec2>, radius_pixels: f32, color: [u8; 4]) -> Self {
+        Self {
+            points,
+            radius_pixels,
+            color,
+            opacity: 1.0,
+            roughness: DEFAULT_ROUGHNESS,
+            metallic: DEFAULT_METALLIC,
+            height: DEFAULT_HEIGHT,
+            emissive: DEFAULT_EMISSIVE,
+            material_opacity: DEFAULT_OPACITY,
+            erase: false,
+            tip: BrushTip::ROUND,
+            pressures: Vec::new(),
+        }
+    }
 }
 
 fn default_stroke_roughness() -> f32 {
     DEFAULT_ROUGHNESS
 }
 
+fn default_height() -> f32 {
+    DEFAULT_HEIGHT
+}
+
+fn default_material_opacity() -> f32 {
+    DEFAULT_OPACITY
+}
+
 /// Roughness of texels no layer has painted.
 pub const DEFAULT_ROUGHNESS: f32 = 0.5;
 /// Metallic value of texels no layer has painted.
 pub const DEFAULT_METALLIC: f32 = 0.0;
+/// Base Color shown (and exported in material sets) where no layer paints.
+pub const DEFAULT_BASE_COLOR: [u8; 3] = [128, 128, 128];
+/// Height of texels no layer has painted (neutral: no bump).
+pub const DEFAULT_HEIGHT: f32 = 0.5;
+/// Emissive colour of texels no layer has painted.
+pub const DEFAULT_EMISSIVE: [u8; 3] = [0, 0, 0];
+/// Opacity of texels no layer has painted.
+pub const DEFAULT_OPACITY: f32 = 1.0;
+/// Default strength of Height-to-normal conversion.
+pub const DEFAULT_HEIGHT_STRENGTH: f32 = 1.0;
+pub const MAX_HEIGHT_STRENGTH: f32 = 16.0;
+
+fn valid_height_strength(value: f32) -> bool {
+    value.is_finite() && (0.0..=MAX_HEIGHT_STRENGTH).contains(&value)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaskStroke {
@@ -768,6 +1130,10 @@ pub struct MaskStroke {
     pub radius_pixels: f32,
     pub value: f32,
     pub opacity: f32,
+    #[serde(default)]
+    pub tip: BrushTip,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pressures: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -776,6 +1142,18 @@ pub struct IdStroke {
     pub radius_pixels: f32,
     pub color: [u8; 3],
     pub opacity: f32,
+    #[serde(default)]
+    pub tip: BrushTip,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pressures: Vec<f32>,
+}
+
+/// Where a layer sits: inside the group `parent` (or the texture set's top
+/// level when `None`) at `index`, counted from the bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerSlot {
+    pub parent: Option<LayerId>,
+    pub index: usize,
 }
 
 /// One undoable project edit. Commands are recorded after they have been
@@ -806,18 +1184,21 @@ pub enum EditCommand {
     },
     InsertLayer {
         texture_set_id: TextureSetId,
-        index: usize,
+        slot: LayerSlot,
         layer: Box<MaterialLayer>,
     },
     RemoveLayer {
         texture_set_id: TextureSetId,
-        index: usize,
+        slot: LayerSlot,
         layer: Box<MaterialLayer>,
     },
+    /// Removes the layer at `from`, then inserts it at `to` (an index into
+    /// the destination after the removal). Moving into a group is allowed;
+    /// moving a group into itself is not.
     MoveLayer {
         texture_set_id: TextureSetId,
-        from: usize,
-        to: usize,
+        from: LayerSlot,
+        to: LayerSlot,
     },
 }
 
@@ -899,18 +1280,16 @@ fn find_layer(
     texture_set_id: TextureSetId,
     layer_id: LayerId,
 ) -> Option<&mut MaterialLayer> {
-    find_texture_set(project, texture_set_id)?
-        .layers
-        .iter_mut()
-        .find(|layer| layer.id == layer_id)
+    find_texture_set(project, texture_set_id)?.layer_mut(layer_id)
 }
 
-fn layer_id_in_use(project: &MaterialProject, layer_id: LayerId) -> bool {
-    project
-        .texture_sets
-        .iter()
-        .flat_map(|set| &set.layers)
-        .any(|layer| layer.id == layer_id)
+fn layer_id_in_use(project: &MaterialProject, layer: &MaterialLayer) -> bool {
+    layer.walk().iter().any(|candidate| {
+        project
+            .texture_sets
+            .iter()
+            .any(|set| set.layer(candidate.id).is_some())
+    })
 }
 
 fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
@@ -920,6 +1299,7 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
             layer_id,
             stroke,
         } => find_layer(project, *texture_set_id, *layer_id)
+            .filter(|layer| !layer.is_group())
             .map(|layer| layer.paint_strokes.push(stroke.clone()))
             .is_some(),
         EditCommand::Mask {
@@ -934,6 +1314,7 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
             layer_id,
             stroke,
         } => find_layer(project, *texture_set_id, *layer_id)
+            .filter(|layer| !layer.is_group())
             .map(|layer| layer.id_strokes.push(stroke.clone()))
             .is_some(),
         EditCommand::LayerSettings {
@@ -944,14 +1325,14 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
         } => replace_layer_settings(project, *texture_set_id, *layer_id, before, after),
         EditCommand::InsertLayer {
             texture_set_id,
-            index,
+            slot,
             layer,
-        } => insert_layer(project, *texture_set_id, *index, layer),
+        } => insert_layer(project, *texture_set_id, *slot, layer),
         EditCommand::RemoveLayer {
             texture_set_id,
-            index,
+            slot,
             layer,
-        } => remove_layer(project, *texture_set_id, *index, layer),
+        } => remove_layer(project, *texture_set_id, *slot, layer),
         EditCommand::MoveLayer {
             texture_set_id,
             from,
@@ -991,14 +1372,14 @@ fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool 
         } => replace_layer_settings(project, *texture_set_id, *layer_id, after, before),
         EditCommand::InsertLayer {
             texture_set_id,
-            index,
+            slot,
             layer,
-        } => remove_layer(project, *texture_set_id, *index, layer),
+        } => remove_layer(project, *texture_set_id, *slot, layer),
         EditCommand::RemoveLayer {
             texture_set_id,
-            index,
+            slot,
             layer,
-        } => insert_layer(project, *texture_set_id, *index, layer),
+        } => insert_layer(project, *texture_set_id, *slot, layer),
         EditCommand::MoveLayer {
             texture_set_id,
             from,
@@ -1027,709 +1408,124 @@ fn replace_layer_settings(
 fn insert_layer(
     project: &mut MaterialProject,
     texture_set_id: TextureSetId,
-    index: usize,
+    slot: LayerSlot,
     layer: &MaterialLayer,
 ) -> bool {
-    if layer_id_in_use(project, layer.id) {
+    if layer_id_in_use(project, layer) {
         return false;
     }
     let Some(set) = find_texture_set(project, texture_set_id) else {
         return false;
     };
-    if index > set.layers.len() {
+    if slot
+        .parent
+        .is_some_and(|parent| set.depth_of(parent) + 1 + layer.group_depth() > MAX_GROUP_DEPTH)
+    {
         return false;
     }
-    set.layers.insert(index, layer.clone());
+    let Some(container) = set.container_mut(slot.parent) else {
+        return false;
+    };
+    if slot.index > container.len() {
+        return false;
+    }
+    container.insert(slot.index, layer.clone());
     true
 }
 
 fn remove_layer(
     project: &mut MaterialProject,
     texture_set_id: TextureSetId,
-    index: usize,
+    slot: LayerSlot,
     layer: &MaterialLayer,
 ) -> bool {
-    let Some(set) = find_texture_set(project, texture_set_id) else {
+    let Some(container) =
+        find_texture_set(project, texture_set_id).and_then(|set| set.container_mut(slot.parent))
+    else {
         return false;
     };
-    if set.layers.get(index) != Some(layer) {
+    if container.get(slot.index) != Some(layer) {
         return false;
     }
-    set.layers.remove(index);
+    container.remove(slot.index);
     true
 }
 
 fn move_layer(
     project: &mut MaterialProject,
     texture_set_id: TextureSetId,
-    from: usize,
-    to: usize,
+    from: LayerSlot,
+    to: LayerSlot,
 ) -> bool {
     let Some(set) = find_texture_set(project, texture_set_id) else {
         return false;
     };
-    if from >= set.layers.len() || to >= set.layers.len() || from == to {
+    if from == to {
         return false;
     }
-    let layer = set.layers.remove(from);
-    set.layers.insert(to, layer);
-    true
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BakedTexture {
-    pub width: u32,
-    pub height: u32,
-    pub rgba8: Vec<u8>,
-}
-
-impl BakedTexture {
-    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
-        if x >= self.width || y >= self.height {
-            return None;
-        }
-        let index = ((y as usize * self.width as usize) + x as usize) * 4;
-        let rgba = self.rgba8.get(index..index + 4)?;
-        Some([rgba[0], rgba[1], rgba[2], rgba[3]])
-    }
-
-    pub fn sample_uv(&self, uv: glam::Vec2) -> Option<[u8; 4]> {
-        if !uv.is_finite() || !(0.0..=1.0).contains(&uv.x) || !(0.0..=1.0).contains(&uv.y) {
-            return None;
-        }
-        let x = (uv.x * self.width.saturating_sub(1) as f32).round() as u32;
-        let y = ((1.0 - uv.y) * self.height.saturating_sub(1) as f32).round() as u32;
-        self.pixel(x, y)
-    }
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum BakeError {
-    #[error("texture bake resolution {width}x{height} exceeds the pixel budget")]
-    ResolutionExceedsBudget { width: u32, height: u32 },
-    #[error("unable to allocate texture bake buffer")]
-    AllocationFailed,
-    #[error("texture set contains invalid or excessive paint strokes")]
-    InvalidStrokeData,
-    #[error("texture set contains invalid layer fill, generator, or polygon mask settings")]
-    InvalidLayerSettings,
-    #[error("the {0:?} channel cannot be baked yet")]
-    UnsupportedChannel(MaterialChannel),
-    #[error("a layer uses a mask generator but no mesh maps have been baked")]
-    MissingMeshMaps,
-    #[error("a layer uses a polygon mask but no mesh geometry was provided")]
-    MissingMesh,
-}
-
-/// Mesh data a texture bake may need: geometry for polygon masks and baked
-/// mesh maps for generators. Layers that need neither bake without it.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BakeContext<'a> {
-    pub mesh: Option<&'a MeshGeometry>,
-    pub mesh_maps: Option<&'a MeshMaps>,
-}
-
-/// Composited output of one channel while layers are applied.
-enum ChannelBuffer {
-    Color(Vec<u8>),
-    Scalar(Vec<f32>),
-    /// Unit tangent-space normals.
-    Vector(Vec<Vec3>),
-}
-
-impl ChannelBuffer {
-    fn blend(&mut self, index: usize, source: ChannelValue, alpha: f32) {
-        match (self, source) {
-            (Self::Color(rgba8), ChannelValue::Color(color)) => {
-                blend_rgba8(&mut rgba8[index * 4..index * 4 + 4], color, alpha);
-            }
-            (Self::Scalar(values), ChannelValue::Scalar(value)) => {
-                let alpha = alpha.clamp(0.0, 1.0);
-                values[index] += (value - values[index]) * alpha;
-            }
-            (Self::Vector(values), ChannelValue::Vector(value)) => {
-                let alpha = alpha.clamp(0.0, 1.0);
-                values[index] = values[index].lerp(value, alpha).normalize_or(Vec3::Z);
-            }
-            _ => {}
-        }
-    }
-
-    fn into_rgba8(self) -> Vec<u8> {
-        match self {
-            Self::Color(rgba8) => rgba8,
-            Self::Scalar(values) => values
-                .into_iter()
-                .flat_map(|value| {
-                    let gray = unit_to_byte(value);
-                    [gray, gray, gray, 255]
-                })
-                .collect(),
-            Self::Vector(values) => values.into_iter().flat_map(encode_normal).collect(),
-        }
-    }
-}
-
-fn unit_to_byte(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-/// Encodes a unit tangent-space normal as OpenGL-convention RGBA (+Y = +V).
-fn encode_normal(normal: Vec3) -> [u8; 4] {
-    let encoded = normal * 0.5 + 0.5;
-    [
-        unit_to_byte(encoded.x),
-        unit_to_byte(encoded.y),
-        unit_to_byte(encoded.z),
-        255,
-    ]
-}
-
-#[derive(Clone, Copy)]
-enum ChannelValue {
-    Color([u8; 4]),
-    Scalar(f32),
-    Vector(Vec3),
-}
-
-/// Viewport-ready textures for one texture set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterialTextures {
-    /// Straight-alpha sRGB Base Color.
-    pub base_color: BakedTexture,
-    /// Linear packed R = ambient occlusion (from mesh maps), G = roughness,
-    /// B = metallic.
-    pub orm: BakedTexture,
-    /// Tangent-space normal (OpenGL convention): baked detail, Normal-channel
-    /// layers, and height-derived detail combined.
-    pub normal: BakedTexture,
-}
-
-impl TextureSet {
-    /// True when a visible layer uses a mask generator, so baking needs maps.
-    pub fn requires_mesh_maps(&self) -> bool {
-        self.layers
-            .iter()
-            .any(|layer| layer.visible && layer.mask_generator.is_some())
-    }
-
-    pub fn bake_base_color(&self) -> Result<BakedTexture, BakeError> {
-        self.bake_channel(MaterialChannel::BaseColor, BakeContext::default())
-    }
-
-    fn validate_for_bake(&self) -> Result<Option<BakedTexture>, BakeError> {
-        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
-            return Err(BakeError::InvalidStrokeData);
-        }
-        if self.layers.iter().any(|layer| !layer.has_valid_settings())
-            || !valid_height_strength(self.height_strength)
-        {
-            return Err(BakeError::InvalidLayerSettings);
-        }
-        checked_bake_pixel_count(self.resolution)?;
-        self.layers
-            .iter()
-            .any(|layer| layer.id_mask_color.is_some())
-            .then(|| self.bake_id_mask())
-            .transpose()
-    }
-
-    /// Composites every visible layer that enables `channel`.
-    ///
-    /// - Base Color: straight-alpha RGBA.
-    /// - Roughness, Metallic, Height: opaque grayscale starting from
-    ///   [`DEFAULT_ROUGHNESS`], [`DEFAULT_METALLIC`], [`DEFAULT_HEIGHT`].
-    /// - Normal: tangent-space normal combining the baked detail normal from
-    ///   the mesh maps, Normal-channel layers (which flatten what is beneath),
-    ///   and detail derived from the Height channel.
-    /// - Id: the discrete ID map.
-    pub fn bake_channel(
-        &self,
-        channel: MaterialChannel,
-        context: BakeContext<'_>,
-    ) -> Result<BakedTexture, BakeError> {
-        if channel == MaterialChannel::Id {
-            return self.bake_id_mask();
-        }
-        let id_map = self.validate_for_bake()?;
-        let buffer = if channel == MaterialChannel::Normal {
-            ChannelBuffer::Vector(self.normal_buffer(context, id_map.as_ref())?)
-        } else {
-            self.composite(channel, context, id_map.as_ref())?
-        };
-        Ok(self.texture(buffer.into_rgba8()))
-    }
-
-    /// Bakes Base Color, packed ORM, and Normal concurrently for display or
-    /// engine export.
-    pub fn bake_material(&self, context: BakeContext<'_>) -> Result<MaterialTextures, BakeError> {
-        let id_map = self.validate_for_bake()?;
-        let id_map = id_map.as_ref();
-        let (base_color, roughness, metallic, normal) = std::thread::scope(|scope| {
-            let base = scope.spawn(|| self.composite(MaterialChannel::BaseColor, context, id_map));
-            let rough = scope.spawn(|| self.composite(MaterialChannel::Roughness, context, id_map));
-            let metal = scope.spawn(|| self.composite(MaterialChannel::Metallic, context, id_map));
-            let normal = self.normal_buffer(context, id_map);
-            let join = |handle: std::thread::ScopedJoinHandle<'_, Result<ChannelBuffer, BakeError>>| {
-                handle.join().unwrap_or(Err(BakeError::AllocationFailed))
-            };
-            (join(base), join(rough), join(metal), normal)
-        });
-        let (ChannelBuffer::Scalar(roughness), ChannelBuffer::Scalar(metallic)) =
-            (roughness?, metallic?)
-        else {
-            return Err(BakeError::AllocationFailed);
-        };
-        let mut occlusion = try_filled(roughness.len(), 1.0_f32)?;
-        if let Some(maps) = context.mesh_maps {
-            parallel_fill(
-                &mut occlusion,
-                self.resolution.width,
-                self.resolution.height,
-                |uv| {
-                    let sample = maps.sample(uv);
-                    if sample.covered {
-                        sample.ambient_occlusion
-                    } else {
-                        1.0
-                    }
-                },
-            );
-        }
-        let orm = occlusion
-            .iter()
-            .zip(&roughness)
-            .zip(&metallic)
-            .flat_map(|((ao, rough), metal)| {
-                [unit_to_byte(*ao), unit_to_byte(*rough), unit_to_byte(*metal), 255]
-            })
-            .collect();
-        Ok(MaterialTextures {
-            base_color: self.texture(base_color?.into_rgba8()),
-            orm: self.texture(orm),
-            normal: self.texture(ChannelBuffer::Vector(normal?).into_rgba8()),
-        })
-    }
-
-    fn texture(&self, rgba8: Vec<u8>) -> BakedTexture {
-        BakedTexture {
-            width: self.resolution.width,
-            height: self.resolution.height,
-            rgba8,
-        }
-    }
-
-    fn composite(
-        &self,
-        channel: MaterialChannel,
-        context: BakeContext<'_>,
-        id_map: Option<&BakedTexture>,
-    ) -> Result<ChannelBuffer, BakeError> {
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let mut output = match channel {
-            MaterialChannel::BaseColor => ChannelBuffer::Color(try_filled(pixel_count * 4, 0_u8)?),
-            MaterialChannel::Roughness => {
-                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_ROUGHNESS)?)
-            }
-            MaterialChannel::Metallic => {
-                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_METALLIC)?)
-            }
-            MaterialChannel::Height => {
-                ChannelBuffer::Scalar(try_filled(pixel_count, DEFAULT_HEIGHT)?)
-            }
-            MaterialChannel::Normal => {
-                let mut normals = try_filled(pixel_count, Vec3::Z)?;
-                if let Some(maps) = context.mesh_maps {
-                    parallel_fill(
-                        &mut normals,
-                        self.resolution.width,
-                        self.resolution.height,
-                        |uv| maps.sample(uv).tangent_normal,
-                    );
-                }
-                ChannelBuffer::Vector(normals)
-            }
-            other => return Err(BakeError::UnsupportedChannel(other)),
-        };
-        let value_for = |color: [u8; 4], roughness: f32, metallic: f32, height: f32| match channel {
-            MaterialChannel::Roughness => ChannelValue::Scalar(roughness),
-            MaterialChannel::Metallic => ChannelValue::Scalar(metallic),
-            MaterialChannel::Height => ChannelValue::Scalar(height),
-            MaterialChannel::Normal => ChannelValue::Vector(Vec3::Z),
-            _ => ChannelValue::Color(color),
-        };
-
-        for layer in &self.layers {
-            if !layer.visible
-                || !layer.channels.contains(&channel)
-                || (layer.fill.is_none() && layer.paint_strokes.is_empty())
-            {
-                continue;
-            }
-            let mask = self.layer_mask(layer, context, id_map)?;
-            let mask_at = |index: usize| mask.as_ref().map_or(1.0, |values| values[index]);
-
-            if let Some(fill) = layer.fill {
-                let value = value_for(fill.color, fill.roughness, fill.metallic, fill.height);
-                for index in 0..pixel_count {
-                    output.blend(index, value, layer.opacity * mask_at(index));
-                }
-            }
-            for stroke in &layer.paint_strokes {
-                let value =
-                    value_for(stroke.color, stroke.roughness, stroke.metallic, stroke.height);
-                rasterize_stroke(
-                    &stroke.points,
-                    stroke.radius_pixels,
-                    self.resolution.width,
-                    self.resolution.height,
-                    |index, coverage| {
-                        let alpha = layer.opacity * stroke.opacity * coverage * mask_at(index);
-                        output.blend(index, value, alpha);
-                    },
-                );
-            }
-        }
-        Ok(output)
-    }
-
-    /// Normal-channel composite with Height-derived detail blended on top
-    /// (whiteout blend), so painted bumps and dents shade in the viewport.
-    fn normal_buffer(
-        &self,
-        context: BakeContext<'_>,
-        id_map: Option<&BakedTexture>,
-    ) -> Result<Vec<Vec3>, BakeError> {
-        let ChannelBuffer::Vector(mut normals) =
-            self.composite(MaterialChannel::Normal, context, id_map)?
-        else {
-            return Err(BakeError::AllocationFailed);
-        };
-        let ChannelBuffer::Scalar(height) =
-            self.composite(MaterialChannel::Height, context, id_map)?
-        else {
-            return Err(BakeError::AllocationFailed);
-        };
-        if self.height_strength <= 0.0
-            || height
-                .iter()
-                .all(|value| (value - DEFAULT_HEIGHT).abs() <= f32::EPSILON)
-        {
-            return Ok(normals);
-        }
-        let width = self.resolution.width as usize;
-        let rows = self.resolution.height as usize;
-        let scale = self.height_strength * self.resolution.width.max(self.resolution.height) as f32
-            / HEIGHT_SLOPE_REFERENCE_TEXELS;
-        let at = |x: usize, y: usize| height[y * width + x];
-        for y in 0..rows {
-            for x in 0..width {
-                let du = (at((x + 1).min(width - 1), y) - at(x.saturating_sub(1), y)) * 0.5;
-                // Rows run top to bottom, so +V is toward the previous row.
-                let dv = (at(x, y.saturating_sub(1)) - at(x, (y + 1).min(rows - 1))) * 0.5;
-                if du == 0.0 && dv == 0.0 {
-                    continue;
-                }
-                let detail = Vec3::new(-du * scale, -dv * scale, 1.0).normalize_or(Vec3::Z);
-                let base = normals[y * width + x];
-                normals[y * width + x] =
-                    Vec3::new(base.x + detail.x, base.y + detail.y, base.z * detail.z)
-                        .normalize_or(Vec3::Z);
-            }
-        }
-        Ok(normals)
-    }
-
-    /// Final per-texel mask of a layer, or `None` when it is fully open. The
-    /// generator (or white) is the base, painted mask strokes blend over it,
-    /// and polygon and ID-colour clipping multiply the result.
-    fn layer_mask(
-        &self,
-        layer: &MaterialLayer,
-        context: BakeContext<'_>,
-        id_map: Option<&BakedTexture>,
-    ) -> Result<Option<Vec<f32>>, BakeError> {
-        if layer.mask_generator.is_none()
-            && layer.mask_strokes.is_empty()
-            && layer.polygon_mask.is_none()
-            && layer.id_mask_color.is_none()
-        {
-            return Ok(None);
-        }
-        let width = self.resolution.width;
-        let height = self.resolution.height;
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let mut values = try_filled(pixel_count, 1.0_f32)?;
-
-        if let Some(generator) = &layer.mask_generator {
-            let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
-            evaluate_generator(&mut values, generator, maps, width, height);
-        }
-        for stroke in &layer.mask_strokes {
-            rasterize_stroke(
-                &stroke.points,
-                stroke.radius_pixels,
-                width,
-                height,
-                |index, coverage| {
-                    let alpha = (stroke.opacity * coverage).clamp(0.0, 1.0);
-                    values[index] += (stroke.value - values[index]) * alpha;
-                },
-            );
-        }
-        if let Some(polygon_mask) = &layer.polygon_mask {
-            let mesh = context.mesh.ok_or(BakeError::MissingMesh)?;
-            let mut selected = try_filled(pixel_count, false)?;
-            for triangle in &polygon_mask.triangles {
-                let Some(corners) = mesh.triangles.get(*triangle as usize) else {
-                    continue;
-                };
-                let Some(uvs) = corners
-                    .iter()
-                    .map(|index| mesh.vertices.get(*index as usize).map(|vertex| vertex.uv))
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                raster::rasterize_uv_triangle(
-                    [uvs[0], uvs[1], uvs[2]],
-                    width,
-                    height,
-                    0.5,
-                    |index, _, _| selected[index] = true,
-                );
-            }
-            for (value, selected) in values.iter_mut().zip(selected) {
-                if selected == polygon_mask.inverted {
-                    *value = 0.0;
-                }
-            }
-        }
-        if let Some(target) = layer.id_mask_color {
-            for (index, value) in values.iter_mut().enumerate() {
-                let matches = id_map
-                    .and_then(|map| map.rgba8.get(index * 4..index * 4 + 4))
-                    .is_some_and(|pixel| pixel[0..3] == target && pixel[3] > 0);
-                if !matches {
-                    *value = 0.0;
-                }
-            }
-        }
-        for value in &mut values {
-            *value = value.clamp(0.0, 1.0);
-        }
-        Ok(Some(values))
-    }
-
-    pub fn bake_id_mask(&self) -> Result<BakedTexture, BakeError> {
-        if self.layers.iter().any(|layer| !valid_layer_strokes(layer)) {
-            return Err(BakeError::InvalidStrokeData);
-        }
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let byte_count = pixel_count
-            .checked_mul(4)
-            .ok_or(BakeError::AllocationFailed)?;
-        let mut rgba8 = try_filled(byte_count, 0_u8)?;
-
-        for layer in &self.layers {
-            if !layer.visible || !layer.channels.contains(&MaterialChannel::Id) {
-                continue;
-            }
-            for stroke in &layer.id_strokes {
-                rasterize_stroke(
-                    &stroke.points,
-                    stroke.radius_pixels,
-                    self.resolution.width,
-                    self.resolution.height,
-                    |index, coverage| {
-                        if coverage * stroke.opacity * layer.opacity >= 0.5 {
-                            let offset = index * 4;
-                            rgba8[offset..offset + 4].copy_from_slice(&[
-                                stroke.color[0],
-                                stroke.color[1],
-                                stroke.color[2],
-                                255,
-                            ]);
-                        }
-                    },
-                );
-            }
-        }
-
-        Ok(BakedTexture {
-            width: self.resolution.width,
-            height: self.resolution.height,
-            rgba8,
-        })
-    }
-}
-
-/// Fills `values` with generator output, splitting rows across threads.
-fn evaluate_generator(
-    values: &mut [f32],
-    generator: &MaskGenerator,
-    maps: &MeshMaps,
-    width: u32,
-    height: u32,
-) {
-    parallel_fill(values, width, height, |uv| generator.evaluate(&maps.sample(uv)));
-}
-
-/// Sets every texel from `value_at(uv)`, splitting rows across threads.
-fn parallel_fill<T: Send>(
-    values: &mut [T],
-    width: u32,
-    height: u32,
-    value_at: impl Fn(glam::Vec2) -> T + Sync,
-) {
-    let row_len = width as usize;
-    if row_len == 0 {
-        return;
-    }
-    let threads = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .clamp(1, 32);
-    let rows_per_chunk = (height as usize).div_ceil(threads).max(1);
-    let chunk_len = rows_per_chunk * row_len;
-    let value_at = &value_at;
-    std::thread::scope(|scope| {
-        for (chunk_index, chunk) in values.chunks_mut(chunk_len).enumerate() {
-            scope.spawn(move || {
-                let start = chunk_index * chunk_len;
-                for (offset, value) in chunk.iter_mut().enumerate() {
-                    let index = start + offset;
-                    let x = (index % row_len) as u32;
-                    let y = (index / row_len) as u32;
-                    *value = value_at(raster::pixel_to_uv(x, y, width, height));
-                }
-            });
-        }
-    });
-}
-
-fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|_| BakeError::AllocationFailed)?;
-    values.resize(count, value);
-    Ok(values)
-}
-
-fn checked_bake_pixel_count(resolution: TextureResolution) -> Result<usize, BakeError> {
-    if resolution.width == 0
-        || resolution.height == 0
-        || resolution.width > MAX_TEXTURE_DIMENSION
-        || resolution.height > MAX_TEXTURE_DIMENSION
+    let Some(moving) = set
+        .container(from.parent)
+        .and_then(|container| container.get(from.index))
+    else {
+        return false;
+    };
+    // A group cannot move into itself or one of its descendants.
+    if to
+        .parent
+        .is_some_and(|parent| moving.contains_layer(parent))
     {
-        return Err(BakeError::ResolutionExceedsBudget {
-            width: resolution.width,
-            height: resolution.height,
-        });
+        return false;
     }
-    (resolution.width as usize)
-        .checked_mul(resolution.height as usize)
-        .filter(|count| *count <= MAX_BAKE_PIXELS)
-        .ok_or(BakeError::ResolutionExceedsBudget {
-            width: resolution.width,
-            height: resolution.height,
-        })
-}
-
-fn rasterize_stroke(
-    points: &[glam::Vec2],
-    radius_pixels: f32,
-    width: u32,
-    height: u32,
-    mut apply: impl FnMut(usize, f32),
-) {
-    let Some(first_point) = points.first().copied() else {
-        return;
+    let depth = moving.group_depth();
+    let destination_fits = match to.parent {
+        None => true,
+        Some(parent) => {
+            set.layer(parent).is_some_and(MaterialLayer::is_group)
+                && set.depth_of(parent) + 1 + depth <= MAX_GROUP_DEPTH
+        }
     };
-    let to_pixel = |point: glam::Vec2| {
-        glam::Vec2::new(
-            point.x * width.saturating_sub(1) as f32,
-            (1.0 - point.y) * height.saturating_sub(1) as f32,
-        )
-    };
-    let mut segments = points
-        .windows(2)
-        .map(|pair| (to_pixel(pair[0]), to_pixel(pair[1])));
-    let first = to_pixel(first_point);
-    let Some(first_segment) = segments.next() else {
-        rasterize_segment(first, first, radius_pixels, width, height, &mut apply);
-        return;
-    };
-    rasterize_segment(
-        first_segment.0,
-        first_segment.1,
-        radius_pixels,
-        width,
-        height,
-        &mut apply,
-    );
-    for (start, end) in segments {
-        rasterize_segment(start, end, radius_pixels, width, height, &mut apply);
+    if !destination_fits {
+        return false;
     }
-}
-
-fn rasterize_segment(
-    start: glam::Vec2,
-    end: glam::Vec2,
-    radius: f32,
-    width: u32,
-    height: u32,
-    apply: &mut impl FnMut(usize, f32),
-) {
-    let min_x = ((start.x.min(end.x) - radius).floor() as i32).max(0);
-    let max_x = ((start.x.max(end.x) + radius).ceil() as i32).min(width as i32 - 1);
-    let min_y = ((start.y.min(end.y) - radius).floor() as i32).max(0);
-    let max_y = ((start.y.max(end.y) + radius).ceil() as i32).min(height as i32 - 1);
-    let segment = end - start;
-    let segment_length_squared = segment.length_squared();
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let pixel = glam::Vec2::new(x as f32, y as f32);
-            let amount = if segment_length_squared > f32::EPSILON {
-                ((pixel - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let distance = pixel.distance(start + segment * amount);
-            if distance < radius {
-                let coverage = 1.0 - distance / radius;
-                let index = y as usize * width as usize + x as usize;
-                apply(index, coverage);
+    let Some(source) = set.container_mut(from.parent) else {
+        return false;
+    };
+    let layer = source.remove(from.index);
+    match set.container_mut(to.parent) {
+        Some(destination) if to.index <= destination.len() => {
+            destination.insert(to.index, layer);
+            true
+        }
+        _ => {
+            // Put it back where it was; the move does not apply.
+            if let Some(source) = set.container_mut(from.parent) {
+                source.insert(from.index, layer);
             }
+            false
         }
     }
 }
 
-fn blend_rgba8(destination: &mut [u8], color: [u8; 4], opacity: f32) {
-    let source_alpha = (color[3] as f32 / 255.0 * opacity).clamp(0.0, 1.0);
-    if source_alpha <= 0.0 {
-        return;
+impl MaterialLayer {
+    /// Nesting levels inside this layer: 0 for a plain layer or empty group.
+    fn group_depth(&self) -> usize {
+        self.children
+            .iter()
+            .flatten()
+            .filter(|child| child.is_group())
+            .map(|child| 1 + child.group_depth())
+            .max()
+            .unwrap_or(0)
     }
-    let destination_alpha = destination[3] as f32 / 255.0;
-    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
-    let output_alpha_byte = (output_alpha * 255.0).round() as u8;
-    if output_alpha_byte == 0 {
-        destination.fill(0);
-        return;
-    }
-    for channel in 0..3 {
-        let source = color[channel] as f32 / 255.0;
-        let existing = destination[channel] as f32 / 255.0;
-        let blended = (source * source_alpha + existing * destination_alpha * (1.0 - source_alpha))
-            / output_alpha;
-        destination[channel] = (blended * 255.0).round() as u8;
-    }
-    destination[3] = output_alpha_byte;
 }
 
-fn valid_stroke(points: &[glam::Vec2], radius_pixels: f32, opacity: f32) -> bool {
+pub(crate) fn valid_stroke(
+    points: &[glam::Vec2],
+    pressures: &[f32],
+    radius_pixels: f32,
+    opacity: f32,
+    tip: BrushTip,
+) -> bool {
     !points.is_empty()
         && points.len() <= MAX_STROKE_POINTS
         && radius_pixels.is_finite()
@@ -1740,9 +1536,11 @@ fn valid_stroke(points: &[glam::Vec2], radius_pixels: f32, opacity: f32) -> bool
         && points.iter().all(|point| {
             point.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y)
         })
+        && brush::valid_pressures(points, pressures)
+        && tip.is_valid()
 }
 
-fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
+pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
     layer
         .paint_strokes
         .len()
@@ -1750,20 +1548,40 @@ fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
         .saturating_add(layer.id_strokes.len())
         <= MAX_LAYER_STROKES
         && layer.paint_strokes.iter().all(|stroke| {
-            valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
-                && [stroke.roughness, stroke.metallic]
-                    .iter()
-                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            valid_stroke(
+                &stroke.points,
+                &stroke.pressures,
+                stroke.radius_pixels,
+                stroke.opacity,
+                stroke.tip,
+            ) && [
+                stroke.roughness,
+                stroke.metallic,
+                stroke.height,
+                stroke.material_opacity,
+            ]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
         })
         && layer.mask_strokes.iter().all(|stroke| {
-            valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity)
-                && stroke.value.is_finite()
+            valid_stroke(
+                &stroke.points,
+                &stroke.pressures,
+                stroke.radius_pixels,
+                stroke.opacity,
+                stroke.tip,
+            ) && stroke.value.is_finite()
                 && (0.0..=1.0).contains(&stroke.value)
         })
-        && layer
-            .id_strokes
-            .iter()
-            .all(|stroke| valid_stroke(&stroke.points, stroke.radius_pixels, stroke.opacity))
+        && layer.id_strokes.iter().all(|stroke| {
+            valid_stroke(
+                &stroke.points,
+                &stroke.pressures,
+                stroke.radius_pixels,
+                stroke.opacity,
+                stroke.tip,
+            )
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1773,7 +1591,98 @@ pub struct TextureSet {
     pub material_slot: String,
     pub resolution: TextureResolution,
     pub channels: BTreeSet<MaterialChannel>,
+    /// Layer stack, bottom first. Groups nest further layers.
     pub layers: Vec<MaterialLayer>,
+    /// How strongly the Height channel bends the Normal channel.
+    #[serde(default = "default_height_strength")]
+    pub height_strength: f32,
+}
+
+fn default_height_strength() -> f32 {
+    DEFAULT_HEIGHT_STRENGTH
+}
+
+impl TextureSet {
+    /// Every layer in the tree, depth first, groups before their children.
+    pub fn walk_layers(&self) -> Vec<&MaterialLayer> {
+        self.layers.iter().flat_map(MaterialLayer::walk).collect()
+    }
+
+    pub fn layer(&self, layer_id: LayerId) -> Option<&MaterialLayer> {
+        fn find(layers: &[MaterialLayer], layer_id: LayerId) -> Option<&MaterialLayer> {
+            layers.iter().find_map(|layer| {
+                if layer.id == layer_id {
+                    Some(layer)
+                } else {
+                    find(layer.children.as_deref()?, layer_id)
+                }
+            })
+        }
+        find(&self.layers, layer_id)
+    }
+
+    pub fn layer_mut(&mut self, layer_id: LayerId) -> Option<&mut MaterialLayer> {
+        fn find(layers: &mut [MaterialLayer], layer_id: LayerId) -> Option<&mut MaterialLayer> {
+            for layer in layers {
+                if layer.id == layer_id {
+                    return Some(layer);
+                }
+                if let Some(found) = layer
+                    .children
+                    .as_deref_mut()
+                    .and_then(|children| find(children, layer_id))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        find(&mut self.layers, layer_id)
+    }
+
+    /// The layer list of group `parent`, or the top level for `None`.
+    pub fn container(&self, parent: Option<LayerId>) -> Option<&Vec<MaterialLayer>> {
+        match parent {
+            None => Some(&self.layers),
+            Some(id) => self.layer(id)?.children.as_ref(),
+        }
+    }
+
+    pub fn container_mut(&mut self, parent: Option<LayerId>) -> Option<&mut Vec<MaterialLayer>> {
+        match parent {
+            None => Some(&mut self.layers),
+            Some(id) => self.layer_mut(id)?.children.as_mut(),
+        }
+    }
+
+    /// Where `layer_id` sits in the tree.
+    pub fn slot_of(&self, layer_id: LayerId) -> Option<LayerSlot> {
+        fn find(
+            layers: &[MaterialLayer],
+            parent: Option<LayerId>,
+            layer_id: LayerId,
+        ) -> Option<LayerSlot> {
+            layers.iter().enumerate().find_map(|(index, layer)| {
+                if layer.id == layer_id {
+                    Some(LayerSlot { parent, index })
+                } else {
+                    find(layer.children.as_deref()?, Some(layer.id), layer_id)
+                }
+            })
+        }
+        find(&self.layers, None, layer_id)
+    }
+
+    /// Groups enclosing `layer_id`: 0 at the top level.
+    pub fn depth_of(&self, layer_id: LayerId) -> usize {
+        let mut depth = 0;
+        let mut current = self.slot_of(layer_id).and_then(|slot| slot.parent);
+        while let Some(parent) = current {
+            depth += 1;
+            current = self.slot_of(parent).and_then(|slot| slot.parent);
+        }
+        depth
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1784,6 +1693,10 @@ pub struct MaterialProject {
     #[serde(default)]
     pub saved_poses: Vec<NamedPose>,
     pub active_texture_set: Option<TextureSetId>,
+    /// Bitmaps layers may reference (fill textures, bitmap masks, brush
+    /// alphas).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ProjectResource>,
 }
 
 impl MaterialProject {
@@ -1794,6 +1707,7 @@ impl MaterialProject {
             texture_sets: Vec::new(),
             saved_poses: Vec::new(),
             active_texture_set: None,
+            resources: Vec::new(),
         }
     }
 
@@ -1802,16 +1716,33 @@ impl MaterialProject {
             return Err(ProjectError::UnsupportedSchemaVersion(self.schema_version));
         }
 
+        let mut resource_ids = BTreeSet::new();
+        for resource in &self.resources {
+            if !resource_ids.insert(resource.id) {
+                return Err(ProjectError::DuplicateResourceId(resource.id));
+            }
+        }
+
         let mut texture_set_ids = BTreeSet::new();
         let mut layer_ids = BTreeSet::new();
 
         for texture_set in &self.texture_sets {
             texture_set.resolution.validate()?;
+            if !valid_height_strength(texture_set.height_strength) {
+                return Err(ProjectError::InvalidTextureSetSettings(texture_set.id));
+            }
             if !texture_set_ids.insert(texture_set.id) {
                 return Err(ProjectError::DuplicateTextureSetId(texture_set.id));
             }
+            if let Some(layer) = texture_set
+                .layers
+                .iter()
+                .find(|layer| layer.is_group() && layer.group_depth() + 1 > MAX_GROUP_DEPTH)
+            {
+                return Err(ProjectError::GroupTooDeep(layer.id));
+            }
 
-            for layer in &texture_set.layers {
+            for layer in texture_set.walk_layers() {
                 if !layer_ids.insert(layer.id) {
                     return Err(ProjectError::DuplicateLayerId(layer.id));
                 }
@@ -1826,6 +1757,12 @@ impl MaterialProject {
                 }
                 if !layer.has_valid_settings() {
                     return Err(ProjectError::InvalidLayerSettings(layer.id));
+                }
+                if let Some(missing) = layer
+                    .own_resources()
+                    .find(|resource| !resource_ids.contains(resource))
+                {
+                    return Err(ProjectError::MissingResource(missing));
                 }
             }
         }
@@ -1880,14 +1817,22 @@ pub enum ProjectError {
     InvalidLayerOpacity { layer: LayerId, opacity: f32 },
     #[error("layer {0:?} has invalid or excessive paint data")]
     InvalidLayerPaintData(LayerId),
-    #[error("layer {0:?} has an invalid fill, mask generator, or polygon mask")]
+    #[error("layer {0:?} has an invalid fill, mask, filter, or projection")]
     InvalidLayerSettings(LayerId),
+    #[error("layer group {0:?} is nested more than {MAX_GROUP_DEPTH} levels deep")]
+    GroupTooDeep(LayerId),
+    #[error("texture set {0:?} has an out-of-range height strength")]
+    InvalidTextureSetSettings(TextureSetId),
     #[error("mesh scale or smoothing settings are out of range")]
     InvalidMeshSettings,
     #[error("pose id {0:?} is duplicated")]
     DuplicatePoseId(PoseId),
     #[error("pose name `{0}` is duplicated")]
     DuplicatePoseName(String),
+    #[error("resource id {0:?} is duplicated")]
+    DuplicateResourceId(ResourceId),
+    #[error("a layer references resource {0:?}, which the project does not list")]
+    MissingResource(ResourceId),
     #[error(transparent)]
     InvalidPose(#[from] PoseError),
 }
@@ -1908,6 +1853,7 @@ mod tests {
             },
             channels: BTreeSet::from([MaterialChannel::BaseColor]),
             layers: Vec::new(),
+            height_strength: DEFAULT_HEIGHT_STRENGTH,
         }
     }
 
@@ -1936,18 +1882,26 @@ mod tests {
                 opacity: 1.0,
                 roughness: DEFAULT_ROUGHNESS,
                 metallic: 0.0,
+                height: DEFAULT_HEIGHT,
+                ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
             }],
             mask_strokes: vec![MaskStroke {
                 points: vec![glam::Vec2::new(7.0 / 15.0, 8.0 / 15.0)],
                 radius_pixels: 2.0,
                 value: 0.0,
                 opacity: 1.0,
+                tip: BrushTip::ROUND,
+                pressures: Vec::new(),
             }],
             id_strokes: Vec::new(),
             id_mask_color: None,
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         });
 
         let baked = set.bake_base_color().unwrap();
@@ -1977,11 +1931,17 @@ mod tests {
                 radius_pixels: 2.0,
                 color: [16, 180, 240],
                 opacity: 1.0,
+                tip: BrushTip::ROUND,
+                pressures: Vec::new(),
             }],
             id_mask_color: None,
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         });
 
         let baked = set.bake_id_mask().unwrap();
@@ -2011,6 +1971,8 @@ mod tests {
                 opacity: 1.0,
                 roughness: DEFAULT_ROUGHNESS,
                 metallic: 0.0,
+                height: DEFAULT_HEIGHT,
+                ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
             }],
             mask_strokes: Vec::new(),
             id_strokes: vec![IdStroke {
@@ -2018,11 +1980,17 @@ mod tests {
                 radius_pixels: 1.0,
                 color: [12, 180, 220],
                 opacity: 1.0,
+                tip: BrushTip::ROUND,
+                pressures: Vec::new(),
             }],
             id_mask_color: Some([12, 180, 220]),
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         });
 
         let baked = set.bake_base_color().unwrap();
@@ -2040,18 +2008,24 @@ mod tests {
             opacity: 1.0,
             roughness: DEFAULT_ROUGHNESS,
             metallic: 0.0,
+            height: DEFAULT_HEIGHT,
+            ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
         };
         let mask = MaskStroke {
             points: vec![glam::Vec2::new(0.5, 0.5)],
             radius_pixels: 3.0,
             value: 0.25,
             opacity: 1.0,
+            tip: BrushTip::ROUND,
+            pressures: Vec::new(),
         };
         let id = IdStroke {
             points: vec![glam::Vec2::new(0.75, 0.25)],
             radius_pixels: 4.0,
             color: [12, 180, 220],
             opacity: 1.0,
+            tip: BrushTip::ROUND,
+            pressures: Vec::new(),
         };
         let mut set = texture_set(1);
         set.layers.push(MaterialLayer {
@@ -2067,6 +2041,10 @@ mod tests {
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         });
         let mut project = MaterialProject {
             texture_sets: vec![set],
@@ -2115,6 +2093,8 @@ mod tests {
                 opacity: 1.0,
                 roughness: DEFAULT_ROUGHNESS,
                 metallic: 0.0,
+                height: DEFAULT_HEIGHT,
+                ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
             },
         });
         assert!(!history.can_redo());
@@ -2174,6 +2154,10 @@ mod tests {
             fill: None,
             mask_generator: None,
             polygon_mask: None,
+            mask_bitmap: None,
+            filters: Vec::new(),
+            mask_filters: Vec::new(),
+            children: None,
         });
         let project = MaterialProject {
             texture_sets: vec![set],
@@ -2205,6 +2189,10 @@ mod tests {
                 fill: None,
                 mask_generator: None,
                 polygon_mask: None,
+                mask_bitmap: None,
+                filters: Vec::new(),
+                mask_filters: Vec::new(),
+                children: None,
             },
             MaterialLayer {
                 id: LayerId(4),
@@ -2219,6 +2207,10 @@ mod tests {
                 fill: None,
                 mask_generator: None,
                 polygon_mask: None,
+                mask_bitmap: None,
+                filters: Vec::new(),
+                mask_filters: Vec::new(),
+                children: None,
             },
         ];
         let project = MaterialProject {
@@ -2467,6 +2459,7 @@ mod tests {
         let context = BakeContext {
             mesh: Some(&cube),
             mesh_maps: None,
+            resources: None,
         };
 
         let baked = set
@@ -2523,6 +2516,8 @@ mod tests {
                 color: [200, 200, 205, 255],
                 roughness: 0.2,
                 metallic: 1.0,
+                height: DEFAULT_HEIGHT,
+                ..LayerFill::default()
             },
         );
         layer.mask_generator = Some(MaskGenerator::EdgeWear(EdgeWear {
@@ -2533,6 +2528,7 @@ mod tests {
         let context = BakeContext {
             mesh: Some(&cube),
             mesh_maps: Some(&maps),
+            resources: None,
         };
 
         let metallic = set
@@ -2560,8 +2556,10 @@ mod tests {
         );
         assert!(set.requires_mesh_maps());
         assert_eq!(
-            set.bake_channel(MaterialChannel::Height, context),
-            Err(BakeError::UnsupportedChannel(MaterialChannel::Height))
+            set.bake_channel(MaterialChannel::AmbientOcclusion, context),
+            Err(BakeError::UnsupportedChannel(
+                MaterialChannel::AmbientOcclusion
+            ))
         );
     }
 
@@ -2575,6 +2573,8 @@ mod tests {
             opacity: 1.0,
             roughness: 0.1,
             metallic: 0.8,
+            height: DEFAULT_HEIGHT,
+            ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
         });
         let set = small_set(9, layer);
 
@@ -2624,7 +2624,10 @@ mod tests {
             &mut project,
             EditCommand::InsertLayer {
                 texture_set_id: set_id,
-                index: 1,
+                slot: LayerSlot {
+                    parent: None,
+                    index: 1
+                },
                 layer: Box::new(fill.clone()),
             }
         ));
@@ -2632,8 +2635,14 @@ mod tests {
             &mut project,
             EditCommand::MoveLayer {
                 texture_set_id: set_id,
-                from: 1,
-                to: 0,
+                from: LayerSlot {
+                    parent: None,
+                    index: 1
+                },
+                to: LayerSlot {
+                    parent: None,
+                    index: 0
+                },
             }
         ));
         assert_eq!(project.texture_sets[0].layers[0].id, LayerId(2));
@@ -2641,7 +2650,10 @@ mod tests {
             &mut project,
             EditCommand::RemoveLayer {
                 texture_set_id: set_id,
-                index: 0,
+                slot: LayerSlot {
+                    parent: None,
+                    index: 0
+                },
                 layer: Box::new(fill.clone()),
             }
         ));
@@ -2656,10 +2668,447 @@ mod tests {
             &mut project,
             EditCommand::InsertLayer {
                 texture_set_id: set_id,
-                index: 0,
+                slot: LayerSlot {
+                    parent: None,
+                    index: 0
+                },
                 layer: Box::new(MaterialLayer::new_paint(LayerId(1), "Dup")),
             }
         ));
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn tc_0048_vertex_tangents_follow_plus_u_with_plus_v_bitangents() {
+        let plane = PrimitivePreset::Plane.build_mesh();
+        let normals = vertex_normals(&plane, 60.0);
+        let tangents = vertex_tangents(&plane, &normals);
+
+        for (normal, tangent) in normals.iter().zip(&tangents) {
+            assert!((*normal - Vec3::Y).length() < 1e-5);
+            assert!(
+                (tangent.truncate() - Vec3::X).length() < 1e-5,
+                "tangent {tangent}"
+            );
+            // +V runs toward -Z on the built-in plane.
+            let bitangent = normal.cross(tangent.truncate()) * tangent.w;
+            assert!(
+                (bitangent - Vec3::NEG_Z).length() < 1e-5,
+                "bitangent {bitangent}"
+            );
+        }
+    }
+
+    #[test]
+    fn tc_0049_painted_height_bends_the_normal_channel_outward() {
+        let mut layer = MaterialLayer::new_paint(LayerId(1), "Bump");
+        layer.channels = BTreeSet::from([MaterialChannel::Height]);
+        layer.paint_strokes.push(PaintStroke {
+            points: vec![glam::Vec2::new(0.5, 0.5)],
+            radius_pixels: 6.0,
+            color: [255, 255, 255, 255],
+            opacity: 1.0,
+            roughness: DEFAULT_ROUGHNESS,
+            metallic: 0.0,
+            height: 1.0,
+            ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
+        });
+        let mut set = small_set(17, layer);
+        // A 17-texel map needs maximum force for a clearly visible tilt.
+        set.height_strength = MAX_HEIGHT_STRENGTH;
+
+        let height = set
+            .bake_channel(MaterialChannel::Height, BakeContext::default())
+            .unwrap();
+        assert_eq!(height.pixel(8, 8).unwrap()[0], 255);
+        assert_eq!(height.pixel(0, 0).unwrap()[0], 128);
+
+        let normal = set
+            .bake_channel(MaterialChannel::Normal, BakeContext::default())
+            .unwrap();
+        // Flat away from the bump.
+        assert_eq!(normal.pixel(0, 0), Some([128, 128, 255, 255]));
+        // Right of the bump tilts toward +U, above it (smaller row) toward +V,
+        // left toward -U.
+        assert!(normal.pixel(11, 8).unwrap()[0] > 150);
+        assert!(normal.pixel(8, 5).unwrap()[1] > 150);
+        assert!(normal.pixel(5, 8).unwrap()[0] < 106);
+
+        let mut flat = set.clone();
+        flat.height_strength = 0.0;
+        let unchanged = flat
+            .bake_channel(MaterialChannel::Normal, BakeContext::default())
+            .unwrap();
+        assert!(
+            unchanged
+                .rgba8
+                .chunks(4)
+                .all(|pixel| pixel == [128, 128, 255, 255])
+        );
+    }
+
+    #[test]
+    fn tc_0050_material_bake_packs_occlusion_roughness_and_metallic() {
+        let mut layer = MaterialLayer::new_fill(
+            LayerId(1),
+            "Metal",
+            LayerFill {
+                color: [200, 100, 50, 255],
+                roughness: 0.2,
+                metallic: 1.0,
+                height: DEFAULT_HEIGHT,
+                ..LayerFill::default()
+            },
+        );
+        layer.opacity = 1.0;
+        let set = small_set(8, layer);
+
+        let textures = set.bake_material(BakeContext::default()).unwrap();
+
+        assert_eq!(textures.base_color.pixel(3, 3), Some([200, 100, 50, 255]));
+        // No mesh maps: occlusion is open (255).
+        assert_eq!(textures.orm.pixel(3, 3), Some([255, 51, 255, 255]));
+        assert_eq!(textures.normal.pixel(3, 3), Some([128, 128, 255, 255]));
+
+        // Unpainted texels show (and export) the neutral default, opaque.
+        let mut empty = set.clone();
+        empty.layers.clear();
+        let neutral = empty.bake_material(BakeContext::default()).unwrap();
+        assert_eq!(neutral.base_color.pixel(0, 0), Some([128, 128, 128, 255]));
+        assert_eq!(neutral.orm.pixel(0, 0), Some([255, 128, 0, 255]));
+
+        let mut invalid = set.clone();
+        invalid.height_strength = f32::NAN;
+        assert_eq!(
+            invalid.bake_material(BakeContext::default()),
+            Err(BakeError::InvalidLayerSettings)
+        );
+    }
+
+    fn uv_of_pixel(x: u32, y: u32, size: u32) -> glam::Vec2 {
+        glam::Vec2::new(
+            x as f32 / (size - 1) as f32,
+            1.0 - y as f32 / (size - 1) as f32,
+        )
+    }
+
+    #[test]
+    fn tc_0060_eraser_removes_paint_from_its_own_layer_only() {
+        let size = 16;
+        let mut under = MaterialLayer::new_fill(
+            LayerId(1),
+            "Under",
+            LayerFill {
+                color: [0, 0, 255, 255],
+                ..LayerFill::default()
+            },
+        );
+        under.channels = BTreeSet::from([MaterialChannel::BaseColor]);
+        let mut paint = MaterialLayer::new_paint(LayerId(2), "Paint");
+        let centre = uv_of_pixel(8, 8, size);
+        paint.paint_strokes.push(PaintStroke::new(
+            vec![uv_of_pixel(2, 8, size), uv_of_pixel(14, 8, size)],
+            3.0,
+            [255, 0, 0, 255],
+        ));
+        paint.paint_strokes.push(PaintStroke {
+            erase: true,
+            tip: BrushTip {
+                hardness: 1.0,
+                ..BrushTip::ROUND
+            },
+            ..PaintStroke::new(vec![centre], 2.0, [0; 4])
+        });
+        let mut set = small_set(size, under);
+        set.layers.push(paint);
+
+        let baked = set.bake_base_color().unwrap();
+        assert_eq!(
+            baked.pixel(8, 8),
+            Some([0, 0, 255, 255]),
+            "erased to the fill"
+        );
+        assert_eq!(
+            baked.pixel(3, 8),
+            Some([255, 0, 0, 255]),
+            "paint elsewhere stays"
+        );
+
+        // Painting after erasing shows again.
+        set.layers[1]
+            .paint_strokes
+            .push(PaintStroke::new(vec![centre], 2.0, [0, 255, 0, 255]));
+        let baked = set.bake_base_color().unwrap();
+        assert_eq!(baked.pixel(8, 8), Some([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn tc_0061_groups_composite_children_through_group_opacity_and_mask() {
+        let size = 8;
+        let red = MaterialLayer::new_fill(
+            LayerId(2),
+            "Red",
+            LayerFill {
+                color: [255, 0, 0, 255],
+                roughness: 0.2,
+                ..LayerFill::default()
+            },
+        );
+        let mut group = MaterialLayer::new_group(LayerId(1), "Group");
+        group.children = Some(vec![red]);
+        group.opacity = 0.5;
+        // Mask out the left half of the group.
+        group.mask_strokes.push(MaskStroke {
+            points: vec![glam::Vec2::new(0.0, 0.5)],
+            radius_pixels: 3.5,
+            value: 0.0,
+            opacity: 1.0,
+            tip: BrushTip {
+                shape: BrushShape::Square,
+                hardness: 1.0,
+                ..BrushTip::ROUND
+            },
+            pressures: Vec::new(),
+        });
+        let set = small_set(size, group);
+
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        // Right half: halfway between the default 0.5 and 0.2.
+        assert!(roughness.pixel(7, 4).unwrap()[0].abs_diff(89) <= 1);
+        assert_eq!(
+            roughness.pixel(0, 4).unwrap()[0],
+            128,
+            "masked by the group"
+        );
+
+        let mut hidden = set.clone();
+        hidden.layers[0].visible = false;
+        let roughness = hidden
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(
+            roughness.pixel(7, 4).unwrap()[0],
+            128,
+            "hidden group hides children"
+        );
+    }
+
+    #[test]
+    fn tc_0062_layers_move_into_and_out_of_groups_with_undo() {
+        let mut set = texture_set(1);
+        set.layers = vec![
+            MaterialLayer::new_paint(LayerId(1), "Paint"),
+            MaterialLayer::new_group(LayerId(2), "Group"),
+        ];
+        let mut project = MaterialProject {
+            texture_sets: vec![set],
+            ..MaterialProject::empty()
+        };
+        let set_id = TextureSetId(1);
+        let mut history = EditHistory::default();
+        let top = |index| LayerSlot {
+            parent: None,
+            index,
+        };
+        let in_group = |index| LayerSlot {
+            parent: Some(LayerId(2)),
+            index,
+        };
+
+        assert!(history.apply(
+            &mut project,
+            EditCommand::MoveLayer {
+                texture_set_id: set_id,
+                from: top(0),
+                to: in_group(0),
+            }
+        ));
+        let set = &project.texture_sets[0];
+        assert_eq!(set.layers.len(), 1);
+        assert_eq!(set.slot_of(LayerId(1)), Some(in_group(0)));
+        assert_eq!(set.depth_of(LayerId(1)), 1);
+        assert!(project.validate().is_ok());
+
+        // A group cannot move into itself.
+        assert!(!history.apply(
+            &mut project,
+            EditCommand::MoveLayer {
+                texture_set_id: set_id,
+                from: top(0),
+                to: in_group(0),
+            }
+        ));
+        // Inserting into a plain layer fails.
+        assert!(!history.apply(
+            &mut project,
+            EditCommand::InsertLayer {
+                texture_set_id: set_id,
+                slot: LayerSlot {
+                    parent: Some(LayerId(1)),
+                    index: 0,
+                },
+                layer: Box::new(MaterialLayer::new_paint(LayerId(9), "Nope")),
+            }
+        ));
+        assert!(history.undo(&mut project));
+        assert_eq!(project.texture_sets[0].slot_of(LayerId(1)), Some(top(0)));
+        assert!(
+            project.texture_sets[0]
+                .layer(LayerId(2))
+                .unwrap()
+                .children
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tc_0065_layer_and_mask_filters_change_the_composite() {
+        let size = 8;
+        let mut layer = MaterialLayer::new_fill(
+            LayerId(1),
+            "Rough",
+            LayerFill {
+                roughness: 0.25,
+                ..LayerFill::default()
+            },
+        );
+        layer.filters = vec![LayerFilter::Invert];
+        let set = small_set(size, layer.clone());
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(roughness.pixel(3, 3).unwrap()[0], 191, "inverted 0.25");
+
+        layer.filters.clear();
+        layer.mask_strokes.push(MaskStroke {
+            points: vec![glam::Vec2::new(0.5, 0.5)],
+            radius_pixels: 100.0,
+            value: 0.0,
+            opacity: 1.0,
+            tip: BrushTip {
+                hardness: 1.0,
+                ..BrushTip::ROUND
+            },
+            pressures: Vec::new(),
+        });
+        // An inverted all-black mask shows the layer everywhere again.
+        layer.mask_filters = vec![LayerFilter::Invert];
+        let set = small_set(size, layer);
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(roughness.pixel(3, 3).unwrap()[0], 64);
+    }
+
+    #[test]
+    fn tc_0066_opacity_and_emissive_channels_bake_into_the_material() {
+        let mut layer = MaterialLayer::new_fill(
+            LayerId(1),
+            "Glow",
+            LayerFill {
+                emissive: [255, 128, 0],
+                material_opacity: 0.25,
+                ..LayerFill::default()
+            },
+        );
+        layer.channels = BTreeSet::from([MaterialChannel::Emissive, MaterialChannel::Opacity]);
+        let set = small_set(4, layer);
+
+        let textures = set.bake_material(BakeContext::default()).unwrap();
+        assert_eq!(textures.emissive.pixel(1, 1), Some([255, 128, 0, 255]));
+        assert_eq!(textures.base_color.pixel(1, 1).unwrap()[3], 64);
+        assert!(textures.has_emission() && textures.has_transparency());
+        let opacity = set
+            .bake_channel(MaterialChannel::Opacity, BakeContext::default())
+            .unwrap();
+        assert_eq!(opacity.pixel(0, 0), Some([64, 64, 64, 255]));
+
+        // Nothing painted: black emission, opaque base colour.
+        let plain = small_set(4, MaterialLayer::new_paint(LayerId(2), "Empty"));
+        let textures = plain.bake_material(BakeContext::default()).unwrap();
+        assert!(!textures.has_emission() && !textures.has_transparency());
+    }
+
+    #[test]
+    fn tc_0072_fill_textures_and_bitmap_masks_read_project_resources() {
+        use std::sync::Arc;
+
+        let size = 8;
+        // Left half red, right half blue, as an 8x1 bitmap.
+        let mut pixels = [255, 0, 0, 255].repeat(4);
+        pixels.extend([0, 0, 255, 255].repeat(4));
+        let image = TextureImage::new(8, 1, pixels).unwrap();
+        let resources = ResourceImages::from([(ResourceId(7), Arc::new(image))]);
+        let mut layer = MaterialLayer::new_fill(
+            LayerId(1),
+            "Textured",
+            LayerFill {
+                textures: FillTextures {
+                    base_color: Some(ResourceId(7)),
+                    ..FillTextures::default()
+                },
+                ..LayerFill::default()
+            },
+        );
+        layer.channels = BTreeSet::from([MaterialChannel::BaseColor]);
+        let set = small_set(size, layer);
+        let context = BakeContext {
+            resources: Some(&resources),
+            ..BakeContext::default()
+        };
+        let baked = set
+            .bake_channel(MaterialChannel::BaseColor, context)
+            .unwrap();
+        assert_eq!(baked.pixel(1, 0), Some([255, 0, 0, 255]));
+        assert_eq!(baked.pixel(6, 0), Some([0, 0, 255, 255]));
+        assert_eq!(
+            set.bake_channel(MaterialChannel::BaseColor, BakeContext::default()),
+            Err(BakeError::MissingResource(ResourceId(7)))
+        );
+        assert_eq!(set.referenced_resources(), BTreeSet::from([ResourceId(7)]));
+
+        // As an inverted mask, the red column's luminance (0.21) leaves 0.79
+        // and the blue column's (0.07) leaves 0.93.
+        let mut masked = MaterialLayer::new_fill(
+            LayerId(2),
+            "Masked",
+            LayerFill {
+                color: [255, 255, 255, 255],
+                ..LayerFill::default()
+            },
+        );
+        masked.channels = BTreeSet::from([MaterialChannel::BaseColor]);
+        masked.mask_bitmap = Some(BitmapMask {
+            resource: ResourceId(7),
+            projection: TextureProjection::default(),
+            invert: true,
+        });
+        let set = small_set(size, masked);
+        let baked = set
+            .bake_channel(MaterialChannel::BaseColor, context)
+            .unwrap();
+        let (left, right) = (baked.pixel(1, 0).unwrap()[3], baked.pixel(6, 0).unwrap()[3]);
+        assert!(left.abs_diff(201) <= 1, "inverted red luminance: {left}");
+        assert!(right.abs_diff(237) <= 1, "inverted blue luminance: {right}");
+
+        // The project must list every resource its layers reference.
+        let mut project = MaterialProject {
+            texture_sets: vec![set],
+            ..MaterialProject::empty()
+        };
+        assert_eq!(
+            project.validate(),
+            Err(ProjectError::MissingResource(ResourceId(7)))
+        );
+        project.resources.push(ProjectResource {
+            id: ResourceId(7),
+            name: "Stripes".to_owned(),
+            source: "stripes.png".to_owned(),
+        });
         assert!(project.validate().is_ok());
     }
 }

@@ -184,7 +184,11 @@ pub fn vertex_tangents(mesh: &MeshGeometry, normals: &[Vec3]) -> Vec<glam::Vec4>
                 .normalize_or(Vec3::Z);
             let mut tangent = tangents[index] - normal * normal.dot(tangents[index]);
             if tangent.length_squared() <= f32::EPSILON {
-                let helper = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+                let helper = if normal.x.abs() < 0.9 {
+                    Vec3::X
+                } else {
+                    Vec3::Y
+                };
                 tangent = normal.cross(helper);
             }
             let tangent = tangent.normalize_or(Vec3::X);
@@ -334,6 +338,13 @@ fn subdivide_once(mesh: &MeshGeometry, crease_angle_degrees: f32) -> MeshGeometr
     MeshGeometry {
         vertices,
         triangles,
+        // Each triangle splits into four children at 4i..4i+4.
+        triangle_materials: mesh
+            .triangle_materials
+            .iter()
+            .flat_map(|slot| [*slot; 4])
+            .collect(),
+        material_slots: mesh.material_slots.clone(),
     }
 }
 
