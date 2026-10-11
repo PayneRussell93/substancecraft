@@ -24,8 +24,8 @@ material {
 fragment {
     void material(inout MaterialInputs material) {
         prepareMaterial(material);
-        float2 uv = getUV0();
-        material.baseColor = texture(materialParams_baseColorMap, float2(uv.x, 1.0 - uv.y));
+        // Base Color rows are uploaded top to bottom, matching MaterialTexture::sample_uv.
+        material.baseColor = texture(materialParams_baseColorMap, getUV0());
         material.roughness = materialParams.roughness;
         material.metallic = materialParams.metallic;
     }

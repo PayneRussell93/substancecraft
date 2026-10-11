@@ -94,8 +94,8 @@ unsafe extern "C" fn readback_trampoline(user: *mut c_void, pixels: *const u8, l
         return;
     }
     // SAFETY: Filament guarantees `pixels` points at `len` readable bytes during the callback.
-    let mut rgba8 = unsafe { std::slice::from_raw_parts(pixels, expected) }.to_vec();
-    flip_rows(&mut rgba8, readback.width, readback.height);
+    // The swap chain readback already arrives with rows top to bottom.
+    let rgba8 = unsafe { std::slice::from_raw_parts(pixels, expected) }.to_vec();
     let Readback { callback, .. } = *readback;
     // A panic must not unwind into Filament's C++ frames.
     let _ = catch_unwind(AssertUnwindSafe(move || callback(rgba8)));
@@ -132,7 +132,8 @@ impl FilamentRuntime {
     }
 
     /// Delivers completed GPU readbacks to their callbacks. Call once per UI frame, including
-    /// frames where no new render is submitted, or pending readbacks never complete.
+    /// frames where no new render is submitted, or pending readbacks never complete. While a
+    /// readback is outstanding this waits for the GPU to finish the submitted frame.
     pub fn poll(&mut self) {
         // SAFETY: `raw` is a live renderer owned by `self`.
         unsafe { ffi::sc_renderer_pump(self.raw.as_ptr()) };
@@ -204,7 +205,6 @@ impl FilamentRuntime {
             // SAFETY: the shim did not take ownership, so reclaim the box here.
             drop(unsafe { Box::from_raw(user) });
         }
-        self.poll();
         Ok(rendered)
     }
 
@@ -422,18 +422,6 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
     })
 }
 
-fn flip_rows(pixels: &mut [u8], width: u32, height: u32) {
-    let row_bytes = width as usize * 4;
-    for row in 0..height as usize / 2 {
-        let opposite = height as usize - row - 1;
-        let split = opposite * row_bytes;
-        let (top, bottom) = pixels.split_at_mut(split);
-        let top_row = &mut top[row * row_bytes..(row + 1) * row_bytes];
-        let bottom_row = &mut bottom[..row_bytes];
-        top_row.swap_with_slice(bottom_row);
-    }
-}
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FilamentError {
     #[error("Filament could not initialize its OpenGL backend")]
@@ -459,7 +447,7 @@ mod tests {
 
     use substancecraft_core::{PrimitivePreset, ViewportCamera};
 
-    use super::{FLOATS_PER_VERTEX, FilamentRuntime, build_mesh_buffers, flip_rows};
+    use super::{FLOATS_PER_VERTEX, FilamentRuntime, build_mesh_buffers};
 
     #[test]
     fn mesh_buffer_generation_preserves_topology_and_emits_finite_tangent_frames() {
@@ -472,13 +460,6 @@ mod tests {
         assert_eq!(buffers.bounds.1.to_array(), [0.5; 3]);
         assert!(buffers.vertex_data.iter().all(|value| value.is_finite()));
         assert_eq!(buffers.indices[0..3], geometry.triangles[0]);
-    }
-
-    #[test]
-    fn readback_rows_are_flipped_for_egui_texture_coordinates() {
-        let mut pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        flip_rows(&mut pixels, 1, 2);
-        assert_eq!(pixels, vec![5, 6, 7, 8, 1, 2, 3, 4]);
     }
 
     #[test]

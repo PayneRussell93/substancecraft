@@ -53,6 +53,7 @@ struct ScRenderer {
     IndexBuffer* indexBuffer = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t pendingReadbacks = 0;
 };
 
 void freeCallback(void* buffer, size_t, void*) {
@@ -170,12 +171,14 @@ bool createSwapChain(ScRenderer* r, uint32_t width, uint32_t height) {
 typedef void (*sc_readback_fn)(void* user, uint8_t const* pixels, size_t len);
 
 struct Readback {
+    ScRenderer* renderer;
     sc_readback_fn callback;
     void* user;
 };
 
 void readbackCallback(void* buffer, size_t size, void* user) {
     auto* readback = static_cast<Readback*>(user);
+    readback->renderer->pendingReadbacks--;
     readback->callback(readback->user, static_cast<uint8_t const*>(buffer), size);
     delete readback;
     std::free(buffer);
@@ -419,7 +422,7 @@ void sc_renderer_set_camera(ScRenderer* r, double left, double right, double bot
     }
 }
 
-// Renders one frame and schedules an RGBA8 readback (rows bottom to top). Returns false when
+// Renders one frame and schedules an RGBA8 readback (rows top to bottom). Returns false when
 // the frame was skipped, in which case `callback` is never invoked and `user` stays owned by
 // the caller. On success `callback` runs exactly once from sc_renderer_pump().
 bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
@@ -431,7 +434,7 @@ bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
 
         size_t const size = size_t(r->width) * size_t(r->height) * 4;
         void* pixels = std::malloc(size);
-        auto* readback = new (std::nothrow) Readback{callback, user};
+        auto* readback = new (std::nothrow) Readback{r, callback, user};
         if (!pixels || !readback) {
             std::free(pixels);
             delete readback;
@@ -441,6 +444,7 @@ bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
         r->renderer->readPixels(0, 0, r->width, r->height,
                 backend::PixelBufferDescriptor(pixels, size, backend::PixelDataFormat::RGBA,
                         backend::PixelDataType::UBYTE, readbackCallback, readback));
+        r->pendingReadbacks++;
         r->renderer->endFrame();
         return true;
     } catch (...) {
@@ -448,8 +452,14 @@ bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
     }
 }
 
+// Delivers finished readbacks. The OpenGL backend only retires readPixels() when the driver
+// ticks (inside begin/endFrame) or finishes, so while a readback is outstanding and no new
+// frame is being submitted, flushAndWait() is needed for it to ever complete.
 void sc_renderer_pump(ScRenderer* r) {
     try {
+        if (r->pendingReadbacks > 0) {
+            r->engine->flushAndWait();
+        }
         r->engine->pumpMessageQueues();
     } catch (...) {
     }
