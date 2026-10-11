@@ -1,5 +1,9 @@
 /target/
 **/*.rs.bk
 .idea/
-.vscode//third_party/filament-build/
+.vscode/
+
+# Filament build outputs (see scripts/build-filament.ps1)
+/build/
+/third_party/filament-build/
 /third_party/filament-install/
