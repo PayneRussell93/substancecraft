@@ -21,8 +21,6 @@ pub const MIN_MESH_MAP_RESOLUTION: u32 = 16;
 pub const MAX_MESH_MAP_RESOLUTION: u32 = 2048;
 pub const MAX_MESH_MAP_SAMPLES: u32 = 256;
 pub const MAX_MESH_MAP_PADDING: u32 = 64;
-/// Faces whose normals differ by more than this are shaded as a hard edge.
-const AUTO_SMOOTH_DEGREES: f32 = 60.0;
 /// Feature edges reach full strength this many degrees past the threshold.
 const EDGE_ANGLE_RAMP_DEGREES: f32 = 40.0;
 /// Scales smooth-surface curvature (relative to the mesh diagonal) before it
@@ -46,6 +44,13 @@ pub struct MeshMapSettings {
     /// Texels of edge padding grown around UV islands.
     pub padding: u32,
     pub seed: u32,
+    /// Faces meeting at less than this angle share smooth normals.
+    #[serde(default = "default_smoothing_angle")]
+    pub smoothing_angle_degrees: f32,
+}
+
+fn default_smoothing_angle() -> f32 {
+    crate::smoothing::DEFAULT_SMOOTHING_ANGLE_DEGREES
 }
 
 impl Default for MeshMapSettings {
@@ -58,6 +63,7 @@ impl Default for MeshMapSettings {
             edge_angle_degrees: 20.0,
             padding: 4,
             seed: 1,
+            smoothing_angle_degrees: default_smoothing_angle(),
         }
     }
 }
@@ -82,6 +88,11 @@ impl MeshMapSettings {
             || !(1.0..=170.0).contains(&self.edge_angle_degrees)
         {
             return Err(MeshMapError::InvalidSettings("edge_angle_degrees"));
+        }
+        if !self.smoothing_angle_degrees.is_finite()
+            || !(0.0..=180.0).contains(&self.smoothing_angle_degrees)
+        {
+            return Err(MeshMapError::InvalidSettings("smoothing_angle_degrees"));
         }
         if self.padding > MAX_MESH_MAP_PADDING {
             return Err(MeshMapError::InvalidSettings("padding"));
@@ -507,25 +518,9 @@ impl SurfaceGeometry {
             }
         }
 
-        let smooth_cos = AUTO_SMOOTH_DEGREES.to_radians().cos();
-        let corner_normals = mesh
-            .triangles
-            .iter()
-            .enumerate()
-            .map(|(triangle_index, triangle)| {
-                let own = face_normals[triangle_index];
-                triangle.map(|vertex| {
-                    let normal = incident
-                        .get(&canonical(vertex))
-                        .into_iter()
-                        .flatten()
-                        .filter(|other| face_normals[**other as usize].dot(own) >= smooth_cos)
-                        .map(|other| face_areas[*other as usize])
-                        .sum::<Vec3>();
-                    normal.normalize_or(own)
-                })
-            })
-            .collect::<Vec<_>>();
+        let smooth_cos = settings.smoothing_angle_degrees.to_radians().cos();
+        let corner_normals =
+            crate::smoothing::corner_normals(mesh, settings.smoothing_angle_degrees);
 
         let corner_curvature = mesh
             .triangles

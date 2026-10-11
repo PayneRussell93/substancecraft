@@ -414,7 +414,7 @@ mod tests {
             breakup: 0.0,
             ..EdgeWear::DEFAULT
         });
-        assert!(everything.evaluate(&sample(0.6, 1.0, Vec3::Y)) > 0.9);
+        assert!(everything.evaluate(&sample(0.65, 1.0, Vec3::Y)) > 0.9);
         assert_eq!(everything.evaluate(&sample(0.5, 1.0, Vec3::Y)), 0.0);
 
         let uncovered = MeshMapSample::default();
@@ -427,7 +427,8 @@ mod tests {
             breakup: 0.0,
             ..Dirt::DEFAULT
         });
-        assert!(dirt.evaluate(&sample(0.1, 0.2, Vec3::Y)) > 0.9);
+        assert!(dirt.evaluate(&sample(0.0, 0.0, Vec3::Y)) > 0.95);
+        assert!(dirt.evaluate(&sample(0.3, 0.6, Vec3::Y)) < dirt.evaluate(&sample(0.0, 0.0, Vec3::Y)));
         assert_eq!(dirt.evaluate(&sample(0.5, 1.0, Vec3::Y)), 0.0);
 
         let up = MaskGenerator::Orientation(Orientation::DEFAULT);

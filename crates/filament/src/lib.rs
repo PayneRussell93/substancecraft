@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 
 use glam::{Mat3, Quat, Vec3};
-use substancecraft_core::{MeshGeometry, ViewportCamera};
+use substancecraft_core::{MeshGeometry, ViewportCamera, vertex_normals};
 use thiserror::Error;
 
 const MAX_VIEWPORT_DIMENSION: u32 = 2048;
@@ -250,7 +250,13 @@ impl FilamentRuntime {
         }
     }
 
-    pub fn set_mesh(&mut self, geometry: &MeshGeometry) -> Result<(), FilamentError> {
+    /// Uploads `geometry`. Shading normals are smoothed across faces meeting at
+    /// less than `smoothing_angle_degrees` (0 = flat, 180 = fully smooth).
+    pub fn set_mesh(
+        &mut self,
+        geometry: &MeshGeometry,
+        smoothing_angle_degrees: f32,
+    ) -> Result<(), FilamentError> {
         if geometry.vertices.is_empty()
             || geometry.triangles.is_empty()
             || geometry.vertices.len() > MAX_MESH_VERTICES
@@ -262,7 +268,7 @@ impl FilamentRuntime {
             vertex_data,
             indices,
             bounds,
-        } = build_mesh_buffers(geometry)?;
+        } = build_mesh_buffers(geometry, smoothing_angle_degrees)?;
         let vertex_count =
             u32::try_from(geometry.vertices.len()).map_err(|_| FilamentError::InvalidMesh)?;
         let index_count = u32::try_from(indices.len()).map_err(|_| FilamentError::InvalidMesh)?;
@@ -334,7 +340,10 @@ struct MeshBuffers {
     bounds: (Vec3, Vec3),
 }
 
-fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentError> {
+fn build_mesh_buffers(
+    geometry: &MeshGeometry,
+    smoothing_angle_degrees: f32,
+) -> Result<MeshBuffers, FilamentError> {
     let vertex_count = geometry.vertices.len();
     if geometry
         .triangles
@@ -344,7 +353,6 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
     {
         return Err(FilamentError::InvalidMesh);
     }
-    let mut normals = vec![Vec3::ZERO; vertex_count];
     let mut tangents = vec![Vec3::ZERO; vertex_count];
     let mut bitangents = vec![Vec3::ZERO; vertex_count];
     for triangle in &geometry.triangles {
@@ -354,10 +362,6 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
         let vertex_c = geometry.vertices[index_c as usize];
         let edge_ab = vertex_b.position - vertex_a.position;
         let edge_ac = vertex_c.position - vertex_a.position;
-        let normal = edge_ab.cross(edge_ac);
-        for index in [index_a, index_b, index_c] {
-            normals[index as usize] += normal;
-        }
         let uv_ab = vertex_b.uv - vertex_a.uv;
         let uv_ac = vertex_c.uv - vertex_a.uv;
         let determinant = uv_ab.x * uv_ac.y - uv_ab.y * uv_ac.x;
@@ -372,6 +376,7 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
         }
     }
 
+    let normals = vertex_normals(geometry, smoothing_angle_degrees);
     let mut vertex_data = Vec::with_capacity(vertex_count.saturating_mul(FLOATS_PER_VERTEX));
     for (index, vertex) in geometry.vertices.iter().enumerate() {
         let mut normal = normals[index].normalize_or_zero();
@@ -459,7 +464,7 @@ mod tests {
     #[test]
     fn mesh_buffer_generation_preserves_topology_and_emits_finite_tangent_frames() {
         let geometry = PrimitivePreset::Cube.build_mesh();
-        let buffers = build_mesh_buffers(&geometry).expect("valid cube buffers");
+        let buffers = build_mesh_buffers(&geometry, 60.0).expect("valid cube buffers");
 
         assert_eq!(
             buffers.vertex_data.len(),
@@ -477,7 +482,7 @@ mod tests {
     fn headless_filament_render_returns_an_rgba_frame() {
         let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
         let geometry = PrimitivePreset::Cube.build_mesh();
-        renderer.set_mesh(&geometry).expect("cube mesh upload");
+        renderer.set_mesh(&geometry, 60.0).expect("cube mesh upload");
         let (sender, receiver) = sync_channel(1);
         let rendered = renderer
             .render(ViewportCamera::default(), 64, 64, 1.0, move |pixels| {

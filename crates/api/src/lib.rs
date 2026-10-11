@@ -12,7 +12,8 @@ use std::{
     path::Path,
 };
 use substancecraft_core::{
-    BakeError, BakedTexture, MaterialProject, MeshError, PrimitivePreset, TextureSet,
+    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MeshError, MeshGeometry,
+    MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing, PrimitivePreset, TextureSet,
 };
 use thiserror::Error;
 
@@ -181,6 +182,31 @@ pub fn bake_texture_set_id_mask(texture_set: &TextureSet) -> Result<BakedTexture
     Ok(texture_set.bake_id_mask()?)
 }
 
+/// Bakes one channel of a texture set. `mesh` is required by polygon masks and
+/// `mesh_maps` by mask generators; pass `None` when no layer uses them.
+pub fn bake_texture_set_channel(
+    texture_set: &TextureSet,
+    channel: MaterialChannel,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+) -> Result<BakedTexture, ApiError> {
+    Ok(texture_set.bake_channel(channel, BakeContext { mesh, mesh_maps })?)
+}
+
+/// Applies smoothing/subdivision, then bakes geometry-derived mesh maps.
+pub fn bake_mesh_maps(
+    mesh: &MeshGeometry,
+    smoothing: &MeshSmoothing,
+    settings: &MeshMapSettings,
+) -> Result<MeshMaps, ApiError> {
+    let smoothed = smoothing.apply(mesh)?;
+    let settings = MeshMapSettings {
+        smoothing_angle_degrees: smoothing.angle_degrees,
+        ..*settings
+    };
+    Ok(substancecraft_core::bake_mesh_maps(&smoothed, &settings, None)?)
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ApiError {
     #[error("unknown mesh preset `{0}`")]
@@ -189,6 +215,8 @@ pub enum ApiError {
     InvalidGeneratedMesh(#[from] MeshError),
     #[error(transparent)]
     TextureBake(#[from] BakeError),
+    #[error(transparent)]
+    MeshMapBake(#[from] MeshMapError),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -247,8 +275,9 @@ mod tests {
 
         use glam::{Quat, Vec2, Vec3};
         use substancecraft_core::{
-            BoneId, BoneTransform, IdStroke, LayerId, MaskStroke, MaterialChannel, MaterialLayer,
-            NamedPose, PaintStroke, PoseId, TextureResolution, TextureSet, TextureSetId,
+            BoneId, BoneTransform, EdgeWear, IdStroke, LayerFill, LayerId, MaskGenerator, MaskStroke,
+            MaterialLayer, NamedPose, PaintStroke, PolygonMask, PoseId, TextureResolution, TextureSet,
+            TextureSetId,
         };
 
         let project = MaterialProject {
@@ -272,6 +301,8 @@ mod tests {
                         radius_pixels: 8.0,
                         color: [32, 64, 128, 255],
                         opacity: 0.8,
+                        roughness: 0.3,
+                        metallic: 1.0,
                     }],
                     mask_strokes: vec![MaskStroke {
                         points: vec![Vec2::new(0.5, 0.5)],
@@ -286,6 +317,12 @@ mod tests {
                         opacity: 1.0,
                     }],
                     id_mask_color: Some([1, 2, 3]),
+                    fill: Some(LayerFill::default()),
+                    mask_generator: Some(MaskGenerator::EdgeWear(EdgeWear::DEFAULT)),
+                    polygon_mask: Some(PolygonMask {
+                        triangles: BTreeSet::from([0, 7, 9]),
+                        inverted: true,
+                    }),
                 }],
             }],
             saved_poses: vec![NamedPose {
@@ -341,6 +378,9 @@ mod tests {
         assert!(layer.mask_strokes.is_empty());
         assert!(layer.id_strokes.is_empty());
         assert_eq!(layer.id_mask_color, None);
+        assert_eq!(layer.fill, None);
+        assert_eq!(layer.mask_generator, None);
+        assert_eq!(layer.polygon_mask, None);
     }
 
     #[test]
@@ -367,6 +407,7 @@ mod tests {
                 id: substancecraft_core::MeshId(9),
                 source: "builtin:Sphere".to_owned(),
                 scale: 1.0,
+                smoothing: MeshSmoothing::default(),
             }),
             ..MaterialProject::empty()
         };

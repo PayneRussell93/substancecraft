@@ -61,7 +61,8 @@ pub(crate) fn rasterize_uv_triangle(
             let w1 = (points[0] - points[2]).perp_dot(point - points[2]) / area;
             let w2 = 1.0 - w0 - w1;
             let weights = [w0, w1, w2];
-            let interior = weights.iter().all(|weight| *weight >= 0.0);
+            // Pixels exactly on an edge count as interior despite rounding.
+            let interior = weights.iter().all(|weight| *weight >= -1e-5);
             if !interior {
                 if fringe <= 0.0 {
                     continue;
