@@ -1,3 +1,4 @@
 [submodule "third_party/filament"]
 	path = third_party/filament
 	url = https://github.com/PayneRussell93/filament.git
+	shallow = true

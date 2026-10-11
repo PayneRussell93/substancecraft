@@ -1,0 +1,32 @@
+// Viewport PBR material for SubstanceCraft. Compiled by build.rs with the matc
+// from the vendored Filament build, so the package always matches the engine version.
+material {
+    name : SubstanceCraftViewport,
+    shadingModel : lit,
+    doubleSided : true,
+    requires : [ uv0 ],
+    parameters : [
+        {
+            type : sampler2d,
+            name : baseColorMap
+        },
+        {
+            type : float,
+            name : roughness
+        },
+        {
+            type : float,
+            name : metallic
+        }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        float2 uv = getUV0();
+        material.baseColor = texture(materialParams_baseColorMap, float2(uv.x, 1.0 - uv.y));
+        material.roughness = materialParams.roughness;
+        material.metallic = materialParams.metallic;
+    }
+}

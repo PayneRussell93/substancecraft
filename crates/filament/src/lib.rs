@@ -1,24 +1,15 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
-use std::mem::size_of;
+//! Offscreen viewport renderer backed by the vendored Filament fork (`third_party/filament`).
+//!
+//! The C++ engine is reached through the C ABI in `cpp/shim.cpp`; this module owns the only
+//! handle to it and keeps all geometry, camera and texture preparation on the Rust side.
 
-use filament_bindings::{
-    backend::{
-        self, Backend, BufferDescriptor, ElementType, PixelBufferDescriptor,
-        PixelDataFormat, PixelDataType, SamplerCompareFunc, SamplerCompareMode, SamplerMagFilter,
-        SamplerMinFilter, SamplerWrapMode, SamplerType, TextureFormat, TextureUsage,
-    },
-    filament::{
-        Bounds, Camera, ClearOptions, Engine, IndexBuffer, IndexBufferBuilder, LightBuilder,
-        IndexType, LightType, LinearColor, Material, MaterialBuilder, MaterialInstance,
-        Projection, RenderableBuilder, Renderer, Scene, SwapChain, SwapChainConfig, Texture,
-        TextureBuilder, TextureSampler, VertexAttribute, VertexBuffer, VertexBufferBuilder, View,
-        Viewport,
-    },
-    math::{Float3, Float4},
-    utils::Entity,
-};
+use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr::NonNull;
+
 use glam::{Mat3, Quat, Vec3};
 use substancecraft_core::{MeshGeometry, ViewportCamera};
 use thiserror::Error;
@@ -26,24 +17,93 @@ use thiserror::Error;
 const MAX_VIEWPORT_DIMENSION: u32 = 2048;
 const MAX_VIEWPORT_PIXELS: usize = 4_194_304;
 const MAX_MESH_VERTICES: usize = 3_000_000;
+const FLOATS_PER_VERTEX: usize = 9;
+const DEFAULT_BASE_COLOR: [u8; 4] = [168, 173, 179, 255];
+
+static VIEWPORT_MATERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/viewport.filamat"));
+
+mod ffi {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct ScRenderer {
+        _private: [u8; 0],
+    }
+
+    pub type ReadbackFn = unsafe extern "C" fn(user: *mut c_void, pixels: *const u8, len: usize);
+
+    unsafe extern "C" {
+        pub fn sc_renderer_create(
+            material: *const u8,
+            material_len: usize,
+            width: u32,
+            height: u32,
+        ) -> *mut ScRenderer;
+        pub fn sc_renderer_destroy(renderer: *mut ScRenderer);
+        pub fn sc_renderer_resize(renderer: *mut ScRenderer, width: u32, height: u32) -> bool;
+        pub fn sc_renderer_set_base_color_map(
+            renderer: *mut ScRenderer,
+            width: u32,
+            height: u32,
+            rgba8: *const u8,
+        ) -> bool;
+        pub fn sc_renderer_set_mesh(
+            renderer: *mut ScRenderer,
+            vertices: *const f32,
+            vertex_count: u32,
+            indices: *const u32,
+            index_count: u32,
+            center: *const f32,
+            half_extent: *const f32,
+        ) -> bool;
+        pub fn sc_renderer_clear_mesh(renderer: *mut ScRenderer);
+        pub fn sc_renderer_set_camera(
+            renderer: *mut ScRenderer,
+            left: f64,
+            right: f64,
+            bottom: f64,
+            top: f64,
+            near_plane: f64,
+            far_plane: f64,
+            eye: *const f64,
+            target: *const f64,
+            up: *const f64,
+        );
+        pub fn sc_renderer_render(
+            renderer: *mut ScRenderer,
+            callback: ReadbackFn,
+            user: *mut c_void,
+        ) -> bool;
+        pub fn sc_renderer_pump(renderer: *mut ScRenderer);
+    }
+}
+
+/// Pending readback handed to Filament; reclaimed in [`readback_trampoline`].
+struct Readback {
+    width: u32,
+    height: u32,
+    callback: Box<dyn FnOnce(Vec<u8>)>,
+}
+
+unsafe extern "C" fn readback_trampoline(user: *mut c_void, pixels: *const u8, len: usize) {
+    // SAFETY: `user` is the `Box<Readback>` leaked in `render`, and Filament invokes this
+    // callback exactly once per successful `sc_renderer_render`.
+    let readback = unsafe { Box::from_raw(user.cast::<Readback>()) };
+    let expected = (readback.width as usize) * (readback.height as usize) * 4;
+    if pixels.is_null() || len < expected {
+        return;
+    }
+    // SAFETY: Filament guarantees `pixels` points at `len` readable bytes during the callback.
+    let mut rgba8 = unsafe { std::slice::from_raw_parts(pixels, expected) }.to_vec();
+    flip_rows(&mut rgba8, readback.width, readback.height);
+    let Readback { callback, .. } = *readback;
+    // A panic must not unwind into Filament's C++ frames.
+    let _ = catch_unwind(AssertUnwindSafe(move || callback(rgba8)));
+}
 
 pub struct FilamentRuntime {
-    engine: Engine,
-    swap_chain: Option<SwapChain>,
-    renderer: Option<Renderer>,
-    view: Option<View>,
-    scene: Option<Scene>,
-    camera: Option<Camera>,
-    camera_entity: Option<Entity>,
-    light_entity: Option<Entity>,
-    material: Option<Material>,
-    material_instance: Option<MaterialInstance>,
-    base_color_texture: Option<Texture>,
-    texture_sampler: TextureSampler,
+    raw: NonNull<ffi::ScRenderer>,
     base_color_map_key: Option<usize>,
-    mesh_entity: Option<Entity>,
-    vertex_buffer: Option<VertexBuffer>,
-    index_buffer: Option<IndexBuffer>,
     mesh_bounds: Option<(Vec3, Vec3)>,
     target_size: [u32; 2],
 }
@@ -51,115 +111,31 @@ pub struct FilamentRuntime {
 impl FilamentRuntime {
     pub fn new(width: u32, height: u32) -> Result<Self, FilamentError> {
         let size = bounded_size(width, height)?;
-        let engine = unsafe { Engine::create(Backend::OPENGL) }
-            .ok_or(FilamentError::EngineUnavailable)?;
+        // SAFETY: the material slice outlives the call; the shim copies what it keeps.
+        let raw = unsafe {
+            ffi::sc_renderer_create(
+                VIEWPORT_MATERIAL.as_ptr(),
+                VIEWPORT_MATERIAL.len(),
+                size[0],
+                size[1],
+            )
+        };
+        let raw = NonNull::new(raw).ok_or(FilamentError::EngineUnavailable)?;
         let mut runtime = Self {
-            engine,
-            swap_chain: None,
-            renderer: None,
-            view: None,
-            scene: None,
-            camera: None,
-            camera_entity: None,
-            light_entity: None,
-            material: None,
-            material_instance: None,
+            raw,
             base_color_map_key: None,
-            mesh_entity: None,
-            vertex_buffer: None,
-            index_buffer: None,
             mesh_bounds: None,
             target_size: size,
         };
-        runtime.initialize()?;
+        runtime.set_base_color_map(0, 1, 1, &DEFAULT_BASE_COLOR)?;
         Ok(runtime)
     }
 
-    fn initialize(&mut self) -> Result<(), FilamentError> {
-        self.swap_chain = Some(unsafe {
-            self.engine.create_headless_swap_chain(
-                self.target_size[0],
-                self.target_size[1],
-                SwapChainConfig::READABLE,
-            )
-        }
-        .ok_or(FilamentError::SwapChainUnavailable)?);
-        self.renderer = Some(
-            unsafe { self.engine.create_renderer() }.ok_or(FilamentError::RendererUnavailable)?,
-        );
-        self.scene = Some(
-            unsafe { self.engine.create_scene() }.ok_or(FilamentError::SceneUnavailable)?,
-        );
-        self.view = Some(unsafe { self.engine.create_view() }.ok_or(FilamentError::ViewUnavailable)?);
-
-        let mut entities = unsafe { self.engine.get_entity_manager() }
-            .ok_or(FilamentError::EntityManagerUnavailable)?;
-        let camera_entity = unsafe { entities.create() };
-        self.camera = Some(
-            unsafe { self.engine.create_camera(&camera_entity) }
-                .ok_or(FilamentError::CameraUnavailable)?,
-        );
-        self.camera_entity = Some(camera_entity);
-
-        let light_entity = unsafe { entities.create() };
-        let mut light_builder = unsafe { LightBuilder::new(LightType::DIRECTIONAL) }
-            .ok_or(FilamentError::LightUnavailable)?;
-        let light_color = LinearColor(Float3::new(1.0, 0.96, 0.9));
-        let light_direction = Float3::new(-0.45, -0.7, -1.0);
-        unsafe {
-            light_builder
-                .direction(&light_direction)
-                .color(&light_color)
-                .intensity(80_000.0);
-        }
-        if unsafe { light_builder.build(&mut self.engine, &light_entity) }.is_none() {
-            return Err(FilamentError::LightUnavailable);
-        }
-        self.light_entity = Some(light_entity);
-
-        let mut material_builder = unsafe { MaterialBuilder::new() }
-            .ok_or(FilamentError::MaterialUnavailable)?;
-        unsafe { material_builder.package(include_bytes!("../assets/aiDefaultMat_ogl.filament")) };
-        self.material = Some(
-            unsafe { material_builder.build(&mut self.engine) }
-                .ok_or(FilamentError::MaterialUnavailable)?,
-        );
-        let material_instance = unsafe {
-            self.material
-                .as_ref()
-                .and_then(|material| material.create_instance())
-        }
-        .ok_or(FilamentError::MaterialUnavailable)?;
-        self.material_instance = Some(material_instance);
-        if let Some(instance) = self.material_instance.as_mut() {
-            unsafe {
-                instance
-                    .set_rgb_parameter(
-                        "baseColor",
-                        filament_bindings::filament::RgbType::LINEAR,
-                        Float3::new(0.66, 0.68, 0.7),
-                    )
-                    .map_err(|_| FilamentError::MaterialUnavailable)?;
-                instance
-                    .set_float_parameter("roughness", &0.58)
-                    .map_err(|_| FilamentError::MaterialUnavailable)?;
-                instance
-                    .set_float_parameter("metallic", &0.0)
-                    .map_err(|_| FilamentError::MaterialUnavailable)?;
-            }
-        }
-        self.set_base_color_map(0, 1, 1, &[168, 173, 179, 255])?;
-
-        self.configure_viewport(self.target_size[0], self.target_size[1])?;
-        let clear_options = ClearOptions {
-            clear_color: Float4::new(0.025, 0.03, 0.035, 1.0),
-            clear: true,
-            discard: true,
-        };
-        if let Some(renderer) = self.renderer.as_mut() {
-            unsafe { renderer.set_clear_options(&clear_options) };
-        }
-        Ok(())
+    /// Delivers completed GPU readbacks to their callbacks. Call once per UI frame, including
+    /// frames where no new render is submitted, or pending readbacks never complete.
+    pub fn poll(&mut self) {
+        // SAFETY: `raw` is a live renderer owned by `self`.
+        unsafe { ffi::sc_renderer_pump(self.raw.as_ptr()) };
     }
 
     pub fn set_base_color_map(
@@ -176,50 +152,24 @@ impl FilamentRuntime {
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
             .filter(|bytes| *bytes <= MAX_VIEWPORT_PIXELS * 4)
-            .ok_or(FilamentError::InvalidViewport)?;
+            .ok_or(FilamentError::InvalidTexture)?;
         if width == 0 || height == 0 || rgba8.len() != byte_count {
             return Err(FilamentError::InvalidTexture);
         }
-
-        let mut builder = unsafe { TextureBuilder::new() }
-            .ok_or(FilamentError::TextureUnavailable)?;
-        unsafe {
-            builder
-                .width(width)
-                .height(height)
-                .levels(1)
-                .sampler(SamplerType::SAMPLER_2D)
-                .format(TextureFormat::SRGB8_A8)
-                .usage(TextureUsage::SAMPLEABLE | TextureUsage::UPLOADABLE);
-        }
-        let mut texture = unsafe { builder.build(&mut self.engine) }
-            .ok_or(FilamentError::TextureUnavailable)?;
-        unsafe {
-            texture.set_image(
-                &mut self.engine,
-                0,
-                PixelBufferDescriptor::new(
-                    rgba8.to_vec(),
-                    PixelDataFormat::RGBA,
-                    PixelDataType::UBYTE,
-                ),
-            );
-        }
-        let Some(material_instance) = self.material_instance.as_mut() else {
-            return Err(FilamentError::MaterialUnavailable);
+        // SAFETY: `rgba8` holds exactly width * height * 4 bytes; the shim copies them.
+        let uploaded = unsafe {
+            ffi::sc_renderer_set_base_color_map(self.raw.as_ptr(), width, height, rgba8.as_ptr())
         };
-        unsafe {
-            material_instance
-                .set_texture_parameter("baseColorMap", &texture, &self.texture_sampler)
-                .map_err(|_| FilamentError::MaterialUnavailable)?;
-        }
-        if let Some(mut old_texture) = self.base_color_texture.replace(texture) {
-            unsafe { self.engine.destroy_texture(&mut old_texture) };
+        if !uploaded {
+            return Err(FilamentError::TextureUnavailable);
         }
         self.base_color_map_key = Some(key);
         Ok(())
     }
 
+    /// Renders one frame and schedules an RGBA8 readback (rows top to bottom). Returns
+    /// `Ok(false)` when Filament skipped the frame, in which case `readback` is dropped unused.
+    /// Otherwise `readback` runs from a later [`FilamentRuntime::poll`] call.
     pub fn render(
         &mut self,
         camera: ViewportCamera,
@@ -230,255 +180,125 @@ impl FilamentRuntime {
     ) -> Result<bool, FilamentError> {
         let size = bounded_size(width, height)?;
         if size != self.target_size {
-            self.resize(size)?;
+            // SAFETY: `raw` is a live renderer owned by `self`.
+            if !unsafe { ffi::sc_renderer_resize(self.raw.as_ptr(), size[0], size[1]) } {
+                return Err(FilamentError::SwapChainUnavailable);
+            }
+            self.target_size = size;
         }
-        if self.mesh_bounds.is_none() {
+        let Some(bounds) = self.mesh_bounds else {
             return Err(FilamentError::InvalidMesh);
-        }
-        self.configure_camera(camera, size[0], size[1], pixels_per_point);
+        };
+        self.configure_camera(bounds, camera, size, pixels_per_point);
 
-        let (Some(renderer), Some(swap_chain), Some(view)) = (
-            self.renderer.as_mut(),
-            self.swap_chain.as_mut(),
-            self.view.as_ref(),
-        ) else {
-            return Err(FilamentError::RendererUnavailable);
+        let user = Box::into_raw(Box::new(Readback {
+            width: size[0],
+            height: size[1],
+            callback: Box::new(readback),
+        }));
+        // SAFETY: ownership of `user` passes to the shim only when it returns true.
+        let rendered = unsafe {
+            ffi::sc_renderer_render(self.raw.as_ptr(), readback_trampoline, user.cast())
         };
-        if !unsafe { renderer.begin_frame(swap_chain) } {
-            return Ok(false);
+        if !rendered {
+            // SAFETY: the shim did not take ownership, so reclaim the box here.
+            drop(unsafe { Box::from_raw(user) });
         }
-        unsafe { renderer.render(view) };
-        let pixel_bytes = (size[0] as usize)
-            .checked_mul(size[1] as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(FilamentError::InvalidViewport)?;
-        let pixel_data = unsafe {
-            PixelBufferDescriptor::new_callback(
-                vec![0_u8; pixel_bytes],
-                PixelDataFormat::RGBA,
-                PixelDataType::UBYTE,
-                move |mut pixels| {
-                    flip_rows(&mut pixels, size[0], size[1]);
-                    readback(pixels);
-                },
-            )
-        };
-        unsafe { renderer.read_pixels(0, 0, size[0], size[1], pixel_data) };
-        unsafe { renderer.end_frame() };
-        unsafe { self.engine.pump_message_queues() };
-        Ok(true)
-    }
-
-    fn configure_viewport(&mut self, width: u32, height: u32) -> Result<(), FilamentError> {
-        let viewport = Viewport {
-            left: 0,
-            bottom: 0,
-            width,
-            height,
-        };
-        let (Some(view), Some(camera), Some(scene)) = (
-            self.view.as_mut(),
-            self.camera.as_mut(),
-            self.scene.as_mut(),
-        ) else {
-            return Err(FilamentError::ViewUnavailable);
-        };
-        view.set_post_processing_enabled(true);
-        view.set_viewport(&viewport);
-        view.set_scene(scene);
-        view.set_camera(camera);
-        Ok(())
+        self.poll();
+        Ok(rendered)
     }
 
     fn configure_camera(
-                .set_rgb_parameter(
-                    "baseColor",
-                    filament_bindings::filament::RgbType::LINEAR,
-                    Float3::new(color.x, color.y, color.z),
-                )
+        &mut self,
+        (center, extent): (Vec3, Vec3),
         camera: ViewportCamera,
-        width: u32,
-        height: u32,
+        size: [u32; 2],
         pixels_per_point: f32,
     ) {
-        let Some((center, extent)) = self.mesh_bounds else {
-            return;
-        };
-        let rotation = camera.rotation();
-        let distance = (extent.length() * 3.2 / camera.zoom.max(0.1)).max(1.0);
-        let scale = (width.min(height) as f32 / pixels_per_point.max(1.0))
-            * 0.42
-            * camera.zoom;
-        let pan_scale = (scale * 0.9).max(1.0);
-        let width_points = width as f32 / pixels_per_point.max(1.0);
-        let height_points = height as f32 / pixels_per_point.max(1.0);
+        // Mirror the CPU viewport projection: world units map to `scale * 0.9` points.
+        let pixels_per_point = pixels_per_point.max(f32::EPSILON);
+        let width_points = size[0] as f32 / pixels_per_point;
+        let height_points = size[1] as f32 / pixels_per_point;
+        let scale = width_points.min(height_points) * 0.42 * camera.zoom;
+        let pan_scale = (scale * 0.9).max(f32::EPSILON);
         let half_width = width_points / (2.0 * pan_scale);
         let half_height = height_points / (2.0 * pan_scale);
-        let target = center
-            + rotation.inverse()
-                * Vec3::new(-camera.pan.x / pan_scale, camera.pan.y / pan_scale, 0.0);
-        let eye = target + rotation.inverse() * Vec3::new(0.0, 0.0, distance);
-        let up = rotation.inverse() * Vec3::Y;
-        if let Some(camera_component) = self.camera.as_mut() {
-            unsafe {
-                camera_component.set_projection(
-                    Projection::ORTHO,
-                    -f64::from(half_width),
-                    f64::from(half_width),
-                    -f64::from(half_height),
-                    f64::from(half_height),
-                    0.01,
-                    1000.0,
-                );
-            }
-            let eye = Float3::new(eye.x, eye.y, eye.z);
-            let target = Float3::new(target.x, target.y, target.z);
-            let up = Float3::new(up.x, up.y, up.z);
-            unsafe { camera_component.look_at_up(&eye, &target, &up) };
-        }
-    }
 
-    fn resize(&mut self, size: [u32; 2]) -> Result<(), FilamentError> {
-        if let Some(mut old_swap_chain) = self.swap_chain.take() {
-            unsafe { self.engine.destroy_swap_chain(&mut old_swap_chain) };
+        let to_world = camera.rotation().inverse();
+        let radius = extent.length().max(0.01);
+        let distance = radius * 4.0;
+        let target =
+            center + to_world * Vec3::new(-camera.pan.x / pan_scale, camera.pan.y / pan_scale, 0.0);
+        let eye = target + to_world * Vec3::new(0.0, 0.0, distance);
+        let up = to_world * Vec3::Y;
+        let eye = eye.as_dvec3().to_array();
+        let target = target.as_dvec3().to_array();
+        let up = up.as_dvec3().to_array();
+        // SAFETY: `raw` is live and the vectors are three-element arrays read during the call.
+        unsafe {
+            ffi::sc_renderer_set_camera(
+                self.raw.as_ptr(),
+                -f64::from(half_width),
+                f64::from(half_width),
+                -f64::from(half_height),
+                f64::from(half_height),
+                f64::from(distance - radius * 2.0).max(0.001),
+                f64::from(distance + radius * 2.0),
+                eye.as_ptr(),
+                target.as_ptr(),
+                up.as_ptr(),
+            );
         }
-        self.swap_chain = Some(unsafe {
-            self.engine
-                .create_headless_swap_chain(size[0], size[1], SwapChainConfig::READABLE)
-        }
-        .ok_or(FilamentError::SwapChainUnavailable)?);
-        self.target_size = size;
-        self.configure_viewport(size[0], size[1])
     }
 
     pub fn set_mesh(&mut self, geometry: &MeshGeometry) -> Result<(), FilamentError> {
-        if geometry.vertices.len() > MAX_MESH_VERTICES {
+        if geometry.vertices.is_empty()
+            || geometry.triangles.is_empty()
+            || geometry.vertices.len() > MAX_MESH_VERTICES
+        {
             return Err(FilamentError::InvalidMesh);
         }
-        self.destroy_mesh();
-
+        self.mesh_bounds = None;
         let MeshBuffers {
             vertex_data,
             indices,
             bounds,
         } = build_mesh_buffers(geometry)?;
-        let mut vertex_builder = unsafe { VertexBufferBuilder::new() }
-            .ok_or(FilamentError::MeshBufferUnavailable)?;
-        unsafe {
-            vertex_builder
-                .vertex_count(geometry.vertices.len() as u32)
-                .buffer_count(1)
-                .attribute(VertexAttribute::POSITION, 0, ElementType::FLOAT3, 0, 36)
-                .attribute(VertexAttribute::UV0, 0, ElementType::FLOAT2, 12, 36)
-                .attribute(VertexAttribute::TANGENTS, 0, ElementType::FLOAT4, 20, 36);
-        }
-        let mut vertex_buffer = unsafe { vertex_builder.build(&mut self.engine) }
-            .ok_or(FilamentError::MeshBufferUnavailable)?;
-        unsafe {
-            vertex_buffer.set_buffer_at(
-                &mut self.engine,
-                0,
-                BufferDescriptor::new(vertex_data),
-                0,
-            );
-        }
-
-        let mut index_builder = unsafe { IndexBufferBuilder::new() }
-            .ok_or(FilamentError::MeshBufferUnavailable)?;
-        unsafe {
-            index_builder
-                .index_count(indices.len() as u32)
-                .buffer_type(IndexType::UINT);
-        }
-        let mut index_buffer = unsafe { index_builder.build(&mut self.engine) }
-            .ok_or(FilamentError::MeshBufferUnavailable)?;
-        unsafe {
-            index_buffer.set_buffer(&mut self.engine, BufferDescriptor::new(indices), 0);
-        }
-
-        let mut entities = unsafe { self.engine.get_entity_manager() }
-            .ok_or(FilamentError::EntityManagerUnavailable)?;
-        let entity = unsafe { entities.create() };
-        let bounds = Bounds {
-            center: bounds.0.to_array().into(),
-            half_extent: bounds.1.to_array().into(),
+        let vertex_count =
+            u32::try_from(geometry.vertices.len()).map_err(|_| FilamentError::InvalidMesh)?;
+        let index_count = u32::try_from(indices.len()).map_err(|_| FilamentError::InvalidMesh)?;
+        let center = bounds.0.to_array();
+        let half_extent = bounds.1.to_array();
+        // SAFETY: slices match the declared counts; the shim copies all of them.
+        let uploaded = unsafe {
+            ffi::sc_renderer_set_mesh(
+                self.raw.as_ptr(),
+                vertex_data.as_ptr(),
+                vertex_count,
+                indices.as_ptr(),
+                index_count,
+                center.as_ptr(),
+                half_extent.as_ptr(),
+            )
         };
-        let mut renderable_builder = unsafe { RenderableBuilder::new(1) }
-            .ok_or(FilamentError::MeshBufferUnavailable)?;
-        let Some(material_instance) = self.material_instance.as_mut() else {
-            return Err(FilamentError::MaterialUnavailable);
-        };
-        let Some(scene) = self.scene.as_mut() else {
-            return Err(FilamentError::SceneUnavailable);
-        };
-        unsafe {
-            renderable_builder
-                .bounding_box(&bounds)
-                .material(0, material_instance)
-                .geometry(
-                    0,
-                    backend::PrimitiveType::TRIANGLES,
-                    &mut vertex_buffer,
-                    &mut index_buffer,
-                )
-                .culling(false);
-        }
-        if unsafe { renderable_builder.build(&mut self.engine, &entity) }.is_none() {
-            unsafe {
-                self.engine.destroy_vertex_buffer(&mut vertex_buffer);
-                self.engine.destroy_index_buffer(&mut index_buffer);
-                self.engine.destroy_entity_components(&entity);
-                entities.destory(&mut entity.clone());
-            }
+        if !uploaded {
             return Err(FilamentError::MeshBufferUnavailable);
         }
-        unsafe { scene.add_entity(&entity) };
-        self.mesh_bounds = Some(bounds_center_extent(geometry));
-        self.mesh_entity = Some(entity);
-        self.vertex_buffer = Some(vertex_buffer);
-        self.index_buffer = Some(index_buffer);
+        self.mesh_bounds = Some(bounds);
         Ok(())
     }
 
-    fn destroy_mesh(&mut self) {
-        if let Some(mut entity) = self.mesh_entity.take() {
-            if let Some(scene) = self.scene.as_mut() {
-                unsafe { scene.remove_entity(&entity) };
-            }
-            unsafe { self.engine.destroy_entity_components(&entity) };
-            if let Some(mut entities) = unsafe { self.engine.get_entity_manager() } {
-                unsafe { entities.destory(&mut entity) };
-            }
-        }
-        if let Some(mut buffer) = self.vertex_buffer.take() {
-            unsafe { self.engine.destroy_vertex_buffer(&mut buffer) };
-        }
-        if let Some(mut buffer) = self.index_buffer.take() {
-            unsafe { self.engine.destroy_index_buffer(&mut buffer) };
-        }
+    pub fn clear_mesh(&mut self) {
+        // SAFETY: `raw` is a live renderer owned by `self`.
+        unsafe { ffi::sc_renderer_clear_mesh(self.raw.as_ptr()) };
         self.mesh_bounds = None;
     }
 }
 
 impl Drop for FilamentRuntime {
     fn drop(&mut self) {
-        self.destroy_mesh();
-        if let Some(entity) = self.light_entity.take() {
-            unsafe { self.engine.destroy_entity_components(&entity) };
-            if let Some(mut entities) = unsafe { self.engine.get_entity_manager() } {
-                let mut entity = entity;
-                unsafe { entities.destory(&mut entity) };
-            }
-        }
-        if let Some(entity) = self.camera_entity.take() {
-            unsafe { self.engine.destroy_camera_component(&entity) };
-            if let Some(mut entities) = unsafe { self.engine.get_entity_manager() } {
-                let mut entity = entity;
-                unsafe { entities.destory(&mut entity) };
-            }
-        }
-        unsafe { self.engine.flush_and_wait() };
-        unsafe { Engine::destroy(&mut self.engine) };
+        // SAFETY: `raw` came from `sc_renderer_create` and is destroyed exactly once here.
+        unsafe { ffi::sc_renderer_destroy(self.raw.as_ptr()) };
     }
 }
 
@@ -514,6 +334,14 @@ struct MeshBuffers {
 
 fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentError> {
     let vertex_count = geometry.vertices.len();
+    if geometry
+        .triangles
+        .iter()
+        .flatten()
+        .any(|index| *index as usize >= vertex_count)
+    {
+        return Err(FilamentError::InvalidMesh);
+    }
     let mut normals = vec![Vec3::ZERO; vertex_count];
     let mut tangents = vec![Vec3::ZERO; vertex_count];
     let mut bitangents = vec![Vec3::ZERO; vertex_count];
@@ -542,9 +370,12 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
         }
     }
 
-    let mut vertex_data = Vec::with_capacity(vertex_count.saturating_mul(9));
+    let mut vertex_data = Vec::with_capacity(vertex_count.saturating_mul(FLOATS_PER_VERTEX));
     for (index, vertex) in geometry.vertices.iter().enumerate() {
-        let normal = normals[index].normalize_or_zero();
+        let mut normal = normals[index].normalize_or_zero();
+        if normal == Vec3::ZERO {
+            normal = Vec3::Z;
+        }
         let mut tangent = tangents[index] - normal * normal.dot(tangents[index]);
         if tangent.length_squared() <= f32::EPSILON {
             let helper = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
@@ -556,8 +387,17 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
         } else {
             1.0
         };
-        let bitangent = normal.cross(tangent) * orientation;
-        let tangent_frame = Quat::from_mat3(&Mat3::from_cols(tangent, bitangent, normal));
+        let bitangent = normal.cross(tangent);
+        let mut tangent_frame =
+            Quat::from_mat3(&Mat3::from_cols(tangent, bitangent, normal)).normalize();
+        // Filament encodes bitangent handedness in the sign of the quaternion's w component.
+        if tangent_frame.w < 0.0 {
+            tangent_frame = -tangent_frame;
+        }
+        tangent_frame.w = tangent_frame.w.max(1e-5);
+        if orientation < 0.0 {
+            tangent_frame = -tangent_frame;
+        }
         vertex_data.extend_from_slice(&[
             vertex.position.x,
             vertex.position.y,
@@ -569,9 +409,6 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentEr
             tangent_frame.z,
             tangent_frame.w,
         ]);
-    }
-    if vertex_data.len() != vertex_count.saturating_mul(size_of::<[f32; 9]>()) / size_of::<f32>() {
-        return Err(FilamentError::InvalidMesh);
     }
     let indices = geometry
         .triangles
@@ -603,20 +440,6 @@ pub enum FilamentError {
     EngineUnavailable,
     #[error("Filament could not create the offscreen swap chain")]
     SwapChainUnavailable,
-    #[error("Filament could not create its renderer")]
-    RendererUnavailable,
-    #[error("Filament could not create its scene")]
-    SceneUnavailable,
-    #[error("Filament could not create its view")]
-    ViewUnavailable,
-    #[error("Filament could not create a camera")]
-    CameraUnavailable,
-    #[error("Filament could not create the entity manager")]
-    EntityManagerUnavailable,
-    #[error("Filament could not create a directional light")]
-    LightUnavailable,
-    #[error("Filament default PBR material is unavailable")]
-    MaterialUnavailable,
     #[error("mesh geometry or its buffers are invalid")]
     InvalidMesh,
     #[error("viewport dimensions exceed the Filament render budget")]
@@ -632,18 +455,18 @@ pub enum FilamentError {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use substancecraft_core::{PrimitivePreset, ViewportCamera};
 
-    use super::{FilamentRuntime, build_mesh_buffers, flip_rows};
+    use super::{FLOATS_PER_VERTEX, FilamentRuntime, build_mesh_buffers, flip_rows};
 
     #[test]
     fn mesh_buffer_generation_preserves_topology_and_emits_finite_tangent_frames() {
         let geometry = PrimitivePreset::Cube.build_mesh();
         let buffers = build_mesh_buffers(&geometry).expect("valid cube buffers");
 
-        assert_eq!(buffers.vertex_data.len(), geometry.vertices.len() * 9);
+        assert_eq!(buffers.vertex_data.len(), geometry.vertices.len() * FLOATS_PER_VERTEX);
         assert_eq!(buffers.indices.len(), geometry.triangles.len() * 3);
         assert_eq!(buffers.bounds.0.to_array(), [0.0; 3]);
         assert_eq!(buffers.bounds.1.to_array(), [0.5; 3]);
@@ -659,23 +482,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the Filament OpenGL backend and headless readback support"]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
     fn headless_filament_render_returns_an_rgba_frame() {
-        let mut renderer = FilamentRuntime::new(32, 32).expect("Filament runtime");
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
         let geometry = PrimitivePreset::Cube.build_mesh();
         renderer.set_mesh(&geometry).expect("cube mesh upload");
         let (sender, receiver) = sync_channel(1);
         let rendered = renderer
-            .render(ViewportCamera::default(), 32, 32, 1.0, move |pixels| {
+            .render(ViewportCamera::default(), 64, 64, 1.0, move |pixels| {
                 let _ = sender.send(pixels);
             })
             .expect("Filament frame submission");
-
         assert!(rendered);
-        let pixels = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .expect("Filament readback callback");
-        assert_eq!(pixels.len(), 32 * 32 * 4);
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0..3] != [0, 0, 0]));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pixels = loop {
+            renderer.poll();
+            if let Ok(pixels) = receiver.try_recv() {
+                break pixels;
+            }
+            assert!(Instant::now() < deadline, "Filament readback timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(pixels.len(), 64 * 64 * 4);
+        let center = (32 * 64 + 32) * 4;
+        let background = &pixels[0..3];
+        assert_ne!(&pixels[center..center + 3], background, "cube should cover the center");
     }
 }

@@ -5,12 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Isolated Filament runtime adapter for the SubstanceCraft viewport"
+build = "build.rs"
+links = "filament"
 
 [dependencies]
 glam.workspace = true
-filament-bindings = { version = "0.2.2", default-features = false, features = ["prebuilt"] }
 substancecraft-core = { path = "../core" }
 thiserror.workspace = true
+
+[build-dependencies]
+cc = "1.2"
 
 [lints.rust]
 unsafe_code = "allow"
