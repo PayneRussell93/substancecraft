@@ -18,6 +18,7 @@ gltf = { version = "1.4.1", default-features = false, features = ["import", "uti
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga"] }
 resvg = { version = "0.45", default-features = false }
 ab_glyph = "0.2"
+quick-xml = "0.41"
 epaint_default_fonts = "0.36"
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io", "schemars"] }
 rfd = "0.17"

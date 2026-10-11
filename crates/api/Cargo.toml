@@ -17,6 +17,7 @@ thiserror.workspace = true
 image.workspace = true
 resvg.workspace = true
 ab_glyph.workspace = true
+quick-xml.workspace = true
 epaint_default_fonts.workspace = true
 gltf.workspace = true
 

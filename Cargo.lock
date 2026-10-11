@@ -2742,6 +2742,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "quick-xml",
  "resvg",
  "serde",
  "serde_json",

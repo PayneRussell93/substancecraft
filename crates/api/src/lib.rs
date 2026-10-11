@@ -3,6 +3,7 @@
 
 mod fbx;
 mod gltf_import;
+mod interchange;
 mod textures;
 mod vector;
 
@@ -10,6 +11,10 @@ pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
 };
 pub use gltf_import::{GltfImportError, MAX_GLTF_BYTES, import_gltf, import_gltf_file};
+pub use interchange::{
+    GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, openpbr_preset,
+    read_openpbr_materialx, write_gltf, write_openpbr_materialx,
+};
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
     encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
