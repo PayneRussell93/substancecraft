@@ -257,6 +257,7 @@ impl SubstanceCraftApp {
             self.viewport_camera,
             width,
             height,
+            scale,
             move |rgba8| {
                 pending.store(false, Ordering::Release);
                 let _ = sender.try_send(FilamentFrame {
@@ -331,6 +332,7 @@ impl SubstanceCraftApp {
         self.imported_meshes = scene.imported_meshes;
         self.selected_imported_mesh = scene.selected_imported_mesh;
         self.mesh_geometry = scene.geometry;
+        self.mark_mesh_changed();
         self.selected_texture_set = self.project.active_texture_set;
         self.selected_layer = self
             .project
@@ -462,6 +464,7 @@ impl SubstanceCraftApp {
                 self.selected_imported_mesh = Some(0);
                 self.selected_primitive = None;
                 self.mesh_geometry = Some(first_geometry);
+                self.mark_mesh_changed();
                 self.import_error = None;
                 self.project.texture_sets.clear();
                 self.project.active_texture_set = None;
@@ -808,6 +811,7 @@ impl SubstanceCraftApp {
             return;
         };
         self.mesh_geometry = Some(mesh.geometry.clone());
+        self.mark_mesh_changed();
         self.selected_imported_mesh = Some(index);
         self.selected_primitive = None;
     }
@@ -970,6 +974,7 @@ impl SubstanceCraftApp {
                         self.selected_primitive = Some(preset);
                         self.selected_imported_mesh = None;
                         self.mesh_geometry = Some(preset.build_mesh());
+                        self.mark_mesh_changed();
                         self.project.mesh = Some(MeshAsset {
                             id: MeshId(1),
                             source: format!("builtin:{}", preset.name()),
@@ -1289,8 +1294,19 @@ impl SubstanceCraftApp {
                 let scroll = ui.input(|input| input.smooth_scroll_delta.y);
                 self.viewport_camera.zoom_by(scroll);
             }
+            self.update_filament_frame(ui.ctx(), viewport);
             let painter = ui.painter_at(viewport);
             painter.rect_filled(viewport, 0.0, egui::Color32::from_rgb(29, 31, 34));
+            if self.mesh_geometry.is_some()
+                && let Some(texture) = &self.filament_frame_texture
+            {
+                painter.image(
+                    texture.id(),
+                    viewport,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
 
             let center = viewport.center();
             let axis = egui::Color32::from_rgb(70, 74, 79);
@@ -1317,6 +1333,11 @@ impl SubstanceCraftApp {
                     .copied()
                     .unwrap_or(BoneTransform::IDENTITY);
                 let camera_rotation = self.viewport_camera.rotation();
+                let source_center = mesh_bounds_center(mesh);
+                let posed_center = pose_transform
+                    .rotation
+                    .mul_vec3(source_center * pose_transform.scale)
+                    + pose_transform.translation;
                 let scale =
                     viewport.width().min(viewport.height()) * 0.42 * self.viewport_camera.zoom;
                 let project = |vertex_index: u32| {
@@ -1325,7 +1346,7 @@ impl SubstanceCraftApp {
                         .rotation
                         .mul_vec3(vertex.position * pose_transform.scale)
                         + pose_transform.translation;
-                    let view_position = camera_rotation * posed;
+                    let view_position = camera_rotation * (posed - posed_center);
                     Some((
                         egui::pos2(
                             center.x + view_position.x * scale * 0.9 + self.viewport_camera.pan.x,
@@ -1368,28 +1389,30 @@ impl SubstanceCraftApp {
                     }
                 }
 
-                for (_, points, uvs, intensity) in faces {
-                    let uv_center = (uvs[0] + uvs[1] + uvs[2]) / 3.0;
-                    let map_color = self
-                        .baked_preview
-                        .as_ref()
-                        .filter(|(set_id, channel, _)| {
-                            Some(*set_id) == self.selected_texture_set
-                                && *channel == self.active_channel
-                        })
-                        .and_then(|(_, _, texture)| texture.sample_uv(uv_center))
-                        .filter(|color| color[3] > 0)
-                        .unwrap_or([92, 132, 151, 255]);
-                    let color = egui::Color32::from_rgb(
-                        (map_color[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                        (map_color[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                        (map_color[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                    );
-                    painter.add(egui::Shape::convex_polygon(
-                        points.to_vec(),
-                        color,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
-                    ));
+                if self.filament_frame_texture.is_none() {
+                    for (_, points, uvs, intensity) in faces {
+                        let uv_center = (uvs[0] + uvs[1] + uvs[2]) / 3.0;
+                        let map_color = self
+                            .baked_preview
+                            .as_ref()
+                            .filter(|(set_id, channel, _)| {
+                                Some(*set_id) == self.selected_texture_set
+                                    && *channel == self.active_channel
+                            })
+                            .and_then(|(_, _, texture)| texture.sample_uv(uv_center))
+                            .filter(|color| color[3] > 0)
+                            .unwrap_or([92, 132, 151, 255]);
+                        let color = egui::Color32::from_rgb(
+                            (map_color[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                            (map_color[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                            (map_color[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                        );
+                        painter.add(egui::Shape::convex_polygon(
+                            points.to_vec(),
+                            color,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
+                        ));
+                    }
                 }
                 painter.text(
                     egui::pos2(viewport.left() + 16.0, viewport.top() + 16.0),
@@ -1453,6 +1476,16 @@ fn barycentric_uv(
     }
     let uv = uvs[0] * weight_a + uvs[1] * weight_b + uvs[2] * weight_c;
     (uv.is_finite() && (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)).then_some(uv)
+}
+
+fn mesh_bounds_center(mesh: &MeshGeometry) -> glam::Vec3 {
+    let mut minimum = glam::Vec3::splat(f32::INFINITY);
+    let mut maximum = glam::Vec3::splat(f32::NEG_INFINITY);
+    for vertex in &mesh.vertices {
+        minimum = minimum.min(vertex.position);
+        maximum = maximum.max(vertex.position);
+    }
+    (minimum + maximum) * 0.5
 }
 
 impl eframe::App for SubstanceCraftApp {

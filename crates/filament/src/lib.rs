@@ -11,8 +11,9 @@ use filament_bindings::{
     },
     filament::{
         Bounds, Camera, ClearOptions, Engine, IndexBuffer, IndexBufferBuilder, LightBuilder,
-        IndexType, LightType, LinearColor, Material, MaterialInstance, RenderableBuilder, Renderer,
-        Scene, SwapChain, SwapChainConfig, Texture, TextureBuilder, TextureSampler, VertexAttribute,
+        IndexType, LightType, LinearColor, Material, MaterialInstance, Projection,
+        RenderableBuilder, Renderer, Scene, SwapChain, SwapChainConfig, Texture, TextureBuilder,
+        TextureSampler, VertexAttribute,
         VertexBuffer, VertexBufferBuilder, View, Viewport,
     },
     math::{Float3, Float4},
@@ -232,23 +233,20 @@ impl FilamentRuntime {
 
     pub fn render(
         &mut self,
-        geometry: &MeshGeometry,
         camera: ViewportCamera,
         width: u32,
         height: u32,
+        pixels_per_point: f32,
         readback: impl FnOnce(Vec<u8>) + 'static,
     ) -> Result<bool, FilamentError> {
-        geometry
-            .validate()
-            .map_err(|_| FilamentError::InvalidMesh)?;
         let size = bounded_size(width, height)?;
         if size != self.target_size {
             self.resize(size)?;
         }
         if self.mesh_bounds.is_none() {
-            self.set_mesh(geometry)?;
+            return Err(FilamentError::InvalidMesh);
         }
-        self.configure_camera(camera, size[0], size[1]);
+        self.configure_camera(camera, size[0], size[1], pixels_per_point);
 
         let (Some(renderer), Some(swap_chain), Some(view)) = (
             self.renderer.as_mut(),
@@ -296,9 +294,6 @@ impl FilamentRuntime {
         ) else {
             return Err(FilamentError::ViewUnavailable);
         };
-        unsafe {
-            camera.set_projection_fov(45.0, f64::from(width) / f64::from(height), 0.01, 1000.0);
-        }
         view.set_post_processing_enabled(true);
         view.set_viewport(&viewport);
         view.set_scene(scene);
@@ -306,19 +301,43 @@ impl FilamentRuntime {
         Ok(())
     }
 
-    fn configure_camera(&mut self, camera: ViewportCamera, width: u32, height: u32) {
+    fn configure_camera(
+        &mut self,
+        camera: ViewportCamera,
+        width: u32,
+        height: u32,
+        pixels_per_point: f32,
+    ) {
         let Some((center, extent)) = self.mesh_bounds else {
             return;
         };
         let rotation = camera.rotation();
         let distance = (extent.length() * 3.2 / camera.zoom.max(0.1)).max(1.0);
-        let pan_scale = (width.min(height) as f32 * 0.42 * camera.zoom * 0.9).max(1.0);
+        let scale = (width.min(height) as f32 / pixels_per_point.max(1.0))
+            * 0.42
+            * camera.zoom;
+        let pan_scale = (scale * 0.9).max(1.0);
+        let width_points = width as f32 / pixels_per_point.max(1.0);
+        let height_points = height as f32 / pixels_per_point.max(1.0);
+        let half_width = width_points / (2.0 * pan_scale);
+        let half_height = height_points / (2.0 * pan_scale);
         let target = center
             + rotation.inverse()
                 * Vec3::new(-camera.pan.x / pan_scale, camera.pan.y / pan_scale, 0.0);
         let eye = target + rotation.inverse() * Vec3::new(0.0, 0.0, distance);
         let up = rotation.inverse() * Vec3::Y;
         if let Some(camera_component) = self.camera.as_mut() {
+            unsafe {
+                camera_component.set_projection(
+                    Projection::ORTHO,
+                    -f64::from(half_width),
+                    f64::from(half_width),
+                    -f64::from(half_height),
+                    f64::from(half_height),
+                    0.01,
+                    1000.0,
+                );
+            }
             let eye = Float3::new(eye.x, eye.y, eye.z);
             let target = Float3::new(target.x, target.y, target.z);
             let up = Float3::new(up.x, up.y, up.z);
@@ -339,13 +358,17 @@ impl FilamentRuntime {
         self.configure_viewport(size[0], size[1])
     }
 
-    fn set_mesh(&mut self, geometry: &MeshGeometry) -> Result<(), FilamentError> {
+    pub fn set_mesh(&mut self, geometry: &MeshGeometry) -> Result<(), FilamentError> {
         if geometry.vertices.len() > MAX_MESH_VERTICES {
             return Err(FilamentError::InvalidMesh);
         }
         self.destroy_mesh();
 
-        let (vertex_data, indices, bounds) = build_mesh_buffers(geometry)?;
+        let MeshBuffers {
+            vertex_data,
+            indices,
+            bounds,
+        } = build_mesh_buffers(geometry)?;
         let mut vertex_builder = unsafe { VertexBufferBuilder::new() }
             .ok_or(FilamentError::MeshBufferUnavailable)?;
         unsafe {
@@ -490,7 +513,13 @@ fn bounds_center_extent(geometry: &MeshGeometry) -> (Vec3, Vec3) {
     ((minimum + maximum) * 0.5, (maximum - minimum) * 0.5)
 }
 
-fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<(Vec<f32>, Vec<u32>, (Vec3, Vec3)), FilamentError> {
+struct MeshBuffers {
+    vertex_data: Vec<f32>,
+    indices: Vec<u32>,
+    bounds: (Vec3, Vec3),
+}
+
+fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<MeshBuffers, FilamentError> {
     let vertex_count = geometry.vertices.len();
     let mut normals = vec![Vec3::ZERO; vertex_count];
     let mut tangents = vec![Vec3::ZERO; vertex_count];
@@ -556,7 +585,11 @@ fn build_mesh_buffers(geometry: &MeshGeometry) -> Result<(Vec<f32>, Vec<u32>, (V
         .iter()
         .flat_map(|triangle| triangle.iter().copied())
         .collect();
-    Ok((vertex_data, indices, bounds_center_extent(geometry)))
+    Ok(MeshBuffers {
+        vertex_data,
+        indices,
+        bounds: bounds_center_extent(geometry),
+    })
 }
 
 fn flip_rows(pixels: &mut [u8], width: u32, height: u32) {
