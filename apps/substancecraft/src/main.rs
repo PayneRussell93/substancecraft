@@ -11,6 +11,7 @@ use substancecraft_api::{
 use substancecraft_core::{
     BoneId, BoneTransform, MaterialChannel, MaterialProject, MeshAsset, MeshGeometry, MeshId,
     NamedPose, PoseId, PrimitivePreset, TextureResolution, TextureSet, TextureSetId,
+    ViewportCamera, ViewportLighting,
 };
 
 const CHANNELS: [MaterialChannel; 8] = [
@@ -56,6 +57,8 @@ struct SubstanceCraftApp {
     active_channel: MaterialChannel,
     next_texture_set_id: u64,
     current_pose: NamedPose,
+    viewport_camera: ViewportCamera,
+    viewport_lighting: ViewportLighting,
     selected_pose: Option<PoseId>,
     pose_name: String,
     pose_transition: Option<PoseTransition>,
@@ -99,6 +102,8 @@ impl Default for SubstanceCraftApp {
                 name: "Current Pose".to_owned(),
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             },
+            viewport_camera: ViewportCamera::default(),
+            viewport_lighting: ViewportLighting::default(),
             selected_pose: None,
             pose_name: "Pose 1".to_owned(),
             pose_transition: None,
@@ -174,6 +179,8 @@ impl SubstanceCraftApp {
                 name: "Current Pose".to_owned(),
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             });
+        self.viewport_camera = ViewportCamera::default();
+        self.viewport_lighting = ViewportLighting::default();
         self.selected_pose = self.project.saved_poses.first().map(|pose| pose.id);
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
@@ -602,12 +609,62 @@ impl SubstanceCraftApp {
                     self.pose_transition = None;
                     self.selected_pose = None;
                 }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.heading("Viewport");
+                if ui.button("Reset View").clicked() {
+                    self.viewport_camera = ViewportCamera::default();
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.viewport_camera.yaw, 0.0..=std::f32::consts::TAU)
+                        .text("Orbit"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.viewport_camera.pitch, -1.55..=1.55).text("Tilt"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.viewport_camera.zoom, 0.1..=20.0)
+                        .logarithmic(true)
+                        .text("Zoom"),
+                );
+                ui.add_space(10.0);
+                ui.heading("Environment Light");
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.viewport_lighting.rotation,
+                        0.0..=std::f32::consts::TAU,
+                    )
+                    .text("Rotation"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.viewport_lighting.ambient_fill, 0.0..=1.0)
+                        .text("Ambient Fill"),
+                );
             });
     }
 
-    fn update_viewport(&self, ui: &mut egui::Ui) {
+    fn update_viewport(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             let viewport = ui.max_rect();
+            let response = ui.interact(
+                viewport,
+                ui.id().with("model_viewport"),
+                egui::Sense::click_and_drag(),
+            );
+            if response.dragged() {
+                let delta = ui.input(|input| input.pointer.delta());
+                let delta = glam::Vec2::new(delta.x, delta.y);
+                if ui.input(|input| input.modifiers.shift) {
+                    self.viewport_camera.pan_by(delta);
+                } else {
+                    self.viewport_camera.orbit(delta);
+                }
+            }
+            if response.hovered() {
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                self.viewport_camera.zoom_by(scroll);
+            }
             let painter = ui.painter_at(viewport);
             painter.rect_filled(viewport, 0.0, egui::Color32::from_rgb(29, 31, 34));
 
@@ -635,20 +692,22 @@ impl SubstanceCraftApp {
                     .get(&BoneId(0))
                     .copied()
                     .unwrap_or(BoneTransform::IDENTITY);
-                let scale = viewport.width().min(viewport.height()) * 0.42;
+                let camera_rotation = self.viewport_camera.rotation();
+                let scale =
+                    viewport.width().min(viewport.height()) * 0.42 * self.viewport_camera.zoom;
                 let project = |vertex_index: u32| {
                     let vertex = mesh.vertices.get(vertex_index as usize)?;
-                    let transformed = pose_transform
+                    let posed = pose_transform
                         .rotation
                         .mul_vec3(vertex.position * pose_transform.scale)
                         + pose_transform.translation;
+                    let view_position = camera_rotation * posed;
                     Some((
                         egui::pos2(
-                            center.x + (transformed.x - transformed.z) * scale * 0.72,
-                            center.y
-                                + (-transformed.y + (transformed.x + transformed.z) * 0.38) * scale,
+                            center.x + view_position.x * scale * 0.9 + self.viewport_camera.pan.x,
+                            center.y - view_position.y * scale * 0.9 + self.viewport_camera.pan.y,
                         ),
-                        transformed.x + transformed.y + transformed.z,
+                        view_position,
                     ))
                 };
                 let mut faces = mesh
@@ -658,14 +717,21 @@ impl SubstanceCraftApp {
                         let a = project(triangle[0])?;
                         let b = project(triangle[1])?;
                         let c = project(triangle[2])?;
-                        Some(((a.1 + b.1 + c.1) / 3.0, [a.0, b.0, c.0]))
+                        let normal = (b.1 - a.1).cross(c.1 - a.1).normalize_or_zero();
+                        let intensity = self.viewport_lighting.face_intensity(normal);
+                        let color = egui::Color32::from_rgb(
+                            (92.0 * intensity).clamp(0.0, 255.0) as u8,
+                            (132.0 * intensity).clamp(0.0, 255.0) as u8,
+                            (151.0 * intensity).clamp(0.0, 255.0) as u8,
+                        );
+                        Some(((a.1.z + b.1.z + c.1.z) / 3.0, [a.0, b.0, c.0], color))
                     })
                     .collect::<Vec<_>>();
                 faces.sort_by(|left, right| left.0.total_cmp(&right.0));
-                for (_, points) in faces {
+                for (_, points, color) in faces {
                     painter.add(egui::Shape::convex_polygon(
                         points.to_vec(),
-                        egui::Color32::from_rgb(95, 109, 120),
+                        color,
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
                     ));
                 }

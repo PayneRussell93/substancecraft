@@ -32,6 +32,6 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 
 ## Current implementation
 
-`substancecraft-core` currently provides serializable project, mesh reference, texture set, layer, channel, and resolution types. `MaterialProject::validate` rejects invalid texture dimensions, duplicate IDs, dangling active texture-set references, and non-finite or out-of-range layer opacity. The model is not yet a persistence format or renderer.
+`substancecraft-core` provides serializable project, mesh reference, texture set, saved pose, layer, channel, mesh geometry, and resolution types. `MaterialProject::validate` rejects invalid texture dimensions, duplicate IDs, dangling active texture-set references, invalid poses, and non-finite or out-of-range layer opacity. `substancecraft-api` offers bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project.
 
-The core also generates UV-mapped indexed triangle meshes for cube, sphere, cylinder, and plane presets. The desktop shell can select these presets and display a shaded isometric preview; this is a starter-mesh preview, not yet the full interactive PBR viewport.
+The core generates UV-mapped indexed triangle meshes for cube, sphere, cylinder, and plane presets. The desktop shell can import binary FBX 7.4+ static meshes, select imported meshes, and display them in a projected preview. The preview supports orbit, pan, zoom, a rotating directional key light, and ambient fill. It uses per-face approximate shading; it is not yet a real-time 3D PBR renderer or global-illumination system.

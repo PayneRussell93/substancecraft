@@ -171,8 +171,8 @@ impl ViewportLighting {
         } else {
             0.0
         };
-        let light_direction = Vec3::new(rotation.cos() * 0.8, 0.65, rotation.sin() * 0.8)
-            .normalize_or_zero();
+        let light_direction =
+            Vec3::new(rotation.cos() * 0.8, 0.65, rotation.sin() * 0.8).normalize_or_zero();
         ambient + (1.0 - ambient) * normal.normalize_or_zero().dot(light_direction).max(0.0)
     }
 }

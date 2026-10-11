@@ -2,9 +2,9 @@
 
 - **Version:** 0.1.0
 - **Status:** Active
-- **Scope:** Core material-project model validation (`REQ-0001`).
+- **Scope:** Project model and persistence, primitive/FBX mesh handling, viewport camera/lighting math, and starter MCP/API behavior (`REQ-0001` through `REQ-0006`).
 - **Environment:** Windows x86_64, Rust stable MSVC toolchain.
-- **Approach:** Automated unit tests in `crates/core/src/lib.rs`; run with `cargo test -p substancecraft-core`.
+- **Approach:** Automated unit tests across `crates/core`, `crates/api`, and `crates/mcp`; run with `cargo test --workspace`.
 - **Entry criteria:** The workspace resolves and the core crate compiles.
 - **Exit criteria:** All listed automated cases pass; formatting and strict Clippy checks pass.
 
@@ -26,7 +26,10 @@
 | TC-0014 | Generate a binary FBX triangle with ByPolygonVertex/Direct UVs and import it. | Imported corners preserve the source UV values and do not report generated UVs. | Import / automated | Passed 2026-10-10 |
 | TC-0015 | Feed the binary preflight a declared decoded-attribute size above its configured budget. | Reject the input before the FBX parser allocates decoded attributes. | Security / automated | Passed 2026-10-10 |
 | TC-0016 | Encode a project with a texture set, layer, and named pose, then decode it. | All serialized project data round-trips unchanged. | Persistence / automated | Passed 2026-10-10 |
-| TC-0017 | Decode a project with an unsupported schema version. | Return a validation error without constructing an accepted project. | Compatibility / automated | Pending final run |
+| TC-0017 | Decode a project with an unsupported schema version. | Return a validation error without constructing an accepted project. | Compatibility / automated | Passed 2026-10-10 |
 | TC-0018 | Save a valid project to a temporary file and load it back. | The atomic file operation succeeds and preserves project data. | Persistence / automated | Passed 2026-10-10 |
+| TC-0019 | Orbit and pan the camera, zoom in, then submit non-finite camera input. | Camera state changes, zoom remains clamped, and non-finite deltas are ignored. | Functional / automated | Passed 2026-10-10 |
+| TC-0020 | Rotate the environment light around a face normal. | Face intensity changes while remaining in the valid range. | Functional / automated | Passed 2026-10-10 |
+| TC-0021 | With a mesh visible, drag to orbit, Shift-drag to pan, scroll to zoom, adjust Environment Rotation/Ambient Fill, then choose Reset View. | The mesh stays visible, view interactions update, lighting changes face shading, and reset restores the default camera. | Usability / manual | Pending manual verification |
 
-The 21 tests before project persistence passed on 2026-10-10. TC-0016 and TC-0018 passed individually; TC-0017 and full workspace gates are pending. Desktop Open/Save has compile coverage but no automated UI interaction test yet. Mesh assets remain external references rather than embedded resources.
+All 26 automated workspace tests passed on 2026-10-10. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed. TC-0021 and desktop Open/Save interaction remain manual checks. Mesh assets remain external references rather than embedded resources; viewport shading is approximate rather than PBR/GI.

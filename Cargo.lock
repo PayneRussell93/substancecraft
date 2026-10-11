@@ -2529,6 +2529,7 @@ name = "substancecraft"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "glam",
  "rfd",
  "substancecraft-api",
  "substancecraft-core",

@@ -40,8 +40,8 @@ This is the product capability map derived from the supplied Painter feature inv
 | 27 | Skew correction and baking correction | Planned | Inspect and paint bake correction maps with edge protection. |
 | 28 | Automatic rebaking and baking iteration | Planned | Track dependencies and rebake affected maps on relevant mesh/settings edits. |
 | 29 | UV Tile and UDIM workflows | Planned | Multi-tile storage, painting, baking, caching, and export. |
-| 30 | 2D and 3D viewports | Partial | Starter-mesh preview exists; real 3D/UV viewports and navigation remain open. |
-| 31 | Real-time PBR viewport | Planned | Physically based shading for enabled channels, maps, and environment lighting. |
+| 30 | 2D and 3D viewports | Partial | Projected mesh preview has orbit, pan, and zoom; actual 3D and UV viewports, layouts, and channel-linked painting remain open. |
+| 31 | Real-time PBR viewport | Partial | Preview has rotating directional lighting and ambient fill; physically based material shading, image-based lighting, and global illumination remain open. |
 | 32 | Rendering | Planned | Interactive and export rendering with camera, lighting, and color-managed output. |
 | 33 | Shader system | Planned | Built-in metallic/roughness and extensible shader definitions. |
 | 34 | OpenPBR support | Planned | Open material representation and tested interchange. |

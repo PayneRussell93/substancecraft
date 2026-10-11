@@ -296,10 +296,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.sproject");
         let project = MaterialProject::empty();
+        let updated = MaterialProject {
+            mesh: Some(substancecraft_core::MeshAsset {
+                id: substancecraft_core::MeshId(9),
+                source: "builtin:Sphere".to_owned(),
+            }),
+            ..MaterialProject::empty()
+        };
 
         save_project_file(&path, &project).unwrap();
+        save_project_file(&path, &updated).unwrap();
         let loaded = load_project_file(&path).unwrap();
 
-        assert_eq!(loaded, project);
+        assert_eq!(loaded, updated);
     }
 }
