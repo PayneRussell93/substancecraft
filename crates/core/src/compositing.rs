@@ -73,6 +73,8 @@ pub enum BakeError {
     MissingMesh,
     #[error("bitmap resource {0:?} is not loaded")]
     MissingResource(ResourceId),
+    #[error(transparent)]
+    InvalidExportPreset(#[from] crate::export::ExportPresetError),
 }
 
 /// Data a texture bake may need: geometry for polygon masks, baked mesh
@@ -147,7 +149,7 @@ fn plane_data(channel: MaterialChannel) -> PlaneData {
 }
 
 /// Texel of a channel no layer has painted.
-fn base_texel(channel: MaterialChannel) -> Result<Vec4, BakeError> {
+pub(crate) fn base_texel(channel: MaterialChannel) -> Result<Vec4, BakeError> {
     let scalar = |value: f32| Vec4::new(value, value, value, 1.0);
     Ok(match channel {
         MaterialChannel::BaseColor => Vec4::ZERO,
@@ -165,7 +167,7 @@ fn byte_unit(value: u8) -> f32 {
     f32::from(value) / 255.0
 }
 
-fn rgb_unit(rgb: [u8; 3]) -> Vec3 {
+pub(crate) fn rgb_unit(rgb: [u8; 3]) -> Vec3 {
     Vec3::new(byte_unit(rgb[0]), byte_unit(rgb[1]), byte_unit(rgb[2]))
 }
 
@@ -232,7 +234,7 @@ fn stroke_value(stroke: &PaintStroke, channel: MaterialChannel) -> (Vec3, f32) {
 }
 
 /// True when `layer` adds anything to one of `channels`.
-fn contributes(layer: &MaterialLayer, channels: &[MaterialChannel]) -> bool {
+pub(crate) fn contributes(layer: &MaterialLayer, channels: &[MaterialChannel]) -> bool {
     layer.visible
         && channels
             .iter()
@@ -243,7 +245,7 @@ fn contributes(layer: &MaterialLayer, channels: &[MaterialChannel]) -> bool {
         }
 }
 
-fn unit_to_byte(value: f32) -> u8 {
+pub(crate) fn unit_to_byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
@@ -402,7 +404,7 @@ impl TextureSet {
         self.bake_channel(MaterialChannel::BaseColor, BakeContext::default())
     }
 
-    fn validate_for_bake(&self) -> Result<Option<BakedTexture>, BakeError> {
+    pub(crate) fn validate_for_bake(&self) -> Result<Option<BakedTexture>, BakeError> {
         let layers = self.walk_layers();
         if layers.iter().any(|layer| !valid_layer_strokes(layer)) {
             return Err(BakeError::InvalidStrokeData);
@@ -569,7 +571,7 @@ impl TextureSet {
         })
     }
 
-    fn texture(&self, rgba8: Vec<u8>) -> BakedTexture {
+    pub(crate) fn texture(&self, rgba8: Vec<u8>) -> BakedTexture {
         BakedTexture {
             width: self.resolution.width,
             height: self.resolution.height,
@@ -579,7 +581,7 @@ impl TextureSet {
 
     /// Masks of every layer (and group) that contributes to one of
     /// `channels`.
-    fn layer_masks(
+    pub(crate) fn layer_masks(
         &self,
         channels: &[MaterialChannel],
         context: BakeContext<'_>,
@@ -612,7 +614,7 @@ impl TextureSet {
         Ok(())
     }
 
-    fn composite_plane(
+    pub(crate) fn composite_plane(
         &self,
         channel: MaterialChannel,
         context: BakeContext<'_>,
@@ -644,7 +646,7 @@ impl TextureSet {
 
     /// Normal-channel composite with Height-derived detail blended on top
     /// (whiteout blend), so painted bumps and dents shade in the viewport.
-    fn normal_plane(
+    pub(crate) fn normal_plane(
         &self,
         context: BakeContext<'_>,
         masks: &LayerMasks,
@@ -861,7 +863,7 @@ fn evaluate_generator(
 }
 
 /// Sets every texel from `value_at(uv)`, splitting rows across threads.
-fn parallel_fill<T: Send>(
+pub(crate) fn parallel_fill<T: Send>(
     values: &mut [T],
     width: u32,
     height: u32,
@@ -893,7 +895,7 @@ fn parallel_fill<T: Send>(
     });
 }
 
-fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
+pub(crate) fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
@@ -902,7 +904,7 @@ fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
     Ok(values)
 }
 
-fn checked_bake_pixel_count(resolution: TextureResolution) -> Result<usize, BakeError> {
+pub(crate) fn checked_bake_pixel_count(resolution: TextureResolution) -> Result<usize, BakeError> {
     if resolution.width == 0
         || resolution.height == 0
         || resolution.width > MAX_TEXTURE_DIMENSION

@@ -10,8 +10,9 @@ pub use fbx::{
 };
 pub use gltf_import::{GltfImportError, MAX_GLTF_BYTES, import_gltf, import_gltf_file};
 pub use textures::{
-    MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image, encode_texture,
-    load_texture_image, write_texture,
+    MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
+    encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
+    write_texture,
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,9 +22,9 @@ use std::{
     path::Path,
 };
 use substancecraft_core::{
-    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MaterialTextures,
-    MeshError, MeshGeometry, MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing,
-    PrimitivePreset, ResourceId, ResourceImages, TextureSet,
+    BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
+    MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
+    MeshMaps, MeshSmoothing, PrimitivePreset, ResourceId, ResourceImages, TextureSet,
 };
 use thiserror::Error;
 
@@ -264,6 +265,31 @@ pub fn bake_texture_set_material(
         mesh_maps,
         resources,
     })?)
+}
+
+/// The built-in export presets, as serializable output descriptions.
+pub fn list_export_presets() -> Vec<ExportPreset> {
+    ExportPreset::built_in()
+}
+
+/// Bakes the files an export preset describes for one texture set. Takes the
+/// same optional inputs as [`bake_texture_set_channel`]; presets that read
+/// mesh maps directly also require `mesh_maps`.
+pub fn bake_texture_set_export(
+    texture_set: &TextureSet,
+    preset: &ExportPreset,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+) -> Result<Vec<ExportedTexture>, ApiError> {
+    Ok(texture_set.bake_export(
+        preset,
+        BakeContext {
+            mesh,
+            mesh_maps,
+            resources,
+        },
+    )?)
 }
 
 /// Loads every bitmap the project lists. Unreadable files are reported per

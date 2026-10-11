@@ -10,11 +10,12 @@ use eframe::egui::{
 };
 use substancecraft_api::TextureFormat;
 use substancecraft_core::{
-    Axis, BitmapMask, BoneId, BoneTransform, BrushShape, Direction, LayerFill, LayerFilter,
-    LayerId, MAX_BLUR_RADIUS, MAX_BRUSH_SPACING, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS,
-    MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer,
-    MeshAsset, MeshId, MeshMapKind, MeshSmoothing, PrimitivePreset, ProjectionMode, ResourceId,
-    SelectionMode, TextureProjection, TextureSetId, ViewportCamera,
+    Axis, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction, ExportOutput,
+    ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS, MAX_BRUSH_SPACING,
+    MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS, MIN_BRUSH_SPACING,
+    MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer, MeshAsset, MeshId,
+    MeshMapKind, MeshSmoothing, OutputLayout, PrimitivePreset, ProjectionMode, ResourceId,
+    SelectionMode, SourceComponent, TextureProjection, TextureSetId, ViewportCamera,
 };
 
 use super::{
@@ -1570,15 +1571,7 @@ impl SubstanceCraftApp {
                         }
                     }
                 });
-                if widgets::pill_button(ui, Some(Icon::Export), "Export material set…", true, true)
-                    .on_hover_text(
-                        "Base Color (Opacity in alpha), packed ORM, Normal, and Emissive \
-                         when anything glows, into a folder",
-                    )
-                    .clicked()
-                {
-                    self.export_material_set();
-                }
+                self.export_preset_controls(ui);
                 ui.add_space(2.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -2388,6 +2381,314 @@ fn filter_controls(ui: &mut Ui, filter: &mut LayerFilter) {
             slider_row(ui, "Hue", hue, -0.5..=0.5, false, 2);
             slider_row(ui, "Saturation", saturation, 0.0..=2.0, false, 2);
             slider_row(ui, "Lightness", lightness, -1.0..=1.0, false, 2);
+        }
+    }
+}
+
+impl SubstanceCraftApp {
+    /// Preset picker, the files the preset writes, the Export button, and
+    /// the custom-preset editor.
+    fn export_preset_controls(&mut self, ui: &mut Ui) {
+        let presets = self.export_presets();
+        let selected = self.selected_export_preset();
+        widgets::property_row(ui, "Preset", |ui| {
+            egui::ComboBox::from_id_salt("export_preset")
+                .width(ui.available_width() - 8.0)
+                .selected_text(selected.name.as_str())
+                .show_ui(ui, |ui| {
+                    for preset in &presets {
+                        let label = if self.is_custom_preset(&preset.name) {
+                            format!("{} (custom)", preset.name)
+                        } else {
+                            preset.name.clone()
+                        };
+                        if ui
+                            .selectable_label(preset.name == selected.name, label)
+                            .clicked()
+                        {
+                            self.export_preset = preset.name.clone();
+                        }
+                    }
+                });
+        });
+        let set_name = self
+            .selected_texture_set_ref()
+            .map_or_else(|| "Material".to_owned(), |set| set.name.clone());
+        for output in &selected.outputs {
+            let routing = output
+                .used_slots()
+                .iter()
+                .zip(slot_names(output.layout))
+                .map(|(slot, channel)| format!("{channel} {}", slot_label(*slot)))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let optional = if output.skip_if_black {
+                " (if not black)"
+            } else {
+                ""
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{}.{}{optional}",
+                    output.resolved_file_name(&set_name),
+                    self.export_format.extension()
+                ))
+                .size(12.0)
+                .color(theme::TEXT),
+            );
+            ui.label(RichText::new(routing).size(11.0).color(theme::TEXT_FAINT));
+        }
+        ui.add_space(4.0);
+        let custom = self.is_custom_preset(&selected.name);
+        ui.horizontal(|ui| {
+            if widgets::pill_button(ui, None, "Duplicate", false, false)
+                .on_hover_text("Copy this preset into an editable custom preset")
+                .clicked()
+            {
+                self.duplicate_export_preset(&selected.name);
+            }
+            if custom {
+                if widgets::pill_button(ui, None, "Edit", false, false).clicked() {
+                    self.edit_export_preset(&selected.name);
+                }
+                if widgets::icon_button(ui, Icon::Trash, true, "Delete this custom preset")
+                    .clicked()
+                {
+                    self.delete_export_preset(&selected.name);
+                }
+            }
+        });
+        if self.preset_draft.is_some() {
+            self.preset_editor(ui);
+        }
+        ui.add_space(4.0);
+        if widgets::pill_button(ui, Some(Icon::Export), "Export textures…", true, true)
+            .on_hover_text(format!(
+                "Write the {} files into a folder as {}",
+                selected.name,
+                self.export_format.name()
+            ))
+            .clicked()
+        {
+            self.export_with_preset();
+        }
+    }
+
+    fn preset_editor(&mut self, ui: &mut Ui) {
+        let Some(mut draft) = self.preset_draft.take() else {
+            return;
+        };
+        let (mut save, mut cancel) = (false, false);
+        egui::Frame::new()
+            .fill(theme::INPUT_DEEP)
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.preset.name)
+                        .desired_width(ui.available_width())
+                        .margin(vec2(8.0, 4.0))
+                        .hint_text("Preset name"),
+                );
+                let mut remove = None;
+                let removable = draft.preset.outputs.len() > 1;
+                for (index, output) in draft.preset.outputs.iter_mut().enumerate() {
+                    ui.push_id(("preset_output", index), |ui| {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut output.file_name)
+                                    .desired_width(ui.available_width() - 34.0)
+                                    .margin(vec2(8.0, 3.0))
+                                    .hint_text("$textureSet_Name"),
+                            )
+                            .on_hover_text("File name; $textureSet becomes the texture set name");
+                            if widgets::icon_button(ui, Icon::Close, removable, "Remove this file")
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for layout in OutputLayout::ALL {
+                                if widgets::chip(ui, layout.name(), output.layout == layout)
+                                    .clicked()
+                                {
+                                    output.layout = layout;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            widgets::toggle(ui, &mut output.skip_if_black)
+                                .on_hover_text("Leave the file out when it is entirely black");
+                            ui.label(
+                                RichText::new("Skip when black")
+                                    .size(11.5)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                        });
+                        let count = output.layout.channel_count();
+                        for (slot, channel) in output.slots[..count]
+                            .iter_mut()
+                            .zip(slot_names(output.layout))
+                        {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    vec2(14.0, 22.0),
+                                    egui::Label::new(
+                                        RichText::new(*channel).size(11.5).color(theme::TEXT_WEAK),
+                                    ),
+                                );
+                                slot_editor(ui, channel, slot);
+                            });
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    draft.preset.outputs.remove(index);
+                }
+                ui.add_space(6.0);
+                if draft.preset.outputs.len() < MAX_EXPORT_OUTPUTS
+                    && widgets::pill_button(ui, Some(Icon::Plus), "Add file", false, true).clicked()
+                {
+                    let number = draft.preset.outputs.len() + 1;
+                    draft.preset.outputs.push(ExportOutput::new(
+                        &format!("$textureSet_Map{number}"),
+                        OutputLayout::Gray,
+                        [ChannelSlot::channel(MaterialChannel::Roughness, SourceComponent::Red); 4],
+                    ));
+                }
+                let error = draft.preset.validate().err();
+                if let Some(error) = &error {
+                    ui.label(
+                        RichText::new(error.to_string())
+                            .size(11.5)
+                            .color(theme::DANGER),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(error.is_none(), |ui| {
+                        save = widgets::pill_button(ui, None, "Save preset", true, false).clicked();
+                    });
+                    cancel = widgets::pill_button(ui, None, "Cancel", false, false).clicked();
+                });
+            });
+        if cancel {
+            return;
+        }
+        self.preset_draft = Some(draft);
+        if save && let Err(error) = self.apply_preset_draft() {
+            self.bake_error = Some(error);
+        }
+    }
+}
+
+/// Channel letters of an output layout, in slot order.
+fn slot_names(layout: OutputLayout) -> &'static [&'static str] {
+    match layout {
+        OutputLayout::Gray => &["V"],
+        OutputLayout::Rgb => &["R", "G", "B"],
+        OutputLayout::Rgba => &["R", "G", "B", "A"],
+    }
+}
+
+fn source_label(source: ExportSource) -> String {
+    match source {
+        ExportSource::Channel(MaterialChannel::AmbientOcclusion) => "Occlusion".to_owned(),
+        ExportSource::Channel(channel) => channel_label(channel).to_owned(),
+        ExportSource::MeshMap(kind) => format!("{} map", kind.name()),
+    }
+}
+
+/// Short description of a slot, e.g. `1 − Roughness` or `Normal.G`.
+fn slot_label(slot: ChannelSlot) -> String {
+    match slot {
+        ChannelSlot::Constant(value) => format!("{value:.2}"),
+        ChannelSlot::Source {
+            source,
+            component,
+            invert,
+        } => {
+            let mut label = source_label(source);
+            if source.is_color() {
+                label.push_str(match component {
+                    SourceComponent::Red => ".R",
+                    SourceComponent::Green => ".G",
+                    SourceComponent::Blue => ".B",
+                });
+            }
+            if invert {
+                format!("1 − {label}")
+            } else {
+                label
+            }
+        }
+    }
+}
+
+/// Source picker plus component, invert, or constant controls for one slot.
+fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
+    let current = slot.source();
+    let mut chosen = current;
+    egui::ComboBox::from_id_salt(("slot_source", id_salt))
+        .width(104.0)
+        .selected_text(current.map_or_else(|| "Constant".to_owned(), source_label))
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(current.is_none(), "Constant").clicked() {
+                chosen = None;
+            }
+            for source in ExportSource::ALL {
+                if ui
+                    .selectable_label(current == Some(source), source_label(source))
+                    .clicked()
+                {
+                    chosen = Some(source);
+                }
+            }
+        });
+    if chosen != current {
+        let invert = matches!(*slot, ChannelSlot::Source { invert: true, .. });
+        *slot = chosen.map_or(ChannelSlot::ONE, |source| ChannelSlot::Source {
+            source,
+            component: SourceComponent::Red,
+            invert,
+        });
+    }
+    match slot {
+        ChannelSlot::Constant(value) => {
+            ui.add(egui::DragValue::new(value).speed(0.01).range(0.0..=1.0));
+        }
+        ChannelSlot::Source {
+            source,
+            component,
+            invert,
+        } => {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if source.is_color() {
+                let letter = |component: SourceComponent| match component {
+                    SourceComponent::Red => "R",
+                    SourceComponent::Green => "G",
+                    SourceComponent::Blue => "B",
+                };
+                egui::ComboBox::from_id_salt(("slot_component", id_salt))
+                    .width(38.0)
+                    .selected_text(letter(*component))
+                    .show_ui(ui, |ui| {
+                        for option in SourceComponent::ALL {
+                            ui.selectable_value(component, option, letter(option));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Component of the source to read");
+            }
+            if widgets::chip(ui, "1−x", *invert)
+                .on_hover_text("Invert: store 1 − value")
+                .clicked()
+            {
+                *invert = !*invert;
+            }
         }
     }
 }

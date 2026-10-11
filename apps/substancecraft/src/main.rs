@@ -11,19 +11,21 @@ use std::time::Duration;
 
 use eframe::egui;
 use substancecraft_api::{
-    ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel,
+    ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
     bake_texture_set_material, import_binary_fbx_meshes, import_gltf_file, load_project_file,
-    load_project_resources, load_texture_image, save_project_file, write_texture,
+    load_project_resources, load_texture_image, save_project_file, write_exported_textures,
+    write_texture,
 };
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
-    DEFAULT_HEIGHT_STRENGTH, DEFAULT_OPACITY, Dirt, EdgeWear, EditCommand, EditHistory, IdStroke,
-    LayerFill, LayerId, LayerSettings, LayerSlot, MAX_STROKE_POINTS, MaskGenerator, MaskStroke,
-    MaterialChannel, MaterialLayer, MaterialProject, MaterialTextures, MeshAsset, MeshGeometry,
-    MeshId, MeshMapError, MeshMapKind, MeshMapSettings, MeshMaps, MeshSmoothing, MeshTopology,
-    NamedPose, PaintStroke, PoseId, PrimitivePreset, ProjectResource, ResourceId, ResourceImages,
-    SelectionMode, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
-    bake_mesh_maps_from, remap_subdivided_triangles,
+    DEFAULT_HEIGHT_STRENGTH, DEFAULT_OPACITY, Dirt, EdgeWear, EditCommand, EditHistory,
+    ExportPreset, ExportedTexture, IdStroke, LayerFill, LayerId, LayerSettings, LayerSlot,
+    MAX_STROKE_POINTS, MaskGenerator, MaskStroke, MaterialChannel, MaterialLayer, MaterialProject,
+    MaterialTextures, MeshAsset, MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings,
+    MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PrimitivePreset,
+    ProjectResource, ResourceId, ResourceImages, SelectionMode, TextureResolution, TextureSet,
+    TextureSetId, ViewportCamera, ViewportLighting, bake_mesh_maps_from,
+    remap_subdivided_triangles,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
@@ -85,6 +87,10 @@ fn main() -> eframe::Result {
                 Ok(renderer) => app.filament_renderer = Some(renderer),
                 Err(error) => app.filament_error = Some(error.to_string()),
             }
+            // `substancecraft path/to/scene.sproject` opens that project.
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.open_project_path(path.into());
+            }
             Ok(Box::new(app))
         }),
     )
@@ -139,6 +145,10 @@ struct SubstanceCraftApp {
     /// Per-resource egui thumbnails for the assets drawer.
     resource_thumbnails: BTreeMap<ResourceId, egui::TextureHandle>,
     export_format: TextureFormat,
+    /// Name of the export preset the Export button uses.
+    export_preset: String,
+    /// Custom preset being edited; applied to the project only when valid.
+    preset_draft: Option<PresetDraft>,
     view_mode: ViewMode,
     uv_view: uv_view::UvView,
     /// Content revision of each texture set; compared against caches.
@@ -259,6 +269,17 @@ struct PreviewJob {
 }
 
 /// Shared inputs of a background texture-set bake.
+/// Preset the Export button starts with: the viewport's own metal/rough layout.
+const DEFAULT_EXPORT_PRESET: &str = "Metal/Rough (ORM)";
+
+/// A custom export preset being edited.
+#[derive(Clone, Debug, PartialEq)]
+struct PresetDraft {
+    /// Name of the project preset the draft replaces; `None` for a new one.
+    original: Option<String>,
+    preset: ExportPreset,
+}
+
 struct BakeInputs {
     mesh: Option<Arc<MeshGeometry>>,
     mesh_maps: Option<Arc<Vec<MeshMaps>>>,
@@ -292,6 +313,21 @@ impl BakeInputs {
     fn bake_material(&self, texture_set: &TextureSet) -> Result<MaterialTextures, String> {
         bake_texture_set_material(
             texture_set,
+            self.mesh.as_deref(),
+            self.maps(),
+            Some(&self.resources),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn bake_export(
+        &self,
+        texture_set: &TextureSet,
+        preset: &ExportPreset,
+    ) -> Result<Vec<ExportedTexture>, String> {
+        bake_texture_set_export(
+            texture_set,
+            preset,
             self.mesh.as_deref(),
             self.maps(),
             Some(&self.resources),
@@ -417,6 +453,8 @@ impl Default for SubstanceCraftApp {
             resource_images: ResourceImages::new(),
             resource_thumbnails: BTreeMap::new(),
             export_format: TextureFormat::Png,
+            export_preset: DEFAULT_EXPORT_PRESET.to_owned(),
+            preset_draft: None,
             view_mode: ViewMode::Model,
             uv_view: uv_view::UvView::default(),
             set_revisions: BTreeMap::new(),
@@ -706,12 +744,16 @@ impl SubstanceCraftApp {
     }
 
     fn open_project(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = rfd::FileDialog::new()
             .add_filter("SubstanceCraft Project", &["sproject"])
             .pick_file()
-        else {
-            return;
-        };
+        {
+            self.open_project_path(path);
+        }
+    }
+
+    /// Loads a project file, reporting failures in the status bar.
+    fn open_project_path(&mut self, path: std::path::PathBuf) {
         let project = match load_project_file(&path) {
             Ok(project) => project,
             Err(error) => {
@@ -1978,9 +2020,10 @@ impl SubstanceCraftApp {
 
     /// Returns a clone of the selected texture set when it can be baked now,
     /// starting a mesh-map bake (and reporting it) when maps are missing.
-    fn exportable_texture_set(&mut self) -> Option<TextureSet> {
+    /// `reads_maps` is true when the export itself samples mesh maps.
+    fn exportable_texture_set(&mut self, reads_maps: bool) -> Option<TextureSet> {
         let texture_set = self.selected_texture_set_ref()?.clone();
-        if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
+        if (reads_maps || texture_set.requires_mesh_maps()) && !self.mesh_maps_fresh() {
             self.ensure_mesh_maps();
             self.bake_error =
                 Some("Mesh maps are still baking; export again when they finish.".to_owned());
@@ -2007,7 +2050,7 @@ impl SubstanceCraftApp {
     }
 
     fn export_baked_map(&mut self, channel: MaterialChannel) {
-        let Some(texture_set) = self.exportable_texture_set() else {
+        let Some(texture_set) = self.exportable_texture_set(false) else {
             return;
         };
         let stem = format!("{}_{}", texture_set.name, channel_label(channel));
@@ -2024,51 +2067,139 @@ impl SubstanceCraftApp {
         }
     }
 
-    /// Writes `<set>_BaseColor`, `_ORM`, `_Normal`, and (when anything glows)
-    /// `_Emissive` into a chosen folder in the export format: the common
-    /// metal/rough engine layout. Base Color carries Opacity in alpha.
-    fn export_material_set(&mut self) {
-        let Some(texture_set) = self.exportable_texture_set() else {
+    /// Built-in presets followed by the project's custom ones.
+    fn export_presets(&self) -> Vec<ExportPreset> {
+        let mut presets = ExportPreset::built_in();
+        presets.extend(self.project.export_presets.iter().cloned());
+        presets
+    }
+
+    fn is_custom_preset(&self, name: &str) -> bool {
+        self.project
+            .export_presets
+            .iter()
+            .any(|preset| preset.name == name)
+    }
+
+    /// The preset the Export button uses, falling back to the default when
+    /// the chosen one was deleted or the project changed.
+    fn selected_export_preset(&self) -> ExportPreset {
+        let presets = self.export_presets();
+        presets
+            .iter()
+            .find(|preset| preset.name == self.export_preset)
+            .or_else(|| {
+                presets
+                    .iter()
+                    .find(|preset| preset.name == DEFAULT_EXPORT_PRESET)
+            })
+            .cloned()
+            .unwrap_or_else(|| presets[0].clone())
+    }
+
+    /// Writes every file of the selected export preset into a chosen folder
+    /// in the export format.
+    fn export_with_preset(&mut self) {
+        let preset = self.selected_export_preset();
+        let Some(texture_set) = self.exportable_texture_set(preset.reads_mesh_maps()) else {
             return;
         };
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        match self.write_material_set(&texture_set, &folder) {
+        match self.write_export(&texture_set, &preset, &folder) {
             Ok(_) => self.bake_error = None,
             Err(error) => self.bake_error = Some(error),
         }
     }
 
-    /// Bakes and writes the material set; returns the files written.
-    fn write_material_set(
+    /// Bakes and writes a preset's files; returns the paths written.
+    fn write_export(
         &self,
         texture_set: &TextureSet,
+        preset: &ExportPreset,
         folder: &std::path::Path,
     ) -> Result<Vec<std::path::PathBuf>, String> {
-        let textures = self
+        let files = self
             .bake_inputs(texture_set.id)
-            .bake_material(texture_set)?;
-        let stem = texture_set.name.replace(' ', "_");
-        let extension = self.export_format.extension();
-        let mut written = Vec::new();
-        for (suffix, texture) in [
-            ("BaseColor", Some(&textures.base_color)),
-            ("ORM", Some(&textures.orm)),
-            ("Normal", Some(&textures.normal)),
-            (
-                "Emissive",
-                textures.has_emission().then_some(&textures.emissive),
-            ),
-        ] {
-            let Some(texture) = texture else {
-                continue;
-            };
-            let path = folder.join(format!("{stem}_{suffix}.{extension}"));
-            write_texture(&path, texture).map_err(|error| error.to_string())?;
-            written.push(path);
+            .bake_export(texture_set, preset)?;
+        write_exported_textures(folder, &files, self.export_format)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Starts editing a copy of `name` as a new custom preset.
+    fn duplicate_export_preset(&mut self, name: &str) {
+        let Some(mut preset) = self
+            .export_presets()
+            .into_iter()
+            .find(|preset| preset.name == name)
+        else {
+            return;
+        };
+        let taken = self.export_presets();
+        preset.name = (1..)
+            .map(|index| match index {
+                1 => format!("{name} copy"),
+                index => format!("{name} copy {index}"),
+            })
+            .find(|candidate| {
+                !taken
+                    .iter()
+                    .any(|preset| preset.name.eq_ignore_ascii_case(candidate))
+            })
+            .unwrap_or_default();
+        self.preset_draft = Some(PresetDraft {
+            original: None,
+            preset,
+        });
+    }
+
+    fn edit_export_preset(&mut self, name: &str) {
+        self.preset_draft = self
+            .project
+            .export_presets
+            .iter()
+            .find(|preset| preset.name == name)
+            .map(|preset| PresetDraft {
+                original: Some(preset.name.clone()),
+                preset: preset.clone(),
+            });
+    }
+
+    /// Validates the draft against the project and stores it, selecting it
+    /// for export. The draft stays open on error.
+    fn apply_preset_draft(&mut self) -> Result<(), String> {
+        let Some(draft) = self.preset_draft.clone() else {
+            return Ok(());
+        };
+        let mut project = self.project.clone();
+        match draft.original.as_ref().and_then(|original| {
+            project
+                .export_presets
+                .iter()
+                .position(|preset| &preset.name == original)
+        }) {
+            Some(index) => project.export_presets[index] = draft.preset.clone(),
+            None => project.export_presets.push(draft.preset.clone()),
         }
-        Ok(written)
+        project.validate().map_err(|error| error.to_string())?;
+        self.project = project;
+        self.export_preset = draft.preset.name;
+        self.preset_draft = None;
+        Ok(())
+    }
+
+    fn delete_export_preset(&mut self, name: &str) {
+        self.project
+            .export_presets
+            .retain(|preset| preset.name != name);
+        if self
+            .preset_draft
+            .as_ref()
+            .is_some_and(|draft| draft.original.as_deref() == Some(name))
+        {
+            self.preset_draft = None;
+        }
     }
 
     fn export_mesh_map(&mut self, kind: MeshMapKind) {
@@ -3195,7 +3326,9 @@ mod tests {
         let set = app.selected_texture_set_ref().unwrap().clone();
         let out = folder.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        let written = app.write_material_set(&set, &out).unwrap();
+        let written = app
+            .write_export(&set, &app.selected_export_preset(), &out)
+            .unwrap();
         let names = written
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
@@ -3267,5 +3400,62 @@ mod tests {
         app.undo();
         let set = app.selected_texture_set_ref().unwrap();
         assert_eq!(set.slot_of(paint).unwrap().parent, Some(group));
+    }
+
+    #[test]
+    fn tc_0114_custom_export_presets_are_edited_saved_and_exported_through_the_app() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        small_sets(&mut app, 8);
+        assert_eq!(app.selected_export_preset().name, DEFAULT_EXPORT_PRESET);
+
+        // Duplicate the Unreal preset and keep only its normal map, packed
+        // as a single-channel green (inverted) map.
+        app.duplicate_export_preset("Unreal Engine");
+        let draft = app.preset_draft.as_mut().unwrap();
+        assert_eq!(draft.preset.name, "Unreal Engine copy");
+        draft
+            .preset
+            .outputs
+            .retain(|output| output.file_name == "T_$textureSet_N");
+        draft.preset.outputs[0].layout = substancecraft_core::OutputLayout::Gray;
+        draft.preset.outputs[0].slots[0] = draft.preset.outputs[0].slots[1];
+        app.apply_preset_draft().unwrap();
+        assert!(app.preset_draft.is_none());
+        assert_eq!(app.export_preset, "Unreal Engine copy");
+        assert!(app.is_custom_preset("Unreal Engine copy"));
+
+        // A second copy gets a distinct name; a draft named like a built-in
+        // is refused and stays open without touching the project.
+        app.duplicate_export_preset("Unreal Engine");
+        assert_eq!(
+            app.preset_draft.as_ref().unwrap().preset.name,
+            "Unreal Engine copy 2"
+        );
+        app.preset_draft.as_mut().unwrap().preset.name = "Separate Channels".to_owned();
+        assert!(app.apply_preset_draft().is_err());
+        assert!(app.preset_draft.is_some());
+        assert_eq!(app.project.export_presets.len(), 1);
+        app.preset_draft = None;
+
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let written = app
+            .write_export(&set, &app.selected_export_preset(), folder.path())
+            .unwrap();
+        let stem = set.name.replace(' ', "_");
+        assert_eq!(written, [folder.path().join(format!("T_{stem}_N.png"))]);
+        let flat_green = load_texture_image(&written[0]).unwrap();
+        assert_eq!(&flat_green.rgba8[..4], &[127, 127, 127, 255]);
+
+        // Custom presets travel with the project.
+        let project = folder.path().join("scene.sproject");
+        save_project_file(&project, &app.project).unwrap();
+        let loaded = load_project_file(&project).unwrap();
+        assert_eq!(loaded.export_presets, app.project.export_presets);
+
+        app.delete_export_preset("Unreal Engine copy");
+        assert!(app.project.export_presets.is_empty());
+        assert_eq!(app.selected_export_preset().name, DEFAULT_EXPORT_PRESET);
     }
 }

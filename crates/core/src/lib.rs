@@ -9,6 +9,7 @@ use thiserror::Error;
 
 mod brush;
 mod compositing;
+mod export;
 mod filters;
 mod generators;
 mod mesh_maps;
@@ -20,6 +21,11 @@ mod topology;
 
 pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING};
 pub use compositing::{BakeContext, BakeError, BakedTexture, MaterialTextures};
+pub use export::{
+    ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource, ExportedTexture,
+    MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS, OutputLayout,
+    SourceComponent, TEXTURE_SET_TOKEN,
+};
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
     Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
@@ -1700,6 +1706,9 @@ pub struct MaterialProject {
     /// alphas).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ProjectResource>,
+    /// Custom export presets, offered alongside [`ExportPreset::built_in`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_presets: Vec<ExportPreset>,
 }
 
 impl MaterialProject {
@@ -1711,6 +1720,7 @@ impl MaterialProject {
             saved_poses: Vec::new(),
             active_texture_set: None,
             resources: Vec::new(),
+            export_presets: Vec::new(),
         }
     }
 
@@ -1788,6 +1798,24 @@ impl MaterialProject {
             }
         }
 
+        let built_in_names: BTreeSet<String> = ExportPreset::built_in()
+            .iter()
+            .map(|preset| preset.name.trim().to_lowercase())
+            .collect();
+        let mut preset_names = BTreeSet::new();
+        for preset in &self.export_presets {
+            preset
+                .validate()
+                .map_err(|error| ProjectError::InvalidExportPreset {
+                    name: preset.name.clone(),
+                    error,
+                })?;
+            let name = preset.name.trim().to_lowercase();
+            if built_in_names.contains(&name) || !preset_names.insert(name) {
+                return Err(ProjectError::DuplicateExportPresetName(preset.name.clone()));
+            }
+        }
+
         if let Some(active_id) = self.active_texture_set
             && !texture_set_ids.contains(&active_id)
         {
@@ -1836,6 +1864,13 @@ pub enum ProjectError {
     DuplicateResourceId(ResourceId),
     #[error("a layer references resource {0:?}, which the project does not list")]
     MissingResource(ResourceId),
+    #[error("export preset `{name}` is invalid: {error}")]
+    InvalidExportPreset {
+        name: String,
+        error: ExportPresetError,
+    },
+    #[error("export preset name `{0}` is duplicated or taken by a built-in preset")]
+    DuplicateExportPresetName(String),
     #[error(transparent)]
     InvalidPose(#[from] PoseError),
 }

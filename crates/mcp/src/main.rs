@@ -10,7 +10,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use substancecraft_api::{inspect_primitive_preset, list_primitive_presets};
+use substancecraft_api::{inspect_primitive_preset, list_export_presets, list_primitive_presets};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct InspectMeshPresetRequest {
@@ -36,6 +36,13 @@ impl SubstanceCraftMcp {
         let summary = inspect_primitive_preset(&request.name).map_err(|error| error.to_string())?;
         serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())
     }
+
+    #[tool(
+        description = "List the built-in texture export presets: each output file's name template, channel layout, and which material channel or mesh map fills each colour channel."
+    )]
+    fn list_export_presets(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&list_export_presets()).map_err(|error| error.to_string())
+    }
 }
 
 #[tool_handler]
@@ -43,7 +50,7 @@ impl ServerHandler for SubstanceCraftMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "SubstanceCraft headless tools. Current tools inspect built-in primitive meshes; project editing tools will be added as their command API lands.",
+                "SubstanceCraft headless tools. Current tools inspect built-in primitive meshes and texture export presets; project editing tools will be added as their command API lands.",
             )
             .with_server_info(Implementation::new(
                 "substancecraft-mcp",
@@ -79,5 +86,19 @@ mod tests {
             .unwrap();
         assert!(result.contains("\"name\": \"Sphere\""));
         assert!(result.contains("\"triangle_count\": 224"));
+    }
+
+    #[test]
+    fn tc_0115_export_preset_tool_lists_built_in_presets_as_json() {
+        let result = SubstanceCraftMcp.list_export_presets().unwrap();
+        let presets: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let names: Vec<&str> = presets
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|preset| preset["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"Unreal Engine"));
+        assert!(result.contains("\"file_name\": \"T_$textureSet_N\""));
     }
 }
