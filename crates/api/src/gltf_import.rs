@@ -183,14 +183,10 @@ impl Importer<'_> {
                 })
                 .collect::<Vec<_>>();
             let triangles = indices
-                .chunks_exact(3)
-                .map(|corners| {
-                    if flips_winding {
-                        [corners[0], corners[2], corners[1]]
-                    } else {
-                        [corners[0], corners[1], corners[2]]
-                    }
-                })
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|&[a, b, c]| if flips_winding { [a, c, b] } else { [a, b, c] })
                 .collect::<Vec<_>>();
             let material = primitive.material();
             let slot = match (material.name(), material.index()) {

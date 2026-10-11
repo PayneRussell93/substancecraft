@@ -29,6 +29,7 @@ pub enum Icon {
     ArrowDown,
     Trash,
     Bake,
+    Image,
 }
 
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -62,6 +63,17 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     };
 
     match icon {
+        Icon::Image => {
+            closed(&[(3.5, 5.0), (20.5, 5.0), (20.5, 19.0), (3.5, 19.0)]);
+            line(&[
+                (3.5, 16.5),
+                (9.0, 11.0),
+                (13.0, 15.0),
+                (15.5, 12.5),
+                (20.5, 17.5),
+            ]);
+            painter.circle_filled(p(15.5, 8.8), 1.6 * scale, color);
+        }
         Icon::Cube => {
             closed(&[
                 (12.0, 3.0),

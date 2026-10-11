@@ -1378,6 +1378,7 @@ mod tests {
                 point(-0.6, -0.6),
             ],
             triangles: vec![[0, 1, 2], [0, 2, 3]],
+            ..MeshGeometry::default()
         }
     }
 

@@ -1,13 +1,18 @@
 // Viewport PBR material for SubstanceCraft. Compiled by build.rs with the matc
 // from the vendored Filament build, so the package always matches the engine version.
 //
-// Material mode: Base Color (sRGB), an ORM map (linear: R ambient occlusion,
-// G roughness, B metallic) and a tangent-space normal map (linear, +Y = +V).
-// Preview mode: only the base colour map is shown, on a neutral dielectric, so
-// single channels and mesh maps can be inspected without PBR interference.
+// Material mode: Base Color (sRGB, Opacity in alpha), an ORM map (linear: R
+// ambient occlusion, G roughness, B metallic), a tangent-space normal map
+// (linear, +Y = +V), and an emissive map (sRGB). Opacity is alpha-tested, so
+// cut-outs stay depth-sorted without blending artifacts.
+// Preview mode: only the base colour map is shown, opaque, on a neutral
+// dielectric, so single channels and mesh maps can be inspected without PBR
+// interference.
 material {
     name : SubstanceCraftViewport,
     shadingModel : lit,
+    blending : masked,
+    maskThreshold : 0.5,
     doubleSided : true,
     requires : [ uv0, tangents ],
     parameters : [
@@ -24,8 +29,16 @@ material {
             name : normalMap
         },
         {
+            type : sampler2d,
+            name : emissiveMap
+        },
+        {
             type : float,
             name : previewMode
+        },
+        {
+            type : float,
+            name : emissiveStrength
         }
     ]
 }
@@ -41,6 +54,7 @@ fragment {
         // Rows are uploaded top to bottom, matching BakedTexture::sample_uv.
         material.baseColor = texture(materialParams_baseColorMap, uv);
         if (preview) {
+            material.baseColor.a = 1.0;
             material.roughness = 0.58;
             material.metallic = 0.0;
         } else {
@@ -48,6 +62,8 @@ fragment {
             material.ambientOcclusion = orm.r;
             material.roughness = orm.g;
             material.metallic = orm.b;
+            float3 emitted = texture(materialParams_emissiveMap, uv).rgb;
+            material.emissive = float4(emitted * materialParams.emissiveStrength, 0.0);
         }
     }
 }

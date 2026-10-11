@@ -353,9 +353,10 @@ mod tests {
 
         use glam::{Quat, Vec2, Vec3};
         use substancecraft_core::{
-            BoneId, BoneTransform, EdgeWear, IdStroke, LayerFill, LayerId, MaskGenerator,
-            MaskStroke, MaterialLayer, NamedPose, PaintStroke, PolygonMask, PoseId,
-            TextureResolution, TextureSet, TextureSetId,
+            BitmapMask, BoneId, BoneTransform, BrushShape, BrushTip, EdgeWear, FillTextures,
+            IdStroke, LayerFill, LayerFilter, LayerId, MaskGenerator, MaskStroke, MaterialLayer,
+            NamedPose, PaintStroke, PolygonMask, PoseId, ProjectResource, ProjectionMode,
+            ResourceId, TextureProjection, TextureResolution, TextureSet, TextureSetId,
         };
 
         let project = MaterialProject {
@@ -368,41 +369,80 @@ mod tests {
                     height: 2048,
                 },
                 channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Roughness]),
-                layers: vec![MaterialLayer {
-                    id: LayerId(3),
-                    name: "Paint".to_owned(),
-                    visible: true,
-                    opacity: 0.75,
-                    channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
-                    paint_strokes: vec![PaintStroke {
-                        points: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
-                        radius_pixels: 8.0,
-                        color: [32, 64, 128, 255],
-                        opacity: 0.8,
-                        roughness: 0.3,
-                        metallic: 1.0,
-                        height: 0.7,
-                    }],
-                    mask_strokes: vec![MaskStroke {
-                        points: vec![Vec2::new(0.5, 0.5)],
-                        radius_pixels: 4.0,
-                        value: 0.25,
-                        opacity: 0.5,
-                    }],
-                    id_strokes: vec![IdStroke {
-                        points: vec![Vec2::new(0.5, 0.5)],
-                        radius_pixels: 4.0,
-                        color: [1, 2, 3],
-                        opacity: 1.0,
-                    }],
-                    id_mask_color: Some([1, 2, 3]),
-                    fill: Some(LayerFill::default()),
-                    mask_generator: Some(MaskGenerator::EdgeWear(EdgeWear::DEFAULT)),
-                    polygon_mask: Some(PolygonMask {
-                        triangles: BTreeSet::from([0, 7, 9]),
-                        inverted: true,
-                    }),
-                }],
+                layers: vec![
+                    MaterialLayer {
+                        id: LayerId(3),
+                        name: "Paint".to_owned(),
+                        visible: true,
+                        opacity: 0.75,
+                        channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+                        paint_strokes: vec![PaintStroke {
+                            points: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
+                            radius_pixels: 8.0,
+                            color: [32, 64, 128, 255],
+                            opacity: 0.8,
+                            roughness: 0.3,
+                            metallic: 1.0,
+                            height: 0.7,
+                            emissive: [9, 8, 7],
+                            material_opacity: 0.6,
+                            erase: true,
+                            tip: BrushTip {
+                                shape: BrushShape::Bitmap(ResourceId(11)),
+                                spacing: 0.5,
+                                ..BrushTip::ROUND
+                            },
+                            pressures: vec![0.2, 0.9],
+                        }],
+                        mask_strokes: vec![MaskStroke {
+                            points: vec![Vec2::new(0.5, 0.5)],
+                            radius_pixels: 4.0,
+                            value: 0.25,
+                            opacity: 0.5,
+                            tip: BrushTip::ROUND,
+                            pressures: Vec::new(),
+                        }],
+                        id_strokes: vec![IdStroke {
+                            points: vec![Vec2::new(0.5, 0.5)],
+                            radius_pixels: 4.0,
+                            color: [1, 2, 3],
+                            opacity: 1.0,
+                            tip: BrushTip::ROUND,
+                            pressures: Vec::new(),
+                        }],
+                        id_mask_color: Some([1, 2, 3]),
+                        fill: Some(LayerFill {
+                            textures: FillTextures {
+                                base_color: Some(ResourceId(11)),
+                                ..FillTextures::default()
+                            },
+                            projection: TextureProjection {
+                                mode: ProjectionMode::Triplanar,
+                                scale: 3.0,
+                                ..TextureProjection::default()
+                            },
+                            ..LayerFill::default()
+                        }),
+                        mask_generator: Some(MaskGenerator::EdgeWear(EdgeWear::DEFAULT)),
+                        polygon_mask: Some(PolygonMask {
+                            triangles: BTreeSet::from([0, 7, 9]),
+                            inverted: true,
+                        }),
+                        mask_bitmap: Some(BitmapMask {
+                            resource: ResourceId(11),
+                            projection: TextureProjection::default(),
+                            invert: true,
+                        }),
+                        filters: vec![LayerFilter::Blur { radius: 3.0 }],
+                        mask_filters: vec![LayerFilter::Invert],
+                        children: None,
+                    },
+                    {
+                        let mut group = MaterialLayer::new_group(LayerId(6), "Group");
+                        group.children = Some(vec![MaterialLayer::new_paint(LayerId(7), "Child")]);
+                        group
+                    },
+                ],
                 height_strength: 2.5,
             }],
             saved_poses: vec![NamedPose {
@@ -418,6 +458,11 @@ mod tests {
                 )]),
             }],
             active_texture_set: Some(TextureSetId(2)),
+            resources: vec![ProjectResource {
+                id: ResourceId(11),
+                name: "Stencil".to_owned(),
+                source: "stencil.png".to_owned(),
+            }],
             ..MaterialProject::empty()
         };
 

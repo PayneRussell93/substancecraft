@@ -46,7 +46,7 @@ pub const MAX_BAKE_PIXELS: usize = 4_194_304;
 /// Upper bound on triangles referenced by one layer's polygon mask.
 pub const MAX_POLYGON_MASK_TRIANGLES: usize = 8_388_608;
 const MAX_LAYER_STROKES: usize = 8_192;
-pub(crate) const MAX_STROKE_POINTS: usize = 4_096;
+pub const MAX_STROKE_POINTS: usize = 4_096;
 const MAX_EDIT_HISTORY: usize = 128;
 
 macro_rules! id_type {
@@ -188,8 +188,7 @@ impl MeshGeometry {
     /// Appends `other`, offsetting its indices and material slots. Slots of
     /// the same name are shared.
     pub fn append(&mut self, other: &MeshGeometry) -> Result<(), MeshError> {
-        let offset =
-            u32::try_from(self.vertices.len()).map_err(|_| MeshError::TooManyTriangles)?;
+        let offset = u32::try_from(self.vertices.len()).map_err(|_| MeshError::TooManyTriangles)?;
         if self.triangle_materials.is_empty() && !self.triangles.is_empty() {
             self.triangle_materials = vec![0; self.triangles.len()];
         }
@@ -199,7 +198,11 @@ impl MeshGeometry {
         let mut slot_map = Vec::with_capacity(other.material_slot_count());
         for slot in 0..other.material_slot_count() as u32 {
             let name = other.material_slot_name(slot);
-            let index = match self.material_slots.iter().position(|existing| *existing == name) {
+            let index = match self
+                .material_slots
+                .iter()
+                .position(|existing| *existing == name)
+            {
                 Some(index) => index,
                 None => {
                     self.material_slots.push(name);
@@ -642,7 +645,7 @@ pub enum PoseError {
     InvalidTransform(BoneId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MaterialChannel {
     BaseColor,
     Id,

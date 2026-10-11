@@ -24,16 +24,23 @@
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 using namespace filament;
 using utils::Entity;
 using utils::EntityManager;
 
 namespace {
+
+constexpr uint32_t MAP_COUNT = 4;
+// Emissive maps hold 0..1 sRGB; this many nits make white glow at the default exposure.
+constexpr float EMISSIVE_NITS = 40000.0f;
+constexpr uint32_t MAX_PRIMITIVES = 256;
 
 struct ScRenderer {
     Engine* engine = nullptr;
@@ -46,9 +53,11 @@ struct ScRenderer {
     Entity sunEntity;
     IndirectLight* indirectLight = nullptr;
     Material* material = nullptr;
-    MaterialInstance* materialInstance = nullptr;
-    // Indexed by material map slot: 0 base colour, 1 ORM, 2 normal.
-    Texture* maps[3] = {nullptr, nullptr, nullptr};
+    // One instance per mesh primitive (material slot), with its own maps indexed by map slot:
+    // 0 base colour, 1 ORM, 2 normal, 3 emissive.
+    std::vector<MaterialInstance*> instances;
+    std::vector<std::array<Texture*, MAP_COUNT>> maps;
+    bool previewMode = false;
     Entity meshEntity;
     VertexBuffer* vertexBuffer = nullptr;
     IndexBuffer* indexBuffer = nullptr;
@@ -118,6 +127,18 @@ uint8_t* downsample(uint8_t const* source, uint32_t width, uint32_t height, uint
     return out;
 }
 
+// Destroys material instances (and their maps) from index `keep` on.
+void destroyInstances(ScRenderer* r, size_t keep) {
+    while (r->instances.size() > keep) {
+        for (Texture* map : r->maps.back()) {
+            if (map) r->engine->destroy(map);
+        }
+        r->engine->destroy(r->instances.back());
+        r->instances.pop_back();
+        r->maps.pop_back();
+    }
+}
+
 void destroyMesh(ScRenderer* r) {
     if (!r->meshEntity.isNull()) {
         r->scene->remove(r->meshEntity);
@@ -141,10 +162,7 @@ void destroyAll(ScRenderer* r) {
     }
     Engine* engine = r->engine;
     destroyMesh(r);
-    if (r->materialInstance) engine->destroy(r->materialInstance);
-    for (Texture* map : r->maps) {
-        if (map) engine->destroy(map);
-    }
+    destroyInstances(r, 0);
     if (r->material) engine->destroy(r->material);
     if (r->indirectLight) engine->destroy(r->indirectLight);
     if (!r->sunEntity.isNull()) {
@@ -194,15 +212,22 @@ void readbackCallback(void* buffer, size_t size, void* user) {
     std::free(buffer);
 }
 
-char const* const MAP_PARAMETERS[3] = {"baseColorMap", "ormMap", "normalMap"};
+char const* const MAP_PARAMETERS[MAP_COUNT] = {"baseColorMap", "ormMap", "normalMap", "emissiveMap"};
 
-// Uploads one material map (RGBA8, rows top to bottom) with a CPU-built mip chain and binds it
-// to its sampler. `srgb` selects colour-managed storage and filtering; data maps stay linear.
-bool uploadMap(ScRenderer* r, uint32_t slot, uint32_t width, uint32_t height,
-        uint8_t const* rgba8, bool srgb) {
-    if (slot >= 3 || width == 0 || height == 0) {
+// Base colour and emissive hold colour; ORM and normals are linear data.
+bool isSrgbSlot(uint32_t slot) {
+    return slot == 0 || slot == 3;
+}
+
+// Uploads one material map (RGBA8, rows top to bottom) of material instance `instance` with a
+// CPU-built mip chain and binds it to its sampler. Colour maps use sRGB storage and filtering;
+// data maps stay linear.
+bool uploadMap(ScRenderer* r, uint32_t instance, uint32_t slot, uint32_t width, uint32_t height,
+        uint8_t const* rgba8) {
+    if (instance >= r->instances.size() || slot >= MAP_COUNT || width == 0 || height == 0) {
         return false;
     }
+    bool const srgb = isSrgbSlot(slot);
     uint8_t levels = 1;
     for (uint32_t extent = width > height ? width : height; extent > 1; extent >>= 1) {
         levels++;
@@ -246,11 +271,36 @@ bool uploadMap(ScRenderer* r, uint32_t slot, uint32_t width, uint32_t height,
     TextureSampler sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
             TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::REPEAT);
     sampler.setAnisotropy(8.0f);
-    r->materialInstance->setParameter(MAP_PARAMETERS[slot], texture, sampler);
-    if (r->maps[slot]) {
-        r->engine->destroy(r->maps[slot]);
+    r->instances[instance]->setParameter(MAP_PARAMETERS[slot], texture, sampler);
+    if (r->maps[instance][slot]) {
+        r->engine->destroy(r->maps[instance][slot]);
     }
-    r->maps[slot] = texture;
+    r->maps[instance][slot] = texture;
+    return true;
+}
+
+// Grows or shrinks the instance list to `count`. New instances start with neutral maps: grey
+// base colour, AO 1 / roughness 0.58 / metallic 0, a flat normal, and no emission.
+bool ensureInstances(ScRenderer* r, uint32_t count) {
+    destroyInstances(r, count);
+    uint8_t const defaults[MAP_COUNT][4] = {
+            {168, 173, 179, 255}, {255, 148, 0, 255}, {128, 128, 255, 255}, {0, 0, 0, 255}};
+    while (r->instances.size() < count) {
+        MaterialInstance* instance = r->material->createInstance();
+        if (!instance) {
+            return false;
+        }
+        instance->setParameter("previewMode", r->previewMode ? 1.0f : 0.0f);
+        instance->setParameter("emissiveStrength", EMISSIVE_NITS);
+        r->instances.push_back(instance);
+        r->maps.push_back({});
+        uint32_t const index = uint32_t(r->instances.size() - 1);
+        for (uint32_t slot = 0; slot < MAP_COUNT; slot++) {
+            if (!uploadMap(r, index, slot, 1, 1, defaults[slot])) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -305,17 +355,11 @@ ScRenderer* sc_renderer_create(uint8_t const* material, size_t material_len, uin
             delete r;
             return nullptr;
         }
-        r->materialInstance = r->material->createInstance();
-        r->materialInstance->setParameter("previewMode", 0.0f);
-        // Every sampler needs a texture before the first frame: neutral grey, AO 1 /
-        // roughness 0.58 / metallic 0, and a flat tangent-space normal.
-        uint8_t const defaults[3][4] = {{168, 173, 179, 255}, {255, 148, 0, 255}, {128, 128, 255, 255}};
-        for (uint32_t slot = 0; slot < 3; slot++) {
-            if (!uploadMap(r, slot, 1, 1, defaults[slot], slot == 0)) {
-                destroyAll(r);
-                delete r;
-                return nullptr;
-            }
+        // Every sampler needs a texture before the first frame; instances start neutral.
+        if (!ensureInstances(r, 1)) {
+            destroyAll(r);
+            delete r;
+            return nullptr;
         }
 
         Renderer::ClearOptions clear;
@@ -361,30 +405,49 @@ bool sc_renderer_resize(ScRenderer* r, uint32_t width, uint32_t height) {
     }
 }
 
-// Upload a material map: slot 0 Base Color (sRGB), 1 ORM (linear), 2 tangent normal (linear).
-bool sc_renderer_set_map(ScRenderer* r, uint32_t slot, uint32_t width, uint32_t height,
-        uint8_t const* rgba8) {
+// Upload a map of primitive `primitive`: slot 0 Base Color (sRGB, opacity in alpha), 1 ORM
+// (linear), 2 tangent normal (linear), 3 emissive (sRGB).
+bool sc_renderer_set_map(ScRenderer* r, uint32_t primitive, uint32_t slot, uint32_t width,
+        uint32_t height, uint8_t const* rgba8) {
     try {
-        return uploadMap(r, slot, width, height, rgba8, slot == 0);
+        return uploadMap(r, primitive, slot, width, height, rgba8);
     } catch (...) {
         return false;
     }
 }
 
-// Preview mode shows only the base colour map on a neutral dielectric.
+// Preview mode shows only the base colour map, opaque, on a neutral dielectric.
 void sc_renderer_set_preview_mode(ScRenderer* r, bool preview) {
     try {
-        r->materialInstance->setParameter("previewMode", preview ? 1.0f : 0.0f);
+        r->previewMode = preview;
+        for (MaterialInstance* instance : r->instances) {
+            instance->setParameter("previewMode", preview ? 1.0f : 0.0f);
+        }
     } catch (...) {
     }
 }
 
 // vertices: interleaved [position.xyz, uv.xy, tangent-frame quaternion.xyzw] (9 floats each).
+// Primitive i draws `primitive_counts[i]` indices from `primitive_offsets[i]` with material
+// instance i; each primitive is one mesh material slot.
 bool sc_renderer_set_mesh(ScRenderer* r, float const* vertices, uint32_t vertex_count,
-        uint32_t const* indices, uint32_t index_count, float const* center,
+        uint32_t const* indices, uint32_t index_count, uint32_t const* primitive_offsets,
+        uint32_t const* primitive_counts, uint32_t primitive_count, float const* center,
         float const* half_extent) {
     try {
         destroyMesh(r);
+        if (primitive_count == 0 || primitive_count > MAX_PRIMITIVES) {
+            return false;
+        }
+        for (uint32_t i = 0; i < primitive_count; i++) {
+            if (primitive_counts[i] == 0 || primitive_offsets[i] > index_count ||
+                    primitive_counts[i] > index_count - primitive_offsets[i]) {
+                return false;
+            }
+        }
+        if (!ensureInstances(r, primitive_count)) {
+            return false;
+        }
         constexpr uint8_t stride = 9 * sizeof(float);
         size_t const vertexBytes = size_t(vertex_count) * stride;
         size_t const indexBytes = size_t(index_count) * sizeof(uint32_t);
@@ -422,15 +485,14 @@ bool sc_renderer_set_mesh(ScRenderer* r, float const* vertices, uint32_t vertex_
         r->meshEntity = EntityManager::get().create();
         Box const bounds = {{center[0], center[1], center[2]},
                 {half_extent[0], half_extent[1], half_extent[2]}};
-        auto const result = RenderableManager::Builder(1)
-                                    .boundingBox(bounds)
-                                    .material(0, r->materialInstance)
-                                    .geometry(0, RenderableManager::PrimitiveType::TRIANGLES,
-                                            r->vertexBuffer, r->indexBuffer)
-                                    .culling(false)
-                                    .receiveShadows(false)
-                                    .castShadows(false)
-                                    .build(*r->engine, r->meshEntity);
+        RenderableManager::Builder builder(primitive_count);
+        builder.boundingBox(bounds).culling(false).receiveShadows(false).castShadows(false);
+        for (uint32_t i = 0; i < primitive_count; i++) {
+            builder.material(i, r->instances[i])
+                    .geometry(i, RenderableManager::PrimitiveType::TRIANGLES, r->vertexBuffer,
+                            r->indexBuffer, primitive_offsets[i], primitive_counts[i]);
+        }
+        auto const result = builder.build(*r->engine, r->meshEntity);
         if (result != RenderableManager::Builder::Success) {
             destroyMesh(r);
             return false;

@@ -42,6 +42,7 @@ mod ffi {
         pub fn sc_renderer_resize(renderer: *mut ScRenderer, width: u32, height: u32) -> bool;
         pub fn sc_renderer_set_map(
             renderer: *mut ScRenderer,
+            primitive: u32,
             slot: u32,
             width: u32,
             height: u32,
@@ -54,6 +55,9 @@ mod ffi {
             vertex_count: u32,
             indices: *const u32,
             index_count: u32,
+            primitive_offsets: *const u32,
+            primitive_counts: *const u32,
+            primitive_count: u32,
             center: *const f32,
             half_extent: *const f32,
         ) -> bool;
@@ -108,11 +112,19 @@ pub enum MaterialMap {
     BaseColor = 0,
     Orm = 1,
     Normal = 2,
+    Emissive = 3,
 }
+
+const MAP_COUNT: usize = 4;
+const MAX_PRIMITIVES: usize = 256;
 
 pub struct FilamentRuntime {
     raw: NonNull<ffi::ScRenderer>,
-    map_keys: [Option<usize>; 3],
+    /// Last uploaded content key per primitive and map.
+    map_keys: Vec<[Option<usize>; MAP_COUNT]>,
+    /// Primitive drawing each mesh material slot; `None` for slots without
+    /// triangles.
+    slot_primitives: Vec<Option<u32>>,
     preview_mode: Option<bool>,
     mesh_bounds: Option<(Vec3, Vec3)>,
     target_size: [u32; 2],
@@ -133,7 +145,8 @@ impl FilamentRuntime {
         let raw = NonNull::new(raw).ok_or(FilamentError::EngineUnavailable)?;
         let runtime = Self {
             raw,
-            map_keys: [None; 3],
+            map_keys: vec![[None; MAP_COUNT]],
+            slot_primitives: vec![Some(0)],
             preview_mode: None,
             mesh_bounds: None,
             target_size: size,
@@ -149,19 +162,33 @@ impl FilamentRuntime {
         unsafe { ffi::sc_renderer_pump(self.raw.as_ptr()) };
     }
 
-    /// Uploads one material map. `key` identifies the content; re-uploading the
-    /// same key is skipped. Base Color is sRGB; ORM (R occlusion, G roughness,
-    /// B metallic) and tangent-space normals (+Y = +V) are linear.
+    /// Number of mesh material slots the current mesh draws.
+    pub fn material_slot_count(&self) -> usize {
+        self.slot_primitives.len()
+    }
+
+    /// Uploads one map of mesh material slot `slot`. `key` identifies the
+    /// content; re-uploading the same key is skipped, and slots without
+    /// triangles ignore uploads. Base Color (Opacity in alpha) and Emissive are
+    /// sRGB; ORM (R occlusion, G roughness, B metallic) and tangent-space
+    /// normals (+Y = +V) are linear.
     pub fn set_map(
         &mut self,
+        slot: usize,
         map: MaterialMap,
         key: usize,
         width: u32,
         height: u32,
         rgba8: &[u8],
     ) -> Result<(), FilamentError> {
-        let slot = map as usize;
-        if self.map_keys[slot] == Some(key) {
+        let Some(primitive) = self.slot_primitives.get(slot).copied().flatten() else {
+            return Ok(());
+        };
+        let map_index = map as usize;
+        let Some(keys) = self.map_keys.get_mut(primitive as usize) else {
+            return Ok(());
+        };
+        if keys[map_index] == Some(key) {
             return Ok(());
         }
         let byte_count = (width as usize)
@@ -176,7 +203,8 @@ impl FilamentRuntime {
         let uploaded = unsafe {
             ffi::sc_renderer_set_map(
                 self.raw.as_ptr(),
-                slot as u32,
+                primitive,
+                map_index as u32,
                 width,
                 height,
                 rgba8.as_ptr(),
@@ -185,7 +213,9 @@ impl FilamentRuntime {
         if !uploaded {
             return Err(FilamentError::TextureUnavailable);
         }
-        self.map_keys[slot] = Some(key);
+        if let Some(keys) = self.map_keys.get_mut(primitive as usize) {
+            keys[map_index] = Some(key);
+        }
         Ok(())
     }
 
@@ -196,7 +226,7 @@ impl FilamentRuntime {
         height: u32,
         rgba8: &[u8],
     ) -> Result<(), FilamentError> {
-        self.set_map(MaterialMap::BaseColor, key, width, height, rgba8)
+        self.set_map(0, MaterialMap::BaseColor, key, width, height, rgba8)
     }
 
     /// Preview mode shows only the base colour map on a neutral dielectric, for
@@ -309,8 +339,14 @@ impl FilamentRuntime {
         let MeshBuffers {
             vertex_data,
             indices,
+            primitives,
+            slot_primitives,
             bounds,
         } = build_mesh_buffers(geometry, smoothing_angle_degrees)?;
+        let offsets = primitives.iter().map(|range| range.0).collect::<Vec<_>>();
+        let counts = primitives.iter().map(|range| range.1).collect::<Vec<_>>();
+        let primitive_count =
+            u32::try_from(primitives.len()).map_err(|_| FilamentError::InvalidMesh)?;
         let vertex_count =
             u32::try_from(geometry.vertices.len()).map_err(|_| FilamentError::InvalidMesh)?;
         let index_count = u32::try_from(indices.len()).map_err(|_| FilamentError::InvalidMesh)?;
@@ -324,6 +360,9 @@ impl FilamentRuntime {
                 vertex_count,
                 indices.as_ptr(),
                 index_count,
+                offsets.as_ptr(),
+                counts.as_ptr(),
+                primitive_count,
                 center.as_ptr(),
                 half_extent.as_ptr(),
             )
@@ -331,6 +370,9 @@ impl FilamentRuntime {
         if !uploaded {
             return Err(FilamentError::MeshBufferUnavailable);
         }
+        // Fresh instances start with neutral maps.
+        self.map_keys = vec![[None; MAP_COUNT]; primitives.len()];
+        self.slot_primitives = slot_primitives;
         self.mesh_bounds = Some(bounds);
         Ok(())
     }
@@ -378,7 +420,12 @@ fn bounds_center_extent(geometry: &MeshGeometry) -> (Vec3, Vec3) {
 
 struct MeshBuffers {
     vertex_data: Vec<f32>,
+    /// Triangle indices grouped by material slot.
     indices: Vec<u32>,
+    /// `(first index, index count)` of each non-empty slot, in slot order.
+    primitives: Vec<(u32, u32)>,
+    /// Primitive drawing each slot, or `None` when the slot has no triangles.
+    slot_primitives: Vec<Option<u32>>,
     bounds: (Vec3, Vec3),
 }
 
@@ -426,14 +473,35 @@ fn build_mesh_buffers(
             tangent_frame.w,
         ]);
     }
-    let indices = geometry
-        .triangles
-        .iter()
-        .flat_map(|triangle| triangle.iter().copied())
-        .collect();
+    let slot_count = geometry.material_slot_count();
+    if slot_count > MAX_PRIMITIVES {
+        return Err(FilamentError::InvalidMesh);
+    }
+    let mut indices = Vec::with_capacity(geometry.triangles.len() * 3);
+    let mut primitives = Vec::new();
+    let mut slot_primitives = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count as u32 {
+        let first = indices.len();
+        for (triangle_index, triangle) in geometry.triangles.iter().enumerate() {
+            if geometry.material_of(triangle_index) == slot {
+                indices.extend_from_slice(triangle);
+            }
+        }
+        let count = indices.len() - first;
+        if count == 0 {
+            slot_primitives.push(None);
+            continue;
+        }
+        let first = u32::try_from(first).map_err(|_| FilamentError::InvalidMesh)?;
+        let count = u32::try_from(count).map_err(|_| FilamentError::InvalidMesh)?;
+        slot_primitives.push(Some(primitives.len() as u32));
+        primitives.push((first, count));
+    }
     Ok(MeshBuffers {
         vertex_data,
         indices,
+        primitives,
+        slot_primitives,
         bounds: bounds_center_extent(geometry),
     })
 }
@@ -480,6 +548,20 @@ mod tests {
         assert_eq!(buffers.bounds.1.to_array(), [0.5; 3]);
         assert!(buffers.vertex_data.iter().all(|value| value.is_finite()));
         assert_eq!(buffers.indices[0..3], geometry.triangles[0]);
+    }
+
+    #[test]
+    fn tc_0093_mesh_buffers_group_triangles_into_one_primitive_per_material_slot() {
+        let mut geometry = PrimitivePreset::Cube.build_mesh();
+        // Alternate the 12 cube triangles between slots 0 and 2; slot 1 is empty.
+        geometry.material_slots = vec!["A".to_owned(), "B".to_owned(), "C".to_owned()];
+        geometry.triangle_materials = (0..12).map(|index| (index % 2) * 2).collect();
+        let buffers = build_mesh_buffers(&geometry, 60.0).expect("valid buffers");
+
+        assert_eq!(buffers.primitives, vec![(0, 18), (18, 18)]);
+        assert_eq!(buffers.slot_primitives, vec![Some(0), None, Some(1)]);
+        assert_eq!(buffers.indices[0..3], geometry.triangles[0]);
+        assert_eq!(buffers.indices[18..21], geometry.triangles[1]);
     }
 
     #[test]
@@ -576,7 +658,7 @@ mod tests {
 
         // Fully metallic, mirror-smooth: a dielectric grey turns very different.
         renderer
-            .set_map(MaterialMap::Orm, 1, 1, 1, &[255, 10, 255, 255])
+            .set_map(0, MaterialMap::Orm, 1, 1, 1, &[255, 10, 255, 255])
             .expect("ORM upload");
         let metal = render_frame(&mut renderer);
         assert!(
@@ -586,10 +668,10 @@ mod tests {
 
         // A strongly tilted tangent-space normal changes lighting.
         renderer
-            .set_map(MaterialMap::Orm, 2, 1, 1, &[255, 148, 0, 255])
+            .set_map(0, MaterialMap::Orm, 2, 1, 1, &[255, 148, 0, 255])
             .expect("ORM reset");
         renderer
-            .set_map(MaterialMap::Normal, 3, 1, 1, &[240, 128, 140, 255])
+            .set_map(0, MaterialMap::Normal, 3, 1, 1, &[240, 128, 140, 255])
             .expect("normal upload");
         let tilted = render_frame(&mut renderer);
         assert!(
@@ -599,13 +681,64 @@ mod tests {
 
         // Preview mode ignores ORM and normal maps.
         renderer
-            .set_map(MaterialMap::Orm, 4, 1, 1, &[255, 10, 255, 255])
+            .set_map(0, MaterialMap::Orm, 4, 1, 1, &[255, 10, 255, 255])
             .expect("ORM upload");
         renderer.set_preview_mode(true);
         let preview = render_frame(&mut renderer);
         assert!(
             mean_difference(&baseline, &preview) < 0.5,
             "preview mode shows a neutral dielectric"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0094_each_material_slot_shows_its_own_maps_with_emission_and_cutout() {
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        let mut geometry = PrimitivePreset::Cube.build_mesh();
+        // Slot 1 owns the +Z face (triangles 0 and 1), which faces the default camera
+        // only partially; slot 0 owns the rest.
+        geometry.material_slots = vec!["Body".to_owned(), "Panel".to_owned()];
+        geometry.triangle_materials = (0..12).map(|index| u32::from(index < 2)).collect();
+        renderer.set_mesh(&geometry, 60.0).expect("two-slot cube");
+        assert_eq!(renderer.material_slot_count(), 2);
+        renderer.set_preview_mode(false);
+        let baseline = render_frame(&mut renderer);
+
+        renderer
+            .set_map(1, MaterialMap::Emissive, 10, 1, 1, &[255, 0, 0, 255])
+            .expect("emissive upload");
+        let glowing = render_frame(&mut renderer);
+        let red_gain = glowing
+            .chunks(4)
+            .zip(baseline.chunks(4))
+            .filter(|(glow, base)| glow[0] > base[0].saturating_add(40))
+            .count();
+        assert!(
+            red_gain > 20,
+            "the panel slot glows red ({red_gain} pixels)"
+        );
+
+        // Opacity 0 on the body cuts it out, revealing background.
+        let background = baseline[0..3].to_vec();
+        renderer
+            .set_map(0, MaterialMap::BaseColor, 11, 1, 1, &[200, 200, 200, 0])
+            .expect("transparent base colour");
+        let cut = render_frame(&mut renderer);
+        let background_pixels = |frame: &[u8]| {
+            frame
+                .chunks(4)
+                .filter(|pixel| {
+                    pixel[0..3]
+                        .iter()
+                        .zip(&background)
+                        .all(|(value, expected)| value.abs_diff(*expected) <= 4)
+                })
+                .count()
+        };
+        assert!(
+            background_pixels(&cut) > background_pixels(&glowing) + 100,
+            "cut-out body shows the background"
         );
     }
 }

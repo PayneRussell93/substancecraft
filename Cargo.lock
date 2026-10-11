@@ -2599,6 +2599,7 @@ dependencies = [
  "substancecraft-api",
  "substancecraft-core",
  "substancecraft-filament",
+ "tempfile",
 ]
 
 [[package]]

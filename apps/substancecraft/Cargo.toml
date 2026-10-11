@@ -16,3 +16,6 @@ substancecraft-core = { path = "../../crates/core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

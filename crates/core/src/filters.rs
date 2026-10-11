@@ -272,8 +272,8 @@ fn box_blur_line(line: &mut [Vec4], radius: usize, scratch: &mut [Vec4]) {
     for offset in -(radius as isize)..=radius as isize {
         sum += at(offset);
     }
-    for index in 0..length {
-        scratch[index] = sum / window;
+    for (index, slot) in scratch.iter_mut().enumerate().take(length) {
+        *slot = sum / window;
         sum += at(index as isize + radius as isize + 1) - at(index as isize - radius as isize);
     }
     line.copy_from_slice(&scratch[..length]);

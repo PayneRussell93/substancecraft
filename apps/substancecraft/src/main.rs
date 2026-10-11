@@ -11,16 +11,18 @@ use std::time::Duration;
 
 use eframe::egui;
 use substancecraft_api::{
-    ImportedFbxMesh, MAX_FBX_BYTES, bake_texture_set_channel, bake_texture_set_material,
-    import_binary_fbx_meshes, load_project_file, save_project_file,
+    ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel,
+    bake_texture_set_material, import_binary_fbx_meshes, import_gltf_file, load_project_file,
+    load_project_resources, load_texture_image, save_project_file, write_texture,
 };
 use substancecraft_core::{
-    BakedTexture, BoneId, BoneTransform, DEFAULT_HEIGHT, DEFAULT_HEIGHT_STRENGTH, Dirt, EdgeWear,
-    EditCommand, EditHistory, IdStroke, LayerFill, LayerId, LayerSettings, MaskGenerator,
-    MaskStroke, MaterialChannel, MaterialLayer, MaterialProject, MaterialTextures, MeshAsset,
-    MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings, MeshMaps, MeshSmoothing,
-    MeshTopology, NamedPose, PaintStroke, PoseId, PrimitivePreset, SelectionMode,
-    TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
+    BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
+    DEFAULT_HEIGHT_STRENGTH, DEFAULT_OPACITY, Dirt, EdgeWear, EditCommand, EditHistory, IdStroke,
+    LayerFill, LayerId, LayerSettings, LayerSlot, MAX_STROKE_POINTS, MaskGenerator, MaskStroke,
+    MaterialChannel, MaterialLayer, MaterialProject, MaterialTextures, MeshAsset, MeshGeometry,
+    MeshId, MeshMapError, MeshMapKind, MeshMapSettings, MeshMaps, MeshSmoothing, MeshTopology,
+    NamedPose, PaintStroke, PoseId, PrimitivePreset, ProjectResource, ResourceId, ResourceImages,
+    SelectionMode, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
     bake_mesh_maps_from, remap_subdivided_triangles,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
@@ -28,6 +30,7 @@ use substancecraft_filament::{FilamentRuntime, MaterialMap};
 mod icons;
 mod panels;
 mod theme;
+mod uv_view;
 mod widgets;
 
 const CHANNELS: [MaterialChannel; 9] = [
@@ -42,14 +45,20 @@ const CHANNELS: [MaterialChannel; 9] = [
     MaterialChannel::Opacity,
 ];
 /// Channels the compositor can bake, preview, and export.
-const BAKEABLE_CHANNELS: [MaterialChannel; 6] = [
+const BAKEABLE_CHANNELS: [MaterialChannel; 8] = [
     MaterialChannel::BaseColor,
     MaterialChannel::Roughness,
     MaterialChannel::Metallic,
     MaterialChannel::Height,
     MaterialChannel::Normal,
+    MaterialChannel::Emissive,
+    MaterialChannel::Opacity,
     MaterialChannel::Id,
 ];
+/// Mesh formats the importer reads.
+const MESH_EXTENSIONS: [&str; 3] = ["fbx", "gltf", "glb"];
+/// Bitmap formats the resource importer reads.
+const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "tga"];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
 const MAX_SAVED_POSES: usize = 256;
 /// Selection overlays stop drawing beyond this many triangles to keep the
@@ -102,7 +111,7 @@ struct SubstanceCraftApp {
     filament_frames_tx: SyncSender<FilamentFrame>,
     filament_frames_rx: Receiver<FilamentFrame>,
     filament_render_pending: Arc<AtomicBool>,
-    imported_meshes: Vec<ImportedFbxMesh>,
+    imported_meshes: Vec<ImportedMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
     import_scale: f32,
@@ -120,6 +129,26 @@ struct SubstanceCraftApp {
     brush_roughness: f32,
     brush_metallic: f32,
     brush_height: f32,
+    brush_emissive: egui::Color32,
+    brush_material_opacity: f32,
+    brush_tip: BrushTip,
+    /// Latest pen pressure (`0..=1`) while a stylus touches; `None` for mice.
+    pen_pressure: Option<f32>,
+    /// Loaded pixels of `project.resources`.
+    resource_images: ResourceImages,
+    /// Per-resource egui thumbnails for the assets drawer.
+    resource_thumbnails: BTreeMap<ResourceId, egui::TextureHandle>,
+    export_format: TextureFormat,
+    view_mode: ViewMode,
+    uv_view: uv_view::UvView,
+    /// Content revision of each texture set; compared against caches.
+    set_revisions: BTreeMap<TextureSetId, u64>,
+    /// Last full-material bake of each texture set, for drawing material
+    /// slots other than the selected one.
+    set_materials: BTreeMap<TextureSetId, CachedMaterial>,
+    set_bake_job: Option<SetBakeJob>,
+    /// Set revisions whose background bake failed, so they are not retried.
+    set_bake_failed: BTreeMap<TextureSetId, u64>,
     /// When true the viewport shows `active_channel` flat instead of the full
     /// PBR material.
     channel_preview: bool,
@@ -137,7 +166,8 @@ struct SubstanceCraftApp {
     preview_failed: bool,
     bake_error: Option<String>,
     mesh_map_settings: MeshMapSettings,
-    mesh_maps: Option<Arc<MeshMaps>>,
+    /// Mesh maps per mesh material slot, baked from each slot's triangles.
+    mesh_maps: Option<Arc<Vec<MeshMaps>>>,
     mesh_maps_key: Option<BakeKey>,
     high_poly: Option<HighPolySource>,
     high_poly_revision: u64,
@@ -163,6 +193,8 @@ struct FilamentFrame {
 enum PaintMode {
     View,
     Paint,
+    /// Removes paint from the selected paint layer.
+    Erase,
     Mask,
     Id,
     Select,
@@ -170,8 +202,30 @@ enum PaintMode {
 
 impl PaintMode {
     fn paints(self) -> bool {
-        matches!(self, Self::Paint | Self::Mask | Self::Id)
+        matches!(self, Self::Paint | Self::Erase | Self::Mask | Self::Id)
     }
+}
+
+/// Which viewports share the central area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    Model,
+    Split,
+    Uv,
+}
+
+/// A texture set's last full-material bake.
+struct CachedMaterial {
+    revision: u64,
+    textures: Arc<MaterialTextures>,
+}
+
+/// Background bake of a texture set that is not selected, so every material
+/// slot of a multi-material mesh shows its own textures.
+struct SetBakeJob {
+    set_id: TextureSetId,
+    revision: u64,
+    receiver: Receiver<Result<MaterialTextures, String>>,
 }
 
 /// What the viewport currently shows on the mesh.
@@ -200,11 +254,62 @@ struct PreviewKey {
 struct PreviewJob {
     receiver: Receiver<Result<PreviewTextures, String>>,
     key: PreviewKey,
+    /// Revision of the texture set when the bake started.
+    set_revision: u64,
+}
+
+/// Shared inputs of a background texture-set bake.
+struct BakeInputs {
+    mesh: Option<Arc<MeshGeometry>>,
+    mesh_maps: Option<Arc<Vec<MeshMaps>>>,
+    /// Mesh material slot whose maps the set uses.
+    slot: usize,
+    resources: ResourceImages,
+}
+
+impl BakeInputs {
+    fn maps(&self) -> Option<&MeshMaps> {
+        self.mesh_maps
+            .as_deref()
+            .and_then(|maps| maps.get(self.slot))
+    }
+
+    fn bake_channel(
+        &self,
+        texture_set: &TextureSet,
+        channel: MaterialChannel,
+    ) -> Result<BakedTexture, String> {
+        bake_texture_set_channel(
+            texture_set,
+            channel,
+            self.mesh.as_deref(),
+            self.maps(),
+            Some(&self.resources),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn bake_material(&self, texture_set: &TextureSet) -> Result<MaterialTextures, String> {
+        bake_texture_set_material(
+            texture_set,
+            self.mesh.as_deref(),
+            self.maps(),
+            Some(&self.resources),
+        )
+        .map_err(|error| error.to_string())
+    }
 }
 
 enum PreviewTextures {
-    Material(Box<MaterialTextures>),
-    Single(BakedTexture),
+    Material(Arc<MaterialTextures>),
+    Single(Arc<BakedTexture>),
+}
+
+/// What one mesh material slot shows in the 3D viewport.
+enum SlotSource {
+    Material(Arc<MaterialTextures>),
+    Single(Arc<BakedTexture>),
+    Neutral,
 }
 
 impl PreviewTextures {
@@ -228,7 +333,7 @@ struct HighPolySource {
 }
 
 struct MeshMapJob {
-    receiver: Receiver<Result<MeshMaps, MeshMapError>>,
+    receiver: Receiver<Result<Vec<MeshMaps>, MeshMapError>>,
     cancel: Arc<AtomicBool>,
     key: BakeKey,
 }
@@ -241,7 +346,7 @@ struct PoseTransition {
 
 struct RestoredMeshScene {
     selected_primitive: Option<PrimitivePreset>,
-    imported_meshes: Vec<ImportedFbxMesh>,
+    imported_meshes: Vec<ImportedMesh>,
     selected_imported_mesh: Option<usize>,
     geometry: Option<MeshGeometry>,
     scale: f32,
@@ -301,6 +406,23 @@ impl Default for SubstanceCraftApp {
             brush_roughness: 0.5,
             brush_metallic: 0.0,
             brush_height: DEFAULT_HEIGHT,
+            brush_emissive: egui::Color32::from_rgb(
+                DEFAULT_EMISSIVE[0],
+                DEFAULT_EMISSIVE[1],
+                DEFAULT_EMISSIVE[2],
+            ),
+            brush_material_opacity: DEFAULT_OPACITY,
+            brush_tip: BrushTip::ROUND,
+            pen_pressure: None,
+            resource_images: ResourceImages::new(),
+            resource_thumbnails: BTreeMap::new(),
+            export_format: TextureFormat::Png,
+            view_mode: ViewMode::Model,
+            uv_view: uv_view::UvView::default(),
+            set_revisions: BTreeMap::new(),
+            set_materials: BTreeMap::new(),
+            set_bake_job: None,
+            set_bake_failed: BTreeMap::new(),
             channel_preview: false,
             mask_value: 0.0,
             selection_mode: SelectionMode::Element,
@@ -343,16 +465,36 @@ impl SubstanceCraftApp {
         self.mesh_maps_key = None;
         self.mesh_map_error = None;
         self.hovered_selection.clear();
-        self.invalidate_preview();
+        self.invalidate_all_sets();
         // Old textures do not fit the new mesh's UVs.
         self.baked_preview = None;
+        self.set_materials.clear();
+        self.set_bake_job = None;
     }
 
     /// Marks the shown preview out of date. It stays visible until the
-    /// background rebake replaces it.
+    /// background rebake replaces it. Edits made through the UI only touch
+    /// the selected texture set.
     fn invalidate_preview(&mut self) {
         self.preview_revision = self.preview_revision.wrapping_add(1);
         self.preview_failed = false;
+        if let Some(set_id) = self.selected_texture_set {
+            self.set_revisions.insert(set_id, self.preview_revision);
+        }
+    }
+
+    /// Marks every texture set out of date: the mesh, its maps, history, or
+    /// shared resources changed.
+    fn invalidate_all_sets(&mut self) {
+        self.invalidate_preview();
+        let revision = self.preview_revision;
+        for set in &self.project.texture_sets {
+            self.set_revisions.insert(set.id, revision);
+        }
+    }
+
+    fn set_revision(&self, set_id: TextureSetId) -> u64 {
+        self.set_revisions.get(&set_id).copied().unwrap_or(0)
     }
 
     fn set_base_geometry(&mut self, geometry: Option<MeshGeometry>) {
@@ -385,18 +527,15 @@ impl SubstanceCraftApp {
         let to = smoothing.subdivision_levels;
         if from != to {
             // Polygon masks index subdivided triangles; carry them across.
-            for layer in self
-                .project
-                .texture_sets
-                .iter_mut()
-                .flat_map(|set| set.layers.iter_mut())
-            {
-                if let Some(mask) = layer.polygon_mask.as_mut() {
-                    mask.triangles =
-                        remap_subdivided_triangles(mask.triangles.iter().copied(), from, to)
-                            .into_iter()
-                            .collect();
-                }
+            for set in &mut self.project.texture_sets {
+                for_each_layer_mut(&mut set.layers, &mut |layer| {
+                    if let Some(mask) = layer.polygon_mask.as_mut() {
+                        mask.triangles =
+                            remap_subdivided_triangles(mask.triangles.iter().copied(), from, to)
+                                .into_iter()
+                                .collect();
+                    }
+                });
             }
             self.layer_settled = None;
         }
@@ -429,8 +568,12 @@ impl SubstanceCraftApp {
 
         let wanted = self.preview_key();
         let target = wanted.target;
-        let Some(mesh) = self.mesh_geometry.as_deref() else {
+        if self.mesh_geometry.is_none() {
             self.filament_frame_texture = None;
+            return;
+        }
+        let plan = self.slot_upload_plan(target);
+        let Some(mesh) = self.mesh_geometry.as_deref() else {
             return;
         };
         let Some(renderer) = self.filament_renderer.as_mut() else {
@@ -446,44 +589,61 @@ impl SubstanceCraftApp {
             }
         }
 
-        let preview = self
-            .baked_preview
-            .as_ref()
-            .filter(|preview| {
-                preview.key.target == wanted.target && preview.key.texture_set == wanted.texture_set
-            })
-            .map(|preview| &preview.textures);
-        let upload = |renderer: &mut FilamentRuntime, map: MaterialMap, texture: &BakedTexture| {
+        let upload = |renderer: &mut FilamentRuntime,
+                      slot: usize,
+                      map: MaterialMap,
+                      texture: &BakedTexture| {
             let key = (texture.rgba8.as_ptr() as usize)
                 ^ (texture.width as usize).rotate_left(7)
                 ^ (texture.height as usize).rotate_left(17);
-            renderer.set_map(map, key, texture.width, texture.height, &texture.rgba8)
+            renderer.set_map(
+                slot,
+                map,
+                key,
+                texture.width,
+                texture.height,
+                &texture.rgba8,
+            )
         };
-        // Neutral fallbacks: grey dielectric, AO 1 / roughness 0.58, flat normal.
-        let neutral = |renderer: &mut FilamentRuntime| {
+        // Neutral fallbacks: grey dielectric, AO 1 / roughness 0.58, flat
+        // normal, no emission.
+        let neutral = |renderer: &mut FilamentRuntime, slot: usize| {
             renderer
-                .set_map(MaterialMap::BaseColor, 0, 1, 1, &[168, 173, 179, 255])
-                .and_then(|()| renderer.set_map(MaterialMap::Orm, 0, 1, 1, &[255, 148, 0, 255]))
+                .set_map(slot, MaterialMap::BaseColor, 0, 1, 1, &[168, 173, 179, 255])
                 .and_then(|()| {
-                    renderer.set_map(MaterialMap::Normal, 0, 1, 1, &[128, 128, 255, 255])
+                    renderer.set_map(slot, MaterialMap::Orm, 0, 1, 1, &[255, 148, 0, 255])
+                })
+                .and_then(|()| {
+                    renderer.set_map(slot, MaterialMap::Normal, 0, 1, 1, &[128, 128, 255, 255])
+                })
+                .and_then(|()| {
+                    renderer.set_map(slot, MaterialMap::Emissive, 0, 1, 1, &[0, 0, 0, 255])
                 })
         };
-        let texture_result = match preview {
-            Some(PreviewTextures::Material(textures)) => {
-                renderer.set_preview_mode(false);
-                upload(renderer, MaterialMap::BaseColor, &textures.base_color)
-                    .and_then(|()| upload(renderer, MaterialMap::Orm, &textures.orm))
-                    .and_then(|()| upload(renderer, MaterialMap::Normal, &textures.normal))
+        renderer.set_preview_mode(target != PreviewTarget::Material);
+        let mut texture_result = Ok(());
+        for (slot, source) in plan.into_iter().enumerate() {
+            let result = match source {
+                SlotSource::Material(textures) => {
+                    upload(renderer, slot, MaterialMap::BaseColor, &textures.base_color)
+                        .and_then(|()| upload(renderer, slot, MaterialMap::Orm, &textures.orm))
+                        .and_then(|()| {
+                            upload(renderer, slot, MaterialMap::Normal, &textures.normal)
+                        })
+                        .and_then(|()| {
+                            upload(renderer, slot, MaterialMap::Emissive, &textures.emissive)
+                        })
+                }
+                SlotSource::Single(texture) => {
+                    upload(renderer, slot, MaterialMap::BaseColor, &texture)
+                }
+                SlotSource::Neutral => neutral(renderer, slot),
+            };
+            if result.is_err() {
+                texture_result = result;
+                break;
             }
-            Some(PreviewTextures::Single(texture)) => {
-                renderer.set_preview_mode(true);
-                upload(renderer, MaterialMap::BaseColor, texture)
-            }
-            None => {
-                renderer.set_preview_mode(target != PreviewTarget::Material);
-                neutral(renderer)
-            }
-        };
+        }
         if let Err(error) = texture_result {
             self.filament_error = Some(error.to_string());
             return;
@@ -576,6 +736,7 @@ impl SubstanceCraftApp {
         self.mesh_smoothing = scene.smoothing;
         self.set_base_geometry(scene.geometry);
         self.restore_high_poly();
+        self.reload_resources();
         self.selected_texture_set = self.project.active_texture_set;
         self.selected_layer = self
             .project
@@ -596,7 +757,7 @@ impl SubstanceCraftApp {
             .project
             .texture_sets
             .iter()
-            .flat_map(|set| set.layers.iter().map(|layer| layer.id.0))
+            .flat_map(|set| set.walk_layers().into_iter().map(|layer| layer.id.0))
             .max()
             .unwrap_or(0)
             .saturating_add(1);
@@ -656,16 +817,9 @@ impl SubstanceCraftApp {
         }
 
         let path = std::path::PathBuf::from(&mesh_asset.source);
-        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
-        let file_size = usize::try_from(metadata.len())
-            .map_err(|_| "referenced FBX file is too large for this platform".to_owned())?;
-        if file_size > MAX_FBX_BYTES {
-            return Err("referenced FBX exceeds the 64 MiB import limit".to_owned());
-        }
-        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-        let meshes = import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())?;
+        let meshes = load_mesh_file(&path)?;
         let Some(first_mesh) = meshes.first() else {
-            return Err("referenced FBX contains no mesh geometry".to_owned());
+            return Err("referenced mesh file contains no mesh geometry".to_owned());
         };
         let scale = sanitize_mesh_scale(mesh_asset.scale);
         let first_geometry = scaled_geometry(&first_mesh.geometry, scale);
@@ -679,77 +833,95 @@ impl SubstanceCraftApp {
         })
     }
 
-    fn import_fbx(&mut self) {
+    fn import_mesh(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("FBX mesh", &["fbx"])
+            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
             .pick_file()
         else {
             return;
         };
+        self.load_imported_mesh(&path);
+    }
 
-        let result = (|| {
-            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
-            let file_size = usize::try_from(metadata.len())
-                .map_err(|_| "FBX file is too large for this platform".to_owned())?;
-            if file_size > MAX_FBX_BYTES {
-                return Err(format!(
-                    "FBX file exceeds the {} MiB import limit",
-                    MAX_FBX_BYTES / (1024 * 1024)
-                ));
+    /// Replaces the project mesh with the file at `path`. A mesh with several
+    /// material slots gets one texture set per slot; otherwise texture sets
+    /// are created on first use.
+    fn load_imported_mesh(&mut self, path: &std::path::Path) {
+        let meshes = match load_mesh_file(path) {
+            Ok(meshes) => meshes,
+            Err(error) => {
+                self.import_error = Some(error);
+                return;
             }
-            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-            import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())
-        })();
-
-        match result {
-            Ok(meshes) => {
-                let Some(first_mesh) = meshes.first() else {
-                    self.import_error = Some("FBX contains no mesh geometry".to_owned());
-                    return;
-                };
-                let first_geometry = scaled_geometry(&first_mesh.geometry, self.import_scale);
-                let display_name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Imported FBX".to_owned());
-                self.project.mesh = Some(MeshAsset {
-                    id: MeshId(1),
-                    source: path.to_string_lossy().into_owned(),
-                    scale: self.import_scale,
-                    smoothing: self.mesh_smoothing,
-                    high_poly_source: None,
-                });
-                self.imported_meshes = meshes;
-                self.selected_imported_mesh = Some(0);
-                self.selected_primitive = None;
-                self.set_base_geometry(Some(first_geometry));
-                // A new low mesh needs its own high-poly source.
-                self.high_poly = None;
-                self.high_poly_changed();
-                self.import_error = None;
-                self.project.texture_sets.clear();
-                self.project.active_texture_set = None;
-                self.selected_texture_set = None;
-                self.selected_layer = None;
-                self.active_stroke = None;
-                self.history = EditHistory::default();
-                self.layer_settled = None;
-                self.current_pose.name = display_name;
-            }
-            Err(error) => self.import_error = Some(error),
+        };
+        let Some(first_mesh) = meshes.first() else {
+            self.import_error = Some("the file contains no mesh geometry".to_owned());
+            return;
+        };
+        let first_geometry = scaled_geometry(&first_mesh.geometry, self.import_scale);
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Imported mesh".to_owned());
+        self.project.mesh = Some(MeshAsset {
+            id: MeshId(1),
+            source: path.to_string_lossy().into_owned(),
+            scale: self.import_scale,
+            smoothing: self.mesh_smoothing,
+            high_poly_source: None,
+        });
+        let slots = if first_geometry.material_slot_count() > 1 {
+            first_geometry.material_slots.clone()
+        } else {
+            Vec::new()
+        };
+        self.imported_meshes = meshes;
+        self.selected_imported_mesh = Some(0);
+        self.selected_primitive = None;
+        self.set_base_geometry(Some(first_geometry));
+        // A new low mesh needs its own high-poly source.
+        self.high_poly = None;
+        self.high_poly_changed();
+        self.import_error = None;
+        self.project.texture_sets.clear();
+        self.project.active_texture_set = None;
+        self.selected_texture_set = None;
+        self.selected_layer = None;
+        self.active_stroke = None;
+        self.history = EditHistory::default();
+        self.layer_settled = None;
+        self.set_materials.clear();
+        self.current_pose.name = display_name;
+        for slot in &slots {
+            self.add_texture_set_for_slot(slot.clone());
+        }
+        if let Some(first) = self.project.texture_sets.first().map(|set| set.id) {
+            self.project.active_texture_set = Some(first);
+            self.selected_texture_set = Some(first);
         }
     }
 
     fn add_texture_set(&mut self) {
+        let name = format!("Material {}", self.next_texture_set_id);
+        self.add_texture_set_for_slot(name);
+    }
+
+    /// Adds and selects a texture set painting mesh material slot `slot`.
+    fn add_texture_set_for_slot(&mut self, slot: String) {
         let Some(next_id) = self.next_texture_set_id.checked_add(1) else {
             return;
         };
         let id = TextureSetId(self.next_texture_set_id);
         self.next_texture_set_id = next_id;
+        let name = if slot.starts_with("Material ") {
+            format!("Texture Set {}", id.0)
+        } else {
+            slot.clone()
+        };
         self.project.texture_sets.push(TextureSet {
             id,
-            name: format!("Texture Set {}", id.0),
-            material_slot: format!("Material {}", id.0),
+            name,
+            material_slot: slot,
             resolution: TextureResolution {
                 width: 2048,
                 height: 2048,
@@ -771,8 +943,33 @@ impl SubstanceCraftApp {
         Some(id)
     }
 
-    /// Inserts `layer` above the selected layer (or on top) as one undoable
-    /// edit, creating a texture set first when none exists.
+    /// Where a new layer goes: inside the selected group (on top), else just
+    /// above the selected layer, else on top of the stack.
+    fn insertion_slot(&self, set: &TextureSet) -> LayerSlot {
+        let top = LayerSlot {
+            parent: None,
+            index: set.layers.len(),
+        };
+        let Some(selected) = self.selected_layer else {
+            return top;
+        };
+        if let Some(children) = set
+            .layer(selected)
+            .and_then(|layer| layer.children.as_ref())
+        {
+            return LayerSlot {
+                parent: Some(selected),
+                index: children.len(),
+            };
+        }
+        set.slot_of(selected).map_or(top, |slot| LayerSlot {
+            parent: slot.parent,
+            index: slot.index + 1,
+        })
+    }
+
+    /// Inserts `layer` (see [`Self::insertion_slot`]) as one undoable edit,
+    /// creating a texture set first when none exists.
     fn insert_layer(&mut self, layer: MaterialLayer) {
         if self.selected_texture_set.is_none() {
             self.add_texture_set();
@@ -780,24 +977,21 @@ impl SubstanceCraftApp {
         let Some(texture_set_id) = self.selected_texture_set else {
             return;
         };
-        let Some(set) = self
+        let Some(slot) = self
             .project
             .texture_sets
             .iter()
             .find(|set| set.id == texture_set_id)
+            .map(|set| self.insertion_slot(set))
         else {
             return;
         };
-        let index = self
-            .selected_layer
-            .and_then(|selected| set.layers.iter().position(|layer| layer.id == selected))
-            .map_or(set.layers.len(), |position| position + 1);
         let layer_id = layer.id;
         if self.history.apply(
             &mut self.project,
             EditCommand::InsertLayer {
                 texture_set_id,
-                index,
+                slot,
                 layer: Box::new(layer),
             },
         ) {
@@ -821,18 +1015,28 @@ impl SubstanceCraftApp {
         let Some(id) = self.allocate_layer_id() else {
             return;
         };
-        let brush = self.brush_color.to_array();
+        let emissive = self.brush_emissive.to_array();
         let fill = LayerFill {
-            color: brush,
+            color: self.brush_color.to_array(),
             roughness: self.brush_roughness,
             metallic: self.brush_metallic,
             height: self.brush_height,
+            emissive: [emissive[0], emissive[1], emissive[2]],
+            material_opacity: self.brush_material_opacity,
+            ..LayerFill::default()
         };
         self.insert_layer(MaterialLayer::new_fill(
             id,
             format!("Fill Layer {}", id.0),
             fill,
         ));
+    }
+
+    fn add_group_layer(&mut self) {
+        let Some(id) = self.allocate_layer_id() else {
+            return;
+        };
+        self.insert_layer(MaterialLayer::new_group(id, format!("Group {}", id.0)));
     }
 
     /// Adds a fill layer pre-wired to a procedural mask generator.
@@ -849,6 +1053,7 @@ impl SubstanceCraftApp {
                     metallic: 1.0,
                     // Chipped paint sits slightly below the coat around it.
                     height: 0.42,
+                    ..LayerFill::default()
                 },
             ),
             MaskGenerator::Dirt(_) => (
@@ -858,6 +1063,7 @@ impl SubstanceCraftApp {
                     roughness: 0.92,
                     metallic: 0.0,
                     height: DEFAULT_HEIGHT,
+                    ..LayerFill::default()
                 },
             ),
             _ => ("Generated", LayerFill::default()),
@@ -875,29 +1081,23 @@ impl SubstanceCraftApp {
         self.add_smart_layer(MaskGenerator::Dirt(Dirt::DEFAULT));
     }
 
-    fn selected_layer_index(&self) -> Option<(TextureSetId, usize, usize)> {
-        let texture_set_id = self.selected_texture_set?;
-        let layer_id = self.selected_layer?;
-        let set = self
-            .project
-            .texture_sets
-            .iter()
-            .find(|set| set.id == texture_set_id)?;
-        let index = set.layers.iter().position(|layer| layer.id == layer_id)?;
-        Some((texture_set_id, index, set.layers.len()))
+    /// The selected layer's texture set, slot, and container length.
+    fn selected_layer_slot(&self) -> Option<(TextureSetId, LayerSlot, usize)> {
+        let set = self.selected_texture_set_ref()?;
+        let slot = set.slot_of(self.selected_layer?)?;
+        let count = set.container(slot.parent)?.len();
+        Some((set.id, slot, count))
     }
 
     fn delete_selected_layer(&mut self) {
         self.finish_active_stroke();
-        let Some((texture_set_id, index, _)) = self.selected_layer_index() else {
+        let Some((texture_set_id, slot, _)) = self.selected_layer_slot() else {
             return;
         };
         let Some(layer) = self
-            .project
-            .texture_sets
-            .iter()
-            .find(|set| set.id == texture_set_id)
-            .and_then(|set| set.layers.get(index))
+            .selected_texture_set_ref()
+            .and_then(|set| set.container(slot.parent))
+            .and_then(|layers| layers.get(slot.index))
             .cloned()
         else {
             return;
@@ -906,43 +1106,99 @@ impl SubstanceCraftApp {
             &mut self.project,
             EditCommand::RemoveLayer {
                 texture_set_id,
-                index,
+                slot,
                 layer: Box::new(layer),
             },
         ) {
             self.selected_layer = self
-                .project
-                .texture_sets
-                .iter()
-                .find(|set| set.id == texture_set_id)
-                .and_then(|set| set.layers.get(index.saturating_sub(1)))
-                .map(|layer| layer.id);
+                .selected_texture_set_ref()
+                .and_then(|set| set.container(slot.parent))
+                .and_then(|layers| layers.get(slot.index.saturating_sub(1)))
+                .map(|layer| layer.id)
+                .or(slot.parent);
             self.layer_settled = None;
             self.invalidate_preview();
         }
     }
 
-    /// Moves the selected layer up (+1, toward the top of the stack) or down.
-    fn move_selected_layer(&mut self, delta: isize) {
-        let Some((texture_set_id, index, count)) = self.selected_layer_index() else {
-            return;
+    fn move_selected_layer_to(&mut self, to: LayerSlot) -> bool {
+        let Some((texture_set_id, from, _)) = self.selected_layer_slot() else {
+            return false;
         };
-        let Some(target) = index
-            .checked_add_signed(delta)
-            .filter(|target| *target < count)
-        else {
-            return;
-        };
-        if self.history.apply(
+        let moved = self.history.apply(
             &mut self.project,
             EditCommand::MoveLayer {
                 texture_set_id,
-                from: index,
-                to: target,
+                from,
+                to,
             },
-        ) {
+        );
+        if moved {
             self.invalidate_preview();
         }
+        moved
+    }
+
+    /// Moves the selected layer up (+1, toward the top of its group) or down.
+    fn move_selected_layer(&mut self, delta: isize) {
+        let Some((_, slot, count)) = self.selected_layer_slot() else {
+            return;
+        };
+        if let Some(index) = slot
+            .index
+            .checked_add_signed(delta)
+            .filter(|index| *index < count)
+        {
+            self.move_selected_layer_to(LayerSlot {
+                parent: slot.parent,
+                index,
+            });
+        }
+    }
+
+    /// The group directly below the selected layer, which it can move into.
+    fn group_below_selected(&self) -> Option<LayerId> {
+        let (_, slot, _) = self.selected_layer_slot()?;
+        let below = self
+            .selected_texture_set_ref()?
+            .container(slot.parent)?
+            .get(slot.index.checked_sub(1)?)?;
+        below.is_group().then_some(below.id)
+    }
+
+    /// Moves the selected layer onto the top of the group below it.
+    fn move_selected_into_group(&mut self) {
+        let Some(group) = self.group_below_selected() else {
+            return;
+        };
+        let Some(count) = self
+            .selected_texture_set_ref()
+            .and_then(|set| set.container(Some(group)))
+            .map(Vec::len)
+        else {
+            return;
+        };
+        self.move_selected_layer_to(LayerSlot {
+            parent: Some(group),
+            index: count,
+        });
+    }
+
+    /// Moves the selected layer out of its group, just above the group.
+    fn move_selected_out_of_group(&mut self) {
+        let Some((_, slot, _)) = self.selected_layer_slot() else {
+            return;
+        };
+        let Some(group_slot) = slot
+            .parent
+            .and_then(|group| self.selected_texture_set_ref()?.slot_of(group))
+        else {
+            return;
+        };
+        self.move_selected_layer_to(LayerSlot {
+            parent: group_slot.parent,
+            index: group_slot.index + 1,
+        });
     }
 
     fn selected_layer_mut(&mut self) -> Option<&mut MaterialLayer> {
@@ -952,21 +1208,11 @@ impl SubstanceCraftApp {
             .texture_sets
             .iter_mut()
             .find(|set| set.id == texture_set_id)?
-            .layers
-            .iter_mut()
-            .find(|layer| layer.id == layer_id)
+            .layer_mut(layer_id)
     }
 
     fn selected_layer(&self) -> Option<&MaterialLayer> {
-        let texture_set_id = self.selected_texture_set?;
-        let layer_id = self.selected_layer?;
-        self.project
-            .texture_sets
-            .iter()
-            .find(|set| set.id == texture_set_id)?
-            .layers
-            .iter()
-            .find(|layer| layer.id == layer_id)
+        self.selected_texture_set_ref()?.layer(self.selected_layer?)
     }
 
     /// Records inspector edits of the selected layer as single history steps.
@@ -1029,6 +1275,8 @@ impl SubstanceCraftApp {
         self.invalidate_preview();
     }
 
+    /// Adds `uv` to the stroke in progress, starting one when needed. Paint
+    /// and ID strokes skip groups; mask strokes work on any layer.
     fn append_stroke_point(&mut self, uv: glam::Vec2) {
         let (Some(texture_set_id), Some(layer_id)) =
             (self.selected_texture_set, self.selected_layer)
@@ -1038,44 +1286,67 @@ impl SubstanceCraftApp {
         if !self.paint_mode.paints() {
             return;
         }
-        let stroke_key = (texture_set_id, layer_id, self.paint_mode);
+        let mode = self.paint_mode;
+        let stroke_key = (texture_set_id, layer_id, mode);
         let starts_stroke = self.active_stroke != Some(stroke_key);
+        let pressure = self.pen_pressure;
         let color = self.brush_color.to_array();
-        let roughness = self.brush_roughness;
-        let metallic = self.brush_metallic;
+        let emissive = self.brush_emissive.to_array();
+        let tip = self.brush_tip;
+        let radius_pixels = self.brush_radius;
+        let (roughness, metallic, height, material_opacity) = (
+            self.brush_roughness,
+            self.brush_metallic,
+            self.brush_height,
+            self.brush_material_opacity,
+        );
+        let mask_value = self.mask_value;
         let Some(layer) = self
             .project
             .texture_sets
             .iter_mut()
             .find(|set| set.id == texture_set_id)
-            .and_then(|set| set.layers.iter_mut().find(|layer| layer.id == layer_id))
+            .and_then(|set| set.layer_mut(layer_id))
         else {
             return;
         };
+        let paints_content = matches!(mode, PaintMode::Paint | PaintMode::Erase | PaintMode::Id);
+        if paints_content && layer.is_group() {
+            return;
+        }
+        // Pressure data is kept only for pen strokes.
+        let pressures =
+            |pressure: Option<f32>| pressure.map(|value| vec![value]).unwrap_or_default();
 
         if starts_stroke {
-            match self.paint_mode {
+            match mode {
                 PaintMode::View | PaintMode::Select => return,
-                PaintMode::Paint => layer.paint_strokes.push(PaintStroke {
-                    points: vec![uv],
-                    radius_pixels: self.brush_radius,
-                    color,
-                    opacity: 1.0,
+                PaintMode::Paint | PaintMode::Erase => layer.paint_strokes.push(PaintStroke {
                     roughness,
                     metallic,
-                    height: self.brush_height,
+                    height,
+                    emissive: [emissive[0], emissive[1], emissive[2]],
+                    material_opacity,
+                    erase: mode == PaintMode::Erase,
+                    tip,
+                    pressures: pressures(pressure),
+                    ..PaintStroke::new(vec![uv], radius_pixels, color)
                 }),
                 PaintMode::Mask => layer.mask_strokes.push(MaskStroke {
                     points: vec![uv],
-                    radius_pixels: self.brush_radius,
-                    value: self.mask_value,
+                    radius_pixels,
+                    value: mask_value,
                     opacity: 1.0,
+                    tip,
+                    pressures: pressures(pressure),
                 }),
                 PaintMode::Id => layer.id_strokes.push(IdStroke {
                     points: vec![uv],
-                    radius_pixels: self.brush_radius,
+                    radius_pixels,
                     color: [color[0], color[1], color[2]],
                     opacity: 1.0,
+                    tip,
+                    pressures: pressures(pressure),
                 }),
             }
             self.active_stroke = Some(stroke_key);
@@ -1083,25 +1354,36 @@ impl SubstanceCraftApp {
             return;
         }
 
-        let points = match self.paint_mode {
+        let path = match mode {
             PaintMode::View | PaintMode::Select => return,
-            PaintMode::Paint => layer
+            PaintMode::Paint | PaintMode::Erase => layer
                 .paint_strokes
                 .last_mut()
-                .map(|stroke| &mut stroke.points),
+                .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
             PaintMode::Mask => layer
                 .mask_strokes
                 .last_mut()
-                .map(|stroke| &mut stroke.points),
-            PaintMode::Id => layer.id_strokes.last_mut().map(|stroke| &mut stroke.points),
+                .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
+            PaintMode::Id => layer
+                .id_strokes
+                .last_mut()
+                .map(|stroke| (&mut stroke.points, &mut stroke.pressures)),
         };
-        if let Some(points) = points
+        if let Some((points, pressures)) = path
+            && points.len() < MAX_STROKE_POINTS
             && points
                 .last()
                 .is_none_or(|last| last.distance_squared(uv) >= 0.000_001)
         {
             points.push(uv);
+            // A pen stroke keeps one pressure per point.
+            if !pressures.is_empty() {
+                pressures.push(pressure.unwrap_or(1.0));
+            }
             self.preview_revision = self.preview_revision.wrapping_add(1);
+            if let Some(set_id) = self.selected_texture_set {
+                self.set_revisions.insert(set_id, self.preview_revision);
+            }
         }
     }
 
@@ -1114,13 +1396,13 @@ impl SubstanceCraftApp {
             .texture_sets
             .iter()
             .find(|set| set.id == texture_set_id)
-            .and_then(|set| set.layers.iter().find(|layer| layer.id == layer_id))
+            .and_then(|set| set.layer(layer_id))
         else {
             return;
         };
         let command = match mode {
             PaintMode::View | PaintMode::Select => None,
-            PaintMode::Paint => {
+            PaintMode::Paint | PaintMode::Erase => {
                 layer
                     .paint_strokes
                     .last()
@@ -1182,7 +1464,7 @@ impl SubstanceCraftApp {
                 .and_then(|set| set.layers.last())
                 .map(|layer| layer.id);
         }
-        self.invalidate_preview();
+        self.invalidate_all_sets();
         self.refresh_baked_preview();
     }
 
@@ -1201,13 +1483,25 @@ impl SubstanceCraftApp {
     }
 
     fn mesh_maps_fresh(&self) -> bool {
-        self.fresh_mesh_maps().is_some()
+        self.mesh_maps.is_some() && self.mesh_maps_key == Some(self.bake_key())
     }
 
+    /// Mesh material slot of the selected texture set.
+    fn selected_slot(&self) -> u32 {
+        self.selected_texture_set
+            .map_or(0, |set_id| self.set_slot(set_id))
+    }
+
+    /// Fresh mesh maps of the selected texture set's material slot.
     fn fresh_mesh_maps(&self) -> Option<&MeshMaps> {
+        self.fresh_slot_maps(self.selected_slot())
+    }
+
+    fn fresh_slot_maps(&self, slot: u32) -> Option<&MeshMaps> {
         self.mesh_maps
             .as_deref()
-            .filter(|_| self.mesh_maps_key == Some(self.bake_key()))
+            .filter(|_| self.mesh_maps_fresh())
+            .and_then(|maps| maps.get(slot as usize))
     }
 
     fn mesh_map_job_running(&self) -> bool {
@@ -1247,11 +1541,11 @@ impl SubstanceCraftApp {
         let spawned = std::thread::Builder::new()
             .name("mesh-map-bake".to_owned())
             .spawn(move || {
-                let _ = sender.send(bake_mesh_maps_from(
+                let _ = sender.send(bake_slot_mesh_maps(
                     &mesh,
                     high.as_ref(),
                     &settings,
-                    Some(&worker_cancel),
+                    &worker_cancel,
                 ));
             });
         match spawned {
@@ -1288,7 +1582,7 @@ impl SubstanceCraftApp {
                     Ok(maps) if key == self.bake_key() => {
                         self.mesh_maps = Some(Arc::new(maps));
                         self.mesh_maps_key = Some(key);
-                        self.invalidate_preview();
+                        self.invalidate_all_sets();
                     }
                     Ok(_) | Err(MeshMapError::Cancelled) => {}
                     Err(error) => self.mesh_map_error = Some(error.to_string()),
@@ -1307,17 +1601,17 @@ impl SubstanceCraftApp {
         self.high_poly_revision = self.high_poly_revision.wrapping_add(1);
         self.cancel_mesh_map_job();
         self.mesh_map_error = None;
-        self.invalidate_preview();
+        self.invalidate_all_sets();
     }
 
     fn pick_high_poly(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("FBX mesh", &["fbx"])
+            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
             .pick_file()
         else {
             return;
         };
-        match load_merged_fbx(&path, self.import_scale) {
+        match load_merged_mesh(&path, self.import_scale) {
             Ok(geometry) => {
                 if let Some(mesh) = self.project.mesh.as_mut() {
                     mesh.high_poly_source = Some(path.to_string_lossy().into_owned());
@@ -1349,7 +1643,7 @@ impl SubstanceCraftApp {
             .and_then(|mesh| mesh.high_poly_source.clone());
         if let Some(source) = source {
             let path = std::path::PathBuf::from(source);
-            match load_merged_fbx(&path, self.import_scale) {
+            match load_merged_mesh(&path, self.import_scale) {
                 Ok(geometry) => self.high_poly = Some(HighPolySource { path, geometry }),
                 Err(error) => {
                     self.mesh_map_error = Some(format!("High poly `{}`: {error}", path.display()));
@@ -1357,6 +1651,88 @@ impl SubstanceCraftApp {
             }
         }
         self.high_poly_changed();
+    }
+
+    /// Texture set painted on mesh material slot `slot`. A single-slot mesh
+    /// shows the selected set; otherwise slots match sets by material name.
+    fn slot_texture_set(&self, slot: u32) -> Option<TextureSetId> {
+        let mesh = self.mesh_geometry.as_deref()?;
+        if mesh.material_slot_count() <= 1 {
+            return self.selected_texture_set;
+        }
+        let name = mesh.material_slot_name(slot);
+        self.project
+            .texture_sets
+            .iter()
+            .find(|set| set.material_slot == name)
+            .map(|set| set.id)
+    }
+
+    /// Mesh material slot a texture set paints; 0 when its name matches none.
+    fn set_slot(&self, set_id: TextureSetId) -> u32 {
+        let Some(mesh) = self.mesh_geometry.as_deref() else {
+            return 0;
+        };
+        self.project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == set_id)
+            .and_then(|set| {
+                mesh.material_slots
+                    .iter()
+                    .position(|slot| *slot == set.material_slot)
+            })
+            .map_or(0, |slot| slot as u32)
+    }
+
+    /// True when triangle `triangle` belongs to the selected texture set's
+    /// material slot, so strokes there paint that set.
+    fn triangle_in_selected_set(&self, triangle: u32) -> bool {
+        let (Some(mesh), Some(set_id)) = (self.mesh_geometry.as_deref(), self.selected_texture_set)
+        else {
+            return false;
+        };
+        mesh.material_slot_count() <= 1
+            || mesh.material_of(triangle as usize) == self.set_slot(set_id)
+    }
+
+    /// Textures each mesh material slot should show for `target`.
+    fn slot_upload_plan(&self, target: PreviewTarget) -> Vec<SlotSource> {
+        let slot_count = self
+            .mesh_geometry
+            .as_deref()
+            .map_or(1, MeshGeometry::material_slot_count);
+        (0..slot_count as u32)
+            .map(|slot| {
+                let set_id = self.slot_texture_set(slot);
+                let selected = set_id.is_some() && set_id == self.selected_texture_set;
+                let mesh_map_preview = matches!(target, PreviewTarget::MeshMap(_));
+                if selected || (mesh_map_preview && self.set_slot_matches_preview(slot)) {
+                    return match self.displayed_preview() {
+                        Some(PreviewTextures::Material(textures)) => {
+                            SlotSource::Material(Arc::clone(textures))
+                        }
+                        Some(PreviewTextures::Single(texture)) => {
+                            SlotSource::Single(Arc::clone(texture))
+                        }
+                        None => SlotSource::Neutral,
+                    };
+                }
+                match (target, set_id.and_then(|id| self.set_materials.get(&id))) {
+                    (PreviewTarget::Material, Some(cached)) => {
+                        SlotSource::Material(Arc::clone(&cached.textures))
+                    }
+                    _ => SlotSource::Neutral,
+                }
+            })
+            .collect()
+    }
+
+    /// Mesh-map previews show on the selected set's slot (or the whole mesh
+    /// when no set is selected).
+    fn set_slot_matches_preview(&self, slot: u32) -> bool {
+        self.selected_texture_set
+            .map_or(slot == 0, |set_id| self.set_slot(set_id) == slot)
     }
 
     fn selected_texture_set_ref(&self) -> Option<&TextureSet> {
@@ -1399,7 +1775,7 @@ impl SubstanceCraftApp {
                 let texture = maps.to_texture(kind);
                 self.baked_preview = Some(BakedPreview {
                     key,
-                    textures: PreviewTextures::Single(texture),
+                    textures: PreviewTextures::Single(Arc::new(texture)),
                 });
             } else {
                 self.ensure_mesh_maps();
@@ -1420,33 +1796,45 @@ impl SubstanceCraftApp {
             self.ensure_mesh_maps();
             return;
         }
-        let maps = self
-            .mesh_maps
-            .clone()
-            .filter(|_| self.mesh_maps_key == Some(self.bake_key()));
-        let mesh = self.mesh_geometry.clone();
+        let set_revision = self.set_revision(texture_set.id);
+        let inputs = self.bake_inputs(texture_set.id);
         let (sender, receiver) = sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("preview-bake".to_owned())
             .spawn(move || {
-                let mesh = mesh.as_deref();
-                let maps = maps.as_deref();
                 let result = match key.target {
-                    PreviewTarget::Channel(channel) => {
-                        bake_texture_set_channel(&texture_set, channel, mesh, maps)
-                            .map(PreviewTextures::Single)
-                    }
-                    _ => bake_texture_set_material(&texture_set, mesh, maps)
-                        .map(|textures| PreviewTextures::Material(Box::new(textures))),
+                    PreviewTarget::Channel(channel) => inputs
+                        .bake_channel(&texture_set, channel)
+                        .map(|texture| PreviewTextures::Single(Arc::new(texture))),
+                    _ => inputs
+                        .bake_material(&texture_set)
+                        .map(|textures| PreviewTextures::Material(Arc::new(textures))),
                 };
-                let _ = sender.send(result.map_err(|error| error.to_string()));
+                let _ = sender.send(result);
             });
         match spawned {
-            Ok(_) => self.preview_job = Some(PreviewJob { receiver, key }),
+            Ok(_) => {
+                self.preview_job = Some(PreviewJob {
+                    receiver,
+                    key,
+                    set_revision,
+                });
+            }
             Err(error) => {
                 self.preview_failed = true;
                 self.bake_error = Some(error.to_string());
             }
+        }
+    }
+
+    /// Everything a background bake of texture set `set_id` reads, shared
+    /// cheaply with the worker thread.
+    fn bake_inputs(&self, set_id: TextureSetId) -> BakeInputs {
+        BakeInputs {
+            mesh: self.mesh_geometry.clone(),
+            mesh_maps: self.mesh_maps.clone().filter(|_| self.mesh_maps_fresh()),
+            slot: self.set_slot(set_id) as usize,
+            resources: self.resource_images.clone(),
         }
     }
 
@@ -1456,10 +1844,21 @@ impl SubstanceCraftApp {
         };
         match job.receiver.try_recv() {
             Ok(result) => {
-                let key = job.key;
+                let (key, set_revision) = (job.key, job.set_revision);
                 self.preview_job = None;
                 match result {
                     Ok(textures) => {
+                        if let (PreviewTextures::Material(material), Some(set_id)) =
+                            (&textures, key.texture_set)
+                        {
+                            self.set_materials.insert(
+                                set_id,
+                                CachedMaterial {
+                                    revision: set_revision,
+                                    textures: Arc::clone(material),
+                                },
+                            );
+                        }
                         self.baked_preview = Some(BakedPreview { key, textures });
                         self.bake_error = None;
                     }
@@ -1476,6 +1875,92 @@ impl SubstanceCraftApp {
             }
             Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(16)),
             Err(TryRecvError::Disconnected) => self.preview_job = None,
+        }
+    }
+
+    /// On multi-material meshes, rebakes (one at a time, after the selected
+    /// preview) texture sets whose cached material is out of date, so every
+    /// slot shows its own textures.
+    fn refresh_set_caches(&mut self) {
+        if self.set_bake_job.is_some() || self.preview_job.is_some() {
+            return;
+        }
+        let slot_count = self
+            .mesh_geometry
+            .as_deref()
+            .map_or(1, MeshGeometry::material_slot_count);
+        if slot_count <= 1 {
+            return;
+        }
+        let stale = (0..slot_count as u32)
+            .filter_map(|slot| self.slot_texture_set(slot))
+            .filter(|set_id| Some(*set_id) != self.selected_texture_set)
+            .find(|set_id| {
+                let revision = self.set_revision(*set_id);
+                self.set_materials
+                    .get(set_id)
+                    .is_none_or(|cached| cached.revision != revision)
+                    && self.set_bake_failed.get(set_id) != Some(&revision)
+            });
+        let Some(set_id) = stale else {
+            return;
+        };
+        let Some(texture_set) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == set_id)
+            .cloned()
+        else {
+            return;
+        };
+        if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
+            self.ensure_mesh_maps();
+            return;
+        }
+        let revision = self.set_revision(set_id);
+        let inputs = self.bake_inputs(set_id);
+        let (sender, receiver) = sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("set-bake".to_owned())
+            .spawn(move || {
+                let _ = sender.send(inputs.bake_material(&texture_set));
+            });
+        if spawned.is_ok() {
+            self.set_bake_job = Some(SetBakeJob {
+                set_id,
+                revision,
+                receiver,
+            });
+        }
+    }
+
+    fn poll_set_bake_job(&mut self, context: &egui::Context) {
+        let Some(job) = &self.set_bake_job else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(result) => {
+                let (set_id, revision) = (job.set_id, job.revision);
+                self.set_bake_job = None;
+                match result {
+                    Ok(textures) => {
+                        self.set_materials.insert(
+                            set_id,
+                            CachedMaterial {
+                                revision,
+                                textures: Arc::new(textures),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        self.set_bake_failed.insert(set_id, revision);
+                    }
+                }
+                context.request_repaint();
+            }
+            Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(32)),
+            Err(TryRecvError::Disconnected) => self.set_bake_job = None,
         }
     }
 
@@ -1504,31 +1989,44 @@ impl SubstanceCraftApp {
         Some(texture_set)
     }
 
+    /// Asks where to save one texture, offering the chosen export format
+    /// first.
+    fn texture_save_path(&self, stem: &str) -> Option<std::path::PathBuf> {
+        let mut dialog = rfd::FileDialog::new();
+        let formats = std::iter::once(self.export_format).chain(
+            TextureFormat::ALL
+                .into_iter()
+                .filter(|format| *format != self.export_format),
+        );
+        for format in formats {
+            dialog = dialog.add_filter(format!("{} texture", format.name()), &[format.extension()]);
+        }
+        dialog
+            .set_file_name(format!("{stem}.{}", self.export_format.extension()).replace(' ', "_"))
+            .save_file()
+    }
+
     fn export_baked_map(&mut self, channel: MaterialChannel) {
         let Some(texture_set) = self.exportable_texture_set() else {
             return;
         };
-        let map_name = channel_label(channel);
-        let path = rfd::FileDialog::new()
-            .add_filter("Targa texture", &["tga"])
-            .set_file_name(format!("{}_{}.tga", texture_set.name, map_name).replace(' ', "_"))
-            .save_file();
-        let Some(path) = path else {
+        let stem = format!("{}_{}", texture_set.name, channel_label(channel));
+        let Some(path) = self.texture_save_path(&stem) else {
             return;
         };
-        let maps = self.fresh_mesh_maps();
-        let result =
-            bake_texture_set_channel(&texture_set, channel, self.mesh_geometry.as_deref(), maps)
-                .map_err(|error| error.to_string())
-                .and_then(|texture| write_tga(&path, &texture));
+        let result = self
+            .bake_inputs(texture_set.id)
+            .bake_channel(&texture_set, channel)
+            .and_then(|texture| write_texture(&path, &texture).map_err(|error| error.to_string()));
         match result {
             Ok(()) => self.bake_error = None,
             Err(error) => self.bake_error = Some(error),
         }
     }
 
-    /// Writes `<set>_BaseColor.tga`, `<set>_ORM.tga`, and `<set>_Normal.tga`
-    /// into a chosen folder: the common metal/rough engine layout.
+    /// Writes `<set>_BaseColor`, `_ORM`, `_Normal`, and (when anything glows)
+    /// `_Emissive` into a chosen folder in the export format: the common
+    /// metal/rough engine layout. Base Color carries Opacity in alpha.
     fn export_material_set(&mut self) {
         let Some(texture_set) = self.exportable_texture_set() else {
             return;
@@ -1536,41 +2034,155 @@ impl SubstanceCraftApp {
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let maps = self.fresh_mesh_maps();
-        let result = bake_texture_set_material(&texture_set, self.mesh_geometry.as_deref(), maps)
-            .map_err(|error| error.to_string())
-            .and_then(|textures| {
-                let stem = texture_set.name.replace(' ', "_");
-                for (suffix, texture) in [
-                    ("BaseColor", &textures.base_color),
-                    ("ORM", &textures.orm),
-                    ("Normal", &textures.normal),
-                ] {
-                    write_tga(&folder.join(format!("{stem}_{suffix}.tga")), texture)?;
-                }
-                Ok(())
-            });
-        match result {
-            Ok(()) => self.bake_error = None,
+        match self.write_material_set(&texture_set, &folder) {
+            Ok(_) => self.bake_error = None,
             Err(error) => self.bake_error = Some(error),
         }
     }
 
+    /// Bakes and writes the material set; returns the files written.
+    fn write_material_set(
+        &self,
+        texture_set: &TextureSet,
+        folder: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        let textures = self
+            .bake_inputs(texture_set.id)
+            .bake_material(texture_set)?;
+        let stem = texture_set.name.replace(' ', "_");
+        let extension = self.export_format.extension();
+        let mut written = Vec::new();
+        for (suffix, texture) in [
+            ("BaseColor", Some(&textures.base_color)),
+            ("ORM", Some(&textures.orm)),
+            ("Normal", Some(&textures.normal)),
+            (
+                "Emissive",
+                textures.has_emission().then_some(&textures.emissive),
+            ),
+        ] {
+            let Some(texture) = texture else {
+                continue;
+            };
+            let path = folder.join(format!("{stem}_{suffix}.{extension}"));
+            write_texture(&path, texture).map_err(|error| error.to_string())?;
+            written.push(path);
+        }
+        Ok(written)
+    }
+
     fn export_mesh_map(&mut self, kind: MeshMapKind) {
-        let Some(maps) = self.mesh_maps.clone().filter(|_| self.mesh_maps_fresh()) else {
+        let Some(texture) = self.fresh_mesh_maps().map(|maps| maps.to_texture(kind)) else {
             self.ensure_mesh_maps();
             return;
         };
-        let path = rfd::FileDialog::new()
-            .add_filter("Targa texture", &["tga"])
-            .set_file_name(format!("{}.tga", kind.name().replace(' ', "_")))
-            .save_file();
-        let Some(path) = path else {
+        let Some(path) = self.texture_save_path(kind.name()) else {
             return;
         };
-        if let Err(error) = write_tga(&path, &maps.to_texture(kind)) {
-            self.mesh_map_error = Some(error);
+        if let Err(error) = write_texture(&path, &texture) {
+            self.mesh_map_error = Some(error.to_string());
         }
+    }
+
+    /// Loads the pixels of every project resource, reporting unreadable files.
+    fn reload_resources(&mut self) {
+        let (images, failures) = load_project_resources(&self.project);
+        self.resource_images = images;
+        self.resource_thumbnails.clear();
+        if let Some((id, error)) = failures.first() {
+            let name = self
+                .project
+                .resources
+                .iter()
+                .find(|resource| resource.id == *id)
+                .map_or("bitmap", |resource| resource.name.as_str());
+            let more = if failures.len() > 1 {
+                format!(" (and {} more)", failures.len() - 1)
+            } else {
+                String::new()
+            };
+            self.project_error = Some(format!("Resource `{name}`: {error}{more}"));
+        }
+        self.invalidate_all_sets();
+    }
+
+    fn import_resources(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Bitmap (PNG, JPEG, TGA)", &IMAGE_EXTENSIONS)
+            .pick_files()
+        else {
+            return;
+        };
+        for path in paths {
+            if let Err(error) = self.add_resource(&path) {
+                self.import_error = Some(error);
+            }
+        }
+    }
+
+    /// Loads a bitmap and lists it as a project resource.
+    fn add_resource(&mut self, path: &std::path::Path) -> Result<ResourceId, String> {
+        let image =
+            load_texture_image(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let id = ResourceId(
+            self.project
+                .resources
+                .iter()
+                .map(|resource| resource.id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("Bitmap {}", id.0));
+        self.project.resources.push(ProjectResource {
+            id,
+            name,
+            source: path.to_string_lossy().into_owned(),
+        });
+        self.resource_images.insert(id, Arc::new(image));
+        Ok(id)
+    }
+
+    /// True when a layer or the current brush uses `id`.
+    fn resource_in_use(&self, id: ResourceId) -> bool {
+        self.brush_tip.resource() == Some(id)
+            || self
+                .project
+                .texture_sets
+                .iter()
+                .any(|set| set.referenced_resources().contains(&id))
+    }
+
+    /// Removes an unused resource from the project.
+    fn remove_resource(&mut self, id: ResourceId) {
+        if self.resource_in_use(id) {
+            return;
+        }
+        self.project.resources.retain(|resource| resource.id != id);
+        self.resource_images.remove(&id);
+        self.resource_thumbnails.remove(&id);
+    }
+
+    /// egui thumbnail of a resource, created on first use.
+    fn resource_thumbnail(
+        &mut self,
+        context: &egui::Context,
+        id: ResourceId,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(texture) = self.resource_thumbnails.get(&id) {
+            return Some(texture.clone());
+        }
+        let image = self.resource_images.get(&id)?;
+        let thumbnail = context.load_texture(
+            format!("resource-{}", id.0),
+            uv_view::thumbnail_image(image, 96),
+            egui::TextureOptions::LINEAR,
+        );
+        self.resource_thumbnails.insert(id, thumbnail.clone());
+        Some(thumbnail)
     }
 
     fn selected_mesh_name(&self) -> Option<&str> {
@@ -1706,195 +2318,238 @@ impl SubstanceCraftApp {
     }
 
     fn update_viewport(&mut self, ui: &mut egui::Ui) {
+        self.read_pen_pressure(ui.ctx());
+        // Strokes end when every button is up, whichever view drew them.
+        if self.active_stroke.is_some() && !ui.input(|input| input.pointer.any_down()) {
+            self.finish_active_stroke();
+            self.invalidate_preview();
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::VIEWPORT_BG))
             .show(ui, |ui| {
-                let viewport = ui.max_rect();
-                let response = ui.interact(
-                    viewport,
-                    ui.id().with("model_viewport"),
-                    egui::Sense::click_and_drag(),
-                );
-                let was_stroke_active = self.active_stroke.is_some();
-                let pointer_position = ui.input(|input| input.pointer.interact_pos());
-                let hover_position = ui.input(|input| input.pointer.hover_pos());
-                let shift = ui.input(|input| input.modifiers.shift);
-                let painting = self.paint_mode.paints();
-                if response.dragged() && !painting {
-                    let delta = ui.input(|input| input.pointer.delta());
-                    let delta = glam::Vec2::new(delta.x, delta.y);
-                    if shift {
-                        self.viewport_camera.pan_by(delta);
-                    } else {
-                        self.viewport_camera.orbit(delta);
+                let area = ui.max_rect();
+                let (model, uv) = match self.view_mode {
+                    ViewMode::Model => (Some(area), None),
+                    ViewMode::Uv => (None, Some(area)),
+                    ViewMode::Split => {
+                        let middle = area.center().x;
+                        (
+                            Some(area.with_max_x(middle - 1.0)),
+                            Some(area.with_min_x(middle + 1.0)),
+                        )
                     }
-                } else if !response.dragged() {
-                    self.finish_active_stroke();
-                    if was_stroke_active {
-                        self.invalidate_preview();
-                    }
-                }
+                };
                 // Runs during strokes too: previews bake in the background, so the
                 // stroke in progress shows up live.
                 self.refresh_baked_preview();
-                if response.hovered() && !painting {
-                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                    self.viewport_camera.zoom_by(scroll);
+                if let Some(rect) = model {
+                    self.model_viewport(ui, rect);
                 }
-                self.update_filament_frame(ui.ctx(), viewport);
-                let painter = ui.painter_at(viewport);
-                painter.rect_filled(viewport, 0.0, theme::VIEWPORT_BG);
-                if self.mesh_geometry.is_some()
-                    && let Some(texture) = &self.filament_frame_texture
-                {
-                    painter.image(
-                        texture.id(),
-                        viewport,
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                if let Some(rect) = uv {
+                    self.uv_viewport(ui, rect);
+                }
+                if model.is_some() && uv.is_some() {
+                    ui.painter().vline(
+                        area.center().x,
+                        area.y_range(),
+                        egui::Stroke::new(2.0, theme::VIEWPORT_BG.gamma_multiply(0.5)),
                     );
-                }
-
-                let center = viewport.center();
-                let software = self.filament_frame_texture.is_none();
-                if software {
-                    let axis = egui::Color32::from_rgb(38, 40, 44);
-                    painter.line_segment(
-                        [
-                            egui::pos2(viewport.left(), center.y),
-                            egui::pos2(viewport.right(), center.y),
-                        ],
-                        egui::Stroke::new(1.0, axis),
-                    );
-                    painter.line_segment(
-                        [
-                            egui::pos2(center.x, viewport.top()),
-                            egui::pos2(center.x, viewport.bottom()),
-                        ],
-                        egui::Stroke::new(1.0, axis),
-                    );
-                }
-
-                if self.mesh_geometry.is_none() {
-                    painter.text(
-                        center,
-                        egui::Align2::CENTER_CENTER,
-                        "Choose a mesh in the Scene drawer to begin",
-                        egui::FontId::proportional(16.0),
-                        theme::TEXT_WEAK,
-                    );
-                    return;
-                }
-
-                let selecting = self.paint_mode == PaintMode::Select;
-                let projection = self.view_projection(viewport);
-                let needs_projection = software
-                    || (painting && response.dragged())
-                    || (selecting && response.hovered());
-                let projected = needs_projection
-                    .then(|| {
-                        self.mesh_geometry
-                            .as_ref()
-                            .map(|mesh| projection.project_mesh(mesh))
-                    })
-                    .flatten();
-
-                if painting
-                    && response.dragged()
-                    && let (Some(points), Some(pointer), Some(mesh)) =
-                        (&projected, pointer_position, &self.mesh_geometry)
-                    && let Some(hit) = pick_triangle(mesh, points, pointer)
-                    && let Some(uv) = hit
-                        .uv
-                        .filter(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y))
-                {
-                    self.append_stroke_point(uv);
-                }
-
-                if selecting {
-                    let hit = match (&projected, hover_position, &self.mesh_geometry) {
-                        (Some(points), Some(pointer), Some(mesh)) if response.hovered() => {
-                            pick_triangle(mesh, points, pointer)
-                        }
-                        _ => None,
-                    };
-                    self.hovered_selection = match (hit, &self.mesh_topology) {
-                        (Some(hit), Some(topology)) => {
-                            topology.select(hit.triangle, self.selection_mode)
-                        }
-                        _ => Vec::new(),
-                    };
-                    if response.clicked() && !self.hovered_selection.is_empty() {
-                        let selection = self.hovered_selection.clone();
-                        self.apply_polygon_selection(&selection, shift);
-                    }
-                } else {
-                    self.hovered_selection.clear();
-                }
-
-                let Some(mesh) = self.mesh_geometry.as_ref() else {
-                    return;
-                };
-                if software && let Some(points) = &projected {
-                    self.paint_software_mesh(&painter, mesh, points);
-                }
-
-                if selecting {
-                    let overlay_points = projected
-                        .clone()
-                        .unwrap_or_else(|| projection.project_mesh(mesh));
-                    if let Some(mask) = self
-                        .selected_layer()
-                        .and_then(|layer| layer.polygon_mask.as_ref())
-                    {
-                        let triangles: Box<dyn Iterator<Item = u32>> = if mask.inverted {
-                            Box::new(
-                                (0..mesh.triangles.len() as u32)
-                                    .filter(|triangle| !mask.triangles.contains(triangle)),
-                            )
-                        } else {
-                            Box::new(mask.triangles.iter().copied())
-                        };
-                        painter.add(triangle_overlay(
-                            mesh,
-                            &overlay_points,
-                            triangles,
-                            theme::ACCENT.gamma_multiply(0.28),
-                        ));
-                    }
-                    let hover_color = if shift {
-                        theme::DANGER.gamma_multiply(0.35)
-                    } else {
-                        egui::Color32::from_white_alpha(46)
-                    };
-                    painter.add(triangle_overlay(
-                        mesh,
-                        &overlay_points,
-                        self.hovered_selection.iter().copied(),
-                        hover_color,
-                    ));
-                }
-
-                if painting
-                    && response.hovered()
-                    && let Some(pointer) = pointer_position
-                {
-                    let cursor_color = if self.paint_mode == PaintMode::Mask {
-                        egui::Color32::WHITE
-                    } else {
-                        self.brush_color
-                    };
-                    let radius =
-                        (self.brush_radius * self.viewport_camera.zoom * 0.35).clamp(3.0, 36.0);
-                    painter.circle(
-                        pointer,
-                        radius,
-                        cursor_color.gamma_multiply(0.12),
-                        egui::Stroke::new(1.5, cursor_color),
-                    );
-                    painter.circle_filled(pointer, 1.5, cursor_color);
                 }
             });
+    }
+
+    /// Tracks stylus pressure from touch events; mice report none.
+    fn read_pen_pressure(&mut self, context: &egui::Context) {
+        context.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Touch { phase, force, .. } = event {
+                    self.pen_pressure = match phase {
+                        egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                            force.filter(|force| force.is_finite() && *force > 0.0)
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => None,
+                    }
+                    .map(|force| force.clamp(0.0, 1.0));
+                }
+            }
+        });
+    }
+
+    /// The 3D view: Filament (or the software fallback), picking, painting,
+    /// and polygon selection.
+    fn model_viewport(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        let response = ui.interact(
+            viewport,
+            ui.id().with("model_viewport"),
+            egui::Sense::click_and_drag(),
+        );
+        let pointer_position = ui.input(|input| input.pointer.interact_pos());
+        let hover_position = ui.input(|input| input.pointer.hover_pos());
+        let shift = ui.input(|input| input.modifiers.shift);
+        let painting = self.paint_mode.paints();
+        if response.dragged() && !painting {
+            let delta = ui.input(|input| input.pointer.delta());
+            let delta = glam::Vec2::new(delta.x, delta.y);
+            if shift {
+                self.viewport_camera.pan_by(delta);
+            } else {
+                self.viewport_camera.orbit(delta);
+            }
+        }
+        if response.hovered() && !painting {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            self.viewport_camera.zoom_by(scroll);
+        }
+        self.update_filament_frame(ui.ctx(), viewport);
+        let painter = ui.painter_at(viewport);
+        painter.rect_filled(viewport, 0.0, theme::VIEWPORT_BG);
+        if self.mesh_geometry.is_some()
+            && let Some(texture) = &self.filament_frame_texture
+        {
+            painter.image(
+                texture.id(),
+                viewport,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        let center = viewport.center();
+        let software = self.filament_frame_texture.is_none();
+        if software {
+            let axis = egui::Color32::from_rgb(38, 40, 44);
+            painter.line_segment(
+                [
+                    egui::pos2(viewport.left(), center.y),
+                    egui::pos2(viewport.right(), center.y),
+                ],
+                egui::Stroke::new(1.0, axis),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, viewport.top()),
+                    egui::pos2(center.x, viewport.bottom()),
+                ],
+                egui::Stroke::new(1.0, axis),
+            );
+        }
+
+        if self.mesh_geometry.is_none() {
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "Choose a mesh in the Scene drawer to begin",
+                egui::FontId::proportional(16.0),
+                theme::TEXT_WEAK,
+            );
+            return;
+        }
+
+        let selecting = self.paint_mode == PaintMode::Select;
+        let projection = self.view_projection(viewport);
+        let needs_projection =
+            software || (painting && response.dragged()) || (selecting && response.hovered());
+        let projected = needs_projection
+            .then(|| {
+                self.mesh_geometry
+                    .as_ref()
+                    .map(|mesh| projection.project_mesh(mesh))
+            })
+            .flatten();
+
+        if painting
+            && response.dragged()
+            && let (Some(points), Some(pointer), Some(mesh)) =
+                (&projected, pointer_position, &self.mesh_geometry)
+            && let Some(hit) = pick_triangle(mesh, points, pointer)
+            && self.triangle_in_selected_set(hit.triangle)
+            && let Some(uv) = hit
+                .uv
+                .filter(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y))
+        {
+            self.append_stroke_point(uv);
+        }
+
+        if selecting {
+            let hit = match (&projected, hover_position, &self.mesh_geometry) {
+                (Some(points), Some(pointer), Some(mesh)) if response.hovered() => {
+                    pick_triangle(mesh, points, pointer)
+                }
+                _ => None,
+            };
+            self.hovered_selection = match (hit, &self.mesh_topology) {
+                (Some(hit), Some(topology)) => topology.select(hit.triangle, self.selection_mode),
+                _ => Vec::new(),
+            };
+            if response.clicked() && !self.hovered_selection.is_empty() {
+                let selection = self.hovered_selection.clone();
+                self.apply_polygon_selection(&selection, shift);
+            }
+        } else {
+            self.hovered_selection.clear();
+        }
+
+        let Some(mesh) = self.mesh_geometry.as_ref() else {
+            return;
+        };
+        if software && let Some(points) = &projected {
+            self.paint_software_mesh(&painter, mesh, points);
+        }
+
+        if selecting {
+            let overlay_points = projected
+                .clone()
+                .unwrap_or_else(|| projection.project_mesh(mesh));
+            if let Some(mask) = self
+                .selected_layer()
+                .and_then(|layer| layer.polygon_mask.as_ref())
+            {
+                let triangles: Box<dyn Iterator<Item = u32>> = if mask.inverted {
+                    Box::new(
+                        (0..mesh.triangles.len() as u32)
+                            .filter(|triangle| !mask.triangles.contains(triangle)),
+                    )
+                } else {
+                    Box::new(mask.triangles.iter().copied())
+                };
+                painter.add(triangle_overlay(
+                    mesh,
+                    &overlay_points,
+                    triangles,
+                    theme::ACCENT.gamma_multiply(0.28),
+                ));
+            }
+            let hover_color = if shift {
+                theme::DANGER.gamma_multiply(0.35)
+            } else {
+                egui::Color32::from_white_alpha(46)
+            };
+            painter.add(triangle_overlay(
+                mesh,
+                &overlay_points,
+                self.hovered_selection.iter().copied(),
+                hover_color,
+            ));
+        }
+
+        if painting
+            && response.hovered()
+            && let Some(pointer) = pointer_position
+        {
+            let cursor_color = if self.paint_mode == PaintMode::Mask {
+                egui::Color32::WHITE
+            } else {
+                self.brush_color
+            };
+            let radius = (self.brush_radius * self.viewport_camera.zoom * 0.35).clamp(3.0, 36.0);
+            painter.circle(
+                pointer,
+                radius,
+                cursor_color.gamma_multiply(0.12),
+                egui::Stroke::new(1.5, cursor_color),
+            );
+            painter.circle_filled(pointer, 1.5, cursor_color);
+        }
     }
 
     /// Flat-shaded painter's-algorithm fallback when Filament is unavailable.
@@ -2112,6 +2767,16 @@ fn barycentric_uv(
     (uv.is_finite() && (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)).then_some(uv)
 }
 
+/// Visits every layer of a stack, groups before their children.
+fn for_each_layer_mut(layers: &mut [MaterialLayer], visit: &mut impl FnMut(&mut MaterialLayer)) {
+    for layer in layers {
+        visit(layer);
+        if let Some(children) = layer.children.as_mut() {
+            for_each_layer_mut(children, visit);
+        }
+    }
+}
+
 fn mesh_bounds_center(mesh: &MeshGeometry) -> glam::Vec3 {
     let mut minimum = glam::Vec3::splat(f32::INFINITY);
     let mut maximum = glam::Vec3::splat(f32::NEG_INFINITY);
@@ -2133,9 +2798,18 @@ fn sanitize_mesh_scale(scale: f32) -> f32 {
     }
 }
 
-/// Reads every mesh in a binary FBX and merges them into one scaled
-/// geometry, as a high-poly source for baking.
-fn load_merged_fbx(path: &std::path::Path, scale: f32) -> Result<MeshGeometry, String> {
+/// Reads an FBX (every mesh it holds) or a glTF/GLB (the flattened scene),
+/// choosing the importer by extension.
+fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension == "gltf" || extension == "glb" {
+        return import_gltf_file(path)
+            .map(|mesh| vec![mesh])
+            .map_err(|error| error.to_string());
+    }
     let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
     let file_size = usize::try_from(metadata.len())
         .map_err(|_| "FBX file is too large for this platform".to_owned())?;
@@ -2146,27 +2820,53 @@ fn load_merged_fbx(path: &std::path::Path, scale: f32) -> Result<MeshGeometry, S
         ));
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    let meshes = import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())?;
-    let mut merged = MeshGeometry {
-        vertices: Vec::new(),
-        triangles: Vec::new(),
-        ..MeshGeometry::default()
-    };
-    for mesh in meshes {
-        let offset = u32::try_from(merged.vertices.len())
-            .map_err(|_| "merged FBX has too many vertices".to_owned())?;
-        merged.vertices.extend(mesh.geometry.vertices);
-        merged.triangles.extend(
-            mesh.geometry
-                .triangles
-                .into_iter()
-                .map(|triangle| triangle.map(|index| index + offset)),
-        );
+    import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())
+}
+
+/// Reads every mesh in a file and merges them into one scaled geometry, as
+/// a high-poly source for baking.
+fn load_merged_mesh(path: &std::path::Path, scale: f32) -> Result<MeshGeometry, String> {
+    let mut merged = MeshGeometry::default();
+    for mesh in load_mesh_file(path)? {
+        merged
+            .append(&mesh.geometry)
+            .map_err(|_| "merged mesh has too many vertices".to_owned())?;
     }
     if merged.triangles.is_empty() {
-        return Err("FBX contains no mesh geometry".to_owned());
+        return Err("the file contains no mesh geometry".to_owned());
     }
     Ok(scaled_geometry(&merged, sanitize_mesh_scale(scale)))
+}
+
+/// Bakes mesh maps for each material slot from that slot's triangles, so
+/// slots sharing UV space get their own maps. A single-slot mesh bakes
+/// whole; an empty slot falls back to the whole mesh.
+fn bake_slot_mesh_maps(
+    mesh: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    cancel: &AtomicBool,
+) -> Result<Vec<MeshMaps>, MeshMapError> {
+    let slot_count = mesh.material_slot_count();
+    if slot_count <= 1 {
+        return Ok(vec![bake_mesh_maps_from(
+            mesh,
+            high,
+            settings,
+            Some(cancel),
+        )?]);
+    }
+    (0..slot_count as u32)
+        .map(|slot| {
+            let submesh = mesh.submesh(slot);
+            let source = if submesh.triangles.is_empty() {
+                mesh
+            } else {
+                &submesh
+            };
+            bake_mesh_maps_from(source, high, settings, Some(cancel))
+        })
+        .collect()
 }
 
 fn scaled_geometry(mesh: &MeshGeometry, scale: f32) -> MeshGeometry {
@@ -2184,6 +2884,8 @@ impl eframe::App for SubstanceCraftApp {
         self.handle_shortcuts(ui.ctx());
         self.poll_mesh_map_job(ui.ctx());
         self.poll_preview_job(ui.ctx());
+        self.poll_set_bake_job(ui.ctx());
+        self.refresh_set_caches();
         self.update_pose_transition(ui.ctx());
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
@@ -2205,51 +2907,11 @@ fn channel_label(channel: MaterialChannel) -> &'static str {
     }
 }
 
-fn write_tga(path: &std::path::Path, texture: &BakedTexture) -> Result<(), String> {
-    let bytes = encode_tga(texture)?;
-    std::fs::write(path, bytes).map_err(|error| error.to_string())
-}
-
-fn encode_tga(texture: &BakedTexture) -> Result<Vec<u8>, String> {
-    let width = u16::try_from(texture.width)
-        .map_err(|_| "TGA width exceeds the format limit".to_owned())?;
-    let height = u16::try_from(texture.height)
-        .map_err(|_| "TGA height exceeds the format limit".to_owned())?;
-    let expected_bytes = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "TGA pixel count overflow".to_owned())?;
-    if texture.rgba8.len() != expected_bytes {
-        return Err("TGA RGBA buffer does not match its dimensions".to_owned());
-    }
-    let capacity = 18_usize
-        .checked_add(texture.rgba8.len())
-        .ok_or_else(|| "TGA output size overflow".to_owned())?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|error| error.to_string())?;
-    let mut header = [0_u8; 18];
-    header[2] = 2;
-    header[12..14].copy_from_slice(&width.to_le_bytes());
-    header[14..16].copy_from_slice(&height.to_le_bytes());
-    header[16] = 32;
-    header[17] = 0x28;
-    bytes.extend_from_slice(&header);
-    let (pixels, remainder) = texture.rgba8.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return Err("TGA RGBA buffer has an incomplete pixel".to_owned());
-    }
-    for [red, green, blue, alpha] in pixels {
-        bytes.extend_from_slice(&[*blue, *green, *red, *alpha]);
-    }
-    Ok(bytes)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use substancecraft_api::write_texture;
 
     #[test]
     fn screen_point_maps_to_triangle_uv_and_rejects_outside_points() {
@@ -2285,7 +2947,9 @@ mod tests {
             );
             app.poll_mesh_map_job(context);
             app.poll_preview_job(context);
+            app.poll_set_bake_job(context);
             app.refresh_baked_preview();
+            app.refresh_set_caches();
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -2375,19 +3039,233 @@ mod tests {
         assert_eq!(face, vec![0, 1]);
     }
 
+    /// A unit quad split into two triangles, each with its own glTF material
+    /// ("Body" and "Trim"), both covering the full UV square.
+    fn write_two_material_gltf(folder: &std::path::Path) -> std::path::PathBuf {
+        let positions: [[f32; 3]; 4] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        // glTF V runs down; these map to SubstanceCraft UV corners.
+        let uvs: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let mut buffer = Vec::new();
+        for value in positions.iter().flatten().chain(uvs.iter().flatten()) {
+            buffer.extend(value.to_le_bytes());
+        }
+        for index in [0_u16, 1, 2, 0, 2, 3] {
+            buffer.extend(index.to_le_bytes());
+        }
+        std::fs::write(folder.join("quad.bin"), &buffer).unwrap();
+        let json = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [{{ "nodes": [0] }}],
+  "nodes": [{{ "mesh": 0 }}],
+  "materials": [{{ "name": "Body" }}, {{ "name": "Trim" }}],
+  "meshes": [{{ "primitives": [
+    {{ "attributes": {{ "POSITION": 0, "TEXCOORD_0": 1 }}, "indices": 2, "material": 0 }},
+    {{ "attributes": {{ "POSITION": 0, "TEXCOORD_0": 1 }}, "indices": 3, "material": 1 }}
+  ] }}],
+  "buffers": [{{ "uri": "quad.bin", "byteLength": {length} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": 0, "byteLength": 48 }},
+    {{ "buffer": 0, "byteOffset": 48, "byteLength": 32 }},
+    {{ "buffer": 0, "byteOffset": 80, "byteLength": 6 }},
+    {{ "buffer": 0, "byteOffset": 86, "byteLength": 6 }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+       "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0] }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC2" }},
+    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }},
+    {{ "bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ]
+}}"#,
+            length = buffer.len()
+        );
+        let path = folder.join("quad.gltf");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn small_sets(app: &mut SubstanceCraftApp, size: u32) {
+        for set in &mut app.project.texture_sets {
+            set.resolution = TextureResolution {
+                width: size,
+                height: size,
+            };
+        }
+        app.invalidate_all_sets();
+    }
+
     #[test]
-    fn tga_export_writes_top_origin_rgba_as_bgra() {
-        let texture = BakedTexture {
-            width: 1,
-            height: 1,
-            rgba8: vec![10, 20, 30, 40],
+    fn tc_0101_gltf_material_slots_become_texture_sets_that_each_show_on_their_slot() {
+        let context = egui::Context::default();
+        let folder = tempfile::tempdir().unwrap();
+        let path = write_two_material_gltf(folder.path());
+        let mut app = SubstanceCraftApp::default();
+
+        app.load_imported_mesh(&path);
+        assert_eq!(app.import_error, None);
+        let names = app
+            .project
+            .texture_sets
+            .iter()
+            .map(|set| set.material_slot.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Body", "Trim"]);
+        let (body, trim) = (
+            app.project.texture_sets[0].id,
+            app.project.texture_sets[1].id,
+        );
+        assert_eq!(app.selected_texture_set, Some(body));
+        assert_eq!(app.slot_texture_set(1), Some(trim));
+        // Painting hits only count on the selected set's triangles.
+        assert!(app.triangle_in_selected_set(0));
+        assert!(!app.triangle_in_selected_set(1));
+        small_sets(&mut app, 32);
+
+        // Give Trim a red fill; Body stays plain.
+        app.select_texture_set(trim);
+        app.add_fill_layer();
+        if let Some(layer) = app.selected_layer_mut() {
+            layer.fill = Some(LayerFill {
+                color: [255, 0, 0, 255],
+                ..LayerFill::default()
+            });
+        }
+        app.select_texture_set(body);
+        app.invalidate_all_sets();
+        pump_until(&mut app, &context, |app| {
+            app.preview_job.is_none()
+                && app.set_bake_job.is_none()
+                && app
+                    .set_materials
+                    .get(&trim)
+                    .is_some_and(|cached| cached.revision == app.set_revision(trim))
+        });
+
+        let plan = app.slot_upload_plan(PreviewTarget::Material);
+        assert_eq!(plan.len(), 2);
+        let centre = |source: &SlotSource| match source {
+            SlotSource::Material(textures) => textures.base_color.pixel(16, 16),
+            _ => None,
         };
+        assert_eq!(
+            centre(&plan[1]),
+            Some([255, 0, 0, 255]),
+            "the Trim slot shows its cached material"
+        );
+        let base_color = centre(&plan[0]);
+        assert_eq!(base_color, Some([128, 128, 128, 255]), "Body is untouched");
+    }
 
-        let encoded = encode_tga(&texture).unwrap();
+    #[test]
+    fn tc_0102_bitmap_resources_texture_fills_and_material_sets_export_as_png() {
+        let folder = tempfile::tempdir().unwrap();
+        let bitmap = folder.path().join("stripes.png");
+        write_texture(
+            &bitmap,
+            &BakedTexture {
+                width: 2,
+                height: 1,
+                rgba8: vec![0, 255, 0, 255, 0, 255, 0, 255],
+            },
+        )
+        .unwrap();
+        let mut app = SubstanceCraftApp::default();
+        let resource = app.add_resource(&bitmap).unwrap();
+        assert_eq!(app.project.resources.len(), 1);
 
-        assert_eq!(encoded[2], 2);
-        assert_eq!(&encoded[12..16], &[1, 0, 1, 0]);
-        assert_eq!(&encoded[16..18], &[32, 0x28]);
-        assert_eq!(&encoded[18..], &[30, 20, 10, 40]);
+        app.add_fill_layer();
+        if let Some(layer) = app.selected_layer_mut() {
+            layer.channels.insert(MaterialChannel::Emissive);
+            let fill = layer.fill.get_or_insert_with(LayerFill::default);
+            fill.textures.base_color = Some(resource);
+            fill.emissive = [10, 20, 30];
+        }
+        small_sets(&mut app, 16);
+        assert!(app.resource_in_use(resource));
+        app.remove_resource(resource);
+        assert_eq!(app.project.resources.len(), 1, "used resources stay");
+
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let out = folder.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let written = app.write_material_set(&set, &out).unwrap();
+        let names = written
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let stem = set.name.replace(' ', "_");
+        assert_eq!(
+            names,
+            ["BaseColor", "ORM", "Normal", "Emissive"].map(|suffix| format!("{stem}_{suffix}.png"))
+        );
+        let base = load_texture_image(&written[0]).unwrap();
+        assert_eq!(&base.rgba8[0..4], &[0, 255, 0, 255], "textured green fill");
+        let emissive = load_texture_image(&written[3]).unwrap();
+        assert_eq!(&emissive.rgba8[0..4], &[10, 20, 30, 255]);
+
+        // The project saves the reference and reloads the pixels.
+        let project = folder.path().join("scene.sproject");
+        save_project_file(&project, &app.project).unwrap();
+        app.project = load_project_file(&project).unwrap();
+        app.resource_images.clear();
+        app.reload_resources();
+        assert!(app.resource_images.contains_key(&resource));
+        assert_eq!(app.project_error, None);
+    }
+
+    #[test]
+    fn tc_0103_erase_mode_and_groups_work_through_the_app() {
+        let mut app = SubstanceCraftApp::default();
+        app.add_paint_layer();
+        let paint = app.selected_layer.unwrap();
+        app.paint_mode = PaintMode::Paint;
+        app.append_stroke_point(glam::Vec2::new(0.4, 0.5));
+        app.append_stroke_point(glam::Vec2::new(0.6, 0.5));
+        app.finish_active_stroke();
+        app.paint_mode = PaintMode::Erase;
+        app.pen_pressure = Some(0.5);
+        app.append_stroke_point(glam::Vec2::new(0.5, 0.5));
+        app.append_stroke_point(glam::Vec2::new(0.55, 0.5));
+        app.finish_active_stroke();
+        let strokes = &app.selected_layer().unwrap().paint_strokes;
+        assert_eq!(strokes.len(), 2);
+        assert!(!strokes[0].erase && strokes[1].erase);
+        assert_eq!(
+            strokes[1].pressures,
+            vec![0.5, 0.5],
+            "pen pressure per point"
+        );
+        assert!(strokes[0].pressures.is_empty(), "mouse strokes carry none");
+
+        // A group added above the paint layer; moving the paint layer up
+        // and into the group below needs it to sit above the group first.
+        app.add_group_layer();
+        let group = app.selected_layer.unwrap();
+        app.selected_layer = Some(paint);
+        app.move_selected_layer(1);
+        assert_eq!(app.group_below_selected(), Some(group));
+        app.move_selected_into_group();
+        let set = app.selected_texture_set_ref().unwrap();
+        assert_eq!(set.slot_of(paint).unwrap().parent, Some(group));
+        // Strokes cannot target a group.
+        app.selected_layer = Some(group);
+        app.paint_mode = PaintMode::Paint;
+        app.append_stroke_point(glam::Vec2::new(0.5, 0.5));
+        assert!(app.active_stroke.is_none());
+
+        app.selected_layer = Some(paint);
+        app.move_selected_out_of_group();
+        let set = app.selected_texture_set_ref().unwrap();
+        assert_eq!(set.slot_of(paint).unwrap().parent, None);
+        app.undo();
+        let set = app.selected_texture_set_ref().unwrap();
+        assert_eq!(set.slot_of(paint).unwrap().parent, Some(group));
     }
 }

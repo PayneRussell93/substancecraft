@@ -103,6 +103,24 @@ impl BrushTip {
         }
     }
 
+    /// Coverage of one stamp (rotated by `angle_degrees`, without jitter)
+    /// sampled on a `cells` x `cells` grid, rows top to bottom; for UI
+    /// previews.
+    pub fn preview(self, cells: usize, resources: Option<&ResourceImages>) -> Vec<f32> {
+        let rotation = Vec2::from_angle(-self.angle_degrees.to_radians());
+        let size = cells.max(1) as f32;
+        (0..cells * cells)
+            .map(|index| {
+                let offset = Vec2::new(
+                    ((index % cells) as f32 + 0.5) / size * 2.0 - 1.0,
+                    ((index / cells) as f32 + 0.5) / size * 2.0 - 1.0,
+                );
+                let local = rotation.rotate(Vec2::new(offset.x, -offset.y));
+                self.stamp_coverage(local, self.seed, resources)
+            })
+            .collect()
+    }
+
     /// Continuous capsules reproduce the classic smooth round stroke; any
     /// other shape or randomness needs discrete stamps.
     fn continuous(self) -> bool {
@@ -549,7 +567,7 @@ mod tests {
         assert_eq!(first, coverage(&path, 101, None));
         // Wide spacing leaves gaps between stamps along the row.
         let row = &first[50 * 101..51 * 101];
-        assert!(row[10..90].iter().any(|value| *value == 0.0));
+        assert!(row[10..90].contains(&0.0));
         assert!(row[10..90].iter().any(|value| *value > 0.0));
     }
 }

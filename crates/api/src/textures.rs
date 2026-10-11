@@ -26,14 +26,25 @@ pub enum TextureIoError {
     UnsupportedFormat(String),
 }
 
-/// Decodes PNG, JPEG, or TGA bytes into straight-alpha RGBA8.
+/// Decodes PNG, JPEG, or TGA bytes into straight-alpha RGBA8. TGA has no
+/// signature, so bytes no other format claims are tried as TGA.
 pub fn decode_texture_image(bytes: &[u8]) -> Result<TextureImage, TextureIoError> {
+    decode_with_hint(bytes, None)
+}
+
+fn decode_with_hint(
+    bytes: &[u8],
+    hint: Option<ImageFormat>,
+) -> Result<TextureImage, TextureIoError> {
     if bytes.len() > MAX_TEXTURE_FILE_BYTES {
         return Err(TextureIoError::TooLarge);
     }
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| TextureIoError::Decode(error.to_string()))?;
+    if reader.format().is_none() {
+        reader.set_format(hint.unwrap_or(ImageFormat::Tga));
+    }
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_RESOURCE_DIMENSION);
     limits.max_image_height = Some(MAX_RESOURCE_DIMENSION);
@@ -49,12 +60,13 @@ pub fn decode_texture_image(bytes: &[u8]) -> Result<TextureImage, TextureIoError
 
 /// Reads and decodes a bitmap file.
 pub fn load_texture_image(path: impl AsRef<Path>) -> Result<TextureImage, TextureIoError> {
+    let path = path.as_ref();
     let file = std::fs::File::open(path).map_err(|error| TextureIoError::Io(error.to_string()))?;
     let mut bytes = Vec::new();
     file.take(MAX_TEXTURE_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| TextureIoError::Io(error.to_string()))?;
-    decode_texture_image(&bytes)
+    decode_with_hint(&bytes, ImageFormat::from_path(path).ok())
 }
 
 /// Output formats for baked textures.

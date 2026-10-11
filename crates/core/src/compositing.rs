@@ -115,7 +115,9 @@ impl MaterialTextures {
     pub fn has_emission(&self) -> bool {
         self.emissive
             .rgba8
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[..3] != [0, 0, 0])
     }
 
@@ -123,7 +125,9 @@ impl MaterialTextures {
     pub fn has_transparency(&self) -> bool {
         self.base_color
             .rgba8
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[3] != 255)
     }
 }
