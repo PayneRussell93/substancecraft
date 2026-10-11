@@ -115,11 +115,7 @@ mod tests {
     use super::*;
 
     fn resource(id: u64, path: &Path) -> ProjectResource {
-        ProjectResource {
-            id: ResourceId(id),
-            name: format!("r{id}"),
-            source: path.to_string_lossy().into_owned(),
-        }
+        ProjectResource::new(ResourceId(id), format!("r{id}"), path.to_string_lossy())
     }
 
     #[test]

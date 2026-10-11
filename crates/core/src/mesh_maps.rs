@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::noise::{lowbias32, unit_float};
+use crate::resources::{TextureImage, luminance};
 use crate::smoothing::{vertex_normals, vertex_tangents};
 use crate::topology::{mesh_bounds, weld_positions};
 use crate::{BakedTexture, MAX_BAKE_PIXELS, MeshError, MeshGeometry, raster};
@@ -56,6 +57,35 @@ pub struct MeshMapSettings {
     /// search for the high mesh, as a fraction of the bounds diagonal.
     #[serde(default = "default_cage_distance")]
     pub cage_distance: f32,
+    /// High-to-low only: skew correction, `0..=1`. Cage rays bend from
+    /// the smoothed normal toward the flat face normal, so details on flat
+    /// areas beside bevels project straight instead of skewed. A skew map
+    /// passed to [`bake_mesh_maps_corrected`] scales it per texel.
+    #[serde(default)]
+    pub skew: f32,
+    /// Edge protection: where the smoothed and face normals differ by more
+    /// than this many degrees (the bevel itself) skew fades out.
+    #[serde(default = "default_skew_edge_degrees")]
+    pub skew_edge_degrees: f32,
+}
+
+fn default_skew_edge_degrees() -> f32 {
+    30.0
+}
+
+/// Cage-ray direction for one texel: the smoothed normal bent toward the
+/// face normal by `skew`, with skew faded out where the two normals differ
+/// by more than `edge_degrees`. Returns the direction and the skew applied.
+pub fn cage_ray_direction(smooth: Vec3, face: Vec3, skew: f32, edge_degrees: f32) -> (Vec3, f32) {
+    let angle = smooth.dot(face).clamp(-1.0, 1.0).acos().to_degrees();
+    let fade_start = edge_degrees * 0.75;
+    let protection = if angle <= fade_start {
+        1.0
+    } else {
+        (1.0 - (angle - fade_start) / (edge_degrees - fade_start).max(1e-3)).clamp(0.0, 1.0)
+    };
+    let applied = skew.clamp(0.0, 1.0) * protection;
+    (smooth.lerp(face, applied).normalize_or(smooth), applied)
 }
 
 fn default_cage_distance() -> f32 {
@@ -78,6 +108,8 @@ impl Default for MeshMapSettings {
             seed: 1,
             smoothing_angle_degrees: default_smoothing_angle(),
             cage_distance: default_cage_distance(),
+            skew: 0.0,
+            skew_edge_degrees: default_skew_edge_degrees(),
         }
     }
 }
@@ -110,6 +142,12 @@ impl MeshMapSettings {
         if !self.cage_distance.is_finite() || !(0.0001..=0.5).contains(&self.cage_distance) {
             return Err(MeshMapError::InvalidSettings("cage_distance"));
         }
+        if !self.skew.is_finite() || !(0.0..=1.0).contains(&self.skew) {
+            return Err(MeshMapError::InvalidSettings("skew"));
+        }
+        if !self.skew_edge_degrees.is_finite() || !(1.0..=90.0).contains(&self.skew_edge_degrees) {
+            return Err(MeshMapError::InvalidSettings("skew_edge_degrees"));
+        }
         if self.padding > MAX_MESH_MAP_PADDING {
             return Err(MeshMapError::InvalidSettings("padding"));
         }
@@ -126,16 +164,19 @@ pub enum MeshMapKind {
     Curvature,
     AmbientOcclusion,
     Thickness,
+    /// Skew correction applied by the high-to-low bake, for inspection.
+    Skew,
 }
 
 impl MeshMapKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Normal,
         Self::WorldNormal,
         Self::Position,
         Self::Curvature,
         Self::AmbientOcclusion,
         Self::Thickness,
+        Self::Skew,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -146,6 +187,7 @@ impl MeshMapKind {
             Self::Curvature => "Curvature",
             Self::AmbientOcclusion => "Ambient Occlusion",
             Self::Thickness => "Thickness",
+            Self::Skew => "Skew",
         }
     }
 }
@@ -170,6 +212,8 @@ struct Texel {
     curvature: f32,
     ambient_occlusion: f32,
     thickness: f32,
+    /// Skew correction applied to this texel's cage ray.
+    skew: f32,
 }
 
 /// Interpolated mesh-map values at a UV coordinate.
@@ -194,6 +238,8 @@ pub struct MeshMapSample {
     pub ambient_occlusion: f32,
     /// `0` is thin, `1` is thick.
     pub thickness: f32,
+    /// Skew correction the high-to-low bake applied here.
+    pub skew: f32,
 }
 
 impl Default for MeshMapSample {
@@ -208,6 +254,7 @@ impl Default for MeshMapSample {
             curvature: 0.5,
             ambient_occlusion: 1.0,
             thickness: 1.0,
+            skew: 0.0,
         }
     }
 }
@@ -308,6 +355,7 @@ impl MeshMaps {
             accumulated.curvature += texel.curvature * weight;
             accumulated.ambient_occlusion += texel.ambient_occlusion * weight;
             accumulated.thickness += texel.thickness * weight;
+            accumulated.skew += texel.skew * weight;
             total += weight;
         }
         if total <= f32::EPSILON {
@@ -325,6 +373,7 @@ impl MeshMaps {
             curvature: accumulated.curvature / total,
             ambient_occlusion: accumulated.ambient_occlusion / total,
             thickness: accumulated.thickness / total,
+            skew: accumulated.skew / total,
         }
     }
 
@@ -346,6 +395,7 @@ impl MeshMaps {
                 MeshMapKind::Curvature => Vec3::splat(texel.curvature),
                 MeshMapKind::AmbientOcclusion => Vec3::splat(texel.ambient_occlusion),
                 MeshMapKind::Thickness => Vec3::splat(texel.thickness),
+                MeshMapKind::Skew => Vec3::splat(texel.skew),
             };
             rgba8.extend_from_slice(&[to_byte(rgb.x), to_byte(rgb.y), to_byte(rgb.z), 255]);
         }
@@ -377,6 +427,19 @@ pub fn bake_mesh_maps_from(
     low: &MeshGeometry,
     high: Option<&MeshGeometry>,
     settings: &MeshMapSettings,
+    cancel: Option<&AtomicBool>,
+) -> Result<MeshMaps, MeshMapError> {
+    bake_mesh_maps_corrected(low, high, settings, None, cancel)
+}
+
+/// [`bake_mesh_maps_from`] with a painted skew map: a grayscale bitmap in
+/// the low mesh's UVs that scales [`MeshMapSettings::skew`] per texel
+/// (white applies it fully, black not at all).
+pub fn bake_mesh_maps_corrected(
+    low: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    skew_map: Option<&TextureImage>,
     cancel: Option<&AtomicBool>,
 ) -> Result<MeshMaps, MeshMapError> {
     settings.validate()?;
@@ -495,11 +558,21 @@ pub fn bake_mesh_maps_from(
                             continue;
                         }
                         let basis = frame.at(triangle, weights[index]);
+                        let map_weight = skew_map.map_or(1.0, |map| {
+                            let (x, y) = (index as u32 % width, index as u32 / width);
+                            luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
+                        });
+                        let (direction, applied_skew) = cage_ray_direction(
+                            basis.normal,
+                            low_geometry.face_normals[triangle as usize],
+                            settings.skew * map_weight,
+                            settings.skew_edge_degrees,
+                        );
                         let projected = high_context.as_ref().and_then(|context| {
-                            let origin = basis.position + basis.normal * cage;
+                            let origin = basis.position + direction * cage;
                             context
                                 .bvh
-                                .closest_hit(origin, -basis.normal, 0.0, cage * 2.0)
+                                .closest_hit(origin, -direction, 0.0, cage * 2.0)
                                 .map(|hit| {
                                     context.evaluate(hit.triangle, hit.weights, index as u32)
                                 })
@@ -511,6 +584,11 @@ pub fn bake_mesh_maps_from(
                             low_context.evaluate(triangle, weights[index], index as u32)
                         });
                         value.tangent_normal = basis.to_tangent(value.normal);
+                        value.skew = if high_context.is_some() {
+                            applied_skew
+                        } else {
+                            0.0
+                        };
                         *texel = value;
                     }
                 }
@@ -972,6 +1050,7 @@ impl TexelContext<'_> {
             curvature,
             ambient_occlusion,
             thickness,
+            skew: 0.0,
         }
     }
 }
@@ -1380,6 +1459,68 @@ mod tests {
             triangles: vec![[0, 1, 2], [0, 2, 3]],
             ..MeshGeometry::default()
         }
+    }
+
+    #[test]
+    fn tc_0171_skew_correction_bends_cage_rays_and_is_inspectable() {
+        // Small smoothing deviation: full skew turns the ray to the face.
+        let face = Vec3::Z;
+        let smooth = Vec3::new(
+            10.0_f32.to_radians().sin(),
+            0.0,
+            10.0_f32.to_radians().cos(),
+        );
+        let (direction, applied) = cage_ray_direction(smooth, face, 1.0, 30.0);
+        assert_eq!(applied, 1.0);
+        assert!((direction - face).length() < 1e-5);
+        let (half, applied) = cage_ray_direction(smooth, face, 0.5, 30.0);
+        assert_eq!(applied, 0.5);
+        assert!(half.angle_between(face) < smooth.angle_between(face));
+        // Edge protection: a bevel-sized deviation keeps the smoothed ray.
+        let bevel = Vec3::new(0.6, 0.0, 0.8);
+        let (direction, applied) = cage_ray_direction(bevel, face, 1.0, 30.0);
+        assert_eq!(applied, 0.0);
+        assert_eq!(direction, bevel);
+        let fading = Vec3::new(
+            26.0_f32.to_radians().sin(),
+            0.0,
+            26.0_f32.to_radians().cos(),
+        );
+        let (_, applied) = cage_ray_direction(fading, face, 1.0, 30.0);
+        assert!(applied > 0.0 && applied < 1.0);
+
+        // A painted skew map (white left half) scales the setting per texel
+        // and shows up in the Skew map; out-of-range settings are refused.
+        let low = PrimitivePreset::Plane.build_mesh();
+        let high = tilted_quad(0.0, 0.02);
+        let settings = MeshMapSettings {
+            cage_distance: 0.2,
+            skew: 0.8,
+            ..fast_settings(16)
+        };
+        let mut pixels = Vec::new();
+        for _ in 0..4 {
+            pixels.extend([255, 255, 255, 255, 255, 255, 255, 255]);
+            pixels.extend([0, 0, 0, 255, 0, 0, 0, 255]);
+        }
+        let map = TextureImage::new(4, 4, pixels).unwrap();
+        let maps =
+            bake_mesh_maps_corrected(&low, Some(&high), &settings, Some(&map), None).unwrap();
+        assert!((maps.sample(Vec2::new(0.1, 0.5)).skew - 0.8).abs() < 1e-3);
+        assert!(maps.sample(Vec2::new(0.9, 0.5)).skew < 1e-3);
+        let inspected = maps.to_texture(MeshMapKind::Skew);
+        assert_eq!(inspected.sample_uv(Vec2::new(0.05, 0.5)).unwrap()[0], 204);
+        // Low-only bakes cast no cage rays, so nothing is skewed.
+        let plain = bake_mesh_maps(&low, &settings, None).unwrap();
+        assert_eq!(plain.sample(Vec2::new(0.1, 0.5)).skew, 0.0);
+        assert_eq!(
+            MeshMapSettings {
+                skew: 1.5,
+                ..settings
+            }
+            .validate(),
+            Err(MeshMapError::InvalidSettings("skew"))
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub enum ExportSource {
 
 impl ExportSource {
     /// Every source, in menu order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Channel(MaterialChannel::BaseColor),
         Self::Channel(MaterialChannel::Roughness),
         Self::Channel(MaterialChannel::Metallic),
@@ -67,6 +67,7 @@ impl ExportSource {
         Self::MeshMap(MeshMapKind::Curvature),
         Self::MeshMap(MeshMapKind::AmbientOcclusion),
         Self::MeshMap(MeshMapKind::Thickness),
+        Self::MeshMap(MeshMapKind::Skew),
     ];
 
     /// True when the source carries different data in R, G, and B.
@@ -595,6 +596,7 @@ impl TextureSet {
                         MeshMapKind::Curvature => Vec3::splat(sample.curvature),
                         MeshMapKind::AmbientOcclusion => Vec3::splat(sample.ambient_occlusion),
                         MeshMapKind::Thickness => Vec3::splat(sample.thickness),
+                        MeshMapKind::Skew => Vec3::splat(sample.skew),
                     }
                 });
                 return to_rgba8(&values);

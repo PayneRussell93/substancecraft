@@ -63,6 +63,23 @@ fn decode_with_hint(
 /// Reads and decodes a bitmap file.
 pub fn load_texture_image(path: impl AsRef<Path>) -> Result<TextureImage, TextureIoError> {
     let path = path.as_ref();
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("svg") => {
+            let data =
+                std::fs::read(path).map_err(|error| TextureIoError::Io(error.to_string()))?;
+            if data.len() > MAX_TEXTURE_FILE_BYTES {
+                return Err(TextureIoError::TooLarge);
+            }
+            return crate::vector::rasterize_svg(&data, crate::vector::DEFAULT_SVG_EDGE);
+        }
+        Some(crate::vector::TEXT_RESOURCE_EXTENSION) => {
+            return crate::vector::load_text_resource(path);
+        }
+        _ => {}
+    }
     let file = std::fs::File::open(path).map_err(|error| TextureIoError::Io(error.to_string()))?;
     let mut bytes = Vec::new();
     file.take(MAX_TEXTURE_FILE_BYTES as u64 + 1)

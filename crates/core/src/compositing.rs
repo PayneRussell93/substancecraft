@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use glam::{Vec2, Vec3, Vec4};
 use thiserror::Error;
 
+use crate::AnchorMask;
 use crate::brush::{self, StrokePath};
 use crate::filters::{self, PlaneData};
-use crate::resources::{ResourceImages, TextureImage, luminance};
+use crate::resources::{ProjectionMode, ResourceImages, TextureImage, luminance};
 use crate::{
     DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_OPACITY, DEFAULT_ROUGHNESS,
     LayerFill, LayerId, MAX_BAKE_PIXELS, MAX_TEXTURE_DIMENSION, MaskGenerator, MaterialChannel,
@@ -96,6 +97,46 @@ impl<'a> BakeContext<'a> {
     }
 }
 
+/// Channels [`TextureSet::flatten_layer`] bakes.
+pub const FLATTEN_CHANNELS: [MaterialChannel; 7] = [
+    MaterialChannel::BaseColor,
+    MaterialChannel::Roughness,
+    MaterialChannel::Metallic,
+    MaterialChannel::Height,
+    MaterialChannel::Normal,
+    MaterialChannel::Emissive,
+    MaterialChannel::Opacity,
+];
+
+/// A layer flattened into one straight-alpha bitmap per channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlattenedLayer {
+    pub channels: Vec<(MaterialChannel, TextureImage)>,
+}
+
+impl FlattenedLayer {
+    /// A fill layer that reproduces the flattened layer from the given
+    /// resources, one per entry of `channels` and in the same order.
+    pub fn to_fill_layer(
+        &self,
+        id: LayerId,
+        name: impl Into<String>,
+        resources: &[ResourceId],
+    ) -> MaterialLayer {
+        let mut fill = LayerFill::default();
+        let mut channels = std::collections::BTreeSet::new();
+        for ((channel, _), resource) in self.channels.iter().zip(resources) {
+            if let Some(slot) = fill.textures.slot_mut(*channel) {
+                *slot = Some(*resource);
+                channels.insert(*channel);
+            }
+        }
+        let mut layer = MaterialLayer::new_fill(id, name, fill);
+        layer.channels = channels;
+        layer
+    }
+}
+
 /// Viewport-ready textures for one texture set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterialTextures {
@@ -112,7 +153,35 @@ pub struct MaterialTextures {
     pub emissive: BakedTexture,
 }
 
+/// Every material channel at one surface point, as the eyedropper picks it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialSample {
+    /// sRGB Base Color.
+    pub color: [u8; 3],
+    pub opacity: f32,
+    pub occlusion: f32,
+    pub roughness: f32,
+    pub metallic: f32,
+    /// sRGB emitted colour.
+    pub emissive: [u8; 3],
+}
+
 impl MaterialTextures {
+    /// Reads every channel at `uv`; `None` outside the unit square.
+    pub fn sample(&self, uv: glam::Vec2) -> Option<MaterialSample> {
+        let base = self.base_color.sample_uv(uv)?;
+        let orm = self.orm.sample_uv(uv)?;
+        let emissive = self.emissive.sample_uv(uv)?;
+        Some(MaterialSample {
+            color: [base[0], base[1], base[2]],
+            opacity: byte_unit(base[3]),
+            occlusion: byte_unit(orm[0]),
+            roughness: byte_unit(orm[1]),
+            metallic: byte_unit(orm[2]),
+            emissive: [emissive[0], emissive[1], emissive[2]],
+        })
+    }
+
     /// True when any texel emits light.
     pub fn has_emission(&self) -> bool {
         self.emissive
@@ -207,9 +276,10 @@ fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
 }
 
 /// Converts a bitmap sample into a channel texel.
-fn texture_texel(sample: Vec4, data: PlaneData) -> Vec4 {
+fn texture_texel(sample: Vec4, data: PlaneData, color_space: crate::ColorSpace) -> Vec4 {
     match data {
-        PlaneData::Color => sample,
+        // Colour channels store sRGB; convert tagged linear or ACEScg images.
+        PlaneData::Color => color_space.to_srgb(sample.truncate()).extend(sample.w),
         PlaneData::Scalar => Vec3::splat(luminance(sample)).extend(sample.w),
         PlaneData::Vector => (sample.truncate() * 2.0 - Vec3::ONE)
             .normalize_or(Vec3::Z)
@@ -336,7 +406,18 @@ impl Compositor<'_> {
 
     fn render_fill(&self, fill: &LayerFill, local: &mut [Vec4]) -> Result<(), BakeError> {
         let Some(resource) = fill.textures.for_channel(self.channel) else {
-            local.fill(fill_texel(fill, self.channel));
+            let texel = fill_texel(fill, self.channel);
+            if fill.projection.mode == ProjectionMode::Decal {
+                // Uniform channels of a decal fill still stay inside its box.
+                let maps = self.context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
+                let projection = fill.projection;
+                parallel_fill(local, self.width(), self.height(), |uv| {
+                    let coverage = projection.coverage(Some(&maps.sample(uv)));
+                    texel.truncate().extend(texel.w * coverage)
+                });
+            } else {
+                local.fill(texel);
+            }
             return Ok(());
         };
         let image = self.context.image(resource)?;
@@ -346,9 +427,30 @@ impl Compositor<'_> {
             None
         };
         let (projection, data) = (fill.projection, self.data);
+        if projection.is_identity_uv()
+            && image.width == self.width()
+            && image.height == self.height()
+        {
+            // Same grid as the bake: copy texels instead of resampling, so
+            // exact-size bitmaps (and flattened layers) stay sharp.
+            for (texel, pixel) in local.iter_mut().zip(image.rgba8.as_chunks::<4>().0) {
+                let sample = Vec4::new(
+                    f32::from(pixel[0]),
+                    f32::from(pixel[1]),
+                    f32::from(pixel[2]),
+                    f32::from(pixel[3]),
+                ) / 255.0;
+                *texel = texture_texel(sample, data, image.color_space);
+            }
+            return Ok(());
+        }
         parallel_fill(local, self.width(), self.height(), |uv| {
             let sample = maps.map(|maps| maps.sample(uv));
-            texture_texel(projection.sample(image, uv, sample.as_ref()), data)
+            texture_texel(
+                projection.sample(image, uv, sample.as_ref()),
+                data,
+                image.color_space,
+            )
         });
         Ok(())
     }
@@ -701,6 +803,7 @@ impl TextureSet {
             && layer.id_mask_color.is_none()
             && layer.mask_bitmap.is_none()
             && layer.mask_filters.is_empty()
+            && layer.mask_anchor.is_none()
         {
             return Ok(None);
         }
@@ -729,6 +832,12 @@ impl TextureSet {
             });
             for (value, bitmap_value) in values.iter_mut().zip(bitmap_values) {
                 *value *= bitmap_value;
+            }
+        }
+        if let Some(anchor) = layer.mask_anchor {
+            let anchored = self.anchor_values(layer.id, anchor, context)?;
+            for (value, anchored) in values.iter_mut().zip(anchored) {
+                *value *= anchored;
             }
         }
         for stroke in &layer.mask_strokes {
@@ -792,6 +901,139 @@ impl TextureSet {
             *value = value.clamp(0.0, 1.0);
         }
         Ok(Some(values))
+    }
+
+    /// True when `layer` may anchor to `anchor`: the anchor exists, is
+    /// composited before `layer`, and is neither `layer` nor one of its
+    /// ancestors (which would make the mask depend on itself).
+    pub fn anchor_is_valid(&self, layer: LayerId, anchor: LayerId) -> bool {
+        let order = self.walk_layers();
+        let position = |id: LayerId| order.iter().position(|candidate| candidate.id == id);
+        let (Some(anchor_at), Some(layer_at)) = (position(anchor), position(layer)) else {
+            return false;
+        };
+        anchor_at < layer_at
+            && !self
+                .layer(anchor)
+                .is_some_and(|candidate| candidate.walk().iter().any(|inner| inner.id == layer))
+    }
+
+    /// A copy of the set holding only what is composited up to and
+    /// including `anchor`: earlier siblings along its path, and the anchor
+    /// with everything inside it.
+    pub fn truncated_through(&self, anchor: LayerId) -> Option<TextureSet> {
+        fn truncate(layers: &[MaterialLayer], anchor: LayerId) -> Option<Vec<MaterialLayer>> {
+            for (index, layer) in layers.iter().enumerate() {
+                if layer.id == anchor {
+                    return Some(layers[..=index].to_vec());
+                }
+                if let Some(kept) = layer
+                    .children
+                    .as_deref()
+                    .and_then(|children| truncate(children, anchor))
+                {
+                    let mut result = layers[..index].to_vec();
+                    result.push(MaterialLayer {
+                        children: Some(kept),
+                        ..layer.clone()
+                    });
+                    return Some(result);
+                }
+            }
+            None
+        }
+        Some(TextureSet {
+            layers: truncate(&self.layers, anchor)?,
+            ..self.clone()
+        })
+    }
+
+    /// Per-texel anchor mask values for `layer`.
+    fn anchor_values(
+        &self,
+        layer: LayerId,
+        anchor: AnchorMask,
+        context: BakeContext<'_>,
+    ) -> Result<Vec<f32>, BakeError> {
+        if !self.anchor_is_valid(layer, anchor.layer) {
+            return Err(BakeError::InvalidLayerSettings);
+        }
+        let stack = self
+            .truncated_through(anchor.layer)
+            .ok_or(BakeError::InvalidLayerSettings)?;
+        let id_map = stack.validate_for_bake()?;
+        let masks = stack.layer_masks(&[anchor.channel], context, id_map.as_ref())?;
+        let plane = stack.composite_plane(anchor.channel, context, &masks)?;
+        let read = |texel: &Vec4| match plane_data(anchor.channel) {
+            // Colour reads luminance of what was painted; unpainted is 0.
+            PlaneData::Color => luminance(*texel) * texel.w,
+            _ => texel.x,
+        };
+        Ok(plane
+            .iter()
+            .map(|texel| anchor.remap(read(texel)))
+            .collect())
+    }
+
+    /// Flattens one layer or group (with its opacity, mask, and filters)
+    /// into a straight-alpha bitmap per channel it writes. Each bitmap's
+    /// alpha is the layer's coverage, so a fill layer textured with them,
+    /// in the same place in the stack, composites to the same result.
+    pub fn flatten_layer(
+        &self,
+        layer_id: LayerId,
+        context: BakeContext<'_>,
+    ) -> Result<FlattenedLayer, BakeError> {
+        let layer = self
+            .layer(layer_id)
+            .ok_or(BakeError::InvalidLayerSettings)?;
+        let id_map = self.validate_for_bake()?;
+        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let channels: Vec<MaterialChannel> = FLATTEN_CHANNELS
+            .into_iter()
+            .filter(|channel| contributes(layer, &[*channel]))
+            .collect();
+        let masks = self.layer_masks(&channels, context, id_map.as_ref())?;
+        let mut flattened = Vec::new();
+        for channel in channels {
+            let data = plane_data(channel);
+            let mut plane = try_filled(pixel_count, Vec4::ZERO)?;
+            Compositor {
+                set: self,
+                channel,
+                data,
+                context,
+                masks: &masks,
+                pixel_count,
+            }
+            .composite(std::slice::from_ref(layer), &mut plane)?;
+            let mut rgba8 = Vec::new();
+            rgba8
+                .try_reserve_exact(pixel_count * 4)
+                .map_err(|_| BakeError::AllocationFailed)?;
+            for texel in &plane {
+                let rgb = match data {
+                    PlaneData::Vector if texel.w > 0.0 => texel.truncate() * 0.5 + 0.5,
+                    PlaneData::Vector => Vec3::new(0.5, 0.5, 1.0),
+                    _ => texel.truncate(),
+                };
+                rgba8.extend([
+                    unit_to_byte(rgb.x),
+                    unit_to_byte(rgb.y),
+                    unit_to_byte(rgb.z),
+                    unit_to_byte(texel.w),
+                ]);
+            }
+            let image = TextureImage::new(self.resolution.width, self.resolution.height, rgba8)
+                .ok_or(BakeError::ResolutionExceedsBudget {
+                    width: self.resolution.width,
+                    height: self.resolution.height,
+                })?;
+            flattened.push((channel, image));
+        }
+        Ok(FlattenedLayer {
+            channels: flattened,
+        })
     }
 
     pub fn bake_id_mask(&self) -> Result<BakedTexture, BakeError> {

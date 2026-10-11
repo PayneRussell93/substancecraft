@@ -4,6 +4,7 @@
 mod fbx;
 mod gltf_import;
 mod textures;
+mod vector;
 
 pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
@@ -13,6 +14,10 @@ pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
     encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
     write_texture,
+};
+pub use vector::{
+    DEFAULT_SVG_EDGE, TEXT_RESOURCE_EXTENSION, TextSpec, load_text_resource, rasterize_svg,
+    render_text, save_text_resource,
 };
 
 use serde::{Deserialize, Serialize};
@@ -24,8 +29,8 @@ use std::{
 use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
     MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
-    MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ResourceId, ResourceImages,
-    TextureSet,
+    MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ProjectResource, ResourceId,
+    ResourceImages, TextureImage, TextureSet,
 };
 use thiserror::Error;
 
@@ -336,13 +341,20 @@ pub fn existing_export_files(
 /// Loads every bitmap the project lists. Unreadable files are reported per
 /// resource rather than failing the whole load, so a project with one
 /// missing texture still opens.
+/// Loads one resource's pixels, tagged with its colour space.
+pub fn load_resource_image(resource: &ProjectResource) -> Result<TextureImage, TextureIoError> {
+    let mut image = load_texture_image(&resource.source)?;
+    image.color_space = resource.color_space;
+    Ok(image)
+}
+
 pub fn load_project_resources(
     project: &MaterialProject,
 ) -> (ResourceImages, Vec<(ResourceId, TextureIoError)>) {
     let mut images = ResourceImages::new();
     let mut failures = Vec::new();
     for resource in &project.resources {
-        match load_texture_image(&resource.source) {
+        match load_resource_image(resource) {
             Ok(image) => {
                 images.insert(resource.id, std::sync::Arc::new(image));
             }
@@ -460,6 +472,10 @@ mod tests {
                                 ..BrushTip::ROUND
                             },
                             pressures: vec![0.2, 0.9],
+                            path: Some(substancecraft_core::PathSpec {
+                                controls: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
+                                closed: false,
+                            }),
                         }],
                         mask_strokes: vec![MaskStroke {
                             points: vec![Vec2::new(0.5, 0.5)],
@@ -502,6 +518,7 @@ mod tests {
                         }),
                         filters: vec![LayerFilter::Blur { radius: 3.0 }],
                         mask_filters: vec![LayerFilter::Invert],
+                        mask_anchor: None,
                         children: None,
                     },
                     {
@@ -525,11 +542,11 @@ mod tests {
                 )]),
             }],
             active_texture_set: Some(TextureSetId(2)),
-            resources: vec![ProjectResource {
-                id: ResourceId(11),
-                name: "Stencil".to_owned(),
-                source: "stencil.png".to_owned(),
-            }],
+            resources: vec![ProjectResource::new(
+                ResourceId(11),
+                "Stencil",
+                "stencil.png",
+            )],
             ..MaterialProject::empty()
         };
 

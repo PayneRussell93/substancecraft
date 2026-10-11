@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 use eframe::egui;
+use substancecraft_api::load_resource_image;
 use substancecraft_api::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
     bake_texture_set_material, existing_export_files, export_preflight, import_binary_fbx_meshes,
@@ -2394,11 +2395,9 @@ impl SubstanceCraftApp {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("Bitmap {}", id.0));
-        self.project.resources.push(ProjectResource {
-            id,
-            name,
-            source: path.to_string_lossy().into_owned(),
-        });
+        self.project
+            .resources
+            .push(ProjectResource::new(id, name, path.to_string_lossy()));
         self.resource_images.insert(id, Arc::new(image));
         self.resource_watcher.remember(id, path);
         Ok(id)
@@ -2442,7 +2441,7 @@ impl SubstanceCraftApp {
             else {
                 continue;
             };
-            match load_texture_image(&resource.source) {
+            match load_resource_image(resource) {
                 Ok(image) => {
                     self.resource_images.insert(*id, Arc::new(image));
                     self.resource_thumbnails.remove(id);

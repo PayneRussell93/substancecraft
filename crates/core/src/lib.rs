@@ -8,19 +8,27 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod brush;
+pub mod color;
 mod compositing;
 mod export;
 mod filters;
 mod generators;
+pub mod library;
 mod mesh_maps;
 pub mod noise;
+pub mod painting;
 mod raster;
 mod resources;
 mod smoothing;
 mod topology;
+pub mod udim;
 
 pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING};
-pub use compositing::{BakeContext, BakeError, BakedTexture, MaterialTextures};
+pub use color::ColorSpace;
+pub use compositing::{
+    BakeContext, BakeError, BakedTexture, FLATTEN_CHANNELS, FlattenedLayer, MaterialSample,
+    MaterialTextures,
+};
 pub use export::{
     ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource, ExportedTexture,
     MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS, OutputLayout,
@@ -30,14 +38,20 @@ pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
     Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
 };
+pub use library::{
+    AssetEntry, AssetKind, BUILT_IN_LICENSE, ExposedParameter, ExposedProperty, LibraryError,
+    MapRequirements, MaterialResource, ParameterValue, SmartMaterial,
+};
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
     MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
-    bake_mesh_maps_from,
+    bake_mesh_maps_corrected, bake_mesh_maps_from, cage_ray_direction,
 };
+pub use painting::{LazyStabilizer, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points};
 pub use resources::{
-    BitmapMask, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MIN_PROJECTION_SCALE,
-    ProjectResource, ProjectionMode, ResourceImages, TextureImage, TextureProjection,
+    BitmapMask, DecalPlacement, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE,
+    MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource, ProjectionMode, ResourceImages,
+    ResourceProvenance, TextureImage, TextureProjection,
 };
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
@@ -45,6 +59,7 @@ pub use smoothing::{
     vertex_tangents,
 };
 pub use topology::{MeshTopology, SelectionMode};
+pub use udim::{UDIM_TOKEN, UdimTile};
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
@@ -762,6 +777,10 @@ pub struct MaterialLayer {
     /// Filters applied, in order, to the layer's mask.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask_filters: Vec<LayerFilter>,
+    /// Multiplies the mask by a channel of the stack beneath, up to an
+    /// earlier anchor layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_anchor: Option<AnchorMask>,
     /// `Some` makes this a group: its children composite together first and
     /// the result blends through the group's own opacity, mask, and filters.
     /// Groups ignore fill and paint strokes.
@@ -792,6 +811,7 @@ impl MaterialLayer {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         }
     }
@@ -847,6 +867,7 @@ impl MaterialLayer {
             mask_bitmap: self.mask_bitmap,
             filters: self.filters.clone(),
             mask_filters: self.mask_filters.clone(),
+            mask_anchor: self.mask_anchor,
         }
     }
 
@@ -862,10 +883,12 @@ impl MaterialLayer {
         self.mask_bitmap = settings.mask_bitmap;
         self.filters = settings.filters;
         self.mask_filters = settings.mask_filters;
+        self.mask_anchor = settings.mask_anchor;
     }
 
     fn has_valid_settings(&self) -> bool {
         self.fill.is_none_or(|fill| fill.is_valid())
+            && self.mask_anchor.is_none_or(AnchorMask::is_valid)
             && self
                 .mask_generator
                 .is_none_or(|generator| generator.is_valid())
@@ -909,7 +932,9 @@ impl MaterialLayer {
                 .mask_bitmap
                 .is_some_and(|bitmap| bitmap.projection.needs_mesh_maps())
             || self.fill.is_some_and(|fill| {
-                fill.projection.needs_mesh_maps() && fill.textures.all().next().is_some()
+                fill.projection.needs_mesh_maps()
+                    && (fill.textures.all().next().is_some()
+                        || fill.projection.mode == ProjectionMode::Decal)
             })
     }
 }
@@ -1034,6 +1059,56 @@ pub struct PolygonMask {
     pub inverted: bool,
 }
 
+/// An anchor point reference: masks a layer by a channel of the stack as
+/// composited up to and including an earlier layer. The layer is referenced
+/// by id, so the link survives reordering and renaming.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnchorMask {
+    pub layer: LayerId,
+    pub channel: MaterialChannel,
+    /// The read value is remapped from `low..high` to `0..1`.
+    pub low: f32,
+    pub high: f32,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+impl AnchorMask {
+    /// Channels an anchor can read; colours are read as luminance.
+    pub const CHANNELS: [MaterialChannel; 6] = [
+        MaterialChannel::BaseColor,
+        MaterialChannel::Roughness,
+        MaterialChannel::Metallic,
+        MaterialChannel::Height,
+        MaterialChannel::Emissive,
+        MaterialChannel::Opacity,
+    ];
+
+    pub fn new(layer: LayerId, channel: MaterialChannel) -> Self {
+        Self {
+            layer,
+            channel,
+            low: 0.0,
+            high: 1.0,
+            invert: false,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        Self::CHANNELS.contains(&self.channel)
+            && self.low.is_finite()
+            && self.high.is_finite()
+            && (0.0..=1.0).contains(&self.low)
+            && (0.0..=1.0).contains(&self.high)
+            && self.low < self.high
+    }
+
+    pub(crate) fn remap(self, value: f32) -> f32 {
+        let mapped = ((value - self.low) / (self.high - self.low)).clamp(0.0, 1.0);
+        if self.invert { 1.0 - mapped } else { mapped }
+    }
+}
+
 /// Snapshot of a layer's non-stroke, non-structural state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerSettings {
@@ -1048,6 +1123,7 @@ pub struct LayerSettings {
     pub mask_bitmap: Option<BitmapMask>,
     pub filters: Vec<LayerFilter>,
     pub mask_filters: Vec<LayerFilter>,
+    pub mask_anchor: Option<AnchorMask>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1079,9 +1155,24 @@ pub struct PaintStroke {
     /// Pen pressure per point (`0..=1`); empty means full pressure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pressures: Vec<f32>,
+    /// Spline the points were sampled from, kept so the path stays
+    /// editable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathSpec>,
 }
 
 impl PaintStroke {
+    /// A stroke following a spline path, with `template`'s material and
+    /// tip.
+    pub fn along_path(path: PathSpec, template: &PaintStroke) -> Self {
+        Self {
+            points: path.sample(PATH_SAMPLES_PER_SEGMENT),
+            pressures: Vec::new(),
+            path: Some(path),
+            ..template.clone()
+        }
+    }
+
     /// A stroke with default material values and a soft round tip.
     pub fn new(points: Vec<glam::Vec2>, radius_pixels: f32, color: [u8; 4]) -> Self {
         Self {
@@ -1097,9 +1188,13 @@ impl PaintStroke {
             erase: false,
             tip: BrushTip::ROUND,
             pressures: Vec::new(),
+            path: None,
         }
     }
 }
+
+/// Points sampled per spline segment of a path stroke.
+pub const PATH_SAMPLES_PER_SEGMENT: usize = 12;
 
 fn default_stroke_roughness() -> f32 {
     DEFAULT_ROUGHNESS
@@ -1209,6 +1304,9 @@ pub enum EditCommand {
         from: LayerSlot,
         to: LayerSlot,
     },
+    /// Several commands applied in order and undone in reverse as one step,
+    /// e.g. a symmetric stroke or a flatten. All or none apply.
+    Batch(Vec<EditCommand>),
 }
 
 /// Bounded undo/redo stacks of [`EditCommand`]s.
@@ -1303,6 +1401,17 @@ fn layer_id_in_use(project: &MaterialProject, layer: &MaterialLayer) -> bool {
 
 fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
     match command {
+        EditCommand::Batch(commands) => {
+            for (applied, command) in commands.iter().enumerate() {
+                if !apply_command(project, command) {
+                    for done in commands[..applied].iter().rev() {
+                        revert_command(project, done);
+                    }
+                    return false;
+                }
+            }
+            true
+        }
         EditCommand::Paint {
             texture_set_id,
             layer_id,
@@ -1352,6 +1461,17 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
 
 fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
     match command {
+        EditCommand::Batch(commands) => {
+            for (reverted, command) in commands.iter().rev().enumerate() {
+                if !revert_command(project, command) {
+                    for done in commands[commands.len() - reverted..].iter() {
+                        apply_command(project, done);
+                    }
+                    return false;
+                }
+            }
+            true
+        }
         EditCommand::Paint {
             texture_set_id,
             layer_id,
@@ -1542,9 +1662,11 @@ pub(crate) fn valid_stroke(
         && radius_pixels <= MAX_TEXTURE_DIMENSION as f32
         && opacity.is_finite()
         && (0.0..=1.0).contains(&opacity)
-        && points.iter().all(|point| {
-            point.is_finite() && (0.0..=1.0).contains(&point.x) && (0.0..=1.0).contains(&point.y)
-        })
+        // UDIM layouts place strokes beyond the unit square: up to ten tiles
+        // across and a hundred rows, either side once shifted to a tile.
+        && points
+            .iter()
+            .all(|point| point.is_finite() && point.abs().cmple(glam::Vec2::new(10.0, 100.0)).all())
         && brush::valid_pressures(points, pressures)
         && tip.is_valid()
 }
@@ -1709,6 +1831,12 @@ pub struct MaterialProject {
     /// Custom export presets, offered alongside [`ExportPreset::built_in`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_presets: Vec<ExportPreset>,
+    /// Saved material resources (fill presets).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materials: Vec<MaterialResource>,
+    /// Saved smart materials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub smart_materials: Vec<SmartMaterial>,
 }
 
 impl MaterialProject {
@@ -1721,6 +1849,8 @@ impl MaterialProject {
             active_texture_set: None,
             resources: Vec::new(),
             export_presets: Vec::new(),
+            materials: Vec::new(),
+            smart_materials: Vec::new(),
         }
     }
 
@@ -1771,6 +1901,12 @@ impl MaterialProject {
                 if !layer.has_valid_settings() {
                     return Err(ProjectError::InvalidLayerSettings(layer.id));
                 }
+                if layer
+                    .mask_anchor
+                    .is_some_and(|anchor| !texture_set.anchor_is_valid(layer.id, anchor.layer))
+                {
+                    return Err(ProjectError::InvalidLayerSettings(layer.id));
+                }
                 if let Some(missing) = layer
                     .own_resources()
                     .find(|resource| !resource_ids.contains(resource))
@@ -1795,6 +1931,21 @@ impl MaterialProject {
             }
             if !pose_names.insert(pose.name.trim().to_lowercase()) {
                 return Err(ProjectError::DuplicatePoseName(pose.name.clone()));
+            }
+        }
+
+        for material in &self.materials {
+            material.validate()?;
+        }
+        for material in &self.smart_materials {
+            material.validate()?;
+            if let Some(missing) = material
+                .requirements()
+                .resources
+                .into_iter()
+                .find(|resource| !resource_ids.contains(resource))
+            {
+                return Err(ProjectError::MissingResource(missing));
             }
         }
 
@@ -1872,6 +2023,8 @@ pub enum ProjectError {
     #[error("export preset name `{0}` is duplicated or taken by a built-in preset")]
     DuplicateExportPresetName(String),
     #[error(transparent)]
+    InvalidLibraryEntry(#[from] LibraryError),
+    #[error(transparent)]
     InvalidPose(#[from] PoseError),
 }
 
@@ -1939,6 +2092,7 @@ mod tests {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         });
 
@@ -1979,6 +2133,7 @@ mod tests {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         });
 
@@ -2028,6 +2183,7 @@ mod tests {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         });
 
@@ -2082,6 +2238,7 @@ mod tests {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         });
         let mut project = MaterialProject {
@@ -2195,6 +2352,7 @@ mod tests {
             mask_bitmap: None,
             filters: Vec::new(),
             mask_filters: Vec::new(),
+            mask_anchor: None,
             children: None,
         });
         let project = MaterialProject {
@@ -2230,6 +2388,7 @@ mod tests {
                 mask_bitmap: None,
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
+                mask_anchor: None,
                 children: None,
             },
             MaterialLayer {
@@ -2248,6 +2407,7 @@ mod tests {
                 mask_bitmap: None,
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
+                mask_anchor: None,
                 children: None,
             },
         ];
@@ -3142,11 +3302,179 @@ mod tests {
             project.validate(),
             Err(ProjectError::MissingResource(ResourceId(7)))
         );
-        project.resources.push(ProjectResource {
-            id: ResourceId(7),
-            name: "Stripes".to_owned(),
-            source: "stripes.png".to_owned(),
-        });
+        project.resources.push(ProjectResource::new(
+            ResourceId(7),
+            "Stripes",
+            "stripes.png",
+        ));
         assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn tc_0150_anchor_masks_read_the_stack_up_to_an_earlier_layer() {
+        use glam::Vec2;
+
+        // Layer 1 paints red in the middle; layer 2 fills roughness 0 only
+        // where layer 1's Base Color is bright.
+        let mut paint = MaterialLayer::new_paint(LayerId(1), "Scratches");
+        paint.channels = BTreeSet::from([MaterialChannel::BaseColor]);
+        paint.paint_strokes.push(PaintStroke::new(
+            vec![Vec2::new(0.2, 0.5), Vec2::new(0.8, 0.5)],
+            3.0,
+            [255, 255, 255, 255],
+        ));
+        paint.paint_strokes[0].tip.hardness = 1.0;
+        let mut gloss = MaterialLayer::new_fill(
+            LayerId(2),
+            "Gloss in scratches",
+            LayerFill {
+                roughness: 0.0,
+                ..LayerFill::default()
+            },
+        );
+        gloss.channels = BTreeSet::from([MaterialChannel::Roughness]);
+        gloss.mask_anchor = Some(AnchorMask::new(LayerId(1), MaterialChannel::BaseColor));
+        let mut set = small_set(32, paint);
+        set.layers.push(gloss);
+
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(roughness.sample_uv(Vec2::new(0.5, 0.5)).unwrap()[0], 0);
+        assert_eq!(roughness.sample_uv(Vec2::new(0.5, 0.1)).unwrap()[0], 128);
+
+        // Inverting flips where the fill lands.
+        let mut inverted = set.clone();
+        if let Some(anchor) = &mut inverted.layers[1].mask_anchor {
+            anchor.invert = true;
+        }
+        let roughness = inverted
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(roughness.sample_uv(Vec2::new(0.5, 0.5)).unwrap()[0], 128);
+        assert_eq!(roughness.sample_uv(Vec2::new(0.5, 0.1)).unwrap()[0], 0);
+
+        // The truncated stack stops at the anchor.
+        let stack = set.truncated_through(LayerId(1)).unwrap();
+        assert_eq!(stack.layers.len(), 1);
+
+        // Anchors must point at an earlier layer that is not an ancestor.
+        assert!(set.anchor_is_valid(LayerId(2), LayerId(1)));
+        assert!(!set.anchor_is_valid(LayerId(1), LayerId(2)), "later layer");
+        assert!(!set.anchor_is_valid(LayerId(2), LayerId(2)), "itself");
+        assert!(!set.anchor_is_valid(LayerId(2), LayerId(9)), "missing");
+        let mut group = MaterialLayer::new_group(LayerId(3), "Group");
+        group.children = Some(vec![set.layers[1].clone()]);
+        let mut nested = set.clone();
+        nested.layers[1] = group;
+        if let Some(children) = &mut nested.layers[1].children {
+            children[0].mask_anchor = Some(AnchorMask::new(LayerId(3), MaterialChannel::Roughness));
+        }
+        assert!(!nested.anchor_is_valid(LayerId(2), LayerId(3)), "ancestor");
+
+        // Projects reject a reordered anchor; the bake refuses it too.
+        let mut project = MaterialProject {
+            texture_sets: vec![set.clone()],
+            ..MaterialProject::empty()
+        };
+        project.validate().unwrap();
+        project.texture_sets[0].layers.swap(0, 1);
+        assert_eq!(
+            project.validate(),
+            Err(ProjectError::InvalidLayerSettings(LayerId(2)))
+        );
+        assert_eq!(
+            project.texture_sets[0]
+                .bake_channel(MaterialChannel::Roughness, BakeContext::default()),
+            Err(BakeError::InvalidLayerSettings)
+        );
+    }
+
+    #[test]
+    fn tc_0151_flattened_groups_composite_like_their_source() {
+        use std::sync::Arc;
+
+        // A blue base, then a 60% group holding a metal fill and a stroke.
+        let base = MaterialLayer::new_fill(
+            LayerId(1),
+            "Base",
+            LayerFill {
+                color: [20, 40, 200, 255],
+                roughness: 0.8,
+                ..LayerFill::default()
+            },
+        );
+        let metal = MaterialLayer::new_fill(
+            LayerId(3),
+            "Metal",
+            LayerFill {
+                color: [200, 60, 30, 255],
+                roughness: 0.2,
+                metallic: 1.0,
+                ..LayerFill::default()
+            },
+        );
+        let mut scratch = MaterialLayer::new_paint(LayerId(4), "Scratch");
+        scratch.paint_strokes.push(PaintStroke::new(
+            vec![glam::Vec2::new(0.1, 0.3), glam::Vec2::new(0.9, 0.6)],
+            2.5,
+            [250, 250, 250, 255],
+        ));
+        let mut group = MaterialLayer::new_group(LayerId(2), "Paint job");
+        group.opacity = 0.6;
+        group.children = Some(vec![metal, scratch]);
+        let mut set = small_set(24, base);
+        set.layers.push(group);
+
+        let flattened = set
+            .flatten_layer(LayerId(2), BakeContext::default())
+            .unwrap();
+        let channels: Vec<MaterialChannel> = flattened.channels.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            channels,
+            [
+                MaterialChannel::BaseColor,
+                MaterialChannel::Roughness,
+                MaterialChannel::Metallic,
+            ],
+            "only channels the children write"
+        );
+        // Coverage is the group opacity.
+        assert_eq!(flattened.channels[1].1.rgba8[3], 153);
+
+        let ids: Vec<ResourceId> = (0..channels.len() as u64)
+            .map(|i| ResourceId(100 + i))
+            .collect();
+        let images: ResourceImages = ids
+            .iter()
+            .zip(&flattened.channels)
+            .map(|(id, (_, image))| (*id, Arc::new(image.clone())))
+            .collect();
+        let mut replaced = set.clone();
+        replaced.layers[1] = flattened.to_fill_layer(LayerId(9), "Flattened", &ids);
+        let context = BakeContext {
+            resources: Some(&images),
+            ..BakeContext::default()
+        };
+        for channel in [
+            MaterialChannel::BaseColor,
+            MaterialChannel::Roughness,
+            MaterialChannel::Metallic,
+        ] {
+            let original = set.bake_channel(channel, BakeContext::default()).unwrap();
+            let rebuilt = replaced.bake_channel(channel, context).unwrap();
+            let worst = original
+                .rgba8
+                .iter()
+                .zip(&rebuilt.rgba8)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(worst <= 2, "{channel:?} differs by {worst}");
+        }
+        assert_eq!(
+            set.flatten_layer(LayerId(77), BakeContext::default()),
+            Err(BakeError::InvalidLayerSettings)
+        );
     }
 }
