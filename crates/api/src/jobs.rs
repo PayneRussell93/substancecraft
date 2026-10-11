@@ -106,15 +106,22 @@ pub fn load_project_mesh(
     Ok(Some((scaled(first.geometry, scale), smoothing)))
 }
 
+/// Preset used when neither the job nor a texture set names one.
+pub const DEFAULT_EXPORT_PRESET_NAME: &str = "Metal/Rough (ORM)";
+
 /// What to export.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExportJob {
     pub project: PathBuf,
     pub output: PathBuf,
-    /// Built-in or project preset name.
-    pub preset: String,
-    pub format: TextureFormat,
-    /// Export every UDIM tile the mesh uses (`$udim` or `.1001` names).
+    /// Built-in or project preset name for every set; `None` uses each
+    /// set's saved choice, else [`DEFAULT_EXPORT_PRESET_NAME`].
+    pub preset: Option<String>,
+    /// File format for every set; `None` uses each set's saved format, else
+    /// PNG.
+    pub format: Option<TextureFormat>,
+    /// Export every UDIM tile the mesh uses (`$udim` or `.1001` names) for
+    /// every set; sets that saved UDIM export do so regardless.
     pub udim: bool,
     /// Mesh-map bake settings; the resolution follows each texture set.
     pub mesh_maps: MeshMapSettings,
@@ -125,8 +132,8 @@ impl ExportJob {
         Self {
             project: project.into(),
             output: output.into(),
-            preset: "Metal/Rough (ORM)".to_owned(),
-            format: TextureFormat::Png,
+            preset: None,
+            format: None,
             udim: false,
             mesh_maps: MeshMapSettings::default(),
         }
@@ -173,11 +180,20 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
         }
         None => None,
     };
-    let preset = ExportPreset::built_in()
+    let presets: Vec<ExportPreset> = ExportPreset::built_in()
         .into_iter()
         .chain(project.export_presets.iter().cloned())
-        .find(|preset| preset.name == job.preset)
-        .ok_or_else(|| JobError::UnknownPreset(job.preset.clone()))?;
+        .collect();
+    let find_preset = |name: &str| {
+        presets
+            .iter()
+            .find(|preset| preset.name == name)
+            .cloned()
+            .ok_or_else(|| JobError::UnknownPreset(name.to_owned()))
+    };
+    if let Some(name) = &job.preset {
+        find_preset(name)?;
+    }
     std::fs::create_dir_all(&job.output).map_err(|error| JobError::Project(error.to_string()))?;
 
     let mut written = Vec::new();
@@ -186,6 +202,18 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
             set: set.name.clone(),
             message,
         };
+        let saved = set.export.as_ref();
+        let preset = find_preset(
+            job.preset
+                .as_deref()
+                .or(saved.map(|export| export.preset.as_str()))
+                .unwrap_or(DEFAULT_EXPORT_PRESET_NAME),
+        )?;
+        let format = job
+            .format
+            .or_else(|| saved.and_then(|export| TextureFormat::from_extension(&export.format)))
+            .unwrap_or(TextureFormat::Png);
+        let udim = job.udim || saved.is_some_and(|export| export.udim);
         let geometry = mesh.as_ref().map(|(mesh, _)| set_geometry(mesh, set));
         let settings = MeshMapSettings {
             resolution: set
@@ -205,7 +233,7 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
             }
             .map_err(|error| fail(error.to_string()))
         };
-        let tiles: Vec<Option<substancecraft_core::UdimTile>> = match (&geometry, job.udim) {
+        let tiles: Vec<Option<substancecraft_core::UdimTile>> = match (&geometry, udim) {
             (Some(geometry), true) => geometry.udim_tiles().into_iter().map(Some).collect(),
             _ => vec![None],
         };
@@ -241,7 +269,7 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
             }
             .map_err(|error| fail(error.to_string()))?;
             written.extend(
-                write_exported_textures(&job.output, &files, job.format)
+                write_exported_textures(&job.output, &files, format)
                     .map_err(|error| fail(error.to_string()))?,
             );
         }
@@ -308,6 +336,7 @@ mod tests {
                 channels: [MaterialChannel::BaseColor].into(),
                 layers: vec![layer],
                 height_strength: 1.0,
+                export: None,
             }],
             active_texture_set: Some(TextureSetId(1)),
             ..MaterialProject::empty()
@@ -346,12 +375,66 @@ mod tests {
             );
         }
 
-        job.preset = "Nope".to_owned();
+        job.preset = Some("Nope".to_owned());
         assert_eq!(
             run_export_job(&job),
             Err(JobError::UnknownPreset("Nope".to_owned()))
         );
         job.project = folder.path().join("missing.sproject");
         assert!(matches!(run_export_job(&job), Err(JobError::Project(_))));
+    }
+
+    #[test]
+    fn tc_0202_jobs_follow_each_texture_sets_saved_export_settings() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut project = project_with_edge_wear();
+        let mut trim = project.texture_sets[0].clone();
+        trim.id = TextureSetId(2);
+        trim.name = "Trim".to_owned();
+        trim.layers[0].id = LayerId(2);
+        trim.export = Some(substancecraft_core::TextureSetExport {
+            preset: "Unreal Engine".to_owned(),
+            format: "tga".to_owned(),
+            udim: false,
+        });
+        project.texture_sets.push(trim);
+        let path = folder.path().join("two.sproject");
+        save_project_file(&path, &project).unwrap();
+
+        let mut job = ExportJob::new(&path, folder.path().join("out"));
+        job.mesh_maps.ao_samples = 2;
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let written = names(run_export_job(&job).unwrap());
+        assert_eq!(
+            written,
+            [
+                "Crate_BaseColor.png",
+                "Crate_ORM.png",
+                "Crate_Normal.png",
+                "T_Trim_BC.tga",
+                "T_Trim_ORM.tga",
+                "T_Trim_N.tga",
+            ]
+        );
+
+        // A job-wide preset and format override the saved choices.
+        job.preset = Some("Separate channels".to_owned());
+        job.format = Some(TextureFormat::Png);
+        job.output = folder.path().join("override");
+        let written = names(run_export_job(&job).unwrap());
+        assert!(written.contains(&"Trim_Roughness.png".to_owned()));
+        assert!(!written.iter().any(|name| name.ends_with(".tga")));
+
+        // Saved settings must name a known preset and format.
+        let mut broken = project.clone();
+        if let Some(export) = &mut broken.texture_sets[1].export {
+            export.format = "exr".to_owned();
+        }
+        assert!(broken.validate().is_err());
     }
 }

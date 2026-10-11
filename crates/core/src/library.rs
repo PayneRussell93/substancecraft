@@ -670,6 +670,7 @@ mod tests {
             channels: BTreeSet::from([MaterialChannel::BaseColor]),
             layers,
             height_strength: crate::DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         }
     }
 

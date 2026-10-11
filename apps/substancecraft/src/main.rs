@@ -1193,6 +1193,7 @@ impl SubstanceCraftApp {
             channels: BAKEABLE_CHANNELS.into_iter().collect::<BTreeSet<_>>(),
             layers: Vec::new(),
             height_strength: DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         });
         self.project.active_texture_set = Some(id);
         self.selected_texture_set = Some(id);
@@ -2772,16 +2773,17 @@ impl SubstanceCraftApp {
     /// first.
     fn texture_save_path(&self, stem: &str) -> Option<std::path::PathBuf> {
         let mut dialog = rfd::FileDialog::new();
-        let formats = std::iter::once(self.export_format).chain(
+        let chosen = self.selected_format();
+        let formats = std::iter::once(chosen).chain(
             TextureFormat::ALL
                 .into_iter()
-                .filter(|format| *format != self.export_format),
+                .filter(|format| *format != chosen),
         );
         for format in formats {
             dialog = dialog.add_filter(format!("{} texture", format.name()), &[format.extension()]);
         }
         dialog
-            .set_file_name(format!("{stem}.{}", self.export_format.extension()).replace(' ', "_"))
+            .set_file_name(format!("{stem}.{}", chosen.extension()).replace(' ', "_"))
             .save_file()
     }
 
@@ -2823,7 +2825,7 @@ impl SubstanceCraftApp {
         let presets = self.export_presets();
         presets
             .iter()
-            .find(|preset| preset.name == self.export_preset)
+            .find(|preset| preset.name == self.selected_preset_name())
             .or_else(|| {
                 presets
                     .iter()
@@ -2874,7 +2876,7 @@ impl SubstanceCraftApp {
         preset: ExportPreset,
         folder: std::path::PathBuf,
     ) {
-        let existing = existing_export_files(&folder, &texture_set, &preset, self.export_format);
+        let existing = existing_export_files(&folder, &texture_set, &preset, self.format_for(&texture_set));
         if existing.is_empty() {
             self.finish_export(&texture_set, &preset, &folder);
         } else {
@@ -2918,7 +2920,7 @@ impl SubstanceCraftApp {
         let files = self
             .bake_inputs(texture_set.id)
             .bake_export(texture_set, preset)?;
-        write_exported_textures(folder, &files, self.export_format)
+        write_exported_textures(folder, &files, self.format_for(texture_set))
             .map_err(|error| error.to_string())
     }
 
@@ -2973,7 +2975,7 @@ impl SubstanceCraftApp {
                     .iter()
                     .any(|texel| texel[3] < 255)
             });
-            let written = write_exported_textures(folder, &files, self.export_format)
+            let written = write_exported_textures(folder, &files, self.format_for(texture_set))
                 .map_err(|error| error.to_string())?;
             let name_of = |suffix: &str| {
                 written
@@ -3042,7 +3044,7 @@ impl SubstanceCraftApp {
                 )
                 .map_err(|error| error.to_string())?;
             written.extend(
-                write_exported_textures(folder, &files, self.export_format)
+                write_exported_textures(folder, &files, self.format_for(texture_set))
                     .map_err(|error| error.to_string())?,
             );
         }
@@ -3150,7 +3152,7 @@ impl SubstanceCraftApp {
         }
         project.validate().map_err(|error| error.to_string())?;
         self.project = project;
-        self.export_preset = draft.preset.name;
+        self.set_preset_choice(draft.preset.name);
         self.preset_draft = None;
         Ok(())
     }

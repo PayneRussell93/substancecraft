@@ -35,7 +35,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
             let mut project = None;
             let mut output = None;
             let mut preset = None;
-            let mut format = TextureFormat::Png;
+            let mut format = None;
             let mut udim = false;
             let mut ao_samples = None;
             while let Some(arg) = args.next() {
@@ -49,10 +49,10 @@ fn parse(args: &[String]) -> Result<Command, String> {
                     "--preset" => preset = Some(value("--preset")?),
                     "--format" => {
                         let name = value("--format")?;
-                        format = TextureFormat::ALL
-                            .into_iter()
-                            .find(|format| format.extension() == name.to_ascii_lowercase())
-                            .ok_or_else(|| format!("unknown format `{name}`"))?;
+                        format = Some(
+                            TextureFormat::from_extension(&name)
+                                .ok_or_else(|| format!("unknown format `{name}`"))?,
+                        );
                     }
                     "--udim" => udim = true,
                     "--ao-samples" => {
@@ -72,9 +72,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
             let project = project.ok_or("export needs a project file")?;
             let output = output.ok_or("export needs --out <dir>")?;
             let mut job = ExportJob::new(project, output);
-            if let Some(preset) = preset {
-                job.preset = preset;
-            }
+            job.preset = preset;
             job.format = format;
             job.udim = udim;
             if let Some(samples) = ao_samples {
@@ -138,8 +136,8 @@ mod tests {
         .unwrap();
         assert_eq!(job.project, std::path::PathBuf::from("scene.sproject"));
         assert_eq!(job.output, std::path::PathBuf::from("build"));
-        assert_eq!(job.preset, "Unreal_Engine");
-        assert_eq!(job.format, TextureFormat::Tga);
+        assert_eq!(job.preset.as_deref(), Some("Unreal_Engine"));
+        assert_eq!(job.format, Some(TextureFormat::Tga));
         assert!(job.udim);
         assert_eq!(job.mesh_maps.ao_samples, 8);
 

@@ -112,6 +112,8 @@ pub const FLATTEN_CHANNELS: [MaterialChannel; 7] = [
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlattenedLayer {
     pub channels: Vec<(MaterialChannel, TextureImage)>,
+    /// The source layer's blend mode, which the replacement keeps.
+    pub blend_mode: BlendMode,
 }
 
 impl FlattenedLayer {
@@ -133,6 +135,7 @@ impl FlattenedLayer {
         }
         let mut layer = MaterialLayer::new_fill(id, name, fill);
         layer.channels = channels;
+        layer.blend_mode = self.blend_mode;
         layer
     }
 }
@@ -238,6 +241,92 @@ fn byte_unit(value: u8) -> f32 {
 
 pub(crate) fn rgb_unit(rgb: [u8; 3]) -> Vec3 {
     Vec3::new(byte_unit(rgb[0]), byte_unit(rgb[1]), byte_unit(rgb[2]))
+}
+
+/// How a layer combines with the stack beneath it. Colour and scalar
+/// channels blend per component with the standard separable formulas;
+/// Normal-channel (vector) data always uses Normal so normals stay unit
+/// length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    SoftLight,
+    Darken,
+    Lighten,
+    Difference,
+    /// Linear dodge: sums values, clamped to 1.
+    Add,
+    Subtract,
+}
+
+impl BlendMode {
+    pub const ALL: [Self; 10] = [
+        Self::Normal,
+        Self::Multiply,
+        Self::Screen,
+        Self::Overlay,
+        Self::SoftLight,
+        Self::Darken,
+        Self::Lighten,
+        Self::Difference,
+        Self::Add,
+        Self::Subtract,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::SoftLight => "Soft light",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::Difference => "Difference",
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+        }
+    }
+
+    /// Blends one component: `backdrop` is the stack beneath, `source` the
+    /// layer. Both in `0..=1`.
+    pub fn apply(self, backdrop: f32, source: f32) -> f32 {
+        let (b, s) = (backdrop, source);
+        let result = match self {
+            Self::Normal => s,
+            Self::Multiply => b * s,
+            Self::Screen => b + s - b * s,
+            Self::Overlay => {
+                if b <= 0.5 {
+                    2.0 * b * s
+                } else {
+                    1.0 - 2.0 * (1.0 - b) * (1.0 - s)
+                }
+            }
+            Self::SoftLight => {
+                if s <= 0.5 {
+                    b - (1.0 - 2.0 * s) * b * (1.0 - b)
+                } else {
+                    let d = if b <= 0.25 {
+                        ((16.0 * b - 12.0) * b + 4.0) * b
+                    } else {
+                        b.sqrt()
+                    };
+                    b + (2.0 * s - 1.0) * (d - b)
+                }
+            }
+            Self::Darken => b.min(s),
+            Self::Lighten => b.max(s),
+            Self::Difference => (b - s).abs(),
+            Self::Add => b + s,
+            Self::Subtract => b - s,
+        };
+        result.clamp(0.0, 1.0)
+    }
 }
 
 /// Straight-alpha "over": `value` at `alpha` on top of `destination`.
@@ -398,7 +487,18 @@ impl Compositor<'_> {
                     continue;
                 }
                 let alpha = source.w * layer.opacity * mask.map_or(1.0, |values| values[index]);
-                over(destination, source.truncate(), alpha, self.data);
+                let mut value = source.truncate();
+                if layer.blend_mode != BlendMode::Normal && self.data != PlaneData::Vector {
+                    // W3C compositing: blend where the backdrop has coverage.
+                    let backdrop = destination.truncate();
+                    let blended = Vec3::new(
+                        layer.blend_mode.apply(backdrop.x, value.x),
+                        layer.blend_mode.apply(backdrop.y, value.y),
+                        layer.blend_mode.apply(backdrop.z, value.z),
+                    );
+                    value = value.lerp(blended, destination.w.clamp(0.0, 1.0));
+                }
+                over(destination, value, alpha, self.data);
             }
         }
         Ok(())
@@ -1033,6 +1133,7 @@ impl TextureSet {
         }
         Ok(FlattenedLayer {
             channels: flattened,
+            blend_mode: layer.blend_mode,
         })
     }
 

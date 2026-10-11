@@ -16,7 +16,10 @@ pub use interchange::{
     GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, openpbr_preset,
     read_openpbr_materialx, write_gltf, write_openpbr_materialx,
 };
-pub use jobs::{ExportJob, JobError, load_mesh_file, load_project_mesh, run_export_job};
+pub use jobs::{
+    DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, load_mesh_file, load_project_mesh,
+    run_export_job,
+};
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
     encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
@@ -599,6 +602,7 @@ mod tests {
                         filters: vec![LayerFilter::Blur { radius: 3.0 }],
                         mask_filters: vec![LayerFilter::Invert],
                         mask_anchor: None,
+                        blend_mode: substancecraft_core::BlendMode::Multiply,
                         children: None,
                     },
                     {
@@ -608,6 +612,11 @@ mod tests {
                     },
                 ],
                 height_strength: 2.5,
+                export: Some(substancecraft_core::TextureSetExport {
+                    preset: "Unreal Engine".to_owned(),
+                    format: "tga".to_owned(),
+                    udim: true,
+                }),
             }],
             saved_poses: vec![NamedPose {
                 id: PoseId(4),

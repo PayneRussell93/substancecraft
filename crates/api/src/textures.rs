@@ -112,6 +112,13 @@ impl TextureFormat {
         }
     }
 
+    /// The format with this extension (case-insensitive), if supported.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.extension().eq_ignore_ascii_case(extension))
+    }
+
     /// Format implied by a file extension (case-insensitive).
     pub fn from_path(path: &Path) -> Result<Self, TextureIoError> {
         let extension = path

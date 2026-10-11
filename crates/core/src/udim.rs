@@ -184,6 +184,7 @@ mod tests {
             channels: [MaterialChannel::BaseColor].into(),
             layers: vec![layer],
             height_strength: crate::DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         };
         let preset = ExportPreset {
             name: "Tiles".to_owned(),

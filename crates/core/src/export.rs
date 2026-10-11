@@ -867,6 +867,7 @@ mod tests {
             channels: BTreeSet::from([MaterialChannel::BaseColor]),
             layers: vec![layer],
             height_strength: DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         }
     }
 

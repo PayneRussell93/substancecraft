@@ -1708,9 +1708,9 @@ impl SubstanceCraftApp {
                 widgets::property_row(ui, "Format", |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for format in TextureFormat::ALL {
-                        if widgets::chip(ui, format.name(), self.export_format == format).clicked()
+                        if widgets::chip(ui, format.name(), self.selected_format() == format).clicked()
                         {
-                            self.export_format = format;
+                            self.set_format_choice(format);
                         }
                     }
                 });
@@ -1723,7 +1723,7 @@ impl SubstanceCraftApp {
                             .on_hover_text(format!(
                                 "Export {} as {}",
                                 channel_label(channel),
-                                self.export_format.name()
+                                self.selected_format().name()
                             ))
                             .clicked()
                         {
@@ -1787,6 +1787,18 @@ impl SubstanceCraftApp {
             );
         });
         slider_row(ui, "Opacity", &mut layer.opacity, 0.0..=1.0, false, 2);
+        widgets::property_row(ui, "Blend", |ui| {
+            egui::ComboBox::from_id_salt(("blend_mode", layer.id.0))
+                .width(ui.available_width() - 8.0)
+                .selected_text(layer.blend_mode.name())
+                .show_ui(ui, |ui| {
+                    for mode in substancecraft_core::BlendMode::ALL {
+                        ui.selectable_value(&mut layer.blend_mode, mode, mode.name());
+                    }
+                })
+                .response
+                .on_hover_text("How this layer combines with the layers beneath; normals always blend normally");
+        });
         widgets::property_row(ui, "Channels", |ui| {
             // Wrap so the chips never widen the inspector column.
             ui.horizontal_wrapped(|ui| {
@@ -2666,7 +2678,7 @@ impl SubstanceCraftApp {
                             .selectable_label(preset.name == selected.name, label)
                             .clicked()
                         {
-                            self.export_preset = preset.name.clone();
+                            self.set_preset_choice(preset.name.clone());
                         }
                     }
                 });
@@ -2691,7 +2703,7 @@ impl SubstanceCraftApp {
                 RichText::new(format!(
                     "{}.{}{optional}",
                     output.resolved_file_name(&set_name),
-                    self.export_format.extension()
+                    self.selected_format().extension()
                 ))
                 .size(12.0)
                 .color(theme::TEXT),
@@ -2755,7 +2767,7 @@ impl SubstanceCraftApp {
             .on_hover_text(format!(
                 "Write the {} files into a folder as {}",
                 selected.name,
-                self.export_format.name()
+                self.selected_format().name()
             ))
             .clicked()
         {

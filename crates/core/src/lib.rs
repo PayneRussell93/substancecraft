@@ -26,8 +26,8 @@ pub mod udim;
 pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING};
 pub use color::ColorSpace;
 pub use compositing::{
-    BakeContext, BakeError, BakedTexture, FLATTEN_CHANNELS, FlattenedLayer, MaterialSample,
-    MaterialTextures,
+    BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
+    MaterialSample, MaterialTextures,
 };
 pub use export::{
     ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource, ExportedTexture,
@@ -781,6 +781,9 @@ pub struct MaterialLayer {
     /// earlier anchor layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask_anchor: Option<AnchorMask>,
+    /// How the layer combines with the stack beneath.
+    #[serde(default, skip_serializing_if = "is_normal_blend")]
+    pub blend_mode: BlendMode,
     /// `Some` makes this a group: its children composite together first and
     /// the result blends through the group's own opacity, mask, and filters.
     /// Groups ignore fill and paint strokes.
@@ -812,6 +815,7 @@ impl MaterialLayer {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         }
     }
@@ -868,6 +872,7 @@ impl MaterialLayer {
             filters: self.filters.clone(),
             mask_filters: self.mask_filters.clone(),
             mask_anchor: self.mask_anchor,
+            blend_mode: self.blend_mode,
         }
     }
 
@@ -884,6 +889,7 @@ impl MaterialLayer {
         self.filters = settings.filters;
         self.mask_filters = settings.mask_filters;
         self.mask_anchor = settings.mask_anchor;
+        self.blend_mode = settings.blend_mode;
     }
 
     fn has_valid_settings(&self) -> bool {
@@ -1059,6 +1065,10 @@ pub struct PolygonMask {
     pub inverted: bool,
 }
 
+fn is_normal_blend(mode: &BlendMode) -> bool {
+    *mode == BlendMode::Normal
+}
+
 /// An anchor point reference: masks a layer by a channel of the stack as
 /// composited up to and including an earlier layer. The layer is referenced
 /// by id, so the link survives reordering and renaming.
@@ -1124,6 +1134,7 @@ pub struct LayerSettings {
     pub filters: Vec<LayerFilter>,
     pub mask_filters: Vec<LayerFilter>,
     pub mask_anchor: Option<AnchorMask>,
+    pub blend_mode: BlendMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1727,6 +1738,30 @@ pub struct TextureSet {
     /// How strongly the Height channel bends the Normal channel.
     #[serde(default = "default_height_strength")]
     pub height_strength: f32,
+    /// Export choices remembered for this set; `None` uses the app-wide
+    /// choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<TextureSetExport>,
+}
+
+/// Image file formats texture exports can be written in, by extension.
+pub const EXPORT_FILE_FORMATS: [&str; 2] = ["png", "tga"];
+
+/// How one texture set exports: its preset, file format, and whether it
+/// writes one file set per UDIM tile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureSetExport {
+    /// Name of a built-in or project export preset.
+    pub preset: String,
+    /// File extension, one of [`EXPORT_FILE_FORMATS`].
+    #[serde(default = "default_export_format")]
+    pub format: String,
+    #[serde(default)]
+    pub udim: bool,
+}
+
+fn default_export_format() -> String {
+    "png".to_owned()
 }
 
 fn default_height_strength() -> f32 {
@@ -1873,6 +1908,15 @@ impl MaterialProject {
             texture_set.resolution.validate()?;
             if !valid_height_strength(texture_set.height_strength) {
                 return Err(ProjectError::InvalidTextureSetSettings(texture_set.id));
+            }
+            if let Some(export) = &texture_set.export {
+                let preset_known = ExportPreset::built_in()
+                    .iter()
+                    .chain(&self.export_presets)
+                    .any(|preset| preset.name == export.preset);
+                if !preset_known || !EXPORT_FILE_FORMATS.contains(&export.format.as_str()) {
+                    return Err(ProjectError::InvalidTextureSetSettings(texture_set.id));
+                }
             }
             if !texture_set_ids.insert(texture_set.id) {
                 return Err(ProjectError::DuplicateTextureSetId(texture_set.id));
@@ -2045,6 +2089,7 @@ mod tests {
             channels: BTreeSet::from([MaterialChannel::BaseColor]),
             layers: Vec::new(),
             height_strength: DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         }
     }
 
@@ -2093,6 +2138,7 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         });
 
@@ -2134,6 +2180,7 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         });
 
@@ -2184,6 +2231,7 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         });
 
@@ -2239,6 +2287,7 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         });
         let mut project = MaterialProject {
@@ -2353,6 +2402,7 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            blend_mode: BlendMode::Normal,
             children: None,
         });
         let project = MaterialProject {
@@ -2389,6 +2439,7 @@ mod tests {
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
+                blend_mode: BlendMode::Normal,
                 children: None,
             },
             MaterialLayer {
@@ -2408,6 +2459,7 @@ mod tests {
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
+                blend_mode: BlendMode::Normal,
                 children: None,
             },
         ];
@@ -3476,5 +3528,100 @@ mod tests {
             set.flatten_layer(LayerId(77), BakeContext::default()),
             Err(BakeError::InvalidLayerSettings)
         );
+    }
+
+    #[test]
+    fn tc_0157_blend_modes_combine_layers_with_the_stack_beneath() {
+        use std::sync::Arc;
+
+        // Separable formulas.
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(close(BlendMode::Multiply.apply(0.5, 0.5), 0.25));
+        assert!(close(BlendMode::Screen.apply(0.5, 0.5), 0.75));
+        assert!(close(BlendMode::Overlay.apply(0.25, 0.5), 0.25));
+        assert!(close(BlendMode::Overlay.apply(0.75, 0.5), 0.75));
+        assert!(close(BlendMode::SoftLight.apply(0.3, 0.5), 0.3));
+        assert!(close(BlendMode::Difference.apply(0.2, 0.7), 0.5));
+        assert!(close(BlendMode::Add.apply(0.7, 0.6), 1.0));
+        assert!(close(BlendMode::Subtract.apply(0.2, 0.6), 0.0));
+        assert!(close(BlendMode::Darken.apply(0.2, 0.6), 0.2));
+        assert!(close(BlendMode::Lighten.apply(0.2, 0.6), 0.6));
+        for mode in BlendMode::ALL {
+            assert!(close(mode.apply(0.0, 0.0), 0.0) || mode == BlendMode::Screen);
+        }
+
+        // A red Multiply fill over mid grey keeps only the red; roughness
+        // 0.5 multiplied by 0.5 gives 0.25.
+        let base = MaterialLayer::new_fill(
+            LayerId(1),
+            "Grey",
+            LayerFill {
+                color: [128, 128, 128, 255],
+                roughness: 0.5,
+                ..LayerFill::default()
+            },
+        );
+        let mut tint = MaterialLayer::new_fill(
+            LayerId(2),
+            "Tint",
+            LayerFill {
+                color: [255, 0, 0, 255],
+                roughness: 0.5,
+                ..LayerFill::default()
+            },
+        );
+        tint.blend_mode = BlendMode::Multiply;
+        let mut set = small_set(8, base);
+        set.layers.push(tint.clone());
+        let context = BakeContext::default();
+        let color = set.bake_base_color().unwrap();
+        assert_eq!(&color.pixel(2, 2).unwrap()[..3], &[128, 0, 0]);
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, context)
+            .unwrap();
+        assert_eq!(roughness.pixel(2, 2).unwrap()[0], 64);
+
+        // Screen lightens instead.
+        set.layers[1].blend_mode = BlendMode::Screen;
+        let color = set.bake_base_color().unwrap();
+        assert_eq!(&color.pixel(2, 2).unwrap()[..3], &[255, 128, 128]);
+
+        // Over nothing, a blended layer shows as itself.
+        let alone = small_set(8, tint);
+        let color = alone.bake_base_color().unwrap();
+        assert_eq!(color.pixel(2, 2).unwrap(), [255, 0, 0, 255]);
+
+        // Flattening keeps the mode, so the rebuilt stack matches exactly.
+        set.layers[1].blend_mode = BlendMode::Overlay;
+        let flattened = set.flatten_layer(LayerId(2), context).unwrap();
+        assert_eq!(flattened.blend_mode, BlendMode::Overlay);
+        let ids: Vec<ResourceId> = (0..flattened.channels.len() as u64)
+            .map(|index| ResourceId(50 + index))
+            .collect();
+        let images: ResourceImages = ids
+            .iter()
+            .zip(&flattened.channels)
+            .map(|(id, (_, image))| (*id, Arc::new(image.clone())))
+            .collect();
+        let mut rebuilt = set.clone();
+        rebuilt.layers[1] = flattened.to_fill_layer(LayerId(9), "Flat", &ids);
+        let with_images = BakeContext {
+            resources: Some(&images),
+            ..context
+        };
+        assert_eq!(
+            rebuilt
+                .bake_channel(MaterialChannel::BaseColor, with_images)
+                .unwrap(),
+            set.bake_channel(MaterialChannel::BaseColor, context)
+                .unwrap()
+        );
+
+        // The mode is a layer setting, so history covers it.
+        let mut settings = set.layers[1].settings();
+        assert_eq!(settings.blend_mode, BlendMode::Overlay);
+        settings.blend_mode = BlendMode::Normal;
+        set.layers[1].apply_settings(settings);
+        assert_eq!(set.layers[1].blend_mode, BlendMode::Normal);
     }
 }

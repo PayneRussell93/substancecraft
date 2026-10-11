@@ -687,6 +687,7 @@ mod tests {
             channels: [MaterialChannel::Roughness].into(),
             layers: vec![layer],
             height_strength: crate::DEFAULT_HEIGHT_STRENGTH,
+            export: None,
         };
         assert!(set.requires_mesh_maps());
         let roughness = set
