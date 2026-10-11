@@ -99,6 +99,84 @@ pub enum MeshError {
     InvalidTriangle(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportCamera {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub zoom: f32,
+    pub pan: glam::Vec2,
+}
+
+impl Default for ViewportCamera {
+    fn default() -> Self {
+        Self {
+            yaw: 0.72,
+            pitch: 0.38,
+            zoom: 1.0,
+            pan: glam::Vec2::ZERO,
+        }
+    }
+}
+
+impl ViewportCamera {
+    pub fn orbit(&mut self, delta: glam::Vec2) {
+        if !delta.is_finite() {
+            return;
+        }
+        self.yaw = (self.yaw - delta.x * 0.01).rem_euclid(std::f32::consts::TAU);
+        self.pitch = (self.pitch + delta.y * 0.01).clamp(-1.55, 1.55);
+    }
+
+    pub fn pan_by(&mut self, delta: glam::Vec2) {
+        if delta.is_finite() {
+            self.pan += delta;
+        }
+    }
+
+    pub fn zoom_by(&mut self, scroll_delta: f32) {
+        if scroll_delta.is_finite() {
+            self.zoom = (self.zoom * (scroll_delta * 0.002).exp()).clamp(0.1, 20.0);
+        }
+    }
+
+    pub fn rotation(self) -> Quat {
+        Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportLighting {
+    pub rotation: f32,
+    pub ambient_fill: f32,
+}
+
+impl Default for ViewportLighting {
+    fn default() -> Self {
+        Self {
+            rotation: 0.65,
+            ambient_fill: 0.36,
+        }
+    }
+}
+
+impl ViewportLighting {
+    pub fn face_intensity(self, normal: Vec3) -> f32 {
+        let rotation = if self.rotation.is_finite() {
+            self.rotation
+        } else {
+            0.0
+        };
+        let ambient = if self.ambient_fill.is_finite() {
+            self.ambient_fill.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let light_direction = Vec3::new(rotation.cos() * 0.8, 0.65, rotation.sin() * 0.8)
+            .normalize_or_zero();
+        ambient + (1.0 - ambient) * normal.normalize_or_zero().dot(light_direction).max(0.0)
+    }
+}
+
 fn push_quad(mesh: &mut MeshGeometry, positions: [Vec3; 4]) {
     let base = mesh.vertices.len() as u32;
     let uvs = [
@@ -781,5 +859,41 @@ mod tests {
                     .all(|vertex| { vertex.position.is_finite() && vertex.uv.is_finite() })
             );
         }
+    }
+
+    #[test]
+    fn tc_0019_viewport_camera_orbits_pans_and_clamps_zoom() {
+        let mut camera = ViewportCamera::default();
+        let original_rotation = camera.rotation();
+        camera.orbit(glam::Vec2::new(30.0, 15.0));
+        camera.pan_by(glam::Vec2::new(8.0, -4.0));
+        camera.zoom_by(30.0);
+
+        assert_ne!(camera.rotation(), original_rotation);
+        assert_eq!(camera.pan, glam::Vec2::new(8.0, -4.0));
+        assert!(camera.zoom > 1.0);
+        camera.zoom_by(f32::INFINITY);
+        assert!(camera.zoom <= 20.0);
+        camera.orbit(glam::Vec2::splat(f32::NAN));
+        assert!(camera.yaw.is_finite() && camera.pitch.is_finite());
+    }
+
+    #[test]
+    fn tc_0020_viewport_environment_rotation_changes_lambert_shading() {
+        let normal = Vec3::X;
+        let first = ViewportLighting {
+            rotation: 0.0,
+            ambient_fill: 0.2,
+        }
+        .face_intensity(normal);
+        let rotated = ViewportLighting {
+            rotation: std::f32::consts::PI,
+            ambient_fill: 0.2,
+        }
+        .face_intensity(normal);
+
+        assert!(first > rotated);
+        assert!(rotated >= 0.0);
+        assert!(first <= 1.0);
     }
 }
