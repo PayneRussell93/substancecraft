@@ -441,6 +441,7 @@ pub enum FilamentError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};

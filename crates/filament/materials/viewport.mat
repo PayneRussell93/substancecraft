@@ -24,7 +24,7 @@ material {
 fragment {
     void material(inout MaterialInputs material) {
         prepareMaterial(material);
-        // Base Color rows are uploaded top to bottom, matching MaterialTexture::sample_uv.
+        // Base Color rows are uploaded top to bottom, matching BakedTexture::sample_uv.
         material.baseColor = texture(materialParams_baseColorMap, getUV0());
         material.roughness = materialParams.roughness;
         material.metallic = materialParams.metallic;
