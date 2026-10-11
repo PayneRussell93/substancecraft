@@ -62,13 +62,41 @@ This is the product capability map derived from the supplied Painter feature inv
 | 49 | VFX and production-pipeline support | Planned | UDIM, OCIO, automation, deterministic headless jobs, and release compatibility targets. |
 | 50 | Substance ecosystem integration | Planned | Interchange based on documented open standards and licensed resources; no proprietary project-format dependency. |
 
+## Workflow and quality-of-life backlog
+
+These features add little new capability, but they shorten everyday iteration. They come from a technical-art review of the current build. **High** items save hours per week on large projects and are scheduled ahead of the remaining production work (delivery stage 5); **Medium** and **Low** items are taken opportunistically. Each builds on the capability areas listed and follows the same status rules.
+
+| ID | Feature | Builds on | Priority | Status | Acceptance target |
+| --- | --- | --- | --- | --- | --- |
+| QoL-01 | Resource auto-reload | 36, 38 | High | Planned | Watch referenced bitmap files; when one changes on disk, reload it and rebake only the texture sets that use it, with an optional confirm-before-reload mode. A missing or undecodable file keeps the last good pixels and reports the error. |
+| QoL-02 | Surface-to-layer inspector | 12, 43 | High | Planned | Clicking the model lists, top to bottom, the visible layers and groups that contribute at that texel for the active channel, with each one's effective mask value and the generator or mesh map driving it; choosing an entry selects that layer. |
+| QoL-03 | Solo and isolation | 12, 43, 46 | High | Planned | One action solos a channel, layer, group, mask, generator, or texture set in the viewport without changing project data; solo state is never saved or exported. |
+| QoL-04 | Layer search and filter | 12 | Medium | Planned | A search box above the layer stack filters by name, layer type, enabled channel, and fill resource, keeping the parent groups of matches visible. |
+| QoL-05 | Material instances | 20, 21 | High | Planned | A shared master material drives linked fills across layers and texture sets; editing the master updates every instance, and per-instance overrides are explicit and undoable. |
+| QoL-06 | Lazy brush stroke stabilization | 06, 08 | Medium | Planned | An adjustable lag distance smooths raw input before stamping, deterministically for a recorded input sequence. |
+| QoL-07 | Hold-to-override hotkeys | 05, 44 | Medium | Planned | Holding a key temporarily switches tool (eraser, picker, pan) and releasing it restores the previous tool and settings; bindings are configurable. Only undo/redo shortcuts exist today. |
+| QoL-08 | Brush favorites shelf | 06, 37 | Low | Planned | Brush tips and presets, including bitmap alphas, can be pinned to a quick-access shelf saved with user preferences. |
+| QoL-09 | Recent colors and materials | 45 | Low | Planned | A history bar of recent brush colours and multi-channel brush materials; one click restores every channel value. |
+| QoL-10 | Mask view mode | 14, 46 | Medium | Planned | A toggle shows the selected layer's final mask (generator, bitmap, strokes, filters, and clipping) as grayscale in the 3D and UV viewports. |
+| QoL-11 | Mask debug overlay | 14, 46 | Medium | Planned | An overlay tints the shaded model by the selected mask (active, blocked, partial) with adjustable opacity. |
+| QoL-12 | Quick mask invert | 14 | Low | Partial | Polygon masks, bitmap masks, and the Invert filter each invert individually; one control that inverts a layer's final mask remains open. |
+| QoL-13 | Lighting check presets | 31, 32 | Medium | Planned | One-click studio, overcast, sunset, warehouse, bright outdoor, and night environments from redistributable HDRIs. The viewport currently offers only light rotation and ambient fill. |
+| QoL-14 | Pinned inspection cameras | 30, 32 | Low | Planned | Named cameras are saved in the project, recalled in the viewport, and used by preview renders. |
+| QoL-15 | UV seam, hard edge, and tangent split display | 30, 46 | Medium | Planned | An overlay draws UV seams, hard (split-normal) edges, and tangent-frame splits on the 3D model to diagnose normal-map issues. |
+| QoL-16 | Export preflight | 39, 40 | High | Planned | Before writing, the chosen preset is checked against the texture set: inputs left at defaults (no baked AO, flat normal), per-profile resolution limits, file-name collisions, and overwrites. Warnings can be acknowledged; errors block the export. |
+| QoL-17 | One-click engine export | 40, 41 | Medium | Partial | Unreal Engine and Unity (URP Lit) presets exist in the export picker; direct per-engine export actions, and Godot, CryEngine, and glTF material profiles, remain open. |
+| QoL-18 | Stale bake detection | 28, 46 | High | Partial | Mesh maps are keyed to the mesh revision and rebake automatically, and the Bake drawer shows Up to date / Not baked / Baking; per-map staleness with its cause (mesh, scale, smoothing, high-poly source, or bake settings) remains open. |
+| QoL-19 | Smart import assignment | 38 | High | Planned | When several bitmaps are imported together, a channel is suggested for each from name tokens (basecolor/albedo, normal, rough, metal, ao, height, emissive, opacity) and image traits; the user confirms before fills are created. |
+| QoL-20 | Material evolution slider | 20 | Low | Planned | One exposed parameter on a smart material (for example clean to worn) drives several generator and fill parameters through user-defined ranges, as a single undoable edit. |
+
 ## Delivery order
 
 1. **Foundation and automation:** project schema, mesh/pose data, command API, MCP tools, tests, and clean-room CI.
 2. **Mesh-to-preview loop:** robust FBX and glTF import, UV/material sets, actual 3D viewport, camera controls, and channel inspection.
 3. **First texturing loop:** UV paint, texture tiles, layer data, deterministic composition, undo/redo, and PNG export.
 4. **Material authoring:** multi-channel brushes, masks, fill layers, filters, and export profiles.
-5. **Production workflows:** skeletal animation pose selection, projection, baking, generators, UDIMs, and higher-resolution performance.
-6. **Extensibility:** versioned public API, MCP resources/prompts/tools, scripting, plugins, and pipeline integrations.
+5. **Workflow acceleration:** the High-priority backlog items: resource auto-reload, surface-to-layer inspector, solo and isolation, material instances, export preflight, stale bake detection, and smart import assignment.
+6. **Production workflows:** skeletal animation pose selection, projection, baking, generators, UDIMs, and higher-resolution performance.
+7. **Extensibility:** versioned public API, MCP resources/prompts/tools, scripting, plugins, and pipeline integrations.
 
 Feature completion is judged by observable behavior and acceptance tests, not by menu presence. Asset libraries, shaders, and reference data must be original or redistributable under an explicit license.
