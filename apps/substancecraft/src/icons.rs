@@ -29,7 +29,6 @@ pub enum Icon {
     ArrowDown,
     Trash,
     Bake,
-    Select,
 }
 
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -219,9 +218,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             for x in [8.0, 12.0, 16.0] {
                 line(&[(x, 6.5), (x - 1.0, 4.5), (x, 2.5)]);
             }
-        }
-        Icon::Select => {
-            closed(&[(6.0, 3.5), (6.0, 18.0), (9.8, 14.4), (12.4, 20.0), (14.6, 19.0), (12.0, 13.5), (17.0, 13.0)]);
         }
     }
 }

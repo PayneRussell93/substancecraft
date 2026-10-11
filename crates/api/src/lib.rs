@@ -12,8 +12,9 @@ use std::{
     path::Path,
 };
 use substancecraft_core::{
-    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MeshError, MeshGeometry,
-    MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing, PrimitivePreset, TextureSet,
+    BakeContext, BakeError, BakedTexture, MaterialChannel, MaterialProject, MeshError,
+    MeshGeometry, MeshMapError, MeshMapSettings, MeshMaps, MeshSmoothing, PrimitivePreset,
+    TextureSet,
 };
 use thiserror::Error;
 
@@ -204,7 +205,9 @@ pub fn bake_mesh_maps(
         smoothing_angle_degrees: smoothing.angle_degrees,
         ..*settings
     };
-    Ok(substancecraft_core::bake_mesh_maps(&smoothed, &settings, None)?)
+    Ok(substancecraft_core::bake_mesh_maps(
+        &smoothed, &settings, None,
+    )?)
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -275,9 +278,9 @@ mod tests {
 
         use glam::{Quat, Vec2, Vec3};
         use substancecraft_core::{
-            BoneId, BoneTransform, EdgeWear, IdStroke, LayerFill, LayerId, MaskGenerator, MaskStroke,
-            MaterialLayer, NamedPose, PaintStroke, PolygonMask, PoseId, TextureResolution, TextureSet,
-            TextureSetId,
+            BoneId, BoneTransform, EdgeWear, IdStroke, LayerFill, LayerId, MaskGenerator,
+            MaskStroke, MaterialLayer, NamedPose, PaintStroke, PolygonMask, PoseId,
+            TextureResolution, TextureSet, TextureSetId,
         };
 
         let project = MaterialProject {

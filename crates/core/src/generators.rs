@@ -428,7 +428,9 @@ mod tests {
             ..Dirt::DEFAULT
         });
         assert!(dirt.evaluate(&sample(0.0, 0.0, Vec3::Y)) > 0.95);
-        assert!(dirt.evaluate(&sample(0.3, 0.6, Vec3::Y)) < dirt.evaluate(&sample(0.0, 0.0, Vec3::Y)));
+        assert!(
+            dirt.evaluate(&sample(0.3, 0.6, Vec3::Y)) < dirt.evaluate(&sample(0.0, 0.0, Vec3::Y))
+        );
         assert_eq!(dirt.evaluate(&sample(0.5, 1.0, Vec3::Y)), 0.0);
 
         let up = MaskGenerator::Orientation(Orientation::DEFAULT);
@@ -443,7 +445,11 @@ mod tests {
         assert!((0.0..=1.0).contains(&value));
 
         for preset in MaskGenerator::PRESETS {
-            assert!(preset.is_valid(), "{} defaults must validate", preset.name());
+            assert!(
+                preset.is_valid(),
+                "{} defaults must validate",
+                preset.name()
+            );
         }
         assert!(
             !MaskGenerator::EdgeWear(EdgeWear {

@@ -5,20 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, SyncSender, sync_channel},
+    mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
 };
 use std::time::Duration;
 
 use eframe::egui;
 use substancecraft_api::{
-    ImportedFbxMesh, MAX_FBX_BYTES, bake_texture_set_base_color, bake_texture_set_id_mask,
-    import_binary_fbx_meshes, load_project_file, save_project_file,
+    ImportedFbxMesh, MAX_FBX_BYTES, bake_texture_set_channel, import_binary_fbx_meshes,
+    load_project_file, save_project_file,
 };
 use substancecraft_core::{
-    BakedTexture, BoneId, BoneTransform, IdStroke, MaskStroke, MaterialChannel, MaterialLayer,
-    MaterialProject, MeshAsset, MeshGeometry, MeshId, NamedPose, PaintStroke, PoseId,
-    PrimitivePreset, StrokeCommand, StrokeHistory, TextureResolution, TextureSet, TextureSetId,
-    ViewportCamera, ViewportLighting,
+    BakedTexture, BoneId, BoneTransform, Dirt, EdgeWear, EditCommand, EditHistory, IdStroke,
+    LayerFill, LayerId, LayerSettings, MaskGenerator, MaskStroke, MaterialChannel, MaterialLayer,
+    MaterialProject, MeshAsset, MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings,
+    MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PrimitivePreset,
+    SelectionMode, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
+    bake_mesh_maps, remap_subdivided_triangles,
 };
 use substancecraft_filament::FilamentRuntime;
 
@@ -38,8 +40,18 @@ const CHANNELS: [MaterialChannel; 9] = [
     MaterialChannel::Emissive,
     MaterialChannel::Opacity,
 ];
+/// Channels the compositor can bake, preview, and export.
+const BAKEABLE_CHANNELS: [MaterialChannel; 4] = [
+    MaterialChannel::BaseColor,
+    MaterialChannel::Roughness,
+    MaterialChannel::Metallic,
+    MaterialChannel::Id,
+];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
 const MAX_SAVED_POSES: usize = 256;
+/// Selection overlays stop drawing beyond this many triangles to keep the
+/// viewport responsive on dense meshes.
+const MAX_OVERLAY_TRIANGLES: usize = 200_000;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -69,9 +81,16 @@ fn main() -> eframe::Result {
 struct SubstanceCraftApp {
     project: MaterialProject,
     selected_texture_set: Option<TextureSetId>,
-    selected_layer: Option<substancecraft_core::LayerId>,
+    selected_layer: Option<LayerId>,
     selected_primitive: Option<PrimitivePreset>,
+    /// Imported or primitive geometry after scaling, before smoothing.
+    base_geometry: Option<MeshGeometry>,
+    /// Smoothed/subdivided geometry used for display, painting, and baking.
     mesh_geometry: Option<MeshGeometry>,
+    mesh_topology: Option<MeshTopology>,
+    mesh_center: glam::Vec3,
+    mesh_smoothing: MeshSmoothing,
+    mesh_error: Option<String>,
     mesh_revision: u64,
     filament_mesh_revision: Option<u64>,
     filament_renderer: Option<FilamentRuntime>,
@@ -95,11 +114,25 @@ struct SubstanceCraftApp {
     paint_mode: PaintMode,
     brush_radius: f32,
     brush_color: egui::Color32,
+    brush_roughness: f32,
+    brush_metallic: f32,
     mask_value: f32,
-    active_stroke: Option<(TextureSetId, substancecraft_core::LayerId, PaintMode)>,
-    stroke_history: StrokeHistory,
-    baked_preview: Option<(TextureSetId, MaterialChannel, BakedTexture)>,
+    selection_mode: SelectionMode,
+    hovered_selection: Vec<u32>,
+    active_stroke: Option<(TextureSetId, LayerId, PaintMode)>,
+    history: EditHistory,
+    /// Last committed settings of the selected layer; edits made through the
+    /// inspector are recorded as one history step once the pointer is up.
+    layer_settled: Option<(TextureSetId, LayerId, LayerSettings)>,
+    baked_preview: Option<BakedPreview>,
+    preview_failed: bool,
     bake_error: Option<String>,
+    mesh_map_settings: MeshMapSettings,
+    mesh_maps: Option<Arc<MeshMaps>>,
+    mesh_maps_revision: Option<u64>,
+    mesh_map_job: Option<MeshMapJob>,
+    mesh_map_error: Option<String>,
+    mesh_map_preview: Option<MeshMapKind>,
     selected_pose: Option<PoseId>,
     pose_name: String,
     pose_transition: Option<PoseTransition>,
@@ -121,6 +154,32 @@ enum PaintMode {
     Paint,
     Mask,
     Id,
+    Select,
+}
+
+impl PaintMode {
+    fn paints(self) -> bool {
+        matches!(self, Self::Paint | Self::Mask | Self::Id)
+    }
+}
+
+/// What the viewport currently shows on the mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewTarget {
+    Channel(MaterialChannel),
+    MeshMap(MeshMapKind),
+}
+
+struct BakedPreview {
+    texture_set: Option<TextureSetId>,
+    target: PreviewTarget,
+    texture: BakedTexture,
+}
+
+struct MeshMapJob {
+    receiver: Receiver<Result<MeshMaps, MeshMapError>>,
+    cancel: Arc<AtomicBool>,
+    revision: u64,
 }
 
 struct PoseTransition {
@@ -135,24 +194,31 @@ struct RestoredMeshScene {
     selected_imported_mesh: Option<usize>,
     geometry: Option<MeshGeometry>,
     scale: f32,
+    smoothing: MeshSmoothing,
 }
 
 impl Default for SubstanceCraftApp {
     fn default() -> Self {
         let (filament_frames_tx, filament_frames_rx) = sync_channel(1);
-        Self {
+        let mut app = Self {
             project: MaterialProject {
                 mesh: Some(MeshAsset {
                     id: MeshId(1),
                     source: "builtin:Cube".to_owned(),
                     scale: 1.0,
+                    smoothing: MeshSmoothing::default(),
                 }),
                 ..MaterialProject::empty()
             },
             selected_texture_set: None,
             selected_layer: None,
             selected_primitive: Some(PrimitivePreset::Cube),
-            mesh_geometry: Some(PrimitivePreset::Cube.build_mesh()),
+            base_geometry: None,
+            mesh_geometry: None,
+            mesh_topology: None,
+            mesh_center: glam::Vec3::ZERO,
+            mesh_smoothing: MeshSmoothing::default(),
+            mesh_error: None,
             mesh_revision: 1,
             filament_mesh_revision: None,
             filament_renderer: None,
@@ -180,11 +246,23 @@ impl Default for SubstanceCraftApp {
             paint_mode: PaintMode::View,
             brush_radius: 16.0,
             brush_color: egui::Color32::from_rgb(214, 108, 66),
+            brush_roughness: 0.5,
+            brush_metallic: 0.0,
             mask_value: 0.0,
+            selection_mode: SelectionMode::Element,
+            hovered_selection: Vec::new(),
             active_stroke: None,
-            stroke_history: StrokeHistory::default(),
+            history: EditHistory::default(),
+            layer_settled: None,
             baked_preview: None,
+            preview_failed: false,
             bake_error: None,
+            mesh_map_settings: MeshMapSettings::default(),
+            mesh_maps: None,
+            mesh_maps_revision: None,
+            mesh_map_job: None,
+            mesh_map_error: None,
+            mesh_map_preview: None,
             selected_pose: None,
             pose_name: "Pose 1".to_owned(),
             pose_transition: None,
@@ -192,7 +270,9 @@ impl Default for SubstanceCraftApp {
             last_drawer: panels::Drawer::Scene,
             show_inspector: true,
             layout: panels::OverlayLayout::default(),
-        }
+        };
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app
     }
 }
 
@@ -200,6 +280,69 @@ impl SubstanceCraftApp {
     fn mark_mesh_changed(&mut self) {
         self.mesh_revision = self.mesh_revision.wrapping_add(1);
         self.filament_frame_texture = None;
+        self.cancel_mesh_map_job();
+        self.mesh_maps = None;
+        self.mesh_maps_revision = None;
+        self.mesh_map_error = None;
+        self.hovered_selection.clear();
+        self.invalidate_preview();
+    }
+
+    fn invalidate_preview(&mut self) {
+        self.baked_preview = None;
+        self.preview_failed = false;
+    }
+
+    fn set_base_geometry(&mut self, geometry: Option<MeshGeometry>) {
+        self.base_geometry = geometry;
+        self.rebuild_mesh();
+    }
+
+    /// Re-derives display geometry from the base mesh and smoothing settings.
+    fn rebuild_mesh(&mut self) {
+        self.mesh_error = None;
+        self.mesh_geometry = self.base_geometry.as_ref().map(|base| {
+            self.mesh_smoothing.apply(base).unwrap_or_else(|error| {
+                self.mesh_error = Some(format!("Smoothing skipped: {error}"));
+                base.clone()
+            })
+        });
+        self.mesh_topology = self.mesh_geometry.as_ref().map(MeshTopology::build);
+        self.mesh_center = self
+            .mesh_geometry
+            .as_ref()
+            .map_or(glam::Vec3::ZERO, mesh_bounds_center);
+        self.mark_mesh_changed();
+    }
+
+    fn set_mesh_smoothing(&mut self, smoothing: MeshSmoothing) {
+        if smoothing == self.mesh_smoothing || !smoothing.is_valid() {
+            return;
+        }
+        let from = self.mesh_smoothing.subdivision_levels;
+        let to = smoothing.subdivision_levels;
+        if from != to {
+            // Polygon masks index subdivided triangles; carry them across.
+            for layer in self
+                .project
+                .texture_sets
+                .iter_mut()
+                .flat_map(|set| set.layers.iter_mut())
+            {
+                if let Some(mask) = layer.polygon_mask.as_mut() {
+                    mask.triangles =
+                        remap_subdivided_triangles(mask.triangles.iter().copied(), from, to)
+                            .into_iter()
+                            .collect();
+                }
+            }
+            self.layer_settled = None;
+        }
+        self.mesh_smoothing = smoothing;
+        if let Some(mesh) = self.project.mesh.as_mut() {
+            mesh.smoothing = smoothing;
+        }
+        self.rebuild_mesh();
     }
 
     fn update_filament_frame(&mut self, context: &egui::Context, viewport: egui::Rect) {
@@ -222,6 +365,7 @@ impl SubstanceCraftApp {
             }
         }
 
+        let target = self.preview_target();
         let Some(mesh) = self.mesh_geometry.as_ref() else {
             self.filament_frame_texture = None;
             return;
@@ -230,7 +374,7 @@ impl SubstanceCraftApp {
             return;
         };
         if self.filament_mesh_revision != Some(self.mesh_revision) {
-            match renderer.set_mesh(mesh) {
+            match renderer.set_mesh(mesh, self.mesh_smoothing.angle_degrees) {
                 Ok(()) => self.filament_mesh_revision = Some(self.mesh_revision),
                 Err(error) => {
                     self.filament_error = Some(error.to_string());
@@ -242,12 +386,12 @@ impl SubstanceCraftApp {
         let preview = self
             .baked_preview
             .as_ref()
-            .filter(|(set_id, channel, _)| {
-                Some(*set_id) == self.selected_texture_set
-                    && *channel == self.active_channel
-                    && matches!(channel, MaterialChannel::BaseColor | MaterialChannel::Id)
+            .filter(|preview| {
+                preview.target == target
+                    && (matches!(target, PreviewTarget::MeshMap(_))
+                        || preview.texture_set == self.selected_texture_set)
             })
-            .map(|(_, _, texture)| texture);
+            .map(|preview| &preview.texture);
         let texture_result = if let Some(texture) = preview {
             let key = (texture.rgba8.as_ptr() as usize)
                 ^ (texture.width as usize).rotate_left(7)
@@ -345,15 +489,15 @@ impl SubstanceCraftApp {
         self.imported_meshes = scene.imported_meshes;
         self.selected_imported_mesh = scene.selected_imported_mesh;
         self.import_scale = scene.scale;
-        self.mesh_geometry = scene.geometry;
-        self.mark_mesh_changed();
+        self.mesh_smoothing = scene.smoothing;
+        self.set_base_geometry(scene.geometry);
         self.selected_texture_set = self.project.active_texture_set;
         self.selected_layer = self
             .project
             .texture_sets
             .iter()
             .find(|set| Some(set.id) == self.selected_texture_set)
-            .and_then(|set| set.layers.first())
+            .and_then(|set| set.layers.last())
             .map(|layer| layer.id);
         self.next_texture_set_id = self
             .project
@@ -387,8 +531,9 @@ impl SubstanceCraftApp {
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
         self.active_stroke = None;
-        self.stroke_history = StrokeHistory::default();
-        self.baked_preview = None;
+        self.history = EditHistory::default();
+        self.layer_settled = None;
+        self.invalidate_preview();
         self.bake_error = None;
         self.import_error = None;
         self.project_error = None;
@@ -402,7 +547,13 @@ impl SubstanceCraftApp {
                 selected_imported_mesh: None,
                 geometry: None,
                 scale: 1.0,
+                smoothing: MeshSmoothing::default(),
             });
+        };
+        let smoothing = if mesh_asset.smoothing.is_valid() {
+            mesh_asset.smoothing
+        } else {
+            MeshSmoothing::default()
         };
         if let Some(name) = mesh_asset.source.strip_prefix("builtin:") {
             let preset = PrimitivePreset::ALL
@@ -415,6 +566,7 @@ impl SubstanceCraftApp {
                 selected_imported_mesh: None,
                 geometry: Some(preset.build_mesh()),
                 scale: 1.0,
+                smoothing,
             });
         }
 
@@ -438,6 +590,7 @@ impl SubstanceCraftApp {
             selected_imported_mesh: Some(0),
             geometry: Some(first_geometry),
             scale,
+            smoothing,
         })
     }
 
@@ -478,19 +631,20 @@ impl SubstanceCraftApp {
                     id: MeshId(1),
                     source: path.to_string_lossy().into_owned(),
                     scale: self.import_scale,
+                    smoothing: self.mesh_smoothing,
                 });
                 self.imported_meshes = meshes;
                 self.selected_imported_mesh = Some(0);
                 self.selected_primitive = None;
-                self.mesh_geometry = Some(first_geometry);
-                self.mark_mesh_changed();
+                self.set_base_geometry(Some(first_geometry));
                 self.import_error = None;
                 self.project.texture_sets.clear();
                 self.project.active_texture_set = None;
                 self.selected_texture_set = None;
                 self.selected_layer = None;
                 self.active_stroke = None;
-                self.baked_preview = None;
+                self.history = EditHistory::default();
+                self.layer_settled = None;
                 self.current_pose.name = display_name;
             }
             Err(error) => self.import_error = Some(error),
@@ -511,45 +665,274 @@ impl SubstanceCraftApp {
                 width: 2048,
                 height: 2048,
             },
-            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+            channels: BAKEABLE_CHANNELS.into_iter().collect::<BTreeSet<_>>(),
             layers: Vec::new(),
         });
         self.project.active_texture_set = Some(id);
         self.selected_texture_set = Some(id);
         self.selected_layer = None;
-        self.baked_preview = None;
+        self.invalidate_preview();
     }
 
-    fn add_paint_layer(&mut self) {
+    fn allocate_layer_id(&mut self) -> Option<LayerId> {
+        let next = self.next_layer_id.checked_add(1)?;
+        let id = LayerId(self.next_layer_id);
+        self.next_layer_id = next;
+        Some(id)
+    }
+
+    /// Inserts `layer` above the selected layer (or on top) as one undoable
+    /// edit, creating a texture set first when none exists.
+    fn insert_layer(&mut self, layer: MaterialLayer) {
+        if self.selected_texture_set.is_none() {
+            self.add_texture_set();
+        }
         let Some(texture_set_id) = self.selected_texture_set else {
             return;
         };
-        let Some(next_id) = self.next_layer_id.checked_add(1) else {
-            return;
-        };
-        let id = substancecraft_core::LayerId(self.next_layer_id);
-        let Some(texture_set) = self
+        let Some(set) = self
             .project
             .texture_sets
-            .iter_mut()
+            .iter()
             .find(|set| set.id == texture_set_id)
         else {
             return;
         };
-        texture_set.layers.push(MaterialLayer {
+        let index = self
+            .selected_layer
+            .and_then(|selected| set.layers.iter().position(|layer| layer.id == selected))
+            .map_or(set.layers.len(), |position| position + 1);
+        let layer_id = layer.id;
+        if self.history.apply(
+            &mut self.project,
+            EditCommand::InsertLayer {
+                texture_set_id,
+                index,
+                layer: Box::new(layer),
+            },
+        ) {
+            self.selected_layer = Some(layer_id);
+            self.layer_settled = None;
+            self.invalidate_preview();
+        }
+    }
+
+    fn add_paint_layer(&mut self) {
+        let Some(id) = self.allocate_layer_id() else {
+            return;
+        };
+        self.insert_layer(MaterialLayer::new_paint(
             id,
-            name: format!("Paint Layer {}", id.0),
-            visible: true,
-            opacity: 1.0,
-            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
-            paint_strokes: Vec::new(),
-            mask_strokes: Vec::new(),
-            id_strokes: Vec::new(),
-            id_mask_color: None,
-        });
-        self.next_layer_id = next_id;
-        self.selected_layer = Some(id);
-        self.baked_preview = None;
+            format!("Paint Layer {}", id.0),
+        ));
+    }
+
+    fn add_fill_layer(&mut self) {
+        let Some(id) = self.allocate_layer_id() else {
+            return;
+        };
+        let brush = self.brush_color.to_array();
+        let fill = LayerFill {
+            color: brush,
+            roughness: self.brush_roughness,
+            metallic: self.brush_metallic,
+        };
+        self.insert_layer(MaterialLayer::new_fill(
+            id,
+            format!("Fill Layer {}", id.0),
+            fill,
+        ));
+    }
+
+    /// Adds a fill layer pre-wired to a procedural mask generator.
+    fn add_smart_layer(&mut self, generator: MaskGenerator) {
+        let Some(id) = self.allocate_layer_id() else {
+            return;
+        };
+        let (name, fill) = match generator {
+            MaskGenerator::EdgeWear(_) => (
+                "Edge Wear",
+                LayerFill {
+                    color: [196, 198, 204, 255],
+                    roughness: 0.28,
+                    metallic: 1.0,
+                },
+            ),
+            MaskGenerator::Dirt(_) => (
+                "Dirt",
+                LayerFill {
+                    color: [62, 50, 38, 255],
+                    roughness: 0.92,
+                    metallic: 0.0,
+                },
+            ),
+            _ => ("Generated", LayerFill::default()),
+        };
+        let mut layer = MaterialLayer::new_fill(id, name, fill);
+        layer.mask_generator = Some(generator);
+        self.insert_layer(layer);
+    }
+
+    fn add_edge_wear_layer(&mut self) {
+        self.add_smart_layer(MaskGenerator::EdgeWear(EdgeWear::DEFAULT));
+    }
+
+    fn add_dirt_layer(&mut self) {
+        self.add_smart_layer(MaskGenerator::Dirt(Dirt::DEFAULT));
+    }
+
+    fn selected_layer_index(&self) -> Option<(TextureSetId, usize, usize)> {
+        let texture_set_id = self.selected_texture_set?;
+        let layer_id = self.selected_layer?;
+        let set = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)?;
+        let index = set.layers.iter().position(|layer| layer.id == layer_id)?;
+        Some((texture_set_id, index, set.layers.len()))
+    }
+
+    fn delete_selected_layer(&mut self) {
+        self.finish_active_stroke();
+        let Some((texture_set_id, index, _)) = self.selected_layer_index() else {
+            return;
+        };
+        let Some(layer) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)
+            .and_then(|set| set.layers.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        if self.history.apply(
+            &mut self.project,
+            EditCommand::RemoveLayer {
+                texture_set_id,
+                index,
+                layer: Box::new(layer),
+            },
+        ) {
+            self.selected_layer = self
+                .project
+                .texture_sets
+                .iter()
+                .find(|set| set.id == texture_set_id)
+                .and_then(|set| set.layers.get(index.saturating_sub(1)))
+                .map(|layer| layer.id);
+            self.layer_settled = None;
+            self.invalidate_preview();
+        }
+    }
+
+    /// Moves the selected layer up (+1, toward the top of the stack) or down.
+    fn move_selected_layer(&mut self, delta: isize) {
+        let Some((texture_set_id, index, count)) = self.selected_layer_index() else {
+            return;
+        };
+        let Some(target) = index
+            .checked_add_signed(delta)
+            .filter(|target| *target < count)
+        else {
+            return;
+        };
+        if self.history.apply(
+            &mut self.project,
+            EditCommand::MoveLayer {
+                texture_set_id,
+                from: index,
+                to: target,
+            },
+        ) {
+            self.invalidate_preview();
+        }
+    }
+
+    fn selected_layer_mut(&mut self) -> Option<&mut MaterialLayer> {
+        let texture_set_id = self.selected_texture_set?;
+        let layer_id = self.selected_layer?;
+        self.project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == texture_set_id)?
+            .layers
+            .iter_mut()
+            .find(|layer| layer.id == layer_id)
+    }
+
+    fn selected_layer(&self) -> Option<&MaterialLayer> {
+        let texture_set_id = self.selected_texture_set?;
+        let layer_id = self.selected_layer?;
+        self.project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)?
+            .layers
+            .iter()
+            .find(|layer| layer.id == layer_id)
+    }
+
+    /// Records inspector edits of the selected layer as single history steps.
+    /// Changes accumulate while the pointer is held (slider drags) and are
+    /// committed on release.
+    fn sync_layer_history(&mut self, context: &egui::Context) {
+        let current =
+            self.selected_texture_set
+                .zip(self.selected_layer)
+                .and_then(|(set_id, layer_id)| {
+                    self.selected_layer()
+                        .map(|layer| (set_id, layer_id, layer.settings()))
+                });
+        let Some((set_id, layer_id, settings)) = current else {
+            self.layer_settled = None;
+            return;
+        };
+        let same_layer =
+            self.layer_settled
+                .as_ref()
+                .is_some_and(|(settled_set, settled_layer, _)| {
+                    *settled_set == set_id && *settled_layer == layer_id
+                });
+        if !same_layer {
+            self.layer_settled = Some((set_id, layer_id, settings));
+            return;
+        }
+        if context.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        if let Some((_, _, before)) = self.layer_settled.take() {
+            if before != settings {
+                self.history.record(EditCommand::LayerSettings {
+                    texture_set_id: set_id,
+                    layer_id,
+                    before: Box::new(before),
+                    after: Box::new(settings.clone()),
+                });
+                self.invalidate_preview();
+            }
+            self.layer_settled = Some((set_id, layer_id, settings));
+        }
+    }
+
+    /// Adds (or with `remove`, subtracts) triangles from the selected layer's
+    /// polygon mask.
+    fn apply_polygon_selection(&mut self, triangles: &[u32], remove: bool) {
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+        let mask = layer.polygon_mask.get_or_insert_with(Default::default);
+        let selecting = remove == mask.inverted;
+        for triangle in triangles {
+            if selecting {
+                mask.triangles.insert(*triangle);
+            } else {
+                mask.triangles.remove(triangle);
+            }
+        }
+        self.invalidate_preview();
     }
 
     fn append_stroke_point(&mut self, uv: glam::Vec2) {
@@ -558,12 +941,14 @@ impl SubstanceCraftApp {
         else {
             return;
         };
-        if self.paint_mode == PaintMode::View {
+        if !self.paint_mode.paints() {
             return;
         }
         let stroke_key = (texture_set_id, layer_id, self.paint_mode);
         let starts_stroke = self.active_stroke != Some(stroke_key);
         let color = self.brush_color.to_array();
+        let roughness = self.brush_roughness;
+        let metallic = self.brush_metallic;
         let Some(layer) = self
             .project
             .texture_sets
@@ -576,12 +961,14 @@ impl SubstanceCraftApp {
 
         if starts_stroke {
             match self.paint_mode {
-                PaintMode::View => return,
+                PaintMode::View | PaintMode::Select => return,
                 PaintMode::Paint => layer.paint_strokes.push(PaintStroke {
                     points: vec![uv],
                     radius_pixels: self.brush_radius,
                     color,
                     opacity: 1.0,
+                    roughness,
+                    metallic,
                 }),
                 PaintMode::Mask => layer.mask_strokes.push(MaskStroke {
                     points: vec![uv],
@@ -601,7 +988,7 @@ impl SubstanceCraftApp {
         }
 
         let points = match self.paint_mode {
-            PaintMode::View => return,
+            PaintMode::View | PaintMode::Select => return,
             PaintMode::Paint => layer
                 .paint_strokes
                 .last_mut()
@@ -635,78 +1022,212 @@ impl SubstanceCraftApp {
             return;
         };
         let command = match mode {
-            PaintMode::View => None,
+            PaintMode::View | PaintMode::Select => None,
             PaintMode::Paint => {
                 layer
                     .paint_strokes
                     .last()
                     .cloned()
-                    .map(|stroke| StrokeCommand::Paint {
+                    .map(|stroke| EditCommand::Paint {
                         texture_set_id,
                         layer_id,
                         stroke,
                     })
             }
-            PaintMode::Mask => {
-                layer
-                    .mask_strokes
-                    .last()
-                    .cloned()
-                    .map(|stroke| StrokeCommand::Mask {
-                        texture_set_id,
-                        layer_id,
-                        stroke,
-                    })
-            }
+            PaintMode::Mask => layer
+                .mask_strokes
+                .last()
+                .cloned()
+                .map(|stroke| EditCommand::Mask {
+                    texture_set_id,
+                    layer_id,
+                    stroke,
+                }),
             PaintMode::Id => layer
                 .id_strokes
                 .last()
                 .cloned()
-                .map(|stroke| StrokeCommand::Id {
+                .map(|stroke| EditCommand::Id {
                     texture_set_id,
                     layer_id,
                     stroke,
                 }),
         };
         if let Some(command) = command {
-            self.stroke_history.record(command);
+            self.history.record(command);
         }
     }
 
-    fn undo_stroke(&mut self) {
+    fn undo(&mut self) {
         self.finish_active_stroke();
-        if self.stroke_history.undo(&mut self.project) {
-            self.baked_preview = None;
-            self.refresh_baked_preview();
+        if self.history.undo(&mut self.project) {
+            self.after_history_change();
         }
     }
 
-    fn redo_stroke(&mut self) {
+    fn redo(&mut self) {
         self.finish_active_stroke();
-        if self.stroke_history.redo(&mut self.project) {
-            self.baked_preview = None;
-            self.refresh_baked_preview();
+        if self.history.redo(&mut self.project) {
+            self.after_history_change();
+        }
+    }
+
+    fn after_history_change(&mut self) {
+        // The settled snapshot must not see undo/redo as a new user edit.
+        self.layer_settled = None;
+        let selected_exists = self.selected_layer().is_some();
+        if !selected_exists {
+            self.selected_layer = self
+                .project
+                .texture_sets
+                .iter()
+                .find(|set| Some(set.id) == self.selected_texture_set)
+                .and_then(|set| set.layers.last())
+                .map(|layer| layer.id);
+        }
+        self.invalidate_preview();
+        self.refresh_baked_preview();
+    }
+
+    fn preview_target(&self) -> PreviewTarget {
+        self.mesh_map_preview.map_or(
+            PreviewTarget::Channel(self.active_channel),
+            PreviewTarget::MeshMap,
+        )
+    }
+
+    fn mesh_maps_fresh(&self) -> bool {
+        self.mesh_maps.is_some() && self.mesh_maps_revision == Some(self.mesh_revision)
+    }
+
+    fn fresh_mesh_maps(&self) -> Option<&MeshMaps> {
+        self.mesh_maps
+            .as_deref()
+            .filter(|_| self.mesh_maps_revision == Some(self.mesh_revision))
+    }
+
+    fn mesh_map_job_running(&self) -> bool {
+        self.mesh_map_job
+            .as_ref()
+            .is_some_and(|job| job.revision == self.mesh_revision)
+    }
+
+    fn effective_mesh_map_settings(&self) -> MeshMapSettings {
+        MeshMapSettings {
+            smoothing_angle_degrees: self.mesh_smoothing.angle_degrees,
+            ..self.mesh_map_settings
+        }
+    }
+
+    fn cancel_mesh_map_job(&mut self) {
+        if let Some(job) = self.mesh_map_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Starts a background bake of the current mesh's maps, replacing any
+    /// bake already running.
+    fn start_mesh_map_bake(&mut self) {
+        self.cancel_mesh_map_job();
+        let Some(mesh) = self.mesh_geometry.clone() else {
+            return;
+        };
+        let settings = self.effective_mesh_map_settings();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = sync_channel(1);
+        let worker_cancel = Arc::clone(&cancel);
+        let spawned = std::thread::Builder::new()
+            .name("mesh-map-bake".to_owned())
+            .spawn(move || {
+                let _ = sender.send(bake_mesh_maps(&mesh, &settings, Some(&worker_cancel)));
+            });
+        match spawned {
+            Ok(_) => {
+                self.mesh_map_error = None;
+                self.mesh_map_job = Some(MeshMapJob {
+                    receiver,
+                    cancel,
+                    revision: self.mesh_revision,
+                });
+            }
+            Err(error) => self.mesh_map_error = Some(error.to_string()),
+        }
+    }
+
+    /// Bakes mesh maps automatically when something needs them and they are
+    /// missing or stale for the current mesh.
+    fn ensure_mesh_maps(&mut self) {
+        if self.mesh_maps_fresh() || self.mesh_map_job_running() || self.mesh_map_error.is_some() {
+            return;
+        }
+        self.start_mesh_map_bake();
+    }
+
+    fn poll_mesh_map_job(&mut self, context: &egui::Context) {
+        let Some(job) = &self.mesh_map_job else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(result) => {
+                let revision = job.revision;
+                self.mesh_map_job = None;
+                match result {
+                    Ok(maps) if revision == self.mesh_revision => {
+                        self.mesh_maps = Some(Arc::new(maps));
+                        self.mesh_maps_revision = Some(revision);
+                        self.invalidate_preview();
+                    }
+                    Ok(_) | Err(MeshMapError::Cancelled) => {}
+                    Err(error) => self.mesh_map_error = Some(error.to_string()),
+                }
+            }
+            Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(100)),
+            Err(TryRecvError::Disconnected) => {
+                self.mesh_map_job = None;
+                self.mesh_map_error = Some("mesh map bake stopped unexpectedly".to_owned());
+            }
         }
     }
 
     fn refresh_baked_preview(&mut self) {
+        let target = self.preview_target();
+        if self.preview_failed {
+            return;
+        }
+        if let PreviewTarget::MeshMap(kind) = target {
+            if self
+                .baked_preview
+                .as_ref()
+                .is_some_and(|preview| preview.target == target)
+            {
+                return;
+            }
+            if !self.mesh_maps_fresh() {
+                self.ensure_mesh_maps();
+                return;
+            }
+            if let Some(maps) = &self.mesh_maps {
+                self.baked_preview = Some(BakedPreview {
+                    texture_set: None,
+                    target,
+                    texture: maps.to_texture(kind),
+                });
+            }
+            return;
+        }
+        let PreviewTarget::Channel(channel) = target else {
+            return;
+        };
         let Some(texture_set_id) = self.selected_texture_set else {
             self.baked_preview = None;
             return;
         };
-        if !matches!(
-            self.active_channel,
-            MaterialChannel::BaseColor | MaterialChannel::Id
-        ) {
+        if !BAKEABLE_CHANNELS.contains(&channel) {
             return;
         }
-        if self
-            .baked_preview
-            .as_ref()
-            .is_some_and(|(set_id, channel, _)| {
-                *set_id == texture_set_id && *channel == self.active_channel
-            })
-        {
+        if self.baked_preview.as_ref().is_some_and(|preview| {
+            preview.texture_set == Some(texture_set_id) && preview.target == target
+        }) {
             return;
         }
         let Some(texture_set) = self
@@ -718,18 +1239,24 @@ impl SubstanceCraftApp {
             self.baked_preview = None;
             return;
         };
-        let baked = match self.active_channel {
-            MaterialChannel::BaseColor => bake_texture_set_base_color(texture_set),
-            MaterialChannel::Id => bake_texture_set_id_mask(texture_set),
-            _ => return,
-        };
-        match baked {
+        if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
+            // Keep the previous preview until fresh maps arrive.
+            self.ensure_mesh_maps();
+            return;
+        }
+        let maps = self.fresh_mesh_maps();
+        match bake_texture_set_channel(texture_set, channel, self.mesh_geometry.as_ref(), maps) {
             Ok(texture) => {
-                self.baked_preview = Some((texture_set_id, self.active_channel, texture));
+                self.baked_preview = Some(BakedPreview {
+                    texture_set: Some(texture_set_id),
+                    target,
+                    texture,
+                });
                 self.bake_error = None;
             }
             Err(error) => {
                 self.baked_preview = None;
+                self.preview_failed = true;
                 self.bake_error = Some(error.to_string());
             }
         }
@@ -745,33 +1272,51 @@ impl SubstanceCraftApp {
         else {
             return;
         };
-        let map_name = if channel == MaterialChannel::Id {
-            "ID Mask"
-        } else {
-            "Base Color"
-        };
+        if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
+            self.ensure_mesh_maps();
+            self.bake_error =
+                Some("Mesh maps are still baking; export again when they finish.".to_owned());
+            return;
+        }
+        let map_name = channel_label(channel);
         let path = rfd::FileDialog::new()
             .add_filter("Targa texture", &["tga"])
-            .set_file_name(format!("{}.tga", map_name.replace(' ', "_")))
+            .set_file_name(format!("{}_{}.tga", texture_set.name, map_name).replace(' ', "_"))
             .save_file();
         let Some(path) = path else {
             return;
         };
-        let result = match channel {
-            MaterialChannel::BaseColor => bake_texture_set_base_color(&texture_set),
-            MaterialChannel::Id => bake_texture_set_id_mask(&texture_set),
-            _ => return,
-        }
-        .map_err(|error| error.to_string())
-        .and_then(|texture| write_tga(&path, &texture));
+        let maps = self.fresh_mesh_maps();
+        let result =
+            bake_texture_set_channel(&texture_set, channel, self.mesh_geometry.as_ref(), maps)
+                .map_err(|error| error.to_string())
+                .and_then(|texture| write_tga(&path, &texture));
         match result {
             Ok(()) => {
                 self.bake_error = None;
                 self.active_channel = channel;
-                self.baked_preview = None;
+                self.mesh_map_preview = None;
+                self.invalidate_preview();
                 self.refresh_baked_preview();
             }
             Err(error) => self.bake_error = Some(error),
+        }
+    }
+
+    fn export_mesh_map(&mut self, kind: MeshMapKind) {
+        let Some(maps) = self.mesh_maps.clone().filter(|_| self.mesh_maps_fresh()) else {
+            self.ensure_mesh_maps();
+            return;
+        };
+        let path = rfd::FileDialog::new()
+            .add_filter("Targa texture", &["tga"])
+            .set_file_name(format!("{}.tga", kind.name().replace(' ', "_")))
+            .save_file();
+        let Some(path) = path else {
+            return;
+        };
+        if let Err(error) = write_tga(&path, &maps.to_texture(kind)) {
+            self.mesh_map_error = Some(error);
         }
     }
 
@@ -789,10 +1334,10 @@ impl SubstanceCraftApp {
         let Some(mesh) = self.imported_meshes.get(index) else {
             return;
         };
-        self.mesh_geometry = Some(scaled_geometry(&mesh.geometry, self.import_scale));
-        self.mark_mesh_changed();
+        let geometry = scaled_geometry(&mesh.geometry, self.import_scale);
         self.selected_imported_mesh = Some(index);
         self.selected_primitive = None;
+        self.set_base_geometry(Some(geometry));
     }
 
     fn set_import_scale(&mut self, scale: f32) {
@@ -889,6 +1434,24 @@ impl SubstanceCraftApp {
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
     }
 
+    fn view_projection(&self, viewport: egui::Rect) -> ViewProjection {
+        let pose = self
+            .current_pose
+            .bones
+            .get(&BoneId(0))
+            .copied()
+            .unwrap_or(BoneTransform::IDENTITY);
+        let posed_center = pose.rotation.mul_vec3(self.mesh_center * pose.scale) + pose.translation;
+        ViewProjection {
+            pose,
+            camera_rotation: self.viewport_camera.rotation(),
+            posed_center,
+            center: viewport.center(),
+            scale: viewport.width().min(viewport.height()) * 0.42 * self.viewport_camera.zoom * 0.9,
+            pan: self.viewport_camera.pan,
+        }
+    }
+
     fn update_viewport(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::VIEWPORT_BG))
@@ -901,10 +1464,13 @@ impl SubstanceCraftApp {
                 );
                 let was_stroke_active = self.active_stroke.is_some();
                 let pointer_position = ui.input(|input| input.pointer.interact_pos());
-                if response.dragged() && self.paint_mode == PaintMode::View {
+                let hover_position = ui.input(|input| input.pointer.hover_pos());
+                let shift = ui.input(|input| input.modifiers.shift);
+                let painting = self.paint_mode.paints();
+                if response.dragged() && !painting {
                     let delta = ui.input(|input| input.pointer.delta());
                     let delta = glam::Vec2::new(delta.x, delta.y);
-                    if ui.input(|input| input.modifiers.shift) {
+                    if shift {
                         self.viewport_camera.pan_by(delta);
                     } else {
                         self.viewport_camera.orbit(delta);
@@ -912,11 +1478,11 @@ impl SubstanceCraftApp {
                 } else if !response.dragged() {
                     self.finish_active_stroke();
                     if was_stroke_active {
-                        self.baked_preview = None;
+                        self.invalidate_preview();
                     }
                     self.refresh_baked_preview();
                 }
-                if response.hovered() && self.paint_mode == PaintMode::View {
+                if response.hovered() && !painting {
                     let scroll = ui.input(|input| input.smooth_scroll_delta.y);
                     self.viewport_camera.zoom_by(scroll);
                 }
@@ -935,7 +1501,8 @@ impl SubstanceCraftApp {
                 }
 
                 let center = viewport.center();
-                if self.filament_frame_texture.is_none() {
+                let software = self.filament_frame_texture.is_none();
+                if software {
                     let axis = egui::Color32::from_rgb(38, 40, 44);
                     painter.line_segment(
                         [
@@ -953,118 +1520,7 @@ impl SubstanceCraftApp {
                     );
                 }
 
-                if let Some(mesh) = &self.mesh_geometry {
-                    let pose_transform = self
-                        .current_pose
-                        .bones
-                        .get(&BoneId(0))
-                        .copied()
-                        .unwrap_or(BoneTransform::IDENTITY);
-                    let camera_rotation = self.viewport_camera.rotation();
-                    let source_center = mesh_bounds_center(mesh);
-                    let posed_center = pose_transform
-                        .rotation
-                        .mul_vec3(source_center * pose_transform.scale)
-                        + pose_transform.translation;
-                    let scale =
-                        viewport.width().min(viewport.height()) * 0.42 * self.viewport_camera.zoom;
-                    let project = |vertex_index: u32| {
-                        let vertex = mesh.vertices.get(vertex_index as usize)?;
-                        let posed = pose_transform
-                            .rotation
-                            .mul_vec3(vertex.position * pose_transform.scale)
-                            + pose_transform.translation;
-                        let view_position = camera_rotation * (posed - posed_center);
-                        Some((
-                            egui::pos2(
-                                center.x
-                                    + view_position.x * scale * 0.9
-                                    + self.viewport_camera.pan.x,
-                                center.y - view_position.y * scale * 0.9
-                                    + self.viewport_camera.pan.y,
-                            ),
-                            view_position,
-                        ))
-                    };
-                    let mut faces = mesh
-                        .triangles
-                        .iter()
-                        .filter_map(|triangle| {
-                            let vertex_a = mesh.vertices.get(triangle[0] as usize)?;
-                            let vertex_b = mesh.vertices.get(triangle[1] as usize)?;
-                            let vertex_c = mesh.vertices.get(triangle[2] as usize)?;
-                            let a = project(triangle[0])?;
-                            let b = project(triangle[1])?;
-                            let c = project(triangle[2])?;
-                            let normal = (b.1 - a.1).cross(c.1 - a.1).normalize_or_zero();
-                            let intensity = self.viewport_lighting.face_intensity(normal);
-                            Some((
-                                (a.1.z + b.1.z + c.1.z) / 3.0,
-                                [a.0, b.0, c.0],
-                                [vertex_a.uv, vertex_b.uv, vertex_c.uv],
-                                intensity,
-                            ))
-                        })
-                        .collect::<Vec<_>>();
-                    faces.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-                    if response.dragged() && self.paint_mode != PaintMode::View {
-                        let hit_uv = pointer_position.and_then(|pointer| {
-                            let mut candidates = faces.iter().filter_map(|(_, points, uvs, _)| {
-                                barycentric_uv(pointer, *points, *uvs)
-                            });
-                            candidates.next_back()
-                        });
-                        if let Some(uv) = hit_uv {
-                            self.append_stroke_point(uv);
-                        }
-                    }
-
-                    if self.filament_frame_texture.is_none() {
-                        for (_, points, uvs, intensity) in faces {
-                            let uv_center = (uvs[0] + uvs[1] + uvs[2]) / 3.0;
-                            let map_color = self
-                                .baked_preview
-                                .as_ref()
-                                .filter(|(set_id, channel, _)| {
-                                    Some(*set_id) == self.selected_texture_set
-                                        && *channel == self.active_channel
-                                })
-                                .and_then(|(_, _, texture)| texture.sample_uv(uv_center))
-                                .filter(|color| color[3] > 0)
-                                .unwrap_or([92, 132, 151, 255]);
-                            let color = egui::Color32::from_rgb(
-                                (map_color[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                                (map_color[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                                (map_color[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
-                            );
-                            painter.add(egui::Shape::convex_polygon(
-                                points.to_vec(),
-                                color,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
-                            ));
-                        }
-                    }
-                    if self.paint_mode != PaintMode::View
-                        && response.hovered()
-                        && let Some(pointer) = pointer_position
-                    {
-                        let cursor_color = if self.paint_mode == PaintMode::Mask {
-                            egui::Color32::WHITE
-                        } else {
-                            self.brush_color
-                        };
-                        let radius =
-                            (self.brush_radius * self.viewport_camera.zoom * 0.35).clamp(3.0, 36.0);
-                        painter.circle(
-                            pointer,
-                            radius,
-                            cursor_color.gamma_multiply(0.12),
-                            egui::Stroke::new(1.5, cursor_color),
-                        );
-                        painter.circle_filled(pointer, 1.5, cursor_color);
-                    }
-                } else {
+                if self.mesh_geometry.is_none() {
                     painter.text(
                         center,
                         egui::Align2::CENTER_CENTER,
@@ -1072,16 +1528,312 @@ impl SubstanceCraftApp {
                         egui::FontId::proportional(16.0),
                         theme::TEXT_WEAK,
                     );
+                    return;
+                }
+
+                let selecting = self.paint_mode == PaintMode::Select;
+                let projection = self.view_projection(viewport);
+                let needs_projection = software
+                    || (painting && response.dragged())
+                    || (selecting && response.hovered());
+                let projected = needs_projection
+                    .then(|| {
+                        self.mesh_geometry
+                            .as_ref()
+                            .map(|mesh| projection.project_mesh(mesh))
+                    })
+                    .flatten();
+
+                if painting
+                    && response.dragged()
+                    && let (Some(points), Some(pointer), Some(mesh)) =
+                        (&projected, pointer_position, &self.mesh_geometry)
+                    && let Some(hit) = pick_triangle(mesh, points, pointer)
+                    && let Some(uv) = hit
+                        .uv
+                        .filter(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y))
+                {
+                    self.append_stroke_point(uv);
+                }
+
+                if selecting {
+                    let hit = match (&projected, hover_position, &self.mesh_geometry) {
+                        (Some(points), Some(pointer), Some(mesh)) if response.hovered() => {
+                            pick_triangle(mesh, points, pointer)
+                        }
+                        _ => None,
+                    };
+                    self.hovered_selection = match (hit, &self.mesh_topology) {
+                        (Some(hit), Some(topology)) => {
+                            topology.select(hit.triangle, self.selection_mode)
+                        }
+                        _ => Vec::new(),
+                    };
+                    if response.clicked() && !self.hovered_selection.is_empty() {
+                        let selection = self.hovered_selection.clone();
+                        self.apply_polygon_selection(&selection, shift);
+                    }
+                } else {
+                    self.hovered_selection.clear();
+                }
+
+                let Some(mesh) = self.mesh_geometry.as_ref() else {
+                    return;
+                };
+                if software && let Some(points) = &projected {
+                    self.paint_software_mesh(&painter, mesh, points);
+                }
+
+                if selecting {
+                    let overlay_points = projected
+                        .clone()
+                        .unwrap_or_else(|| projection.project_mesh(mesh));
+                    if let Some(mask) = self
+                        .selected_layer()
+                        .and_then(|layer| layer.polygon_mask.as_ref())
+                    {
+                        let triangles: Box<dyn Iterator<Item = u32>> = if mask.inverted {
+                            Box::new(
+                                (0..mesh.triangles.len() as u32)
+                                    .filter(|triangle| !mask.triangles.contains(triangle)),
+                            )
+                        } else {
+                            Box::new(mask.triangles.iter().copied())
+                        };
+                        painter.add(triangle_overlay(
+                            mesh,
+                            &overlay_points,
+                            triangles,
+                            theme::ACCENT.gamma_multiply(0.28),
+                        ));
+                    }
+                    let hover_color = if shift {
+                        theme::DANGER.gamma_multiply(0.35)
+                    } else {
+                        egui::Color32::from_white_alpha(46)
+                    };
+                    painter.add(triangle_overlay(
+                        mesh,
+                        &overlay_points,
+                        self.hovered_selection.iter().copied(),
+                        hover_color,
+                    ));
+                }
+
+                if painting
+                    && response.hovered()
+                    && let Some(pointer) = pointer_position
+                {
+                    let cursor_color = if self.paint_mode == PaintMode::Mask {
+                        egui::Color32::WHITE
+                    } else {
+                        self.brush_color
+                    };
+                    let radius =
+                        (self.brush_radius * self.viewport_camera.zoom * 0.35).clamp(3.0, 36.0);
+                    painter.circle(
+                        pointer,
+                        radius,
+                        cursor_color.gamma_multiply(0.12),
+                        egui::Stroke::new(1.5, cursor_color),
+                    );
+                    painter.circle_filled(pointer, 1.5, cursor_color);
                 }
             });
     }
+
+    /// Flat-shaded painter's-algorithm fallback when Filament is unavailable.
+    fn paint_software_mesh(
+        &self,
+        painter: &egui::Painter,
+        mesh: &MeshGeometry,
+        points: &[ProjectedVertex],
+    ) {
+        let preview = self.baked_preview.as_ref().filter(|preview| {
+            preview.target == self.preview_target()
+                && (preview.texture_set.is_none()
+                    || preview.texture_set == self.selected_texture_set)
+        });
+        let mut faces = mesh
+            .triangles
+            .iter()
+            .filter_map(|triangle| {
+                let [a, b, c] = triangle.map(|index| points.get(index as usize));
+                let (a, b, c) = (a?, b?, c?);
+                let uvs = triangle.map(|index| mesh.vertices[index as usize].uv);
+                let normal = (b.view - a.view).cross(c.view - a.view).normalize_or_zero();
+                let intensity = self.viewport_lighting.face_intensity(normal);
+                Some((
+                    (a.view.z + b.view.z + c.view.z) / 3.0,
+                    [a.screen, b.screen, c.screen],
+                    uvs,
+                    intensity,
+                ))
+            })
+            .collect::<Vec<_>>();
+        faces.sort_by(|left, right| left.0.total_cmp(&right.0));
+        for (_, points, uvs, intensity) in faces {
+            let uv_center = (uvs[0] + uvs[1] + uvs[2]) / 3.0;
+            let map_color = preview
+                .and_then(|preview| preview.texture.sample_uv(uv_center))
+                .filter(|color| color[3] > 0)
+                .unwrap_or([92, 132, 151, 255]);
+            let color = egui::Color32::from_rgb(
+                (map_color[0] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                (map_color[1] as f32 * intensity).clamp(0.0, 255.0) as u8,
+                (map_color[2] as f32 * intensity).clamp(0.0, 255.0) as u8,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                points.to_vec(),
+                color,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(182, 195, 202)),
+            ));
+        }
+    }
+
+    fn handle_shortcuts(&mut self, context: &egui::Context) {
+        if context.egui_wants_keyboard_input() {
+            return;
+        }
+        let redo = context.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            )) || input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Y,
+            ))
+        });
+        if redo {
+            self.redo();
+            return;
+        }
+        let undo = context.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Z,
+            ))
+        });
+        if undo {
+            self.undo();
+        }
+    }
 }
 
-fn barycentric_uv(
-    point: egui::Pos2,
-    screen: [egui::Pos2; 3],
-    uvs: [glam::Vec2; 3],
-) -> Option<glam::Vec2> {
+/// Maps mesh positions through the current pose and camera onto the screen,
+/// matching the orientation Filament renders.
+struct ViewProjection {
+    pose: BoneTransform,
+    camera_rotation: glam::Quat,
+    posed_center: glam::Vec3,
+    center: egui::Pos2,
+    scale: f32,
+    pan: glam::Vec2,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedVertex {
+    screen: egui::Pos2,
+    /// Camera-space position; larger `z` is closer to the viewer.
+    view: glam::Vec3,
+}
+
+impl ViewProjection {
+    fn project(&self, position: glam::Vec3) -> ProjectedVertex {
+        let posed = self.pose.rotation.mul_vec3(position * self.pose.scale) + self.pose.translation;
+        let view = self.camera_rotation * (posed - self.posed_center);
+        ProjectedVertex {
+            screen: egui::pos2(
+                self.center.x + view.x * self.scale + self.pan.x,
+                self.center.y - view.y * self.scale + self.pan.y,
+            ),
+            view,
+        }
+    }
+
+    fn project_mesh(&self, mesh: &MeshGeometry) -> Vec<ProjectedVertex> {
+        mesh.vertices
+            .iter()
+            .map(|vertex| self.project(vertex.position))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TriangleHit {
+    triangle: u32,
+    /// Interpolated UV, when the triangle's UVs are usable.
+    uv: Option<glam::Vec2>,
+}
+
+/// Nearest triangle under `pointer`.
+fn pick_triangle(
+    mesh: &MeshGeometry,
+    points: &[ProjectedVertex],
+    pointer: egui::Pos2,
+) -> Option<TriangleHit> {
+    let mut best: Option<(f32, TriangleHit)> = None;
+    for (index, triangle) in mesh.triangles.iter().enumerate() {
+        let [a, b, c] = triangle.map(|vertex| points.get(vertex as usize));
+        let (Some(a), Some(b), Some(c)) = (a, b, c) else {
+            continue;
+        };
+        let min_x = a.screen.x.min(b.screen.x).min(c.screen.x);
+        let max_x = a.screen.x.max(b.screen.x).max(c.screen.x);
+        let min_y = a.screen.y.min(b.screen.y).min(c.screen.y);
+        let max_y = a.screen.y.max(b.screen.y).max(c.screen.y);
+        if pointer.x < min_x || pointer.x > max_x || pointer.y < min_y || pointer.y > max_y {
+            continue;
+        }
+        let Some(weights) = barycentric_weights(pointer, [a.screen, b.screen, c.screen]) else {
+            continue;
+        };
+        let depth = a.view.z * weights.x + b.view.z * weights.y + c.view.z * weights.z;
+        if best.is_some_and(|(best_depth, _)| best_depth >= depth) {
+            continue;
+        }
+        let uvs = triangle.map(|vertex| mesh.vertices[vertex as usize].uv);
+        let uv = uvs[0] * weights.x + uvs[1] * weights.y + uvs[2] * weights.z;
+        best = Some((
+            depth,
+            TriangleHit {
+                triangle: index as u32,
+                uv: uv.is_finite().then_some(uv),
+            },
+        ));
+    }
+    best.map(|(_, hit)| hit)
+}
+
+/// Translucent fill over front-facing `triangles`, built as one mesh shape.
+fn triangle_overlay(
+    mesh: &MeshGeometry,
+    points: &[ProjectedVertex],
+    triangles: impl Iterator<Item = u32>,
+    color: egui::Color32,
+) -> egui::Shape {
+    let mut overlay = egui::Mesh::default();
+    for triangle in triangles.take(MAX_OVERLAY_TRIANGLES) {
+        let Some(corners) = mesh.triangles.get(triangle as usize) else {
+            continue;
+        };
+        let [a, b, c] = corners.map(|vertex| points.get(vertex as usize));
+        let (Some(a), Some(b), Some(c)) = (a, b, c) else {
+            continue;
+        };
+        if (b.view - a.view).cross(c.view - a.view).z <= 0.0 {
+            continue;
+        }
+        let base = overlay.vertices.len() as u32;
+        for point in [a, b, c] {
+            overlay.colored_vertex(point.screen, color);
+        }
+        overlay.add_triangle(base, base + 1, base + 2);
+    }
+    egui::Shape::mesh(overlay)
+}
+
+fn barycentric_weights(point: egui::Pos2, screen: [egui::Pos2; 3]) -> Option<glam::Vec3> {
     let edge_a = glam::Vec2::new(screen[1].x - screen[0].x, screen[1].y - screen[0].y);
     let edge_b = glam::Vec2::new(screen[2].x - screen[0].x, screen[2].y - screen[0].y);
     let relative = glam::Vec2::new(point.x - screen[0].x, point.y - screen[0].y);
@@ -1095,7 +1847,17 @@ fn barycentric_uv(
     if weight_a < -0.001 || weight_b < -0.001 || weight_c < -0.001 {
         return None;
     }
-    let uv = uvs[0] * weight_a + uvs[1] * weight_b + uvs[2] * weight_c;
+    Some(glam::Vec3::new(weight_a, weight_b, weight_c))
+}
+
+#[cfg(test)]
+fn barycentric_uv(
+    point: egui::Pos2,
+    screen: [egui::Pos2; 3],
+    uvs: [glam::Vec2; 3],
+) -> Option<glam::Vec2> {
+    let weights = barycentric_weights(point, screen)?;
+    let uv = uvs[0] * weights.x + uvs[1] * weights.y + uvs[2] * weights.z;
     (uv.is_finite() && (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)).then_some(uv)
 }
 
@@ -1132,9 +1894,12 @@ fn scaled_geometry(mesh: &MeshGeometry, scale: f32) -> MeshGeometry {
 
 impl eframe::App for SubstanceCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ui.ctx());
+        self.poll_mesh_map_job(ui.ctx());
         self.update_pose_transition(ui.ctx());
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
+        self.sync_layer_history(ui.ctx());
     }
 }
 
@@ -1216,6 +1981,34 @@ mod tests {
             Some(glam::Vec2::new(0.25, 0.25))
         );
         assert_eq!(barycentric_uv(egui::pos2(75.0, 75.0), screen, uvs), None);
+    }
+
+    #[test]
+    fn tc_0045_viewport_pick_returns_the_nearest_triangle_under_the_pointer() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let projection = ViewProjection {
+            pose: BoneTransform::IDENTITY,
+            camera_rotation: glam::Quat::IDENTITY,
+            posed_center: glam::Vec3::ZERO,
+            center: egui::pos2(100.0, 100.0),
+            scale: 100.0,
+            pan: glam::Vec2::ZERO,
+        };
+        let points = projection.project_mesh(&cube);
+
+        // Looking down -Z, the screen centre covers the +Z face (triangles 0
+        // and 1) in front of the -Z face (triangles 2 and 3).
+        let hit = pick_triangle(&cube, &points, egui::pos2(110.0, 90.0)).unwrap();
+        assert!(hit.triangle < 2, "picked {}", hit.triangle);
+        assert!(hit.uv.is_some());
+        assert_eq!(
+            pick_triangle(&cube, &points, egui::pos2(400.0, 400.0)),
+            None
+        );
+
+        let topology = MeshTopology::build(&cube);
+        let face = topology.select(hit.triangle, SelectionMode::UvIsland);
+        assert_eq!(face, vec![0, 1]);
     }
 
     #[test]

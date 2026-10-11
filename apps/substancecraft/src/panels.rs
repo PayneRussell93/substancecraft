@@ -9,13 +9,14 @@ use eframe::egui::{
     RichText, Sense, Ui, pos2, vec2,
 };
 use substancecraft_core::{
-    BoneId, BoneTransform, MaterialChannel, MeshAsset, MeshId, PrimitivePreset, TextureSetId,
-    ViewportCamera,
+    Axis, BoneId, BoneTransform, Direction, LayerFill, MAX_SUBDIVISION_LEVELS, MaskGenerator,
+    MaterialChannel, MeshAsset, MeshId, MeshMapKind, MeshSmoothing, PrimitivePreset, SelectionMode,
+    TextureSetId, ViewportCamera,
 };
 
 use super::{
-    CHANNELS, MAX_MESH_SCALE, MAX_SAVED_POSES, MIN_MESH_SCALE, PaintMode, SubstanceCraftApp,
-    channel_label,
+    BAKEABLE_CHANNELS, CHANNELS, MAX_MESH_SCALE, MAX_SAVED_POSES, MIN_MESH_SCALE, PaintMode,
+    SubstanceCraftApp, channel_label,
 };
 use crate::icons::{self, Icon};
 use crate::theme;
@@ -25,29 +26,39 @@ const DRAWER_WIDTH: f32 = 284.0;
 const INSPECTOR_WIDTH: f32 = 296.0;
 /// Vertical space kept free above the bottom edge for the status pill.
 const STATUS_RESERVE: f32 = 56.0;
-const MODES: [(PaintMode, &str); 4] = [
+const MODES: [(PaintMode, &str); 5] = [
     (PaintMode::View, "View"),
     (PaintMode::Paint, "Paint"),
     (PaintMode::Mask, "Mask"),
     (PaintMode::Id, "ID"),
+    (PaintMode::Select, "Select"),
 ];
+const MESH_MAP_RESOLUTIONS: [u32; 4] = [256, 512, 1024, 2048];
 const WARNING: Color32 = Color32::from_rgb(240, 180, 80);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Drawer {
     Scene,
     Brush,
+    Bake,
     Poses,
     Environment,
 }
 
 impl Drawer {
-    const ALL: [Self; 4] = [Self::Scene, Self::Brush, Self::Poses, Self::Environment];
+    const ALL: [Self; 5] = [
+        Self::Scene,
+        Self::Brush,
+        Self::Bake,
+        Self::Poses,
+        Self::Environment,
+    ];
 
     fn icon(self) -> Icon {
         match self {
             Self::Scene => Icon::Cube,
             Self::Brush => Icon::Brush,
+            Self::Bake => Icon::Bake,
             Self::Poses => Icon::Figure,
             Self::Environment => Icon::Sun,
         }
@@ -56,7 +67,8 @@ impl Drawer {
     fn label(self) -> &'static str {
         match self {
             Self::Scene => "Scene",
-            Self::Brush => "Brush",
+            Self::Brush => "Tools",
+            Self::Bake => "Bake",
             Self::Poses => "Poses",
             Self::Environment => "Light",
         }
@@ -65,7 +77,8 @@ impl Drawer {
     fn title(self) -> &'static str {
         match self {
             Self::Scene => "Scene",
-            Self::Brush => "Brush",
+            Self::Brush => "Tools",
+            Self::Bake => "Mesh Maps",
             Self::Poses => "Poses",
             Self::Environment => "Camera & Light",
         }
@@ -92,7 +105,9 @@ impl Default for OverlayLayout {
 enum ErrorSlot {
     Project,
     Import,
+    Mesh,
     Bake,
+    MeshMaps,
     Renderer,
 }
 
@@ -115,30 +130,42 @@ impl SubstanceCraftApp {
         }
         self.paint_mode = mode;
         self.finish_active_stroke();
-        self.baked_preview = None;
-        self.active_channel = match mode {
-            PaintMode::Id => MaterialChannel::Id,
-            PaintMode::Paint | PaintMode::Mask => MaterialChannel::BaseColor,
-            PaintMode::View => self.active_channel,
+        self.hovered_selection.clear();
+        let channel = match mode {
+            PaintMode::Id => Some(MaterialChannel::Id),
+            PaintMode::Paint | PaintMode::Mask if self.active_channel == MaterialChannel::Id => {
+                Some(MaterialChannel::BaseColor)
+            }
+            _ => None,
         };
+        if let Some(channel) = channel {
+            self.set_preview_channel(channel);
+        }
         if mode != PaintMode::View && self.drawer.is_none() {
             self.drawer = Some(Drawer::Brush);
         }
     }
 
+    fn set_preview_channel(&mut self, channel: MaterialChannel) {
+        self.active_channel = channel;
+        self.mesh_map_preview = None;
+        self.invalidate_preview();
+    }
+
     fn select_primitive(&mut self, preset: PrimitivePreset) {
         self.selected_primitive = Some(preset);
         self.selected_imported_mesh = None;
-        self.mesh_geometry = Some(preset.build_mesh());
-        self.mark_mesh_changed();
         self.project.mesh = Some(MeshAsset {
             id: MeshId(1),
             source: format!("builtin:{}", preset.name()),
             scale: 1.0,
+            smoothing: self.mesh_smoothing,
         });
+        self.set_base_geometry(Some(preset.build_mesh()));
     }
 
     fn select_texture_set(&mut self, set_id: TextureSetId) {
+        self.finish_active_stroke();
         self.selected_texture_set = Some(set_id);
         self.project.active_texture_set = Some(set_id);
         self.selected_layer = self
@@ -146,9 +173,9 @@ impl SubstanceCraftApp {
             .texture_sets
             .iter()
             .find(|set| set.id == set_id)
-            .and_then(|set| set.layers.first())
+            .and_then(|set| set.layers.last())
             .map(|layer| layer.id);
-        self.baked_preview = None;
+        self.invalidate_preview();
     }
 
     /// Shows the brand and tool pills and returns the y coordinate where
@@ -247,15 +274,20 @@ impl SubstanceCraftApp {
                     self.save_project();
                 }
                 widgets::divider(ui);
-                if widgets::icon_button(ui, Icon::Undo, self.stroke_history.can_undo(), "Undo")
+                if widgets::icon_button(ui, Icon::Undo, self.history.can_undo(), "Undo (Ctrl+Z)")
                     .clicked()
                 {
-                    self.undo_stroke();
+                    self.undo();
                 }
-                if widgets::icon_button(ui, Icon::Redo, self.stroke_history.can_redo(), "Redo")
-                    .clicked()
+                if widgets::icon_button(
+                    ui,
+                    Icon::Redo,
+                    self.history.can_redo(),
+                    "Redo (Ctrl+Shift+Z)",
+                )
+                .clicked()
                 {
-                    self.redo_stroke();
+                    self.redo();
                 }
                 widgets::divider(ui);
                 let mut mode = self.paint_mode;
@@ -264,20 +296,34 @@ impl SubstanceCraftApp {
                 }
                 widgets::divider(ui);
                 ui.add_space(2.0);
+                let selected_text = match self.mesh_map_preview {
+                    Some(kind) => kind.name(),
+                    None => channel_label(self.active_channel),
+                };
+                let mut chosen = None;
                 egui::ComboBox::from_id_salt("toolbar_channel")
                     .width(118.0)
-                    .selected_text(channel_label(self.active_channel))
+                    .selected_text(selected_text)
                     .show_ui(ui, |ui| {
                         for channel in CHANNELS {
-                            ui.selectable_value(
-                                &mut self.active_channel,
-                                channel,
-                                channel_label(channel),
-                            );
+                            let selected =
+                                self.mesh_map_preview.is_none() && self.active_channel == channel;
+                            if ui
+                                .add_enabled(
+                                    BAKEABLE_CHANNELS.contains(&channel),
+                                    egui::Button::selectable(selected, channel_label(channel)),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(channel);
+                            }
                         }
                     })
                     .response
                     .on_hover_text("Preview channel");
+                if let Some(channel) = chosen {
+                    self.set_preview_channel(channel);
+                }
                 ui.add_space(2.0);
                 widgets::divider(ui);
                 if widgets::icon_button(ui, Icon::Focus, true, "Reset view").clicked() {
@@ -367,6 +413,7 @@ impl SubstanceCraftApp {
                             .show(ui, |ui| match drawer {
                                 Drawer::Scene => self.scene_drawer(ui),
                                 Drawer::Brush => self.brush_drawer(ui),
+                                Drawer::Bake => self.bake_drawer(ui),
                                 Drawer::Poses => self.poses_drawer(ui),
                                 Drawer::Environment => self.environment_drawer(ui),
                             });
@@ -430,9 +477,55 @@ impl SubstanceCraftApp {
             }
         });
 
+        widgets::caption(ui, "Smoothing");
+        let mut smoothing = self.mesh_smoothing;
+        let mut changed = slider_row(
+            ui,
+            "Smooth angle",
+            &mut smoothing.angle_degrees,
+            0.0..=180.0,
+            false,
+            0,
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for (label, angle) in [("Flat", 0.0), ("Auto 60°", 60.0), ("Smooth", 180.0)] {
+                if widgets::chip(ui, label, smoothing.angle_degrees == angle).clicked() {
+                    smoothing.angle_degrees = angle;
+                    changed = true;
+                }
+            }
+        });
+        widgets::property_row(ui, "Subdivide", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for level in 0..=MAX_SUBDIVISION_LEVELS {
+                let label = if level == 0 {
+                    "Off".to_owned()
+                } else {
+                    format!("{level}")
+                };
+                if widgets::chip(ui, &label, smoothing.subdivision_levels == level).clicked() {
+                    smoothing.subdivision_levels = level;
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            self.set_mesh_smoothing(MeshSmoothing { ..smoothing });
+        }
+        hint(
+            ui,
+            "Faces meeting below the smooth angle shade smoothly; sharper edges stay hard \
+             and are kept as creases when subdividing.",
+        );
+
         if let Some(mesh) = &self.mesh_geometry {
             widgets::caption(ui, "Mesh");
             let name = self.selected_mesh_name().unwrap_or("Mesh").to_owned();
+            let elements = self
+                .mesh_topology
+                .as_ref()
+                .map(|topology| (topology.element_count(), topology.island_count()));
             widgets::property_row(ui, "Name", |ui| ui.label(name));
             widgets::property_row(ui, "Vertices", |ui| {
                 ui.label(mesh.vertices.len().to_string())
@@ -440,6 +533,10 @@ impl SubstanceCraftApp {
             widgets::property_row(ui, "Triangles", |ui| {
                 ui.label(mesh.triangles.len().to_string())
             });
+            if let Some((elements, islands)) = elements {
+                widgets::property_row(ui, "Elements", |ui| ui.label(elements.to_string()));
+                widgets::property_row(ui, "UV islands", |ui| ui.label(islands.to_string()));
+            }
         }
     }
 
@@ -449,13 +546,21 @@ impl SubstanceCraftApp {
         if widgets::segmented(ui, Id::new("drawer_mode"), &mut mode, &MODES) {
             self.set_paint_mode(mode);
         }
-        if self.paint_mode == PaintMode::View {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("Pick Paint, Mask, or ID to paint directly on the mesh.")
-                    .size(12.0)
-                    .color(theme::TEXT_WEAK),
-            );
+        match self.paint_mode {
+            PaintMode::View => {
+                ui.add_space(2.0);
+                hint(
+                    ui,
+                    "Pick Paint, Mask, or ID to paint on the mesh, or Select to build a \
+                     polygon mask from faces, elements, or UV islands.",
+                );
+                return;
+            }
+            PaintMode::Select => {
+                self.selection_tools(ui);
+                return;
+            }
+            _ => {}
         }
 
         widgets::caption(ui, "Brush");
@@ -476,13 +581,202 @@ impl SubstanceCraftApp {
         );
 
         slider_row(ui, "Size", &mut self.brush_radius, 1.0..=128.0, false, 0);
-        if self.paint_mode != PaintMode::Mask {
-            widgets::property_row(ui, "Color", |ui| {
-                ui.color_edit_button_srgba(&mut self.brush_color);
-            });
+        match self.paint_mode {
+            PaintMode::Mask => {
+                slider_row(ui, "Mask value", &mut self.mask_value, 0.0..=1.0, false, 2);
+            }
+            PaintMode::Paint => {
+                widgets::property_row(ui, "Color", |ui| {
+                    ui.color_edit_button_srgba(&mut self.brush_color);
+                });
+                slider_row(
+                    ui,
+                    "Roughness",
+                    &mut self.brush_roughness,
+                    0.0..=1.0,
+                    false,
+                    2,
+                );
+                slider_row(
+                    ui,
+                    "Metallic",
+                    &mut self.brush_metallic,
+                    0.0..=1.0,
+                    false,
+                    2,
+                );
+                hint(
+                    ui,
+                    "One stroke paints every channel the layer enables: color, roughness, \
+                     and metallic.",
+                );
+            }
+            _ => {
+                widgets::property_row(ui, "Color", |ui| {
+                    ui.color_edit_button_srgba(&mut self.brush_color);
+                });
+            }
         }
-        if self.paint_mode == PaintMode::Mask {
-            slider_row(ui, "Mask value", &mut self.mask_value, 0.0..=1.0, false, 2);
+    }
+
+    fn selection_tools(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Select by");
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for mode in SelectionMode::ALL {
+                if widgets::chip(ui, mode.name(), self.selection_mode == mode).clicked() {
+                    self.selection_mode = mode;
+                    self.hovered_selection.clear();
+                }
+            }
+        });
+        hint(
+            ui,
+            match self.selection_mode {
+                SelectionMode::Triangle => "Click single triangles.",
+                SelectionMode::Element => {
+                    "Click a connected part of the mesh — a separate object, button, or strap."
+                }
+                SelectionMode::UvIsland => "Click to take a whole UV island.",
+            },
+        );
+        hint(
+            ui,
+            "Click adds to the selected layer's polygon mask, Shift-click removes. Drag to \
+             orbit.",
+        );
+        if self.selected_layer.is_none() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Select or add a layer first.")
+                    .size(12.0)
+                    .color(WARNING),
+            );
+            if widgets::pill_button(ui, Some(Icon::Plus), "Add fill layer", true, true).clicked() {
+                self.add_fill_layer();
+            }
+        }
+    }
+
+    fn bake_drawer(&mut self, ui: &mut Ui) {
+        let running = self.mesh_map_job_running();
+        let fresh = self.mesh_maps_fresh();
+        widgets::property_row(ui, "Status", |ui| {
+            let (text, color) = if running {
+                ("Baking…", theme::ACCENT)
+            } else if fresh {
+                ("Up to date", theme::TEXT)
+            } else if self.mesh_map_error.is_some() {
+                ("Failed", theme::DANGER)
+            } else {
+                ("Not baked", theme::TEXT_WEAK)
+            };
+            if running {
+                ui.add(egui::Spinner::new().size(12.0));
+            }
+            ui.label(RichText::new(text).color(color));
+        });
+        if let Some(maps) = self.mesh_maps.as_ref().filter(|_| fresh) {
+            let summary = format!(
+                "{}² · {:.0}% UV coverage",
+                maps.width(),
+                maps.coverage() * 100.0
+            );
+            widgets::property_row(ui, "Maps", |ui| ui.label(summary));
+        }
+        if running {
+            if widgets::pill_button(ui, Some(Icon::Close), "Cancel bake", false, true).clicked() {
+                self.cancel_mesh_map_job();
+            }
+        } else if widgets::pill_button(ui, Some(Icon::Bake), "Bake mesh maps", true, true).clicked()
+        {
+            self.mesh_map_error = None;
+            self.start_mesh_map_bake();
+        }
+        hint(
+            ui,
+            "Generators such as Edge Wear and Dirt read these maps. They rebake \
+             automatically when the mesh or its smoothing changes.",
+        );
+
+        widgets::caption(ui, "Settings");
+        widgets::property_row(ui, "Resolution", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for resolution in MESH_MAP_RESOLUTIONS {
+                let label = if resolution >= 1024 {
+                    format!("{}k", resolution / 1024)
+                } else {
+                    resolution.to_string()
+                };
+                if widgets::chip(ui, &label, self.mesh_map_settings.resolution == resolution)
+                    .clicked()
+                {
+                    self.mesh_map_settings.resolution = resolution;
+                }
+            }
+        });
+        let mut samples = self.mesh_map_settings.ao_samples as f32;
+        if slider_row(ui, "AO samples", &mut samples, 4.0..=128.0, false, 0) {
+            self.mesh_map_settings.ao_samples = samples.round() as u32;
+        }
+        slider_row(
+            ui,
+            "AO distance",
+            &mut self.mesh_map_settings.ao_distance,
+            0.01..=1.0,
+            true,
+            2,
+        );
+        slider_row(
+            ui,
+            "Edge width",
+            &mut self.mesh_map_settings.edge_width,
+            0.002..=0.15,
+            true,
+            3,
+        );
+        slider_row(
+            ui,
+            "Edge angle",
+            &mut self.mesh_map_settings.edge_angle_degrees,
+            1.0..=120.0,
+            false,
+            0,
+        );
+        let mut padding = self.mesh_map_settings.padding as f32;
+        if slider_row(ui, "Padding", &mut padding, 0.0..=16.0, false, 0) {
+            self.mesh_map_settings.padding = padding.round() as u32;
+        }
+        hint(ui, "Setting changes apply on the next bake.");
+
+        widgets::caption(ui, "Preview on mesh");
+        let mut preview = self.mesh_map_preview;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            if widgets::chip(ui, "Material", preview.is_none()).clicked() {
+                preview = None;
+            }
+            for kind in MeshMapKind::ALL {
+                if widgets::chip(ui, kind.name(), preview == Some(kind)).clicked() {
+                    preview = Some(kind);
+                }
+            }
+        });
+        if preview != self.mesh_map_preview {
+            self.mesh_map_preview = preview;
+            self.invalidate_preview();
+        }
+        if let Some(kind) = self.mesh_map_preview
+            && widgets::pill_button(
+                ui,
+                Some(Icon::Export),
+                &format!("Export {}", kind.name()),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.export_mesh_map(kind);
         }
     }
 
@@ -609,6 +903,7 @@ impl SubstanceCraftApp {
     }
 
     fn show_inspector_column(&mut self, context: &egui::Context, screen: Rect) {
+        let max_height = (screen.height() - theme::EDGE * 2.0).max(240.0);
         egui::Area::new(Id::new("overlay_inspector"))
             .order(Order::Middle)
             .pivot(Align2::RIGHT_TOP)
@@ -618,10 +913,16 @@ impl SubstanceCraftApp {
             ))
             .show(context, |ui| {
                 ui.set_width(INSPECTOR_WIDTH);
-                ui.spacing_mut().item_spacing.y = theme::GAP;
-                self.texture_sets_card(ui);
-                self.layers_card(ui);
-                self.properties_card(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .max_height(max_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = theme::GAP;
+                        self.texture_sets_card(ui);
+                        self.layers_card(ui);
+                        self.properties_card(ui);
+                    });
             });
     }
 
@@ -654,8 +955,7 @@ impl SubstanceCraftApp {
                     .collect::<Vec<_>>();
                 egui::ScrollArea::vertical()
                     .id_salt("texture_sets_scroll")
-                    .max_height(172.0)
-                    .min_scrolled_height(172.0)
+                    .max_height(120.0)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for (set_id, name, slot) in sets {
@@ -686,7 +986,6 @@ impl SubstanceCraftApp {
     }
 
     fn layers_card(&mut self, ui: &mut Ui) {
-        let has_set = self.selected_texture_set.is_some();
         let mut add = false;
         widgets::card(
             ui,
@@ -695,11 +994,35 @@ impl SubstanceCraftApp {
             "Layers",
             1,
             |ui| {
-                add = widgets::header_action(ui, Icon::Plus, has_set, "Add paint layer").clicked();
+                add = widgets::header_action(ui, Icon::Plus, true, "Add paint layer").clicked();
             },
             |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+                    if widgets::chip(ui, "+ Paint", false).clicked() {
+                        self.add_paint_layer();
+                    }
+                    if widgets::chip(ui, "+ Fill", false)
+                        .on_hover_text("Uniform material covering the layer mask")
+                        .clicked()
+                    {
+                        self.add_fill_layer();
+                    }
+                    if widgets::chip(ui, "Edge Wear", false)
+                        .on_hover_text("Bare metal on convex edges, driven by curvature")
+                        .clicked()
+                    {
+                        self.add_edge_wear_layer();
+                    }
+                    if widgets::chip(ui, "Dirt", false)
+                        .on_hover_text("Grime in cavities, driven by occlusion and curvature")
+                        .clicked()
+                    {
+                        self.add_dirt_layer();
+                    }
+                });
                 let Some(texture_set_id) = self.selected_texture_set else {
-                    empty_state(ui, "Select a texture set to see its layers.");
+                    empty_state(ui, "Add a layer to create a texture set.");
                     return;
                 };
                 let layers = self
@@ -710,28 +1033,36 @@ impl SubstanceCraftApp {
                     .map(|set| {
                         set.layers
                             .iter()
+                            .rev()
                             .map(|layer| {
-                                (layer.id, layer.name.clone(), layer.visible, layer.opacity)
+                                let kind = match (&layer.fill, &layer.mask_generator) {
+                                    (_, Some(generator)) => generator.name(),
+                                    (Some(_), None) => "Fill",
+                                    (None, None) => "Paint",
+                                };
+                                (
+                                    layer.id,
+                                    layer.name.clone(),
+                                    layer.visible,
+                                    layer.opacity,
+                                    kind,
+                                    layer.polygon_mask.is_some(),
+                                )
                             })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
                 if layers.is_empty() {
                     empty_state(ui, "This texture set has no layers.");
-                    if widgets::pill_button(ui, Some(Icon::Plus), "Add paint layer", true, true)
-                        .clicked()
-                    {
-                        self.add_paint_layer();
-                    }
                     return;
                 }
+                ui.add_space(2.0);
                 egui::ScrollArea::vertical()
                     .id_salt("layers_scroll")
-                    .max_height(220.0)
-                    .min_scrolled_height(220.0)
+                    .max_height(200.0)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        for (layer_id, name, visible, opacity) in layers {
+                        for (layer_id, name, visible, opacity, kind, polygon) in layers {
                             let selected = self.selected_layer == Some(layer_id);
                             let mut toggle_visibility = false;
                             let row = widgets::list_row(
@@ -760,31 +1091,83 @@ impl SubstanceCraftApp {
                                                 .size(11.5)
                                                 .color(theme::TEXT_FAINT),
                                         );
+                                        let badge = if polygon {
+                                            format!("{kind} · Poly")
+                                        } else {
+                                            kind.to_owned()
+                                        };
+                                        ui.label(
+                                            RichText::new(badge).size(10.5).color(theme::ACCENT),
+                                        );
                                     });
                                 },
                             );
-                            if toggle_visibility
-                                && let Some(layer) = self
-                                    .project
-                                    .texture_sets
-                                    .iter_mut()
-                                    .find(|set| set.id == texture_set_id)
-                                    .and_then(|set| {
-                                        set.layers.iter_mut().find(|layer| layer.id == layer_id)
-                                    })
-                            {
-                                layer.visible = !layer.visible;
-                                self.baked_preview = None;
+                            if toggle_visibility {
+                                self.toggle_layer_visibility(texture_set_id, layer_id);
                             } else if row.clicked() {
+                                self.finish_active_stroke();
                                 self.selected_layer = Some(layer_id);
                             }
                         }
                     });
+
+                if let Some((_, index, count)) = self.selected_layer_index() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if widgets::icon_button(ui, Icon::ArrowUp, index + 1 < count, "Move up")
+                            .clicked()
+                        {
+                            self.move_selected_layer(1);
+                        }
+                        if widgets::icon_button(ui, Icon::ArrowDown, index > 0, "Move down")
+                            .clicked()
+                        {
+                            self.move_selected_layer(-1);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::icon_button(ui, Icon::Trash, true, "Delete layer").clicked()
+                            {
+                                self.delete_selected_layer();
+                            }
+                        });
+                    });
+                }
             },
         );
         if add {
             self.add_paint_layer();
         }
+    }
+
+    fn toggle_layer_visibility(
+        &mut self,
+        texture_set_id: TextureSetId,
+        layer_id: substancecraft_core::LayerId,
+    ) {
+        let Some(layer) = self
+            .project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == texture_set_id)
+            .and_then(|set| set.layers.iter_mut().find(|layer| layer.id == layer_id))
+        else {
+            return;
+        };
+        let before = layer.settings();
+        layer.visible = !layer.visible;
+        let after = layer.settings();
+        self.history
+            .record(substancecraft_core::EditCommand::LayerSettings {
+                texture_set_id,
+                layer_id,
+                before: Box::new(before),
+                after: Box::new(after.clone()),
+            });
+        if self.selected_layer == Some(layer_id) {
+            self.layer_settled = Some((texture_set_id, layer_id, after));
+        }
+        self.invalidate_preview();
     }
 
     fn properties_card(&mut self, ui: &mut Ui) {
@@ -806,72 +1189,185 @@ impl SubstanceCraftApp {
                     return;
                 };
                 let name = texture_set.name.clone();
-                let slot = texture_set.material_slot.clone();
                 let resolution = format!(
                     "{} × {}",
                     texture_set.resolution.width, texture_set.resolution.height
                 );
-                let layer_count = texture_set.layers.len().to_string();
                 widgets::property_row(ui, "Texture set", |ui| ui.label(name));
-                widgets::property_row(ui, "Material slot", |ui| ui.label(slot));
                 widgets::property_row(ui, "Resolution", |ui| ui.label(resolution));
-                widgets::property_row(ui, "Layers", |ui| ui.label(layer_count));
 
-                if let (Some(texture_set_id), Some(layer_id)) =
-                    (self.selected_texture_set, self.selected_layer)
-                {
-                    widgets::caption(ui, "Selected layer");
-                    let existing_mask = self
-                        .project
-                        .texture_sets
-                        .iter()
-                        .find(|set| set.id == texture_set_id)
-                        .and_then(|set| set.layers.iter().find(|layer| layer.id == layer_id))
-                        .and_then(|layer| layer.id_mask_color);
-                    let mut enabled = existing_mask.is_some();
-                    let color = existing_mask.unwrap_or_else(|| {
-                        let brush = self.brush_color.to_array();
-                        [brush[0], brush[1], brush[2]]
-                    });
-                    let mut color = Color32::from_rgb(color[0], color[1], color[2]);
-                    let changed = widgets::property_row(ui, "Clip by ID", |ui| {
-                        let mut changed = widgets::toggle(ui, &mut enabled).changed();
-                        if enabled {
-                            ui.add_space(4.0);
-                            changed |= ui.color_edit_button_srgba(&mut color).changed();
-                        }
-                        changed
-                    });
-                    if changed
-                        && let Some(layer) = self
-                            .project
-                            .texture_sets
-                            .iter_mut()
-                            .find(|set| set.id == texture_set_id)
-                            .and_then(|set| {
-                                set.layers.iter_mut().find(|layer| layer.id == layer_id)
-                            })
-                    {
-                        let channels = color.to_array();
-                        layer.id_mask_color =
-                            enabled.then_some([channels[0], channels[1], channels[2]]);
-                        self.baked_preview = None;
-                    }
+                if self.selected_layer().is_some() {
+                    self.layer_properties(ui);
                 }
 
                 widgets::caption(ui, "Bake & export");
-                if widgets::pill_button(ui, Some(Icon::Export), "Export Base Color", false, true)
-                    .clicked()
-                {
-                    self.export_baked_map(MaterialChannel::BaseColor);
-                }
-                if widgets::pill_button(ui, Some(Icon::Export), "Export ID Mask", false, true)
-                    .clicked()
-                {
-                    self.export_baked_map(MaterialChannel::Id);
-                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for channel in BAKEABLE_CHANNELS {
+                        if widgets::chip(ui, channel_label(channel), false)
+                            .on_hover_text(format!("Export {} as TGA", channel_label(channel)))
+                            .clicked()
+                        {
+                            self.export_baked_map(channel);
+                        }
+                    }
+                });
             },
         );
+    }
+
+    fn layer_properties(&mut self, ui: &mut Ui) {
+        let mesh_maps_needed = self
+            .selected_layer()
+            .is_some_and(|layer| layer.mask_generator.is_some());
+        let maps_state = if self.mesh_map_job_running() {
+            Some(("Baking mesh maps…", theme::ACCENT))
+        } else if mesh_maps_needed && !self.mesh_maps_fresh() {
+            Some(("Mesh maps needed", WARNING))
+        } else {
+            None
+        };
+        let brush = self.brush_color.to_array();
+        let triangle_count = self
+            .mesh_geometry
+            .as_ref()
+            .map_or(0, |mesh| mesh.triangles.len());
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+
+        widgets::caption(ui, "Layer");
+        widgets::property_row(ui, "Name", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut layer.name)
+                    .desired_width(ui.available_width())
+                    .margin(vec2(8.0, 3.0)),
+            );
+        });
+        slider_row(ui, "Opacity", &mut layer.opacity, 0.0..=1.0, false, 2);
+        widgets::property_row(ui, "Channels", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (channel, label) in [
+                (MaterialChannel::BaseColor, "Color"),
+                (MaterialChannel::Roughness, "Rough"),
+                (MaterialChannel::Metallic, "Metal"),
+                (MaterialChannel::Id, "ID"),
+            ] {
+                let enabled = layer.channels.contains(&channel);
+                if widgets::chip(ui, label, enabled).clicked() {
+                    if enabled {
+                        layer.channels.remove(&channel);
+                    } else {
+                        layer.channels.insert(channel);
+                    }
+                }
+            }
+        });
+
+        if let Some(fill) = layer.fill.as_mut() {
+            widgets::caption(ui, "Fill");
+            let mut color = Color32::from_rgba_unmultiplied(
+                fill.color[0],
+                fill.color[1],
+                fill.color[2],
+                fill.color[3],
+            );
+            widgets::property_row(ui, "Color", |ui| {
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    fill.color = color.to_srgba_unmultiplied();
+                }
+            });
+            slider_row(ui, "Roughness", &mut fill.roughness, 0.0..=1.0, false, 2);
+            slider_row(ui, "Metallic", &mut fill.metallic, 0.0..=1.0, false, 2);
+        } else {
+            ui.add_space(2.0);
+            if widgets::pill_button(ui, Some(Icon::Plus), "Add fill", false, true)
+                .on_hover_text("Cover this layer's mask with uniform material values")
+                .clicked()
+            {
+                layer.fill = Some(LayerFill {
+                    color: brush,
+                    ..LayerFill::default()
+                });
+            }
+        }
+
+        widgets::caption(ui, "Mask generator");
+        let current = layer.mask_generator;
+        let mut chosen = current;
+        egui::ComboBox::from_id_salt(("generator_kind", layer.id.0))
+            .width(ui.available_width() - 8.0)
+            .selected_text(current.map_or("None", |generator| generator.name()))
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "None").clicked() {
+                    chosen = None;
+                }
+                for preset in MaskGenerator::PRESETS {
+                    let selected = current.is_some_and(|generator| generator.same_kind(&preset));
+                    if ui.selectable_label(selected, preset.name()).clicked() && !selected {
+                        chosen = Some(preset);
+                    }
+                }
+            });
+        if chosen != current {
+            layer.mask_generator = chosen;
+        }
+        if let Some((text, color)) = maps_state {
+            ui.horizontal(|ui| {
+                if color == theme::ACCENT {
+                    ui.add(egui::Spinner::new().size(11.0));
+                }
+                ui.label(RichText::new(text).size(12.0).color(color));
+            });
+        }
+        if let Some(generator) = layer.mask_generator.as_mut() {
+            generator_controls(ui, generator);
+        }
+
+        widgets::caption(ui, "Polygon mask");
+        match layer.polygon_mask.as_mut() {
+            None => {
+                hint(
+                    ui,
+                    "Use the Select tool to limit this layer to parts of the mesh.",
+                );
+            }
+            Some(mask) => {
+                let count = if mask.inverted {
+                    triangle_count.saturating_sub(mask.triangles.len())
+                } else {
+                    mask.triangles.len()
+                };
+                widgets::property_row(ui, "Triangles", |ui| {
+                    ui.label(format!("{count} of {triangle_count}"))
+                });
+                widgets::property_row(ui, "Invert", |ui| widgets::toggle(ui, &mut mask.inverted));
+                if widgets::pill_button(ui, Some(Icon::Close), "Remove polygon mask", false, true)
+                    .clicked()
+                {
+                    layer.polygon_mask = None;
+                }
+            }
+        }
+
+        widgets::caption(ui, "ID clip");
+        let mut enabled = layer.id_mask_color.is_some();
+        let color = layer
+            .id_mask_color
+            .unwrap_or([brush[0], brush[1], brush[2]]);
+        let mut color = Color32::from_rgb(color[0], color[1], color[2]);
+        let changed = widgets::property_row(ui, "Clip by ID", |ui| {
+            let mut changed = widgets::toggle(ui, &mut enabled).changed();
+            if enabled {
+                ui.add_space(4.0);
+                changed |= ui.color_edit_button_srgba(&mut color).changed();
+            }
+            changed
+        });
+        if changed {
+            let channels = color.to_array();
+            layer.id_mask_color = enabled.then_some([channels[0], channels[1], channels[2]]);
+        }
     }
 
     fn show_status(&self, context: &egui::Context, screen: Rect) {
@@ -909,15 +1405,27 @@ impl SubstanceCraftApp {
                                 );
                             }
                             status_separator(ui);
-                            status_text(ui, channel_label(self.active_channel), theme::TEXT_WEAK);
+                            let preview = match self.mesh_map_preview {
+                                Some(kind) => kind.name(),
+                                None => channel_label(self.active_channel),
+                            };
+                            status_text(ui, preview, theme::TEXT_WEAK);
+                            if self.mesh_map_job_running() {
+                                status_separator(ui);
+                                ui.add(egui::Spinner::new().size(11.0));
+                                status_text(ui, "Baking mesh maps", theme::ACCENT);
+                            }
                             status_separator(ui);
                             let hint = match self.paint_mode {
                                 PaintMode::View => {
                                     "Drag to orbit · Shift-drag to pan · Scroll to zoom"
                                 }
-                                PaintMode::Paint => "Painting base color",
+                                PaintMode::Paint => "Painting material",
                                 PaintMode::Mask => "Painting layer mask",
                                 PaintMode::Id => "Painting ID mask",
+                                PaintMode::Select => {
+                                    "Click to select · Shift-click to deselect · Drag to orbit"
+                                }
                             };
                             status_text(ui, hint, theme::TEXT_FAINT);
                         });
@@ -929,7 +1437,9 @@ impl SubstanceCraftApp {
         let errors = [
             (ErrorSlot::Project, &self.project_error),
             (ErrorSlot::Import, &self.import_error),
+            (ErrorSlot::Mesh, &self.mesh_error),
             (ErrorSlot::Bake, &self.bake_error),
+            (ErrorSlot::MeshMaps, &self.mesh_map_error),
             (ErrorSlot::Renderer, &self.filament_error),
         ]
         .into_iter()
@@ -987,11 +1497,103 @@ impl SubstanceCraftApp {
             match slot {
                 ErrorSlot::Project => self.project_error = None,
                 ErrorSlot::Import => self.import_error = None,
-                ErrorSlot::Bake => self.bake_error = None,
+                ErrorSlot::Mesh => self.mesh_error = None,
+                ErrorSlot::Bake => {
+                    self.bake_error = None;
+                    self.invalidate_preview();
+                }
+                ErrorSlot::MeshMaps => self.mesh_map_error = None,
                 ErrorSlot::Renderer => self.filament_error = None,
             }
         }
     }
+}
+
+/// Parameter sliders for one mask generator.
+fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
+    match generator {
+        MaskGenerator::EdgeWear(settings) => {
+            slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
+            slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
+            slider_row(ui, "Breakup", &mut settings.breakup, 0.0..=1.0, false, 2);
+            slider_row(
+                ui,
+                "Breakup scale",
+                &mut settings.breakup_scale,
+                0.5..=64.0,
+                true,
+                1,
+            );
+            seed_row(ui, &mut settings.seed);
+        }
+        MaskGenerator::Dirt(settings) => {
+            slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
+            slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
+            slider_row(
+                ui,
+                "Cavity ↔ AO",
+                &mut settings.cavity_weight,
+                0.0..=1.0,
+                false,
+                2,
+            );
+            slider_row(ui, "Breakup", &mut settings.breakup, 0.0..=1.0, false, 2);
+            slider_row(
+                ui,
+                "Breakup scale",
+                &mut settings.breakup_scale,
+                0.5..=64.0,
+                true,
+                1,
+            );
+            seed_row(ui, &mut settings.seed);
+        }
+        MaskGenerator::Orientation(settings) => {
+            widgets::property_row(ui, "Direction", |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for direction in Direction::ALL {
+                    if widgets::chip(ui, direction.name(), settings.direction == direction)
+                        .clicked()
+                    {
+                        settings.direction = direction;
+                    }
+                }
+            });
+            slider_row(
+                ui,
+                "Spread°",
+                &mut settings.spread_degrees,
+                0.0..=180.0,
+                false,
+                0,
+            );
+            slider_row(ui, "Softness", &mut settings.softness, 0.0..=1.0, false, 2);
+        }
+        MaskGenerator::Gradient(settings) => {
+            widgets::property_row(ui, "Axis", |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for axis in Axis::ALL {
+                    if widgets::chip(ui, axis.name(), settings.axis == axis).clicked() {
+                        settings.axis = axis;
+                    }
+                }
+            });
+            slider_row(ui, "Start", &mut settings.start, 0.0..=1.0, false, 2);
+            slider_row(ui, "End", &mut settings.end, 0.0..=1.0, false, 2);
+        }
+        MaskGenerator::Noise(settings) => {
+            slider_row(ui, "Scale", &mut settings.scale, 0.5..=64.0, true, 1);
+            slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
+            slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
+            seed_row(ui, &mut settings.seed);
+        }
+    }
+}
+
+fn seed_row(ui: &mut Ui, seed: &mut u32) {
+    widgets::property_row(ui, "Seed", |ui| {
+        ui.add(egui::DragValue::new(seed).range(0..=9_999));
+    });
 }
 
 /// Dock tab: icon above a short label inside a rounded hover plate.
@@ -1040,6 +1642,10 @@ fn small_icon(ui: &mut Ui, icon: Icon, color: Color32) {
 
 fn empty_state(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.5).color(theme::TEXT_FAINT));
+}
+
+fn hint(ui: &mut Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(theme::TEXT_WEAK)).wrap());
 }
 
 fn status_text(ui: &mut Ui, text: &str, color: Color32) {

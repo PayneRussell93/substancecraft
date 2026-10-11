@@ -84,8 +84,7 @@ impl MeshMapSettings {
         if !self.edge_width.is_finite() || !(0.0005..=0.5).contains(&self.edge_width) {
             return Err(MeshMapError::InvalidSettings("edge_width"));
         }
-        if !self.edge_angle_degrees.is_finite()
-            || !(1.0..=170.0).contains(&self.edge_angle_degrees)
+        if !self.edge_angle_degrees.is_finite() || !(1.0..=170.0).contains(&self.edge_angle_degrees)
         {
             return Err(MeshMapError::InvalidSettings("edge_angle_degrees"));
         }
@@ -224,7 +223,9 @@ impl MeshMaps {
     }
 
     fn diagonal(&self) -> f32 {
-        (self.bounds_max - self.bounds_min).length().max(f32::EPSILON)
+        (self.bounds_max - self.bounds_min)
+            .length()
+            .max(f32::EPSILON)
     }
 
     /// Bilinearly samples every map at `uv`, ignoring texels outside UV
@@ -359,7 +360,10 @@ pub fn bake_mesh_maps(
             },
         );
     }
-    let covered = owner.iter().map(|owner| *owner != u32::MAX).collect::<Vec<_>>();
+    let covered = owner
+        .iter()
+        .map(|owner| *owner != u32::MAX)
+        .collect::<Vec<_>>();
 
     let mut texels = try_filled_vec(pixel_count, Texel::default())?;
     let context = TexelContext {
@@ -432,7 +436,13 @@ fn try_filled_vec<T: Clone>(count: usize, value: T) -> Result<Vec<T>, MeshMapErr
 
 /// Grows island texels outward by `padding` texels, copying the nearest
 /// island texel, and returns the filled mask.
-fn dilate(texels: &mut [Texel], covered: &[bool], width: u32, height: u32, padding: u32) -> Vec<bool> {
+fn dilate(
+    texels: &mut [Texel],
+    covered: &[bool],
+    width: u32,
+    height: u32,
+    padding: u32,
+) -> Vec<bool> {
     let mut filled = covered.to_vec();
     let width = width as i64;
     let height = height as i64;
@@ -611,7 +621,11 @@ impl SurfaceGeometry {
                         // Only edges bounding a surface facing roughly the
                         // same way count, so thin walls do not pick up the
                         // opposite side's edges.
-                        if edge.normals.iter().all(|normal| normal.dot(face_normal) < 0.5) {
+                        if edge
+                            .normals
+                            .iter()
+                            .all(|normal| normal.dot(face_normal) < 0.5)
+                        {
                             continue;
                         }
                         let distance = distance_to_segment(point, edge.start, edge.end);
@@ -686,7 +700,8 @@ fn feature_edges(
             .iter()
             .map(|index| mesh.vertices[*index as usize].position)
             .max_by(|left, right| {
-                distance_to_segment(*left, start, end).total_cmp(&distance_to_segment(*right, start, end))
+                distance_to_segment(*left, start, end)
+                    .total_cmp(&distance_to_segment(*right, start, end))
             })
             .unwrap_or(start);
         let convex = first_normal.dot(far - start) < 0.0;
@@ -931,7 +946,8 @@ impl Bvh {
     }
 
     fn any_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> bool {
-        self.traverse(origin, direction, t_min, t_max, true).is_some()
+        self.traverse(origin, direction, t_min, t_max, true)
+            .is_some()
     }
 
     fn closest_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> Option<f32> {
@@ -1048,7 +1064,11 @@ mod tests {
         let centre = maps.sample(front_face_uv(0.0, 0.0));
         let near_edge = maps.sample(front_face_uv(0.49, 0.0));
         assert!(centre.covered && near_edge.covered);
-        assert!((centre.curvature - 0.5).abs() < 0.02, "centre {}", centre.curvature);
+        assert!(
+            (centre.curvature - 0.5).abs() < 0.02,
+            "centre {}",
+            centre.curvature
+        );
         assert!(near_edge.curvature > 0.8, "edge {}", near_edge.curvature);
         assert!((centre.normal - Vec3::Z).length() < 0.01);
         assert!((centre.position - Vec3::new(0.0, 0.0, 0.5)).length() < 0.05);
@@ -1105,9 +1125,21 @@ mod tests {
         // Floor UV v=0 is z=+0.5 (open), v=1 is z=-0.5 (at the wall).
         let open = maps.sample(Vec2::new(0.245, 0.1));
         let corner = maps.sample(Vec2::new(0.245, 0.97));
-        assert!(open.ambient_occlusion > 0.85, "open {}", open.ambient_occlusion);
-        assert!(corner.ambient_occlusion < 0.7, "corner {}", corner.ambient_occlusion);
-        assert!(corner.curvature < 0.4, "concave corner {}", corner.curvature);
+        assert!(
+            open.ambient_occlusion > 0.85,
+            "open {}",
+            open.ambient_occlusion
+        );
+        assert!(
+            corner.ambient_occlusion < 0.7,
+            "corner {}",
+            corner.ambient_occlusion
+        );
+        assert!(
+            corner.curvature < 0.4,
+            "concave corner {}",
+            corner.curvature
+        );
         assert!(maps.to_texture(MeshMapKind::AmbientOcclusion).rgba8.len() == 64 * 64 * 4);
     }
 
@@ -1140,6 +1172,10 @@ mod tests {
         assert!(sample.covered);
         assert!(sample.ambient_occlusion > 0.9);
         assert!(sample.thickness > 0.5);
-        assert!(sample.curvature > 0.55, "sphere is convex: {}", sample.curvature);
+        assert!(
+            sample.curvature > 0.55,
+            "sphere is convex: {}",
+            sample.curvature
+        );
     }
 }

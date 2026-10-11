@@ -92,9 +92,13 @@ mod tests {
 
     #[test]
     fn half_square_triangle_covers_its_half_without_fringe() {
-        let mut covered = vec![false; 16];
+        let mut covered = [false; 16];
         rasterize_uv_triangle(
-            [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)],
+            [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+            ],
             4,
             4,
             0.0,

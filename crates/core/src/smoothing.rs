@@ -124,7 +124,11 @@ pub fn corner_normals(mesh: &MeshGeometry, angle_degrees: f32) -> Vec<[Vec3; 3]>
 /// smoothing groups receives the average of its corner normals.
 pub fn vertex_normals(mesh: &MeshGeometry, angle_degrees: f32) -> Vec<Vec3> {
     let mut normals = vec![Vec3::ZERO; mesh.vertices.len()];
-    for (triangle, corners) in mesh.triangles.iter().zip(corner_normals(mesh, angle_degrees)) {
+    for (triangle, corners) in mesh
+        .triangles
+        .iter()
+        .zip(corner_normals(mesh, angle_degrees))
+    {
         for (vertex, normal) in triangle.iter().zip(corners) {
             if let Some(slot) = normals.get_mut(*vertex as usize) {
                 *slot += normal;
@@ -321,7 +325,14 @@ mod tests {
             uv: Vec2::new(position.x, position.z),
         };
         MeshGeometry {
-            vertices: vec![vertex(a), vertex(c), vertex(b), vertex(a), vertex(d), vertex(c)],
+            vertices: vec![
+                vertex(a),
+                vertex(c),
+                vertex(b),
+                vertex(a),
+                vertex(d),
+                vertex(c),
+            ],
             triangles: vec![[0, 1, 2], [3, 4, 5]],
         }
     }
@@ -333,11 +344,17 @@ mod tests {
         // Vertex 0 and 3 are the same position in different triangles.
         assert!((smooth[0] - smooth[3]).length() < 1e-5);
         let flat = vertex_normals(&mesh, 0.0);
-        assert!((flat[0] - flat[3]).length() > 0.1, "flat shading keeps facets");
+        assert!(
+            (flat[0] - flat[3]).length() > 0.1,
+            "flat shading keeps facets"
+        );
 
         let cube = PrimitivePreset::Cube.build_mesh();
         let normals = vertex_normals(&cube, 60.0);
-        assert!((normals[0] - Vec3::Z).length() < 1e-5, "cube edges stay hard");
+        assert!(
+            (normals[0] - Vec3::Z).length() < 1e-5,
+            "cube edges stay hard"
+        );
     }
 
     #[test]

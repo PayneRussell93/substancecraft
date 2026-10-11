@@ -482,7 +482,9 @@ mod tests {
     fn headless_filament_render_returns_an_rgba_frame() {
         let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
         let geometry = PrimitivePreset::Cube.build_mesh();
-        renderer.set_mesh(&geometry, 60.0).expect("cube mesh upload");
+        renderer
+            .set_mesh(&geometry, 60.0)
+            .expect("cube mesh upload");
         let (sender, receiver) = sync_channel(1);
         let rendered = renderer
             .render(ViewportCamera::default(), 64, 64, 1.0, move |pixels| {

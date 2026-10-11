@@ -15,7 +15,7 @@ mod smoothing;
 mod topology;
 
 pub use generators::{
-    Axis, Dirt, Direction, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
+    Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
@@ -679,7 +679,9 @@ impl MaterialLayer {
 
     fn has_valid_settings(&self) -> bool {
         self.fill.is_none_or(|fill| fill.is_valid())
-            && self.mask_generator.is_none_or(|generator| generator.is_valid())
+            && self
+                .mask_generator
+                .is_none_or(|generator| generator.is_valid())
             && self
                 .polygon_mask
                 .as_ref()
@@ -2273,7 +2275,9 @@ mod tests {
             mesh_maps: None,
         };
 
-        let baked = set.bake_channel(MaterialChannel::BaseColor, context).unwrap();
+        let baked = set
+            .bake_channel(MaterialChannel::BaseColor, context)
+            .unwrap();
         let selected = baked.sample_uv(cube_face_uv(0, glam::Vec2::ZERO)).unwrap();
         let other = baked.sample_uv(cube_face_uv(1, glam::Vec2::ZERO)).unwrap();
         assert_eq!(selected, [220, 20, 20, 255]);
@@ -2290,9 +2294,16 @@ mod tests {
         let inverted = small_set(48, layer)
             .bake_channel(MaterialChannel::BaseColor, context)
             .unwrap();
-        assert_eq!(inverted.sample_uv(cube_face_uv(0, glam::Vec2::ZERO)).unwrap()[3], 0);
         assert_eq!(
-            inverted.sample_uv(cube_face_uv(1, glam::Vec2::ZERO)).unwrap()[3],
+            inverted
+                .sample_uv(cube_face_uv(0, glam::Vec2::ZERO))
+                .unwrap()[3],
+            0
+        );
+        assert_eq!(
+            inverted
+                .sample_uv(cube_face_uv(1, glam::Vec2::ZERO))
+                .unwrap()[3],
             255
         );
     }
@@ -2330,7 +2341,9 @@ mod tests {
             mesh_maps: Some(&maps),
         };
 
-        let metallic = set.bake_channel(MaterialChannel::Metallic, context).unwrap();
+        let metallic = set
+            .bake_channel(MaterialChannel::Metallic, context)
+            .unwrap();
         let centre = metallic
             .sample_uv(cube_face_uv(0, glam::Vec2::ZERO))
             .unwrap();
@@ -2340,7 +2353,9 @@ mod tests {
         assert_eq!(centre, [0, 0, 0, 255]);
         assert!(edge[0] > 200, "edge metallic {}", edge[0]);
 
-        let roughness = set.bake_channel(MaterialChannel::Roughness, context).unwrap();
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, context)
+            .unwrap();
         let centre = roughness
             .sample_uv(cube_face_uv(0, glam::Vec2::ZERO))
             .unwrap();

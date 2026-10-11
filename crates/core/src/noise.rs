@@ -88,8 +88,10 @@ pub fn fbm3(point: Vec3, octaves: u32, seed: u32) -> f32 {
     let mut total = 0.0;
     let mut frequency = 1.0;
     for octave in 0..octaves.clamp(1, 8) {
-        sum += gradient_noise3(point * frequency, seed.wrapping_add(octave.wrapping_mul(0x6d2b_79f5)))
-            * amplitude;
+        sum += gradient_noise3(
+            point * frequency,
+            seed.wrapping_add(octave.wrapping_mul(0x6d2b_79f5)),
+        ) * amplitude;
         total += amplitude;
         amplitude *= 0.5;
         frequency *= 2.03;
