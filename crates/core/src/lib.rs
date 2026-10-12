@@ -771,6 +771,9 @@ pub struct MaterialLayer {
     /// Multiplies the mask by a grayscale bitmap.
     #[serde(default)]
     pub mask_bitmap: Option<BitmapMask>,
+    /// Inverts the fully evaluated mask after every mask source and filter.
+    #[serde(default)]
+    pub invert_final_mask: bool,
     /// Filters applied, in order, to the layer's content before masking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<LayerFilter>,
@@ -812,6 +815,7 @@ impl MaterialLayer {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -869,6 +873,7 @@ impl MaterialLayer {
             mask_generator: self.mask_generator,
             polygon_mask: self.polygon_mask.clone(),
             mask_bitmap: self.mask_bitmap,
+            invert_final_mask: self.invert_final_mask,
             filters: self.filters.clone(),
             mask_filters: self.mask_filters.clone(),
             mask_anchor: self.mask_anchor,
@@ -886,6 +891,7 @@ impl MaterialLayer {
         self.mask_generator = settings.mask_generator;
         self.polygon_mask = settings.polygon_mask;
         self.mask_bitmap = settings.mask_bitmap;
+        self.invert_final_mask = settings.invert_final_mask;
         self.filters = settings.filters;
         self.mask_filters = settings.mask_filters;
         self.mask_anchor = settings.mask_anchor;
@@ -1131,6 +1137,7 @@ pub struct LayerSettings {
     pub mask_generator: Option<MaskGenerator>,
     pub polygon_mask: Option<PolygonMask>,
     pub mask_bitmap: Option<BitmapMask>,
+    pub invert_final_mask: bool,
     pub filters: Vec<LayerFilter>,
     pub mask_filters: Vec<LayerFilter>,
     pub mask_anchor: Option<AnchorMask>,
@@ -2135,6 +2142,7 @@ mod tests {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -2177,6 +2185,7 @@ mod tests {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -2228,6 +2237,7 @@ mod tests {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -2284,6 +2294,7 @@ mod tests {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -2399,6 +2410,7 @@ mod tests {
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
+            invert_final_mask: false,
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
@@ -2436,6 +2448,7 @@ mod tests {
                 mask_generator: None,
                 polygon_mask: None,
                 mask_bitmap: None,
+                invert_final_mask: false,
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
@@ -2456,6 +2469,7 @@ mod tests {
                 mask_generator: None,
                 polygon_mask: None,
                 mask_bitmap: None,
+                invert_final_mask: false,
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
@@ -3252,6 +3266,56 @@ mod tests {
             .bake_channel(MaterialChannel::Roughness, BakeContext::default())
             .unwrap();
         assert_eq!(roughness.pixel(3, 3).unwrap()[0], 64);
+    }
+
+    #[test]
+    fn tc_0067_final_mask_inversion_runs_after_filters_and_is_serialized() {
+        let mut layer = MaterialLayer::new_fill(
+            LayerId(1),
+            "Rough",
+            LayerFill {
+                roughness: 0.25,
+                ..LayerFill::default()
+            },
+        );
+        layer.mask_strokes.push(MaskStroke {
+            points: vec![glam::Vec2::new(0.5, 0.5)],
+            radius_pixels: 100.0,
+            value: 0.0,
+            opacity: 1.0,
+            tip: BrushTip {
+                hardness: 1.0,
+                ..BrushTip::ROUND
+            },
+            pressures: Vec::new(),
+        });
+        layer.mask_filters = vec![LayerFilter::Invert];
+        layer.invert_final_mask = true;
+        let set = small_set(8, layer.clone());
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, BakeContext::default())
+            .unwrap();
+        assert_eq!(
+            roughness.pixel(3, 3).unwrap()[0],
+            128,
+            "filter makes the intermediate mask white, final inversion hides the fill"
+        );
+
+        let serialized = serde_json::to_string(&layer).unwrap();
+        let restored: MaterialLayer = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.invert_final_mask);
+        let mut changed = restored;
+        changed.apply_settings({
+            let mut settings = changed.settings();
+            settings.invert_final_mask = false;
+            settings
+        });
+        assert!(!changed.invert_final_mask);
+
+        let mut legacy = serde_json::to_value(layer).unwrap();
+        legacy.as_object_mut().unwrap().remove("invert_final_mask");
+        let restored: MaterialLayer = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.invert_final_mask, "older projects default to off");
     }
 
     #[test]

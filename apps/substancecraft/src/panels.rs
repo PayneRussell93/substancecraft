@@ -995,6 +995,11 @@ impl SubstanceCraftApp {
             }
             ui.label(RichText::new(text).color(color));
         });
+        if let Some(reason) = self.mesh_map_stale_reason() {
+            widgets::property_row(ui, "Stale because", |ui| {
+                ui.label(RichText::new(reason).color(WARNING))
+            });
+        }
         if let Some(maps) = self.fresh_mesh_maps() {
             let summary = format!(
                 "{}² · {:.0}% UV coverage",
@@ -1474,16 +1479,34 @@ impl SubstanceCraftApp {
                         self.add_dirt_layer();
                     }
                 });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.layer_query)
+                        .desired_width(ui.available_width())
+                        .margin(vec2(10.0, 5.0))
+                        .hint_text("Search layers: name, type, channel, resource…"),
+                );
                 let Some(texture_set_id) = self.selected_texture_set else {
                     empty_state(ui, "Add a layer to create a texture set.");
                     return;
                 };
+                let resources = self
+                    .project
+                    .resources
+                    .iter()
+                    .map(|resource| (resource.id, resource.name.clone()))
+                    .collect::<Vec<_>>();
                 let rows = self
                     .selected_texture_set_ref()
-                    .map(|set| layer_rows(&set.layers, 0))
+                    .map(|set| layer_rows(&set.layers, 0, &self.layer_query, &resources))
                     .unwrap_or_default();
                 if rows.is_empty() {
-                    empty_state(ui, "This texture set has no layers.");
+                    let message = if self.layer_query.trim().is_empty() {
+                        "This texture set has no layers."
+                    } else {
+                        "No layers match this search."
+                    };
+                    empty_state(ui, message);
                     return;
                 }
                 ui.add_space(2.0);
@@ -1908,6 +1931,10 @@ impl SubstanceCraftApp {
 
         anchor_controls(ui, layer.id, &mut layer.mask_anchor, &anchor_candidates);
 
+        widgets::property_row(ui, "Invert final mask", |ui| {
+            widgets::toggle(ui, &mut layer.invert_final_mask)
+        });
+
         widgets::caption(ui, "Mask filters");
         filter_stack(
             ui,
@@ -2329,7 +2356,25 @@ struct LayerRow {
     badge: String,
 }
 
-fn layer_rows(layers: &[MaterialLayer], depth: usize) -> Vec<LayerRow> {
+fn layer_rows(
+    layers: &[MaterialLayer],
+    depth: usize,
+    query: &str,
+    resources: &[(ResourceId, String)],
+) -> Vec<LayerRow> {
+    let query = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    filtered_layer_rows(layers, depth, &query, resources)
+}
+
+fn filtered_layer_rows(
+    layers: &[MaterialLayer],
+    depth: usize,
+    query: &[String],
+    resources: &[(ResourceId, String)],
+) -> Vec<LayerRow> {
     let mut rows = Vec::new();
     for layer in layers.iter().rev() {
         let kind = if layer.is_group() {
@@ -2341,6 +2386,27 @@ fn layer_rows(layers: &[MaterialLayer], depth: usize) -> Vec<LayerRow> {
                 (None, None) => "Paint",
             }
         };
+        let searchable = std::iter::once(layer.name.to_lowercase())
+            .chain(std::iter::once(kind.to_lowercase()))
+            .chain(
+                layer
+                    .channels
+                    .iter()
+                    .map(|channel| channel_label(*channel).to_lowercase()),
+            )
+            .chain(layer.fill.iter().flat_map(|fill| {
+                fill.textures.all().filter_map(|id| {
+                    resources
+                        .iter()
+                        .find(|(resource_id, _)| *resource_id == id)
+                        .map(|(_, name)| name.to_lowercase())
+                })
+            }))
+            .collect::<Vec<_>>();
+        let matches = query.is_empty()
+            || query
+                .iter()
+                .all(|token| searchable.iter().any(|field| field.contains(token)));
         let mut badge = kind.to_owned();
         if layer.polygon_mask.is_some() {
             badge.push_str(" · Poly");
@@ -2348,17 +2414,22 @@ fn layer_rows(layers: &[MaterialLayer], depth: usize) -> Vec<LayerRow> {
         if !layer.filters.is_empty() {
             badge.push_str(" · Fx");
         }
-        rows.push(LayerRow {
-            id: layer.id,
-            depth,
-            name: layer.name.clone(),
-            visible: layer.visible,
-            opacity: layer.opacity,
-            group: layer.is_group(),
-            badge,
-        });
-        if let Some(children) = &layer.children {
-            rows.extend(layer_rows(children, depth + 1));
+        let children = layer
+            .children
+            .as_deref()
+            .map(|children| filtered_layer_rows(children, depth + 1, query, resources))
+            .unwrap_or_default();
+        if matches || !children.is_empty() {
+            rows.push(LayerRow {
+                id: layer.id,
+                depth,
+                name: layer.name.clone(),
+                visible: layer.visible,
+                opacity: layer.opacity,
+                group: layer.is_group(),
+                badge,
+            });
+            rows.extend(children);
         }
     }
     rows
@@ -2806,6 +2877,18 @@ impl SubstanceCraftApp {
                 .clicked()
             {
                 self.export_gltf();
+            }
+            if widgets::chip(ui, "Unreal…", false)
+                .on_hover_text("Select the Unreal Engine preset and export")
+                .clicked()
+            {
+                self.export_engine_preset("Unreal Engine");
+            }
+            if widgets::chip(ui, "Unity…", false)
+                .on_hover_text("Select the Unity (URP Lit) preset and export")
+                .clicked()
+            {
+                self.export_engine_preset("Unity (URP Lit)");
             }
             if widgets::chip(ui, "All sets…", false)
                 .on_hover_text("Export every texture set with its own preset and format")
@@ -3431,6 +3514,46 @@ impl SubstanceCraftApp {
         }
         if !reload.is_empty() {
             self.reload_changed_resources(&reload);
+        }
+    }
+}
+
+#[cfg(test)]
+mod layer_search_tests {
+    use super::*;
+    use substancecraft_core::{FillTextures, LayerFill, LayerId};
+
+    #[test]
+    fn layer_search_matches_name_type_channel_and_resource_and_keeps_ancestors() {
+        let mut fill = MaterialLayer::new_fill(LayerId(3), "Trim Paint", LayerFill::default());
+        fill.fill = Some(LayerFill {
+            textures: FillTextures {
+                base_color: Some(ResourceId(42)),
+                ..FillTextures::default()
+            },
+            ..LayerFill::default()
+        });
+        let mut group = MaterialLayer::new_group(LayerId(1), "Hardware");
+        group.children = Some(vec![
+            MaterialLayer::new_paint(LayerId(2), "Brushed metal"),
+            fill,
+        ]);
+        let resources = [(ResourceId(42), "brass_albedo.png".to_owned())];
+
+        for (query, expected) in [
+            ("brushed", vec![LayerId(1), LayerId(2)]),
+            ("group", vec![LayerId(1)]),
+            ("metallic", vec![LayerId(1), LayerId(3), LayerId(2)]),
+            ("brass_albedo", vec![LayerId(1), LayerId(3)]),
+            ("fill brass", vec![LayerId(1), LayerId(3)]),
+            ("missing", Vec::new()),
+        ] {
+            let rows = layer_rows(&[group.clone()], 0, query, &resources);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                expected,
+                "query {query}"
+            );
         }
     }
 }

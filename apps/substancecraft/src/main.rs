@@ -195,8 +195,11 @@ struct SubstanceCraftApp {
     picking_material: bool,
     /// Bitmap scaling skew correction per texel in high-to-low bakes.
     skew_map: Option<ResourceId>,
+    skew_map_revision: u64,
     /// Search text of the Assets drawer.
     asset_query: String,
+    /// Search text for filtering the layer stack.
+    layer_query: String,
     history: EditHistory,
     /// Last committed settings of the selected layer; edits made through the
     /// inspector are recorded as one history step once the pointer is up.
@@ -435,9 +438,17 @@ impl PreviewTextures {
     }
 }
 
-/// Identifies the inputs mesh maps were baked from: the working mesh
-/// revision and the high-poly source revision.
-type BakeKey = (u64, u64);
+/// Identifies every input that can make a mesh-map bake stale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BakeKey {
+    mesh_revision: u64,
+    high_poly_revision: u64,
+    import_scale: f32,
+    smoothing: MeshSmoothing,
+    settings: MeshMapSettings,
+    skew_map: Option<ResourceId>,
+    skew_map_revision: u64,
+}
 
 /// Optional high-resolution source for high-to-low mesh-map baking.
 struct HighPolySource {
@@ -557,7 +568,9 @@ impl Default for SubstanceCraftApp {
             path_controls: None,
             picking_material: false,
             skew_map: None,
+            skew_map_revision: 0,
             asset_query: String::new(),
+            layer_query: String::new(),
             history: EditHistory::default(),
             layer_settled: None,
             baked_preview: None,
@@ -592,7 +605,6 @@ impl SubstanceCraftApp {
         self.filament_frame_texture = None;
         self.cancel_mesh_map_job();
         self.mesh_maps = None;
-        self.mesh_maps_key = None;
         self.mesh_map_error = None;
         self.hovered_selection.clear();
         self.invalidate_all_sets();
@@ -2039,18 +2051,20 @@ impl SubstanceCraftApp {
             if response.drag_started() {
                 self.stroke_stabilizer.reset();
             }
-            let Some(point) = self
-                .stroke_stabilizer
-                .update(glam::Vec2::new(pointer.x, pointer.y))
-            else {
+            let Some(at) = self.stabilized_cursor(pointer) else {
                 return;
             };
-            let at = egui::pos2(point.x, point.y);
             if let Some(hit) = pick(self, at) {
                 self.paint_hit(hit);
                 self.last_paint_screen = Some(at);
             }
         }
+    }
+
+    fn stabilized_cursor(&mut self, pointer: egui::Pos2) -> Option<egui::Pos2> {
+        self.stroke_stabilizer
+            .update(glam::Vec2::new(pointer.x, pointer.y))
+            .map(|point| egui::pos2(point.x, point.y))
     }
 
     /// Centres the selected layer's decal (0 = fill, 1 = bitmap mask) on a
@@ -2254,11 +2268,43 @@ impl SubstanceCraftApp {
     }
 
     fn bake_key(&self) -> BakeKey {
-        (self.mesh_revision, self.high_poly_revision)
+        BakeKey {
+            mesh_revision: self.mesh_revision,
+            high_poly_revision: self.high_poly_revision,
+            import_scale: self.import_scale,
+            smoothing: self.mesh_smoothing,
+            settings: self.effective_mesh_map_settings(),
+            skew_map: self.skew_map,
+            skew_map_revision: self.skew_map_revision,
+        }
     }
 
     fn mesh_maps_fresh(&self) -> bool {
         self.mesh_maps.is_some() && self.mesh_maps_key == Some(self.bake_key())
+    }
+
+    fn mesh_map_stale_reason(&self) -> Option<&'static str> {
+        let baked = self.mesh_maps_key?;
+        let current = self.bake_key();
+        if baked == current {
+            return None;
+        }
+        if baked.high_poly_revision != current.high_poly_revision {
+            Some("High-poly source changed")
+        } else if baked.import_scale != current.import_scale {
+            Some("Scale changed")
+        } else if baked.smoothing != current.smoothing {
+            Some("Smoothing changed")
+        } else if baked.settings != current.settings
+            || baked.skew_map != current.skew_map
+            || baked.skew_map_revision != current.skew_map_revision
+        {
+            Some("Bake settings changed")
+        } else if baked.mesh_revision != current.mesh_revision {
+            Some("Mesh changed")
+        } else {
+            Some("Bake settings changed")
+        }
     }
 
     /// Mesh material slot of the selected texture set.
@@ -2969,6 +3015,32 @@ impl SubstanceCraftApp {
     /// in the export format.
     fn export_with_preset(&mut self) {
         let preset = self.selected_export_preset();
+        self.export_with_selected_or_named_preset(preset);
+    }
+
+    /// Selects a built-in engine preset before following the regular export
+    /// preflight and overwrite-confirmation flow.
+    fn export_engine_preset(&mut self, name: &str) {
+        let Some(preset) = self.select_engine_preset(name) else {
+            return;
+        };
+        self.export_with_selected_or_named_preset(preset);
+    }
+
+    fn select_engine_preset(&mut self, name: &str) -> Option<ExportPreset> {
+        let Some(preset) = self
+            .export_presets()
+            .into_iter()
+            .find(|preset| preset.name == name)
+        else {
+            self.bake_error = Some(format!("Export preset `{name}` is unavailable."));
+            return None;
+        };
+        self.set_preset_choice(preset.name.clone());
+        Some(preset)
+    }
+
+    fn export_with_selected_or_named_preset(&mut self, preset: ExportPreset) {
         let Some(texture_set) = self.exportable_texture_set(preset.reads_mesh_maps()) else {
             return;
         };
@@ -3480,6 +3552,9 @@ impl SubstanceCraftApp {
             .filter(|set| !set.referenced_resources().is_disjoint(&reloaded))
             .map(|set| set.id)
             .collect();
+        if self.skew_map.is_some_and(|id| reloaded.contains(&id)) {
+            self.skew_map_revision = self.skew_map_revision.wrapping_add(1);
+        }
         self.invalidate_sets(&affected);
     }
 
@@ -4936,6 +5011,86 @@ mod tests {
     }
 
     #[test]
+    fn tc_0162_lazy_stabilization_records_the_trailing_brush_position() {
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.add_paint_layer();
+        small_sets(&mut app, 32);
+        app.set_paint_mode(PaintMode::Paint);
+        app.stroke_stabilizer = substancecraft_core::LazyStabilizer::new(10.0);
+
+        let mesh = PrimitivePreset::Cube.build_mesh();
+        let projection = ViewProjection {
+            pose: BoneTransform::IDENTITY,
+            camera_rotation: glam::Quat::IDENTITY,
+            posed_center: glam::Vec3::ZERO,
+            center: egui::pos2(100.0, 100.0),
+            scale: 100.0,
+            pan: glam::Vec2::ZERO,
+        };
+        let projected = projection.project_mesh(&mesh);
+        let first = app.stabilized_cursor(egui::pos2(100.0, 100.0)).unwrap();
+        let first_hit = pick_triangle(&mesh, &projected, first).unwrap();
+        app.paint_hit(first_hit);
+
+        assert_eq!(
+            app.stabilized_cursor(egui::pos2(106.0, 108.0)),
+            None,
+            "cursor jitter within the lazy radius does not add a dab"
+        );
+        let trailing = app.stabilized_cursor(egui::pos2(130.0, 100.0)).unwrap();
+        assert_eq!(trailing, egui::pos2(120.0, 100.0));
+        app.paint_hit(pick_triangle(&mesh, &projected, trailing).unwrap());
+        app.finish_active_stroke();
+
+        let recorded = &app.selected_layer().unwrap().paint_strokes[0].points;
+        let expected = pick_triangle(&mesh, &projected, trailing)
+            .unwrap()
+            .uv
+            .unwrap();
+        let raw = pick_triangle(&mesh, &projected, egui::pos2(130.0, 100.0))
+            .unwrap()
+            .uv
+            .unwrap();
+        assert_eq!(recorded.last(), Some(&expected));
+        assert_ne!(recorded.last(), Some(&raw));
+        assert_eq!(recorded.len(), 2);
+    }
+
+    #[test]
+    fn tc_0180_mesh_map_staleness_reports_the_changed_input() {
+        let mut app = SubstanceCraftApp::default();
+        app.mesh_maps_key = Some(app.bake_key());
+        assert_eq!(app.mesh_map_stale_reason(), None);
+
+        app.import_scale = 2.0;
+        assert_eq!(app.mesh_map_stale_reason(), Some("Scale changed"));
+
+        app.mesh_maps_key = Some(app.bake_key());
+        app.mesh_smoothing.angle_degrees += 1.0;
+        assert_eq!(app.mesh_map_stale_reason(), Some("Smoothing changed"));
+
+        app.mesh_maps_key = Some(app.bake_key());
+        app.high_poly_revision += 1;
+        assert_eq!(
+            app.mesh_map_stale_reason(),
+            Some("High-poly source changed")
+        );
+
+        app.mesh_maps_key = Some(app.bake_key());
+        app.mesh_map_settings.ao_samples += 1;
+        assert_eq!(app.mesh_map_stale_reason(), Some("Bake settings changed"));
+
+        app.mesh_maps_key = Some(app.bake_key());
+        app.skew_map_revision += 1;
+        assert_eq!(app.mesh_map_stale_reason(), Some("Bake settings changed"));
+
+        app.mesh_maps_key = Some(app.bake_key());
+        app.mesh_revision += 1;
+        assert_eq!(app.mesh_map_stale_reason(), Some("Mesh changed"));
+    }
+
+    #[test]
     fn tc_0156_flatten_materials_and_smart_materials_work_through_the_app() {
         let folder = tempfile::tempdir().unwrap();
         let mut app = SubstanceCraftApp::default();
@@ -5116,6 +5271,38 @@ mod tests {
         // Forgetting falls back to the app-wide choice.
         app.remember_export_for_selected(false);
         assert_eq!(app.selected_format(), TextureFormat::Png);
+    }
+
+    #[test]
+    fn tc_0204_engine_export_actions_select_presets_and_name_outputs() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        small_sets(&mut app, 8);
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let stem = set.name.replace(' ', "_");
+
+        let unreal = app.select_engine_preset("Unreal Engine").unwrap();
+        assert_eq!(app.selected_preset_name(), "Unreal Engine");
+        let unreal_folder = folder.path().join("unreal");
+        std::fs::create_dir(&unreal_folder).unwrap();
+        let unreal_files = app.write_export(&set, &unreal, &unreal_folder).unwrap();
+        assert!(unreal_files.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&format!("T_{stem}_BC")))
+        }));
+
+        let unity = app.select_engine_preset("Unity (URP Lit)").unwrap();
+        assert_eq!(app.selected_preset_name(), "Unity (URP Lit)");
+        let unity_folder = folder.path().join("unity");
+        std::fs::create_dir(&unity_folder).unwrap();
+        let unity_files = app.write_export(&set, &unity, &unity_folder).unwrap();
+        assert!(unity_files.iter().any(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(&format!("{stem}_BaseMap"))
+            })
+        }));
     }
 
     #[test]

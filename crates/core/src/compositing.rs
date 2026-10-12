@@ -902,6 +902,7 @@ impl TextureSet {
             && layer.polygon_mask.is_none()
             && layer.id_mask_color.is_none()
             && layer.mask_bitmap.is_none()
+            && !layer.invert_final_mask
             && layer.mask_filters.is_empty()
             && layer.mask_anchor.is_none()
         {
@@ -998,6 +999,9 @@ impl TextureSet {
             }
         }
         for value in &mut values {
+            if layer.invert_final_mask {
+                *value = 1.0 - *value;
+            }
             *value = value.clamp(0.0, 1.0);
         }
         Ok(Some(values))
