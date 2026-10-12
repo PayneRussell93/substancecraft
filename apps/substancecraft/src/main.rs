@@ -15,7 +15,7 @@ use substancecraft_api::load_project_file;
 use substancecraft_api::load_resource_image;
 use substancecraft_api::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
-    bake_texture_set_material, existing_export_files, export_preflight, import_binary_fbx_meshes,
+    bake_texture_set_material, existing_export_files, export_preflight, import_fbx_meshes,
     import_gltf_file, load_project_file_with_report, load_project_resources, load_texture_image,
     rebake_texture_set_channel_regions, rebake_texture_set_material_regions, save_project_file,
     write_exported_textures, write_texture,
@@ -5677,7 +5677,7 @@ fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
         ));
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())
+    import_fbx_meshes(&bytes).map_err(|error| error.to_string())
 }
 
 /// Reads every mesh in a file and merges them into one scaled geometry, as

@@ -3,6 +3,7 @@
 
 mod automation;
 mod fbx;
+mod fbx_ascii;
 mod gltf_import;
 mod history_file;
 mod interchange;
@@ -15,11 +16,12 @@ mod vector;
 
 pub use automation::{
     AUTOMATION_API_VERSION, AutomationEdit, AutomationError, EditOutcome, LayerSummary,
-    MaterialSummary, ProjectSummary, ResourceSummary, TextureSetSummary, apply_automation_edit,
-    edit_project_file, project_summary, texture_set_ids,
+    MaterialSummary, NewLayerKind, ProjectSummary, ResourceSummary, TextureSetSummary,
+    apply_automation_edit, edit_project_file, project_summary, texture_set_ids,
 };
 pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
+    import_fbx_meshes,
 };
 pub use gltf_import::{GltfImportError, MAX_GLTF_BYTES, import_gltf, import_gltf_file};
 pub use history_file::{

@@ -6,7 +6,7 @@
 
 - `list_primitive_presets()` for the supported starter-mesh names.
 - `inspect_primitive_preset(name)` for indexed topology counts, local-space bounds, and UV bounds.
-- `import_binary_fbx_meshes(bytes)` for static mesh geometry from binary FBX 7.4+ files.
+- `import_fbx_meshes(bytes)` for static mesh geometry from binary or ASCII FBX 7.4+ files (`import_binary_fbx_meshes(bytes)` accepts binary only).
 - `bake_texture_set_base_color(texture_set)` for a bounded RGBA8 composite respecting layer opacity, grayscale masks, and optional ID-color clipping.
 - `bake_texture_set_id_mask(texture_set)` for the discrete color-coded ID map painted into UV layers.
 - `bake_texture_set_channel(texture_set, channel, mesh, mesh_maps)` for Base Color, Roughness, Metallic, or ID. Fill layers, mask generators (which need `mesh_maps`), polygon masks (which need `mesh`), painted masks, and ID clipping all compose here.
@@ -15,7 +15,7 @@
 - `bake_texture_set_material(texture_set, mesh, mesh_maps)` for the viewport and engine trio: opaque Base Color, packed ORM (R occlusion, G roughness, B metallic), and an OpenGL-convention tangent-space Normal combining baked detail, Normal-channel layers, and Height.
 - `encode_project_json(project)` and `decode_project_json(bytes)` for validated, size-bounded project serialization.
 - `save_project_file(path, project)` and `load_project_file(path)` for atomic `.sproject` file persistence.
-- `project_summary(project)` and `apply_automation_edit(project, edit)` / `edit_project_file(path, edit)` for the automation API (version `AUTOMATION_API_VERSION`, currently 1). An `AutomationEdit` is JSON tagged by `edit`: `add_fill_layer`, `set_layer`, `remove_layer`, `edit_material`, or `link_material`. Texture sets, layers, and materials are referenced by numeric id or exact name; a name shared by several entries is refused. Each edit becomes one `EditCommand` and the project is validated afterwards, so a refused edit leaves the project unchanged.
+- `project_summary(project)` and `apply_automation_edit(project, edit)` / `edit_project_file(path, edit)` for the automation API (version `AUTOMATION_API_VERSION`, currently 1). An `AutomationEdit` is JSON tagged by `edit`: `add_fill_layer`, `add_layer` (a paint layer or group, optionally inside a group at an index), `set_layer`, `move_layer`, `remove_layer`, `set_mask` (mask generator and final inversion), `paint` and `paint_mask` (one stroke, points in UV and radius in texels), `edit_material`, `link_material`, `set_texture_set` (name, resolution, channels, height strength), or `set_mesh` (scale, smoothing angle, subdivision levels; polygon masks follow a subdivision change). A `set_mask` generator is a name such as `"Edge Wear"` or `"none"`, or an object such as `{"kind": "EdgeWear", "amount": 0.8}` whose fields replace those of the layer's generator of that kind (or its defaults); unknown fields and out-of-range values are refused. Texture sets, layers, and materials are referenced by numeric id or exact name; a name shared by several entries is refused. Each edit becomes one `EditCommand` and the project is validated afterwards, so a refused edit leaves the project unchanged.
 
 The result types use Serde and plain numeric arrays at the API boundary, so clients do not need to depend on the renderer's math or UI types. Invalid preset names and over-budget texture bakes return typed errors. The desktop exports baked channels and mesh maps as 32-bit TGA. Mesh maps are geometry-derived (no high-to-low projection yet) and import-derived ID maps are not implemented.
 
@@ -36,6 +36,13 @@ The `substancecraft-mcp` binary uses the official `rmcp` Rust SDK and stdio tran
 | `remove_layer` | `project`, `texture_set`, `layer` | Outcome; the project is saved. |
 | `edit_material` | `project`, `material`, optional `name`, `color`, `roughness`, `metallic`, `height`, `opacity` | Outcome naming how many linked layers followed; the project is saved. |
 | `link_material` | `project`, `texture_set`, `layer`, `material` | Outcome; the project is saved. |
+| `add_layer` | `project`, `texture_set`, `name`, optional `kind` (`paint` or `group`), `parent`, `index` | Outcome with the new layer id; the project is saved. |
+| `move_layer` | `project`, `texture_set`, `layer`, optional `parent`, `index` | Outcome; the project is saved. |
+| `set_mask` | `project`, `texture_set`, `layer`, optional `generator`, `invert` | Outcome naming the generator; the project is saved. |
+| `paint_stroke` | `project`, `texture_set`, `layer`, `points` (UV), `radius` (texels), optional `color`, `opacity`, `roughness`, `metallic`, `height`, `erase` | Outcome; the project is saved. |
+| `paint_mask` | `project`, `texture_set`, `layer`, `points` (UV), `radius` (texels), `value`, optional `opacity` | Outcome; the project is saved. |
+| `set_texture_set` | `project`, `texture_set`, optional `name`, `resolution`, `channels`, `height_strength` | Outcome; the project is saved. |
+| `set_mesh` | `project`, optional `scale`, `smoothing_angle`, `subdivision_levels` | Outcome, counting remapped polygon masks; the project is saved. |
 | `export_textures` | `project`, `output`, optional `preset`, `format` | JSON list of the files written, as `substancecraft-cli export` writes them. |
 
 Run it with `cargo run -p substancecraft-mcp`. Configure an MCP client to launch that command from the SubstanceCraft workspace directory. Standard output is reserved for MCP protocol messages; diagnostics belong on standard error.
@@ -44,7 +51,7 @@ Project tools only reach paths inside the server's root directory: `SUBSTANCECRA
 
 The command line takes the same edits: `substancecraft-cli inspect <project>` prints the summary, and `substancecraft-cli edit <project> '<edit as JSON>'` applies one edit and prints its outcome (exit status 1 when refused, 2 when the JSON is invalid).
 
-The desktop uses the Rust API for local file import after checking the file-size limit. Binary FBX import preserves supported FBX UV mappings, creates a planar UV fallback when a mesh has no UV layer, and preflights declared decoded data against a memory budget. ASCII FBX, materials, model transforms, skins, and animation curves are not imported yet. Future MCP tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
+The desktop uses the Rust API for local file import after checking the file-size limit. FBX import preserves supported FBX UV mappings, maps per-polygon materials to named material slots, creates a planar UV fallback when a mesh has no UV layer, and preflights declared decoded data against a memory budget. ASCII FBX is parsed, typed as binary FBX stores each value, and re-encoded as binary, so both forms share one importer. Model transforms, skins, and animation curves are not imported yet. Future MCP tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
 
 ## Verification
 

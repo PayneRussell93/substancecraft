@@ -117,6 +117,128 @@ struct LinkMaterialRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct AddLayerRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Name of the new layer")]
+    name: String,
+    #[schemars(description = "Optional kind: paint (default) or group")]
+    kind: Option<String>,
+    #[schemars(description = "Optional group (id or exact name) to add the layer inside")]
+    parent: Option<String>,
+    #[schemars(description = "Optional position counted from the bottom; default on top")]
+    index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveLayerRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional destination group (id or exact name); none for the top level"
+    )]
+    parent: Option<String>,
+    #[schemars(description = "Optional position counted from the bottom; default on top")]
+    index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional mask generator: a name (Edge Wear, Dirt, Orientation, Gradient, Noise, Thickness, ID, Pattern, or none), or an object with a kind and the settings to change, such as {\"kind\": \"EdgeWear\", \"amount\": 0.8}"
+    )]
+    generator: Option<serde_json::Value>,
+    #[schemars(description = "Optional: invert the final mask")]
+    invert: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PaintRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name (not a group)")]
+    layer: String,
+    #[schemars(description = "Stroke points as UV coordinates [u, v]; 0-1 covers tile 1001")]
+    points: Vec<[f32; 2]>,
+    #[schemars(description = "Brush radius in texels")]
+    radius: f32,
+    #[schemars(description = "Optional sRGB base colour [r, g, b], 0-255; default white")]
+    color: Option<[u8; 3]>,
+    #[schemars(description = "Optional stroke opacity, 0-1; default 1")]
+    opacity: Option<f32>,
+    #[schemars(description = "Optional roughness written where the layer enables it, 0-1")]
+    roughness: Option<f32>,
+    #[schemars(description = "Optional metallic written where the layer enables it, 0-1")]
+    metallic: Option<f32>,
+    #[schemars(description = "Optional height written where the layer enables it, 0-1")]
+    height: Option<f32>,
+    #[schemars(description = "Optional: erase paint along the stroke instead")]
+    erase: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PaintMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(description = "Stroke points as UV coordinates [u, v]; 0-1 covers tile 1001")]
+    points: Vec<[f32; 2]>,
+    #[schemars(description = "Brush radius in texels")]
+    radius: f32,
+    #[schemars(description = "Mask value painted, 0 (hide) to 1 (show)")]
+    value: f32,
+    #[schemars(description = "Optional stroke opacity, 0-1; default 1")]
+    opacity: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetTextureSetRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Optional new name")]
+    name: Option<String>,
+    #[schemars(description = "Optional resolution [width, height] in texels, up to 8192")]
+    resolution: Option<[u32; 2]>,
+    #[schemars(
+        description = "Optional enabled channels: Base Color, Id, Roughness, Metallic, Normal, Height, Ambient Occlusion, Emissive, Opacity"
+    )]
+    channels: Option<Vec<String>>,
+    #[schemars(description = "Optional Height-to-normal strength, 0-16")]
+    height_strength: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetMeshRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Optional uniform import scale, above 0")]
+    scale: Option<f32>,
+    #[schemars(description = "Optional smoothing angle in degrees, 0-180")]
+    smoothing_angle: Option<f32>,
+    #[schemars(description = "Optional subdivision levels, 0-3; polygon masks follow")]
+    subdivision_levels: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ExportTexturesRequest {
     #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
     project: String,
@@ -191,6 +313,14 @@ impl SubstanceCraftMcp {
         let path = self.project_path(project)?;
         let outcome = edit_project_file(&path, &edit).map_err(|error| error.to_string())?;
         serde_json::to_string_pretty(&outcome).map_err(|error| error.to_string())
+    }
+
+    /// Applies an edit given as automation JSON, for edits whose values
+    /// (strokes) are built here rather than taken whole from the request.
+    fn edit_json(&self, project: &str, edit: serde_json::Value) -> Result<String, String> {
+        let edit: AutomationEdit =
+            serde_json::from_value(edit).map_err(|error| error.to_string())?;
+        self.edit(project, edit)
     }
 }
 
@@ -320,6 +450,150 @@ impl SubstanceCraftMcp {
                 texture_set: request.texture_set,
                 layer: request.layer,
                 material: request.material,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Add an empty paint layer or group to a texture set, on top or inside a group at a given position, and save the project."
+    )]
+    fn add_layer(
+        &self,
+        Parameters(request): Parameters<AddLayerRequest>,
+    ) -> Result<String, String> {
+        self.edit_json(
+            &request.project,
+            serde_json::json!({
+                "edit": "add_layer",
+                "texture_set": request.texture_set,
+                "name": request.name,
+                "kind": request.kind.as_deref().map_or("paint", str::trim).to_ascii_lowercase(),
+                "parent": request.parent,
+                "index": request.index,
+            }),
+        )
+    }
+
+    #[tool(
+        description = "Move a layer within its texture set, into or out of groups, and save the project. A group cannot move into itself."
+    )]
+    fn move_layer(
+        &self,
+        Parameters(request): Parameters<MoveLayerRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::MoveLayer {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                parent: request.parent,
+                index: request.index,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Set a layer's mask generator (by name, or a kind with the settings to change) and final-mask inversion, and save the project."
+    )]
+    fn set_mask(&self, Parameters(request): Parameters<SetMaskRequest>) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetMask {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                generator: request.generator,
+                invert: request.invert,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Paint (or erase) a stroke on a layer through UV points with a round brush, writing colour and, where the layer enables them, roughness, metallic, and height; save the project. Undoable in the app like a brush stroke."
+    )]
+    fn paint_stroke(
+        &self,
+        Parameters(request): Parameters<PaintRequest>,
+    ) -> Result<String, String> {
+        let [r, g, b] = request.color.unwrap_or([255, 255, 255]);
+        let mut stroke = serde_json::json!({
+            "points": request.points,
+            "radius_pixels": request.radius,
+            "color": [r, g, b, 255],
+            "opacity": request.opacity.unwrap_or(1.0),
+            "erase": request.erase.unwrap_or(false),
+        });
+        for (key, value) in [
+            ("roughness", request.roughness),
+            ("metallic", request.metallic),
+            ("height", request.height),
+        ] {
+            if let Some(value) = value {
+                stroke[key] = value.into();
+            }
+        }
+        self.edit_json(
+            &request.project,
+            serde_json::json!({
+                "edit": "paint",
+                "texture_set": request.texture_set,
+                "layer": request.layer,
+                "stroke": stroke,
+            }),
+        )
+    }
+
+    #[tool(
+        description = "Paint a grayscale stroke into a layer's mask through UV points (0 hides the layer, 1 shows it) and save the project."
+    )]
+    fn paint_mask(
+        &self,
+        Parameters(request): Parameters<PaintMaskRequest>,
+    ) -> Result<String, String> {
+        self.edit_json(
+            &request.project,
+            serde_json::json!({
+                "edit": "paint_mask",
+                "texture_set": request.texture_set,
+                "layer": request.layer,
+                "stroke": {
+                    "points": request.points,
+                    "radius_pixels": request.radius,
+                    "value": request.value,
+                    "opacity": request.opacity.unwrap_or(1.0),
+                },
+            }),
+        )
+    }
+
+    #[tool(
+        description = "Change a texture set's name, resolution, enabled channels, or Height-to-normal strength and save the project."
+    )]
+    fn set_texture_set(
+        &self,
+        Parameters(request): Parameters<SetTextureSetRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetTextureSet {
+                texture_set: request.texture_set,
+                name: request.name,
+                resolution: request.resolution,
+                channels: request.channels,
+                height_strength: request.height_strength,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Change the project mesh's import scale, smoothing angle, or subdivision levels (polygon masks follow a subdivision change) and save the project."
+    )]
+    fn set_mesh(&self, Parameters(request): Parameters<SetMeshRequest>) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetMesh {
+                scale: request.scale,
+                smoothing_angle: request.smoothing_angle,
+                subdivision_levels: request.subdivision_levels,
             },
         )
     }
@@ -597,5 +871,160 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown format")
         );
+    }
+
+    #[test]
+    fn tc_0310_layer_mask_paint_and_property_tools_edit_project_files() {
+        let (folder, server) = server();
+        let project = MaterialProject {
+            mesh: Some(MeshAsset {
+                id: MeshId(1),
+                source: "builtin:Cube".to_owned(),
+                scale: 1.0,
+                smoothing: MeshSmoothing::default(),
+                high_poly_source: None,
+                content_hash: None,
+                high_poly_hash: None,
+            }),
+            texture_sets: vec![TextureSet {
+                id: TextureSetId(1),
+                name: "Body".to_owned(),
+                material_slot: "Body".to_owned(),
+                resolution: TextureResolution::new(16, 16).unwrap(),
+                channels: [MaterialChannel::BaseColor, MaterialChannel::Roughness].into(),
+                layers: vec![MaterialLayer::new_paint(LayerId(1), "Base")],
+                height_strength: 1.0,
+                export: None,
+            }],
+            active_texture_set: Some(TextureSetId(1)),
+            ..MaterialProject::empty()
+        };
+        let path = folder.path().join("tools.sproject");
+        substancecraft_api::save_project_file(&path, &project).unwrap();
+        let file = || "tools.sproject".to_owned();
+
+        let added = server
+            .add_layer(Parameters(AddLayerRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                name: "Wear".to_owned(),
+                kind: Some("Group".to_owned()),
+                parent: None,
+                index: None,
+            }))
+            .unwrap();
+        assert!(added.contains("added group 2 `Wear`"), "{added}");
+        server
+            .move_layer(Parameters(MoveLayerRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                parent: Some("Wear".to_owned()),
+                index: None,
+            }))
+            .unwrap();
+        let painted = server
+            .paint_stroke(Parameters(PaintRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                points: vec![[0.2, 0.5], [0.8, 0.5]],
+                radius: 2.0,
+                color: Some([200, 40, 10]),
+                opacity: None,
+                roughness: Some(0.1),
+                metallic: None,
+                height: None,
+                erase: None,
+            }))
+            .unwrap();
+        assert!(painted.contains("painted 2 point(s)"), "{painted}");
+        server
+            .paint_mask(Parameters(PaintMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Wear".to_owned(),
+                points: vec![[0.5, 0.5]],
+                radius: 3.0,
+                value: 0.0,
+                opacity: None,
+            }))
+            .unwrap();
+        server
+            .set_mask(Parameters(SetMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Wear".to_owned(),
+                generator: Some(serde_json::json!({"kind": "Dirt", "amount": 0.7})),
+                invert: None,
+            }))
+            .unwrap();
+        server
+            .set_texture_set(Parameters(SetTextureSetRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                name: None,
+                resolution: Some([32, 32]),
+                channels: Some(vec!["Base Color".to_owned(), "Height".to_owned()]),
+                height_strength: Some(2.0),
+            }))
+            .unwrap();
+        server
+            .set_mesh(Parameters(SetMeshRequest {
+                project: file(),
+                scale: Some(0.5),
+                smoothing_angle: None,
+                subdivision_levels: Some(1),
+            }))
+            .unwrap();
+
+        let saved = substancecraft_api::load_project_file(&path).unwrap();
+        let set = &saved.texture_sets[0];
+        assert_eq!(set.resolution.width, 32);
+        assert_eq!(set.height_strength, 2.0);
+        let wear = &set.layers[0];
+        assert!(wear.is_group());
+        assert_eq!(wear.mask_strokes.len(), 1);
+        assert!(matches!(
+            wear.mask_generator,
+            Some(substancecraft_core::MaskGenerator::Dirt(dirt)) if dirt.amount == 0.7
+        ));
+        let base = &wear.children.as_ref().unwrap()[0];
+        assert_eq!(base.name, "Base");
+        assert_eq!(base.paint_strokes[0].color, [200, 40, 10, 255]);
+        assert_eq!(base.paint_strokes[0].roughness, 0.1);
+        let mesh = saved.mesh.as_ref().unwrap();
+        assert_eq!((mesh.scale, mesh.smoothing.subdivision_levels), (0.5, 1));
+
+        // Refusals are actionable and leave the file alone.
+        let bytes = std::fs::read(&path).unwrap();
+        let error = server
+            .paint_stroke(Parameters(PaintRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Wear".to_owned(),
+                points: vec![[0.5, 0.5]],
+                radius: 2.0,
+                color: None,
+                opacity: None,
+                roughness: None,
+                metallic: None,
+                height: None,
+                erase: None,
+            }))
+            .unwrap_err();
+        assert_eq!(error, "groups hold no paint; paint a layer inside");
+        let error = server
+            .add_layer(Parameters(AddLayerRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                name: "x".to_owned(),
+                kind: Some("folder".to_owned()),
+                parent: None,
+                index: None,
+            }))
+            .unwrap_err();
+        assert!(error.contains("unknown variant `folder`"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

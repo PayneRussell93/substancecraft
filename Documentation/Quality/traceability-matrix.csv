@@ -54,3 +54,5 @@ REQ-0052,Adjust tones with more filters and limit filters to chosen channels,doc
 REQ-0053,Preview the brush footprint on the surface,docs/feature-map.md,docs/architecture.md,,TC-0301,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0054,Collect project diagnostics in one panel with a copyable report,docs/feature-map.md,docs/architecture.md,,TC-0302,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0055,Start new projects from built-in or saved templates,docs/feature-map.md,docs/architecture.md,,TC-0303;TC-0304,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0056,Import ASCII FBX meshes like binary ones,docs/feature-map.md,docs/api-and-mcp.md,,TC-0305;TC-0306,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0057,Edit layer structure masks strokes texture sets and meshes through automation and MCP,docs/feature-map.md,docs/api-and-mcp.md,,TC-0307;TC-0308;TC-0309;TC-0310,Documentation/Quality/TestPlan-short.md,Project owner,Verified

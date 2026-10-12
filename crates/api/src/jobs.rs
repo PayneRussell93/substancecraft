@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_mesh_maps, bake_mesh_maps_high_to_low,
-    import_binary_fbx_meshes, import_gltf_file, load_project_file, load_project_resources,
+    import_fbx_meshes, import_gltf_file, load_project_file, load_project_resources,
     write_exported_textures,
 };
 
@@ -51,7 +51,7 @@ pub fn load_mesh_file(path: &Path) -> Result<Vec<ImportedMesh>, String> {
         ));
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    import_binary_fbx_meshes(&bytes).map_err(|error| error.to_string())
+    import_fbx_meshes(&bytes).map_err(|error| error.to_string())
 }
 
 fn resolve(source: &str, base: Option<&Path>) -> PathBuf {

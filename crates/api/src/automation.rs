@@ -10,9 +10,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{
-    BlendMode, EditCommand, EditHistory, LayerFill, LayerId, LayerSlot, MaterialChannel,
-    MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource, TextureSet,
-    TextureSetId, mask_drivers,
+    BlendMode, EditCommand, EditHistory, LayerFill, LayerId, LayerSlot, MaskGenerator, MaskStroke,
+    MaterialChannel, MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource,
+    PaintStroke, TextureResolution, TextureSet, TextureSetId, mask_drivers,
+    remap_subdivided_triangles,
 };
 use thiserror::Error;
 
@@ -244,7 +245,99 @@ pub enum AutomationEdit {
         layer: String,
         material: String,
     },
+    /// Adds an empty paint layer or group, inside `parent` (a group) or at
+    /// the top level, at `index` counted from the bottom (default: on top).
+    AddLayer {
+        texture_set: String,
+        name: String,
+        #[serde(default)]
+        kind: NewLayerKind,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    /// Moves a layer into `parent` (a group; none for the top level) at
+    /// `index` counted from the bottom (default: on top).
+    MoveLayer {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    /// Sets a layer's mask generator and final inversion. `generator` is a
+    /// generator name (`Edge Wear`, `Dirt`, ... or `none` to remove it), or
+    /// an object such as `{"kind": "EdgeWear", "amount": 0.8}` whose fields
+    /// replace those of the layer's generator of that kind, or its defaults.
+    SetMask {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        generator: Option<serde_json::Value>,
+        #[serde(default)]
+        invert: Option<bool>,
+    },
+    /// Adds a paint (or, with `erase`, erase) stroke to a layer. Points are
+    /// UV coordinates; the radius is in texels.
+    Paint {
+        texture_set: String,
+        layer: String,
+        stroke: PaintStroke,
+    },
+    /// Adds a grayscale stroke to a layer's mask.
+    PaintMask {
+        texture_set: String,
+        layer: String,
+        stroke: MaskStroke,
+    },
+    /// Changes a texture set's name, resolution, enabled channels, or
+    /// Height-to-normal strength.
+    SetTextureSet {
+        texture_set: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        resolution: Option<[u32; 2]>,
+        #[serde(default)]
+        channels: Option<Vec<String>>,
+        #[serde(default)]
+        height_strength: Option<f32>,
+    },
+    /// Changes the mesh's import scale, smoothing angle, or subdivision
+    /// levels; polygon masks follow a subdivision change.
+    SetMesh {
+        #[serde(default)]
+        scale: Option<f32>,
+        #[serde(default)]
+        smoothing_angle: Option<f32>,
+        #[serde(default)]
+        subdivision_levels: Option<u32>,
+    },
 }
+
+/// The kind of layer [`AutomationEdit::AddLayer`] creates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewLayerKind {
+    #[default]
+    Paint,
+    Group,
+}
+
+/// Every channel, for parsing channel names.
+const ALL_CHANNELS: [MaterialChannel; 9] = [
+    MaterialChannel::BaseColor,
+    MaterialChannel::Id,
+    MaterialChannel::Roughness,
+    MaterialChannel::Metallic,
+    MaterialChannel::Normal,
+    MaterialChannel::Height,
+    MaterialChannel::AmbientOcclusion,
+    MaterialChannel::Emissive,
+    MaterialChannel::Opacity,
+];
 
 /// What an edit did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -640,7 +733,493 @@ fn automation_command(
                 None => Ok((None, unchanged(Some(target.id)))),
             }
         }
+        AutomationEdit::AddLayer {
+            texture_set,
+            name,
+            kind,
+            parent,
+            index,
+        } => {
+            let set = find_set(project, texture_set)?;
+            if name.trim().is_empty() {
+                return Err(AutomationError::InvalidValue(
+                    "a layer needs a name".to_owned(),
+                ));
+            }
+            let parent = parent
+                .as_deref()
+                .map(|parent| find_group(set, parent))
+                .transpose()?;
+            let index = slot_index(*index, siblings(set, parent).len())?;
+            let id = next_layer_id(project);
+            let (layer, noun) = match kind {
+                NewLayerKind::Paint => (MaterialLayer::new_paint(id, name.trim()), "paint layer"),
+                NewLayerKind::Group => (MaterialLayer::new_group(id, name.trim()), "group"),
+            };
+            Ok((
+                Some(EditCommand::InsertLayer {
+                    texture_set_id: set.id,
+                    slot: LayerSlot {
+                        parent: parent.map(|group| group.id),
+                        index,
+                    },
+                    layer: Box::new(layer),
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "added {noun} {} `{}` to `{}`{}",
+                        id.0,
+                        name.trim(),
+                        set.name,
+                        in_group(parent)
+                    ),
+                    layer: Some(id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::MoveLayer {
+            texture_set,
+            layer,
+            parent,
+            index,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let from = set
+                .slot_of(target.id)
+                .ok_or_else(|| AutomationError::UnknownLayer(layer.clone()))?;
+            let parent = parent
+                .as_deref()
+                .map(|parent| find_group(set, parent))
+                .transpose()?;
+            if let Some(group) = parent
+                && target.walk().iter().any(|layer| layer.id == group.id)
+            {
+                return Err(AutomationError::InvalidValue(
+                    "a group cannot move into itself".to_owned(),
+                ));
+            }
+            let parent_id = parent.map(|group| group.id);
+            // The index counts the destination's layers after the removal.
+            let mut count = siblings(set, parent).len();
+            if from.parent == parent_id {
+                count -= 1;
+            }
+            let to = LayerSlot {
+                parent: parent_id,
+                index: slot_index(*index, count)?,
+            };
+            if to == from {
+                return Ok((None, unchanged(Some(target.id))));
+            }
+            Ok((
+                Some(EditCommand::MoveLayer {
+                    texture_set_id: set.id,
+                    from,
+                    to,
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "moved layer {} `{}` to position {}{}",
+                        target.id.0,
+                        target.name,
+                        to.index,
+                        in_group(parent)
+                    ),
+                    layer: Some(target.id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::SetMask {
+            texture_set,
+            layer,
+            generator,
+            invert,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let before = target.settings();
+            let mut after = before.clone();
+            if let Some(generator) = generator {
+                after.mask_generator = parse_generator(generator, before.mask_generator)?;
+            }
+            if let Some(invert) = invert {
+                after.invert_final_mask = *invert;
+            }
+            if after == before {
+                return Ok((None, unchanged(Some(target.id))));
+            }
+            let generator = after
+                .mask_generator
+                .as_ref()
+                .map_or("no generator", MaskGenerator::name);
+            Ok((
+                Some(EditCommand::LayerSettings {
+                    texture_set_id: set.id,
+                    layer_id: target.id,
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "set the mask of layer {} `{}` ({generator})",
+                        target.id.0, target.name
+                    ),
+                    layer: Some(target.id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::Paint {
+            texture_set,
+            layer,
+            stroke,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            if target.is_group() {
+                return Err(AutomationError::InvalidValue(
+                    "groups hold no paint; paint a layer inside".to_owned(),
+                ));
+            }
+            Ok((
+                Some(EditCommand::Paint {
+                    texture_set_id: set.id,
+                    layer_id: target.id,
+                    stroke: stroke.clone(),
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "{} {} point(s) on layer {} `{}`",
+                        if stroke.erase { "erased" } else { "painted" },
+                        stroke.points.len(),
+                        target.id.0,
+                        target.name
+                    ),
+                    layer: Some(target.id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::PaintMask {
+            texture_set,
+            layer,
+            stroke,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            Ok((
+                Some(EditCommand::Mask {
+                    texture_set_id: set.id,
+                    layer_id: target.id,
+                    stroke: stroke.clone(),
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "painted {} point(s) on the mask of layer {} `{}`",
+                        stroke.points.len(),
+                        target.id.0,
+                        target.name
+                    ),
+                    layer: Some(target.id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::SetTextureSet {
+            texture_set,
+            name,
+            resolution,
+            channels,
+            height_strength,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let before = set.properties();
+            let mut after = before.clone();
+            if let Some(name) = name {
+                if name.trim().is_empty() {
+                    return Err(AutomationError::InvalidValue(
+                        "a texture set needs a name".to_owned(),
+                    ));
+                }
+                after.name = name.trim().to_owned();
+            }
+            if let Some([width, height]) = resolution {
+                after.resolution = TextureResolution::new(*width, *height)
+                    .map_err(|error| AutomationError::InvalidValue(error.to_string()))?;
+            }
+            if let Some(channels) = channels {
+                after.channels = channels
+                    .iter()
+                    .map(|name| parse_channel(name))
+                    .collect::<Result<_, _>>()?;
+                if after.channels.is_empty() {
+                    return Err(AutomationError::InvalidValue(
+                        "a texture set needs at least one channel".to_owned(),
+                    ));
+                }
+            }
+            if let Some(strength) = height_strength {
+                if !strength.is_finite()
+                    || !(0.0..=substancecraft_core::MAX_HEIGHT_STRENGTH).contains(strength)
+                {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "height strength must be between 0 and {}, not {strength}",
+                        substancecraft_core::MAX_HEIGHT_STRENGTH
+                    )));
+                }
+                after.height_strength = *strength;
+            }
+            if after == before {
+                return Ok((None, unchanged(None)));
+            }
+            Ok((
+                Some(EditCommand::TextureSetProperties {
+                    texture_set_id: set.id,
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }),
+                EditOutcome {
+                    summary: format!("updated texture set {} `{}`", set.id.0, set.name),
+                    layer: None,
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::SetMesh {
+            scale,
+            smoothing_angle,
+            subdivision_levels,
+        } => {
+            let mesh = project.mesh.as_ref().ok_or_else(|| {
+                AutomationError::InvalidValue("the project has no mesh".to_owned())
+            })?;
+            let mut after = mesh.clone();
+            if let Some(scale) = scale {
+                if !scale.is_finite() || *scale <= 0.0 {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "scale must be above 0, not {scale}"
+                    )));
+                }
+                after.scale = *scale;
+            }
+            if let Some(angle) = smoothing_angle {
+                if !angle.is_finite() || !(0.0..=180.0).contains(angle) {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "smoothing angle must be between 0 and 180 degrees, not {angle}"
+                    )));
+                }
+                after.smoothing.angle_degrees = *angle;
+            }
+            if let Some(levels) = subdivision_levels {
+                if *levels > substancecraft_core::MAX_SUBDIVISION_LEVELS {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "at most {} subdivision levels, not {levels}",
+                        substancecraft_core::MAX_SUBDIVISION_LEVELS
+                    )));
+                }
+                after.smoothing.subdivision_levels = *levels;
+            }
+            if after == *mesh {
+                return Ok((None, unchanged(None)));
+            }
+            // Polygon masks index triangles of the subdivided mesh, so they
+            // follow a change of level, as in the desktop app.
+            let (from, to) = (
+                mesh.smoothing.subdivision_levels,
+                after.smoothing.subdivision_levels,
+            );
+            let mut commands = vec![EditCommand::Mesh {
+                before: Some(mesh.clone()),
+                after: Some(after.clone()),
+            }];
+            if from != to {
+                for set in &project.texture_sets {
+                    for layer in set.walk_layers() {
+                        if layer.polygon_mask.is_none() {
+                            continue;
+                        }
+                        let before = layer.settings();
+                        let mut remapped = before.clone();
+                        if let Some(mask) = remapped.polygon_mask.as_mut() {
+                            mask.triangles = remap_subdivided_triangles(
+                                mask.triangles.iter().copied(),
+                                from,
+                                to,
+                            )
+                            .into_iter()
+                            .collect();
+                        }
+                        commands.push(EditCommand::LayerSettings {
+                            texture_set_id: set.id,
+                            layer_id: layer.id,
+                            before: Box::new(before),
+                            after: Box::new(remapped),
+                        });
+                    }
+                }
+            }
+            let masks = commands.len() - 1;
+            Ok((
+                Some(if masks == 0 {
+                    commands.remove(0)
+                } else {
+                    EditCommand::Batch(commands)
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "updated the mesh: scale {}, smoothing {}°, {} subdivision level(s){}",
+                        after.scale,
+                        after.smoothing.angle_degrees,
+                        after.smoothing.subdivision_levels,
+                        if masks == 0 {
+                            String::new()
+                        } else {
+                            format!("; remapped {masks} polygon mask(s)")
+                        }
+                    ),
+                    layer: None,
+                    changed: true,
+                },
+            ))
+        }
     }
+}
+
+/// The group whose id or exact name is `reference`.
+fn find_group<'a>(
+    set: &'a TextureSet,
+    reference: &str,
+) -> Result<&'a MaterialLayer, AutomationError> {
+    let group = find_layer(set, reference)?;
+    if group.is_group() {
+        Ok(group)
+    } else {
+        Err(AutomationError::InvalidValue(format!(
+            "layer `{}` is not a group",
+            group.name
+        )))
+    }
+}
+
+/// The layers directly inside `parent`, or the top level.
+fn siblings<'a>(set: &'a TextureSet, parent: Option<&'a MaterialLayer>) -> &'a [MaterialLayer] {
+    match parent {
+        Some(group) => group.children.as_deref().unwrap_or(&[]),
+        None => &set.layers,
+    }
+}
+
+fn in_group(parent: Option<&MaterialLayer>) -> String {
+    parent.map_or_else(String::new, |group| format!(" in group `{}`", group.name))
+}
+
+/// `index` (from the bottom) among `count` layers, or the top when absent.
+fn slot_index(index: Option<usize>, count: usize) -> Result<usize, AutomationError> {
+    match index {
+        None => Ok(count),
+        Some(index) if index <= count => Ok(index),
+        Some(index) => Err(AutomationError::InvalidValue(format!(
+            "index {index} is past the top ({count})"
+        ))),
+    }
+}
+
+/// A channel by its name, ignoring case and spaces (`Base Color`,
+/// `roughness`, `AmbientOcclusion`).
+fn parse_channel(name: &str) -> Result<MaterialChannel, AutomationError> {
+    let wanted: String = name
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ALL_CHANNELS
+        .into_iter()
+        .find(|channel| format!("{channel:?}").to_ascii_lowercase() == wanted)
+        .ok_or_else(|| AutomationError::InvalidValue(format!("unknown channel `{name}`")))
+}
+
+/// The serialized `kind` tag of a generator.
+fn generator_kind(generator: &MaskGenerator) -> Option<String> {
+    serde_json::to_value(generator)
+        .ok()?
+        .get("kind")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The default generator named `name`: its display name (`Edge Wear`) or
+/// its kind tag (`EdgeWear`), ignoring case.
+fn generator_preset(name: &str) -> Result<MaskGenerator, AutomationError> {
+    let name = name.trim();
+    MaskGenerator::PRESETS
+        .into_iter()
+        .find(|preset| {
+            preset.name().eq_ignore_ascii_case(name)
+                || generator_kind(preset).is_some_and(|kind| kind.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| AutomationError::InvalidValue(format!("unknown generator `{name}`")))
+}
+
+/// The generator `value` asks for, given the layer's `current` one: a name
+/// selects that generator (keeping the current settings when it is already
+/// that kind), and an object's fields replace those of that generator.
+fn parse_generator(
+    value: &serde_json::Value,
+    current: Option<MaskGenerator>,
+) -> Result<Option<MaskGenerator>, AutomationError> {
+    let based_on = |preset: MaskGenerator| match current {
+        Some(current) if current.same_kind(&preset) => current,
+        _ => preset,
+    };
+    let fields = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(name)
+            if name.trim().is_empty() || name.trim().eq_ignore_ascii_case("none") =>
+        {
+            return Ok(None);
+        }
+        serde_json::Value::String(name) => return Ok(Some(based_on(generator_preset(name)?))),
+        serde_json::Value::Object(fields) => fields,
+        _ => {
+            return Err(AutomationError::InvalidValue(
+                "a generator is a name or an object with a `kind`".to_owned(),
+            ));
+        }
+    };
+    let kind = fields
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AutomationError::InvalidValue("a generator object needs a `kind`".to_owned())
+        })?;
+    let base = based_on(generator_preset(kind)?);
+    let invalid = |error: serde_json::Error| AutomationError::InvalidValue(error.to_string());
+    let mut merged = serde_json::to_value(base).map_err(invalid)?;
+    if let serde_json::Value::Object(settings) = &mut merged {
+        for (key, value) in fields {
+            if key == "kind" {
+                continue;
+            }
+            if !settings.contains_key(key) {
+                return Err(AutomationError::InvalidValue(format!(
+                    "the {} generator has no `{key}` setting",
+                    base.name()
+                )));
+            }
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+    let generator: MaskGenerator = serde_json::from_value(merged).map_err(invalid)?;
+    if !generator.is_valid() {
+        return Err(AutomationError::InvalidValue(format!(
+            "the {} generator settings are out of range",
+            generator.name()
+        )));
+    }
+    Ok(Some(generator))
 }
 
 /// Texture-set ids, for callers that list them.
@@ -931,5 +1510,365 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn edit(json: &str) -> AutomationEdit {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn tc_0307_automation_adds_and_moves_layers_and_groups() {
+        let mut project = project();
+
+        // A group at the bottom, then a paint layer on top inside it.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"add_layer","texture_set":"Body","name":"Wear","kind":"group","index":0}"#),
+        )
+        .unwrap();
+        assert_eq!(outcome.layer, Some(5));
+        assert_eq!(outcome.summary, "added group 5 `Wear` to `Body`");
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"add_layer","texture_set":"Body","name":"Chips","parent":"Wear"}"#),
+        )
+        .unwrap();
+        let body = &project.texture_sets[0];
+        assert!(body.layers[0].is_group());
+        let chips = &body.layers[0].children.as_ref().unwrap()[0];
+        assert_eq!((chips.id, chips.name.as_str()), (LayerId(6), "Chips"));
+        assert!(!chips.is_group());
+
+        // Base moves under Chips inside the group; its old place closes up.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"move_layer","texture_set":"Body","layer":"Base","parent":"5","index":0}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "moved layer 1 `Base` to position 0 in group `Wear`"
+        );
+        let body = &project.texture_sets[0];
+        let names: Vec<&str> = body.layers[0]
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(names, ["Base", "Chips"]);
+        assert_eq!(body.layers.len(), 2);
+
+        // Without a parent and index, a layer moves to the top level's top;
+        // a move to where it already is changes nothing.
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"move_layer","texture_set":"Body","layer":"Chips"}"#),
+        )
+        .unwrap();
+        assert_eq!(project.texture_sets[0].layers.last().unwrap().name, "Chips");
+        let again = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"move_layer","texture_set":"Body","layer":"Chips"}"#),
+        )
+        .unwrap();
+        assert!(!again.changed);
+
+        let before = project.clone();
+        for (json, expected) in [
+            (
+                r#"{"edit":"move_layer","texture_set":"Body","layer":"Wear","parent":"Wear"}"#,
+                "a group cannot move into itself",
+            ),
+            (
+                r#"{"edit":"add_layer","texture_set":"Body","name":"x","parent":"Chips"}"#,
+                "layer `Chips` is not a group",
+            ),
+            (
+                r#"{"edit":"add_layer","texture_set":"Body","name":"x","index":9}"#,
+                "index 9 is past the top (3)",
+            ),
+            (
+                r#"{"edit":"add_layer","texture_set":"Body","name":"  "}"#,
+                "a layer needs a name",
+            ),
+        ] {
+            assert_eq!(
+                apply_automation_edit(&mut project, &edit(json)),
+                Err(AutomationError::InvalidValue(expected.to_owned())),
+                "{json}"
+            );
+            assert_eq!(project, before);
+        }
+        // A group nested inside its own child is refused too.
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"add_layer","texture_set":"Body","name":"Inner","kind":"group","parent":"Wear"}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_automation_edit(
+                &mut project,
+                &edit(
+                    r#"{"edit":"move_layer","texture_set":"Body","layer":"Wear","parent":"Inner"}"#
+                ),
+            ),
+            Err(AutomationError::InvalidValue(
+                "a group cannot move into itself".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn tc_0308_automation_sets_mask_generators_and_paints_strokes() {
+        let mut project = project();
+        let layer = |project: &MaterialProject| project.texture_sets[0].layer(LayerId(1)).cloned();
+
+        // By name: the default Edge Wear generator, inverted.
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":"edge wear","invert":true}"#),
+        )
+        .unwrap();
+        let base = layer(&project).unwrap();
+        assert_eq!(
+            base.mask_generator,
+            Some(MaskGenerator::EdgeWear(
+                substancecraft_core::EdgeWear::DEFAULT
+            ))
+        );
+        assert!(base.invert_final_mask);
+
+        // An object changes only the fields it names, keeping the others.
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":{"kind":"EdgeWear","seed":7}}"#),
+        )
+        .unwrap();
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":{"kind":"Edge Wear","amount":0.9}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "set the mask of layer 1 `Base` (Edge Wear)"
+        );
+        let wear = match layer(&project).unwrap().mask_generator {
+            Some(MaskGenerator::EdgeWear(wear)) => Some(wear),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!((wear.amount, wear.seed), (0.9, 7));
+        assert_eq!(
+            wear.contrast,
+            substancecraft_core::EdgeWear::DEFAULT.contrast
+        );
+        // Naming the kind it already has keeps its settings.
+        let same = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":"EdgeWear"}"#,
+            ),
+        )
+        .unwrap();
+        assert!(!same.changed);
+
+        let before = project.clone();
+        for (generator, expected) in [
+            (
+                r#"{"kind":"EdgeWear","sharpness":1}"#,
+                "the Edge Wear generator has no `sharpness` setting",
+            ),
+            (
+                r#"{"kind":"EdgeWear","amount":3}"#,
+                "the Edge Wear generator settings are out of range",
+            ),
+            (r#""Sparkles""#, "unknown generator `Sparkles`"),
+            (r#"{"amount":1}"#, "a generator object needs a `kind`"),
+        ] {
+            let json = format!(
+                r#"{{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":{generator}}}"#
+            );
+            assert_eq!(
+                apply_automation_edit(&mut project, &edit(&json)),
+                Err(AutomationError::InvalidValue(expected.to_owned())),
+                "{generator}"
+            );
+            assert_eq!(project, before);
+        }
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_mask","texture_set":"Body","layer":"Base","generator":"none","invert":false}"#),
+        )
+        .unwrap();
+        assert_eq!(layer(&project).unwrap().mask_generator, None);
+        assert!(!layer(&project).unwrap().invert_final_mask);
+
+        // Strokes: paint and mask strokes record as written, with defaults
+        // for the material values a stroke leaves out.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"paint","texture_set":"Body","layer":"Base","stroke":{"points":[[0.25,0.5],[0.75,0.5]],"radius_pixels":3,"color":[255,0,0,255],"opacity":1,"roughness":0.2}}"#),
+        )
+        .unwrap();
+        assert_eq!(outcome.summary, "painted 2 point(s) on layer 1 `Base`");
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"paint_mask","texture_set":"Body","layer":"Details","stroke":{"points":[[0.5,0.5]],"radius_pixels":4,"value":0,"opacity":1}}"#),
+        )
+        .unwrap();
+        let base = layer(&project).unwrap();
+        assert_eq!(base.paint_strokes.len(), 1);
+        assert_eq!(base.paint_strokes[0].roughness, 0.2);
+        assert_eq!(
+            base.paint_strokes[0].metallic,
+            substancecraft_core::DEFAULT_METALLIC
+        );
+        assert_eq!(
+            project.texture_sets[0]
+                .layer(LayerId(3))
+                .unwrap()
+                .mask_strokes
+                .len(),
+            1
+        );
+        // The painted texels composite: the stroke's middle is red.
+        let red = project.texture_sets[0]
+            .bake_channel(MaterialChannel::BaseColor, Default::default())
+            .unwrap();
+        let texel = (16 * 32 + 16) * 4;
+        assert_eq!(red.rgba8[texel..texel + 3], [255, 0, 0]);
+
+        // Groups hold no paint, and invalid strokes are refused unchanged.
+        let before = project.clone();
+        assert_eq!(
+            apply_automation_edit(
+                &mut project,
+                &edit(
+                    r#"{"edit":"paint","texture_set":"Body","layer":"Details","stroke":{"points":[[0.5,0.5]],"radius_pixels":3,"color":[0,0,0,255],"opacity":1}}"#
+                ),
+            ),
+            Err(AutomationError::InvalidValue(
+                "groups hold no paint; paint a layer inside".to_owned()
+            ))
+        );
+        assert!(matches!(
+            apply_automation_edit(
+                &mut project,
+                &edit(
+                    r#"{"edit":"paint","texture_set":"Body","layer":"Base","stroke":{"points":[[0.5,0.5]],"radius_pixels":0,"color":[0,0,0,255],"opacity":1}}"#
+                ),
+            ),
+            Err(AutomationError::Rejected(_))
+        ));
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn tc_0309_automation_sets_texture_set_and_mesh_properties() {
+        let mut project = project();
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_texture_set","texture_set":"Trim","name":"Trim 2","resolution":[64,128],"channels":["Base Color","height","AmbientOcclusion"],"height_strength":4}"#),
+        )
+        .unwrap();
+        let trim = &project.texture_sets[1];
+        assert_eq!(trim.name, "Trim 2");
+        assert_eq!((trim.resolution.width, trim.resolution.height), (64, 128));
+        assert_eq!(
+            trim.channels,
+            [
+                MaterialChannel::BaseColor,
+                MaterialChannel::Height,
+                MaterialChannel::AmbientOcclusion
+            ]
+            .into()
+        );
+        assert_eq!(trim.height_strength, 4.0);
+
+        let before = project.clone();
+        for (json, expected) in [
+            (
+                r#"{"edit":"set_texture_set","texture_set":"Body","channels":["Shine"]}"#,
+                Some("unknown channel `Shine`"),
+            ),
+            (
+                r#"{"edit":"set_texture_set","texture_set":"Body","channels":[]}"#,
+                Some("a texture set needs at least one channel"),
+            ),
+            (
+                r#"{"edit":"set_texture_set","texture_set":"Body","height_strength":17}"#,
+                Some("height strength must be between 0 and 16, not 17"),
+            ),
+            (
+                r#"{"edit":"set_texture_set","texture_set":"Body","resolution":[0,32]}"#,
+                None,
+            ),
+            (
+                r#"{"edit":"set_mesh","scale":2}"#,
+                Some("the project has no mesh"),
+            ),
+        ] {
+            let result = apply_automation_edit(&mut project, &edit(json));
+            match expected {
+                Some(message) => assert_eq!(
+                    result,
+                    Err(AutomationError::InvalidValue(message.to_owned())),
+                    "{json}"
+                ),
+                None => assert!(
+                    matches!(result, Err(AutomationError::InvalidValue(_))),
+                    "{json}"
+                ),
+            }
+            assert_eq!(project, before);
+        }
+
+        // A subdivision change carries polygon masks to the new level.
+        project.mesh = Some(substancecraft_core::MeshAsset {
+            id: substancecraft_core::MeshId(1),
+            source: "builtin:cube".to_owned(),
+            scale: 1.0,
+            smoothing: Default::default(),
+            high_poly_source: None,
+            content_hash: None,
+            high_poly_hash: None,
+        });
+        project.texture_sets[0].layers[0].polygon_mask = Some(substancecraft_core::PolygonMask {
+            triangles: [0, 2].into(),
+            inverted: false,
+        });
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_mesh","scale":2,"smoothing_angle":30,"subdivision_levels":1}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "updated the mesh: scale 2, smoothing 30°, 1 subdivision level(s); remapped 1 polygon mask(s)"
+        );
+        let mesh = project.mesh.as_ref().unwrap();
+        assert_eq!(mesh.scale, 2.0);
+        assert_eq!(mesh.smoothing.angle_degrees, 30.0);
+        assert_eq!(mesh.smoothing.subdivision_levels, 1);
+        assert_eq!(
+            project.texture_sets[0].layers[0]
+                .polygon_mask
+                .as_ref()
+                .unwrap()
+                .triangles,
+            [0, 1, 2, 3, 8, 9, 10, 11].into()
+        );
+        assert_eq!(
+            apply_automation_edit(
+                &mut project,
+                &edit(r#"{"edit":"set_mesh","subdivision_levels":4}"#)
+            ),
+            Err(AutomationError::InvalidValue(
+                "at most 3 subdivision levels, not 4".to_owned()
+            ))
+        );
     }
 }

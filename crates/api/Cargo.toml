@@ -7,6 +7,7 @@ license.workspace = true
 description = "Stable headless API for SubstanceCraft domain operations"
 
 [dependencies]
+fbxcel.workspace = true
 fbxcel-dom.workspace = true
 glam.workspace = true
 serde.workspace = true
@@ -25,5 +26,3 @@ gltf.workspace = true
 [lints]
 workspace = true
 
-[dev-dependencies]
-fbxcel.workspace = true

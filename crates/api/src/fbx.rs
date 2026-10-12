@@ -14,9 +14,9 @@ use thiserror::Error;
 
 pub const MAX_FBX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IMPORTED_VERTICES: usize = 3_000_000;
-const MAX_DECODED_ATTRIBUTES: u64 = 128 * 1024 * 1024;
-const MAX_FBX_NODES: usize = 1_000_000;
-const MAX_FBX_DEPTH: usize = 128;
+pub(crate) const MAX_DECODED_ATTRIBUTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_FBX_NODES: usize = 1_000_000;
+pub(crate) const MAX_FBX_DEPTH: usize = 128;
 const FBX_BINARY_MAGIC: &[u8] = b"Kaydara FBX Binary  \0\x1a\0";
 
 struct BinaryPreflight<'a> {
@@ -298,13 +298,36 @@ pub struct ImportedMesh {
 /// Former name of [`ImportedMesh`].
 pub type ImportedFbxMesh = ImportedMesh;
 
+/// Reads every mesh of a binary or ASCII FBX 7.4+ file.
+pub fn import_fbx_meshes(bytes: &[u8]) -> Result<Vec<ImportedMesh>, FbxImportError> {
+    check_input_size(bytes)?;
+    if crate::fbx_ascii::is_ascii_fbx(bytes) {
+        import_binary_document(&crate::fbx_ascii::ascii_to_binary(bytes)?)
+    } else {
+        import_binary_document(bytes)
+    }
+}
+
+/// Reads every mesh of a binary FBX 7.4+ file; see [`import_fbx_meshes`]
+/// for ASCII files too.
 pub fn import_binary_fbx_meshes(bytes: &[u8]) -> Result<Vec<ImportedMesh>, FbxImportError> {
+    check_input_size(bytes)?;
+    import_binary_document(bytes)
+}
+
+fn check_input_size(bytes: &[u8]) -> Result<(), FbxImportError> {
     if bytes.is_empty() {
         return Err(FbxImportError::EmptyInput);
     }
     if bytes.len() > MAX_FBX_BYTES {
         return Err(FbxImportError::InputTooLarge(bytes.len()));
     }
+    Ok(())
+}
+
+/// Imports binary FBX after its size check: binary converted from ASCII
+/// may be larger than the input limit, but its arrays stay in budget.
+fn import_binary_document(bytes: &[u8]) -> Result<Vec<ImportedMesh>, FbxImportError> {
     BinaryPreflight::validate(bytes)?;
 
     let document = AnyDocument::from_seekable_reader(Cursor::new(bytes))
@@ -517,7 +540,7 @@ pub enum FbxImportError {
     InvalidBinary(String),
     #[error("FBX decoded attributes exceed the 128 MiB budget ({0} bytes)")]
     ResourceBudgetExceeded(u64),
-    #[error("this FBX version is not supported; binary FBX 7.4+ is required")]
+    #[error("this FBX version is not supported; FBX 7.4+ (binary or ASCII) is required")]
     UnsupportedVersion,
     #[error("the FBX contains no mesh geometry")]
     NoMeshes,
@@ -687,6 +710,231 @@ mod tests {
         assert_eq!(geometry.material_slot_count(), 2);
         assert_eq!(geometry.submesh(1).triangles.len(), 1);
         geometry.validate().unwrap();
+    }
+
+    /// A quad in two triangles with indexed UVs and two materials, as an
+    /// Autodesk exporter writes it in ASCII.
+    const ASCII_CRATE: &str = r#"; FBX 7.4.0 project file
+; Copyright (C) 1997-2015 Autodesk Inc. and/or its licensors.
+; All rights reserved.
+; ----------------------------------------------------
+
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+	Creator: "FBX SDK/FBX Plugins version 2020.3"
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+		P: "TimeSpanStop", "KTime", "Time", "",46186158000
+	}
+}
+
+; Object definitions
+;------------------------------------------------------------------
+
+Documents:  {
+	Count: 1
+	Document: 1890140528, "Scene", "Scene" {
+		RootNode: 0
+	}
+}
+
+; Object properties
+;------------------------------------------------------------------
+
+Objects:  {
+	Geometry: 1001, "Geometry::Crate", "Mesh" {
+		Vertices: *12 {
+			a: 0,0,0,1,0,0,0,1,0,1,1,0
+		}
+		PolygonVertexIndex: *6 {
+			a: 0,1,-3,1,3,-3
+		}
+		GeometryVersion: 124
+		LayerElementUV: 0 {
+			Version: 101
+			Name: "UVChannel_1"
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "IndexToDirect"
+			UV: *8 {
+				a: 0,0,1,0,0,1,1,1
+			}
+			UVIndex: *6 {
+				a: 0,1,2,1,3,2
+			}
+		}
+		LayerElementMaterial: 0 {
+			Version: 101
+			Name: ""
+			MappingInformationType: "ByPolygon"
+			ReferenceInformationType: "IndexToDirect"
+			Materials: *2 {
+				a: 0,1
+			}
+		}
+		Layer: 0 {
+			Version: 100
+			LayerElement:  {
+				Type: "LayerElementUV"
+				TypedIndex: 0
+			}
+			LayerElement:  {
+				Type: "LayerElementMaterial"
+				TypedIndex: 0
+			}
+		}
+	}
+	Model: 1002, "Model::Crate", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Material: 1003, "Material::Paint", "" {
+		Version: 102
+		ShadingModel: "phong"
+		Properties70:  {
+			P: "DiffuseColor", "Color", "", "A",0.8,0.2,0.1
+		}
+	}
+	Material: 1004, "Material::Metal", "" {
+		Version: 102
+		ShadingModel: "phong"
+	}
+}
+
+; Object connections
+;------------------------------------------------------------------
+
+Connections:  {
+
+	;Model::Crate, Model::RootNode
+	C: "OO",1002,0
+
+	;Geometry::Crate, Model::Crate
+	C: "OO",1001,1002
+
+	;Material::Paint, Model::Crate
+	C: "OO",1003,1002
+
+	;Material::Metal, Model::Crate
+	C: "OO",1004,1002
+}
+"#;
+
+    #[test]
+    fn tc_0305_ascii_fbx_imports_like_the_same_binary_file() {
+        let ascii = import_fbx_meshes(ASCII_CRATE.as_bytes()).unwrap();
+
+        let mut writer = Writer::new(Cursor::new(Vec::new()), FbxVersion::V7_4).unwrap();
+        write_v7400_binary!(
+            writer = writer,
+            tree = {
+                Documents: {
+                    Document: [1_890_140_528_i64, "Scene", "Scene"] {
+                        RootNode: [0_i64] {}
+                    }
+                }
+                Objects: {
+                    Geometry: [1001_i64, "Crate\0\u{1}Geometry", "Mesh"] {
+                        Vertices: [&[
+                            0.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+                        ][..]] {}
+                        PolygonVertexIndex: [&[0_i32, 1, -3, 1, 3, -3][..]] {}
+                        LayerElementUV: [0_i32] {
+                            Version: [101_i32] {}
+                            Name: ["UVChannel_1"] {}
+                            MappingInformationType: ["ByPolygonVertex"] {}
+                            ReferenceInformationType: ["IndexToDirect"] {}
+                            UV: [&[0.0_f64, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0][..]] {}
+                            UVIndex: [&[0_i32, 1, 2, 1, 3, 2][..]] {}
+                        }
+                        LayerElementMaterial: [0_i32] {
+                            Version: [101_i32] {}
+                            Name: [""] {}
+                            MappingInformationType: ["ByPolygon"] {}
+                            ReferenceInformationType: ["IndexToDirect"] {}
+                            Materials: [&[0_i32, 1][..]] {}
+                        }
+                        Layer: [0_i32] {
+                            Version: [100_i32] {}
+                            LayerElement: {
+                                Type: ["LayerElementUV"] {}
+                                TypedIndex: [0_i32] {}
+                            }
+                            LayerElement: {
+                                Type: ["LayerElementMaterial"] {}
+                                TypedIndex: [0_i32] {}
+                            }
+                        }
+                    }
+                    Model: [1002_i64, "Crate\0\u{1}Model", "Mesh"] {}
+                    Material: [1003_i64, "Paint\0\u{1}Material", ""] {}
+                    Material: [1004_i64, "Metal\0\u{1}Material", ""] {}
+                }
+                Connections: {
+                    C: ["OO", 1002_i64, 0_i64] {}
+                    C: ["OO", 1001_i64, 1002_i64] {}
+                    C: ["OO", 1003_i64, 1002_i64] {}
+                    C: ["OO", 1004_i64, 1002_i64] {}
+                }
+            },
+        )
+        .unwrap();
+        let bytes = writer
+            .finalize_and_flush(&Default::default())
+            .unwrap()
+            .into_inner();
+        let binary = import_fbx_meshes(&bytes).unwrap();
+
+        assert_eq!(ascii, binary);
+        let mesh = &ascii[0];
+        assert_eq!(mesh.name, "Crate");
+        assert!(!mesh.generated_uvs);
+        assert_eq!(mesh.geometry.material_slots, ["Paint", "Metal"]);
+        assert_eq!(mesh.geometry.triangle_materials, [0, 1]);
+        let uvs: Vec<Vec2> = mesh.geometry.vertices.iter().map(|v| v.uv).collect();
+        assert_eq!(
+            uvs,
+            [Vec2::ZERO, Vec2::X, Vec2::Y, Vec2::X, Vec2::ONE, Vec2::Y]
+        );
+    }
+
+    #[test]
+    fn tc_0306_ascii_fbx_errors_are_typed_and_binary_only_entry_rejects_ascii() {
+        // A byte-order mark is accepted.
+        let with_bom = [b"\xEF\xBB\xBF".as_slice(), ASCII_CRATE.as_bytes()].concat();
+        assert_eq!(import_fbx_meshes(&with_bom).unwrap().len(), 1);
+        // Old ASCII files are refused by version, not by a parse failure.
+        let old = ASCII_CRATE.replace("FBXVersion: 7400", "FBXVersion: 6100");
+        assert_eq!(
+            import_fbx_meshes(old.as_bytes()),
+            Err(FbxImportError::UnsupportedVersion)
+        );
+        // A file with no geometry has no meshes.
+        let start = ASCII_CRATE.find("\tGeometry:").unwrap();
+        let end = ASCII_CRATE.find("\tModel:").unwrap();
+        let empty = [&ASCII_CRATE[..start], &ASCII_CRATE[end..]].concat();
+        assert_eq!(
+            import_fbx_meshes(empty.as_bytes()),
+            Err(FbxImportError::NoMeshes)
+        );
+        // Truncation is a parse error naming the line.
+        let truncated = &ASCII_CRATE[..ASCII_CRATE.find("UVIndex").unwrap() + 20];
+        assert!(matches!(
+            import_fbx_meshes(truncated.as_bytes()),
+            Err(FbxImportError::Parse(message)) if message.contains("ASCII FBX line")
+        ));
+        assert!(matches!(
+            import_binary_fbx_meshes(ASCII_CRATE.as_bytes()),
+            Err(FbxImportError::Parse(_))
+        ));
     }
 
     #[test]
