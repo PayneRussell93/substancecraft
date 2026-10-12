@@ -11,6 +11,7 @@ mod brush;
 mod camera_paint;
 pub mod color;
 mod compositing;
+pub mod environment;
 mod evolution;
 mod export;
 mod filters;
@@ -36,6 +37,7 @@ pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
     MaterialSample, MaterialTextures,
 };
+pub use environment::{EnvironmentImage, LightingPreset, SunLight};
 pub use evolution::{Evolution, EvolutionDrive, MAX_EVOLUTION_DRIVES, MAX_EVOLUTIONS};
 pub use export::{
     BitDepth, ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource,
@@ -344,20 +346,37 @@ pub struct NamedCamera {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportLighting {
+    /// Turns the environment and its sun about the vertical axis (radians).
     pub rotation: f32,
+    /// Strength of the environment's light; the default is 1x.
     pub ambient_fill: f32,
+    pub preset: LightingPreset,
 }
 
 impl Default for ViewportLighting {
     fn default() -> Self {
         Self {
             rotation: 0.65,
-            ambient_fill: 0.36,
+            ambient_fill: DEFAULT_AMBIENT_FILL,
+            preset: LightingPreset::default(),
         }
     }
 }
 
+/// Ambient fill at which an environment shines at its own strength.
+pub const DEFAULT_AMBIENT_FILL: f32 = 0.36;
+
 impl ViewportLighting {
+    /// Multiplier of the environment's light for the current ambient fill.
+    pub fn environment_scale(self) -> f32 {
+        if self.ambient_fill.is_finite() {
+            self.ambient_fill.clamp(0.0, 1.0) / DEFAULT_AMBIENT_FILL
+        } else {
+            1.0
+        }
+    }
+
+
     pub fn face_intensity(self, normal: Vec3) -> f32 {
         let rotation = if self.rotation.is_finite() {
             self.rotation
@@ -3461,11 +3480,13 @@ mod tests {
         let first = ViewportLighting {
             rotation: 0.0,
             ambient_fill: 0.2,
+            ..ViewportLighting::default()
         }
         .face_intensity(normal);
         let rotated = ViewportLighting {
             rotation: std::f32::consts::PI,
             ambient_fill: 0.2,
+            ..ViewportLighting::default()
         }
         .face_intensity(normal);
 

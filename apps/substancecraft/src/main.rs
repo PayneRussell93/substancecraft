@@ -137,6 +137,9 @@ struct SubstanceCraftApp {
     mesh_error: Option<String>,
     mesh_revision: u64,
     filament_mesh_revision: Option<u64>,
+    /// Lighting preset the renderer was last given, and the lux and rotation
+    /// it was applied at.
+    filament_environment: Option<(substancecraft_core::LightingPreset, f32, f32)>,
     filament_renderer: Option<FilamentRuntime>,
     filament_error: Option<String>,
     filament_frame_texture: Option<egui::TextureHandle>,
@@ -725,6 +728,7 @@ impl Default for SubstanceCraftApp {
             mesh_error: None,
             mesh_revision: 1,
             filament_mesh_revision: None,
+            filament_environment: None,
             filament_renderer: None,
             filament_error: None,
             filament_frame_texture: None,
@@ -1121,6 +1125,12 @@ impl SubstanceCraftApp {
                 }
             }
         }
+        if let Err(error) =
+            apply_environment(renderer, self.viewport_lighting, &mut self.filament_environment)
+        {
+            self.filament_error = Some(error.to_string());
+            return;
+        }
 
         let patch = self
             .baked_preview
@@ -1464,7 +1474,11 @@ impl SubstanceCraftApp {
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             });
         self.viewport_camera = ViewportCamera::default();
-        self.viewport_lighting = ViewportLighting::default();
+        // The lighting preset is a user preference, not part of the project.
+        self.viewport_lighting = ViewportLighting {
+            preset: self.viewport_lighting.preset,
+            ..ViewportLighting::default()
+        };
         self.selected_pose = self.project.saved_poses.first().map(|pose| pose.id);
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
@@ -5655,6 +5669,36 @@ fn sanitize_mesh_scale(scale: f32) -> f32 {
     }
 }
 
+/// Brings the renderer's environment up to `lighting`: a new preset is
+/// rendered and prefiltered again; a new strength or rotation only turns and
+/// rescales the one already there. `applied` records what the renderer has.
+fn apply_environment(
+    renderer: &mut FilamentRuntime,
+    lighting: ViewportLighting,
+    applied: &mut Option<(substancecraft_core::LightingPreset, f32, f32)>,
+) -> Result<(), substancecraft_filament::FilamentError> {
+    let preset = lighting.preset;
+    let lux = preset.environment_lux() * lighting.environment_scale();
+    let rotation = if lighting.rotation.is_finite() {
+        lighting.rotation
+    } else {
+        0.0
+    };
+    match *applied {
+        Some(current) if current == (preset, lux, rotation) => {}
+        Some((current, _, _)) if current == preset => {
+            renderer.set_environment_transform(lux, rotation, preset.sun());
+            *applied = Some((preset, lux, rotation));
+        }
+        _ => {
+            let image = preset.equirect(substancecraft_core::environment::ENVIRONMENT_WIDTH);
+            renderer.set_environment(&image, lux, rotation, preset.sun())?;
+            *applied = Some((preset, lux, rotation));
+        }
+    }
+    Ok(())
+}
+
 /// Reads an FBX (every mesh it holds) or a glTF/GLB (the flattened scene),
 /// choosing the importer by extension.
 fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
@@ -5875,6 +5919,7 @@ fn suggest_import_channel(
 mod tests {
     use super::*;
     use substancecraft_api::write_texture;
+    use substancecraft_core::LightingPreset;
 
     #[test]
     fn tc_0220_bitmap_import_suggestions_use_names_and_image_traits() {
@@ -7693,5 +7738,95 @@ mod tests {
                 .any(|texel| texel[..3] != image.rgba8[..3]),
             "the mesh is visible against the background"
         );
+    }
+
+    #[test]
+    fn tc_0314_lighting_presets_are_remembered_and_survive_opening_projects() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("preferences.json");
+        let mut app = SubstanceCraftApp::default();
+        app.load_preferences(path.clone());
+        assert_eq!(app.viewport_lighting.preset, LightingPreset::Studio);
+
+        app.set_lighting_preset(LightingPreset::Sunset);
+        app.viewport_lighting.rotation = 2.0;
+        assert_eq!(app.viewport_lighting.preset, LightingPreset::Sunset);
+        assert_eq!(
+            preferences::Preferences::load(&path).lighting_preset,
+            LightingPreset::Sunset
+        );
+
+        // Opening a project resets the camera and rotation but not the
+        // user's preset.
+        app.adopt_project(MaterialProject::empty(), None).unwrap();
+        assert_eq!(app.viewport_lighting.preset, LightingPreset::Sunset);
+        assert_eq!(
+            app.viewport_lighting.rotation,
+            ViewportLighting::default().rotation
+        );
+
+        // A later session starts with it.
+        let mut later = SubstanceCraftApp::default();
+        later.load_preferences(path);
+        assert_eq!(later.viewport_lighting.preset, LightingPreset::Sunset);
+
+        // Strength scales the environment around its own level.
+        let mut lighting = ViewportLighting::default();
+        assert_eq!(lighting.environment_scale(), 1.0);
+        lighting.ambient_fill = 0.72;
+        assert!((lighting.environment_scale() - 2.0).abs() < 1e-6);
+        lighting.ambient_fill = f32::NAN;
+        assert_eq!(lighting.environment_scale(), 1.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn tc_0315_still_renders_follow_the_lighting_preset() {
+        let folder = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp {
+            filament_renderer: Some(FilamentRuntime::new(64, 64).unwrap()),
+            ..SubstanceCraftApp::default()
+        };
+        app.add_fill_layer();
+        small_sets(&mut app, 16);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 150.0));
+        let mut render = |app: &mut SubstanceCraftApp, name: &str| {
+            let path = folder.path().join(name);
+            app.queue_render(path.clone(), 128, None);
+            for _ in 0..600 {
+                app.update_filament_frame(&context, viewport);
+                if app.render_request.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            load_texture_image(&path).unwrap().rgba8
+        };
+        let mut frames = Vec::new();
+        for preset in [LightingPreset::BrightOutdoor, LightingPreset::Night] {
+            app.set_lighting_preset(preset);
+            // The first render after a change may still use the old light.
+            render(&mut app, "warmup.png");
+            assert_eq!(
+                app.filament_environment.map(|(applied, _, _)| applied),
+                Some(preset)
+            );
+            frames.push(render(&mut app, &format!("{preset:?}.png")));
+        }
+        let mean = |frame: &[u8]| -> f64 {
+            frame.iter().map(|value| f64::from(*value)).sum::<f64>() / frame.len() as f64
+        };
+        assert!(
+            mean(&frames[0]) > mean(&frames[1]) + 1.0,
+            "a bright outdoor render is brighter than a night one"
+        );
+
+        // A new rotation keeps the preset and only turns it.
+        app.viewport_lighting.rotation += 1.0;
+        app.update_filament_frame(&context, viewport);
+        let (preset, _, rotation) = app.filament_environment.unwrap();
+        assert_eq!(preset, LightingPreset::Night);
+        assert_eq!(rotation, app.viewport_lighting.rotation);
     }
 }

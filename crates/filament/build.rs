@@ -10,6 +10,7 @@ use std::process::Command;
 
 const FILAMENT_LIBS: &[&str] = &[
     "filament",
+    "filament-iblprefilter",
     "backend",
     "bluegl",
     "filabridge",

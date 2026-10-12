@@ -250,6 +250,8 @@ pub struct Preferences {
     pub overlay_pattern: bool,
     /// Memory background texture-set bakes may use, in MiB.
     pub cache_budget_mb: u32,
+    /// Lighting-check environment of the viewport.
+    pub lighting_preset: substancecraft_core::LightingPreset,
 }
 
 impl Default for Preferences {
@@ -262,6 +264,7 @@ impl Default for Preferences {
             overlay_palette: substancecraft_core::OverlayPalette::Standard,
             overlay_pattern: false,
             cache_budget_mb: crate::cache::DEFAULT_CACHE_BUDGET_MB,
+            lighting_preset: substancecraft_core::LightingPreset::default(),
         }
     }
 }
@@ -367,7 +370,18 @@ pub struct PreferenceState {
 impl SubstanceCraftApp {
     pub(super) fn load_preferences(&mut self, path: PathBuf) {
         self.preferences.values = Preferences::load(&path);
+        self.viewport_lighting.preset = self.preferences.values.lighting_preset;
         self.preferences.path = Some(path);
+    }
+
+    /// Lights the viewport (and still renders) with `preset` and remembers it
+    /// for later sessions.
+    pub(super) fn set_lighting_preset(&mut self, preset: substancecraft_core::LightingPreset) {
+        self.viewport_lighting.preset = preset;
+        if self.preferences.values.lighting_preset != preset {
+            self.preferences.values.lighting_preset = preset;
+            self.save_preferences();
+        }
     }
 
     pub(super) fn save_preferences(&mut self) {

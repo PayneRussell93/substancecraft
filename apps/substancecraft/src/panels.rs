@@ -1441,6 +1441,22 @@ impl SubstanceCraftApp {
         self.edge_overlay_controls(ui);
 
         widgets::caption(ui, "Environment light");
+        let mut chosen = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for preset in substancecraft_core::LightingPreset::ALL {
+                let selected = self.viewport_lighting.preset == preset;
+                if widgets::chip(ui, preset.name(), selected)
+                    .on_hover_text(preset.description())
+                    .clicked()
+                {
+                    chosen = Some(preset);
+                }
+            }
+        });
+        if let Some(preset) = chosen.filter(|preset| *preset != self.viewport_lighting.preset) {
+            self.set_lighting_preset(preset);
+        }
         slider_row(
             ui,
             "Rotation",
@@ -1451,7 +1467,7 @@ impl SubstanceCraftApp {
         );
         slider_row(
             ui,
-            "Ambient fill",
+            "Strength",
             &mut self.viewport_lighting.ambient_fill,
             0.0..=1.0,
             false,

@@ -21,6 +21,10 @@
 #include <filament/View.h>
 #include <filament/Viewport.h>
 
+#include <filament-iblprefilter/IBLPrefilterContext.h>
+
+#include <math/mat3.h>
+
 #include <utils/Entity.h>
 #include <utils/EntityManager.h>
 
@@ -51,7 +55,12 @@ struct ScRenderer {
     Camera* camera = nullptr;
     Entity cameraEntity;
     Entity sunEntity;
+    bool sunInScene = true;
     IndirectLight* indirectLight = nullptr;
+    // Prefiltered environment behind `indirectLight`, when one is set.
+    Texture* reflections = nullptr;
+    Texture* irradiance = nullptr;
+    IBLPrefilterContext* iblContext = nullptr;
     Material* material = nullptr;
     // One instance per mesh primitive (material slot), with its own maps indexed by map slot:
     // 0 base colour, 1 ORM, 2 normal, 3 emissive.
@@ -165,6 +174,10 @@ void destroyAll(ScRenderer* r) {
     destroyInstances(r, 0);
     if (r->material) engine->destroy(r->material);
     if (r->indirectLight) engine->destroy(r->indirectLight);
+    if (r->reflections) engine->destroy(r->reflections);
+    if (r->irradiance) engine->destroy(r->irradiance);
+    delete r->iblContext;
+    r->iblContext = nullptr;
     if (!r->sunEntity.isNull()) {
         engine->destroy(r->sunEntity);
         EntityManager::get().destroy(r->sunEntity);
@@ -606,6 +619,134 @@ bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
         return true;
     } catch (...) {
         return false;
+    }
+}
+
+// Lights the scene with an environment: `rgb` is a linear equirectangular image (`width` x
+// `height` RGB floats, rows top to bottom, as IBLPrefilterContext reads one), prefiltered here
+// into reflection and irradiance cubemaps and applied at `intensity` lux. `rotation` turns the
+// environment, and the sun with it, about +Y (radians). With `has_sun`, the directional light
+// shines along `sun_direction` (before rotation) at `sun_lux`; otherwise it is removed.
+bool sc_renderer_set_environment(ScRenderer* r, float const* rgb, uint32_t width,
+        uint32_t height, float intensity, float rotation, bool has_sun,
+        float const* sun_direction, float const* sun_color, float sun_lux) {
+    Texture* equirect = nullptr;
+    Texture* environment = nullptr;
+    Texture* reflections = nullptr;
+    Texture* irradiance = nullptr;
+    try {
+        if (width < 2 || height < 1 || width > 8192 || height > 4096 || !(intensity >= 0.0f)) {
+            return false;
+        }
+        if (!r->iblContext) {
+            r->iblContext = new IBLPrefilterContext(*r->engine);
+        }
+        size_t const bytes = size_t(width) * height * 3 * sizeof(float);
+        void* copy = copyBytes(rgb, bytes);
+        if (!copy) {
+            return false;
+        }
+        // The converter samples the image's mips, which it generates itself, so it needs every
+        // level allocated and a format the backend can mipmap.
+        uint8_t levels = 1;
+        for (uint32_t extent = width; extent > 1; extent >>= 1) {
+            levels++;
+        }
+        equirect = Texture::Builder()
+                           .width(width)
+                           .height(height)
+                           .levels(levels)
+                           .sampler(Texture::Sampler::SAMPLER_2D)
+                           .format(Texture::InternalFormat::R11F_G11F_B10F)
+                           .usage(Texture::Usage::DEFAULT | Texture::Usage::GEN_MIPMAPPABLE)
+                           .build(*r->engine);
+        if (!equirect) {
+            std::free(copy);
+            return false;
+        }
+        // Filament takes ownership of `copy` and frees it once uploaded.
+        equirect->setImage(*r->engine, 0,
+                Texture::PixelBufferDescriptor(copy, bytes, Texture::Format::RGB,
+                        Texture::Type::FLOAT, freeCallback));
+
+        IBLPrefilterContext::EquirectangularToCubemap toCubemap(*r->iblContext);
+        environment = toCubemap(equirect);
+        IBLPrefilterContext::SpecularFilter specularFilter(*r->iblContext);
+        reflections = specularFilter(environment);
+        IBLPrefilterContext::IrradianceFilter irradianceFilter(*r->iblContext);
+        irradiance = irradianceFilter(environment);
+        r->engine->destroy(equirect);
+        equirect = nullptr;
+        r->engine->destroy(environment);
+        environment = nullptr;
+        if (!reflections || !irradiance) {
+            if (reflections) r->engine->destroy(reflections);
+            if (irradiance) r->engine->destroy(irradiance);
+            return false;
+        }
+
+        math::mat3f const turn = math::mat3f::rotation(rotation, math::float3{0, 1, 0});
+        IndirectLight* light = IndirectLight::Builder()
+                                       .reflections(reflections)
+                                       .irradiance(irradiance)
+                                       .intensity(intensity)
+                                       .rotation(turn)
+                                       .build(*r->engine);
+        if (!light) {
+            r->engine->destroy(reflections);
+            r->engine->destroy(irradiance);
+            return false;
+        }
+        r->scene->setIndirectLight(light);
+        if (r->indirectLight) r->engine->destroy(r->indirectLight);
+        if (r->reflections) r->engine->destroy(r->reflections);
+        if (r->irradiance) r->engine->destroy(r->irradiance);
+        r->indirectLight = light;
+        r->reflections = reflections;
+        r->irradiance = irradiance;
+
+        // The renderer rotates shading space by the IBL rotation's transpose, so the
+        // environment turns by `turn`; the sun turns with it.
+        auto& lights = r->engine->getLightManager();
+        auto const instance = lights.getInstance(r->sunEntity);
+        if (has_sun) {
+            math::float3 const direction =
+                    turn * math::float3{sun_direction[0], sun_direction[1], sun_direction[2]};
+            lights.setDirection(instance, direction);
+            lights.setColor(instance, {sun_color[0], sun_color[1], sun_color[2]});
+            lights.setIntensity(instance, sun_lux);
+            if (!r->sunInScene) {
+                r->scene->addEntity(r->sunEntity);
+                r->sunInScene = true;
+            }
+        } else if (r->sunInScene) {
+            r->scene->remove(r->sunEntity);
+            r->sunInScene = false;
+        }
+        return true;
+    } catch (...) {
+        if (equirect) r->engine->destroy(equirect);
+        if (environment) r->engine->destroy(environment);
+        return false;
+    }
+}
+
+// Changes the environment's strength and rotation without prefiltering it again.
+void sc_renderer_set_environment_transform(ScRenderer* r, float intensity, float rotation,
+        bool has_sun, float const* sun_direction) {
+    try {
+        if (!r->indirectLight) {
+            return;
+        }
+        math::mat3f const turn = math::mat3f::rotation(rotation, math::float3{0, 1, 0});
+        r->indirectLight->setIntensity(intensity);
+        r->indirectLight->setRotation(turn);
+        if (has_sun) {
+            auto& lights = r->engine->getLightManager();
+            lights.setDirection(lights.getInstance(r->sunEntity),
+                    turn * math::float3{sun_direction[0], sun_direction[1], sun_direction[2]});
+        }
+    } catch (...) {
     }
 }
 

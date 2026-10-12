@@ -12,7 +12,8 @@ use std::ptr::NonNull;
 
 use glam::{Mat3, Quat, Vec3};
 use substancecraft_core::{
-    MeshGeometry, TexelRect, ViewportCamera, vertex_normals, vertex_tangents,
+    EnvironmentImage, MeshGeometry, SunLight, TexelRect, ViewportCamera, vertex_normals,
+    vertex_tangents,
 };
 use thiserror::Error;
 
@@ -101,6 +102,26 @@ mod ffi {
             user: *mut c_void,
         ) -> bool;
         pub fn sc_renderer_pump(renderer: *mut ScRenderer);
+        #[allow(clippy::too_many_arguments)]
+        pub fn sc_renderer_set_environment(
+            renderer: *mut ScRenderer,
+            rgb: *const f32,
+            width: u32,
+            height: u32,
+            intensity: f32,
+            rotation: f32,
+            has_sun: bool,
+            sun_direction: *const f32,
+            sun_color: *const f32,
+            sun_lux: f32,
+        ) -> bool;
+        pub fn sc_renderer_set_environment_transform(
+            renderer: *mut ScRenderer,
+            intensity: f32,
+            rotation: f32,
+            has_sun: bool,
+            sun_direction: *const f32,
+        );
     }
 }
 
@@ -397,6 +418,60 @@ impl FilamentRuntime {
         self.preview_mode = Some(preview);
     }
 
+    /// Lights the scene with `image` (prefiltered on the GPU) at `lux` per unit of radiance,
+    /// turned by `rotation` radians about +Y together with `sun` (given unrotated); without a
+    /// sun the directional light is off.
+    pub fn set_environment(
+        &mut self,
+        image: &EnvironmentImage,
+        lux: f32,
+        rotation: f32,
+        sun: Option<SunLight>,
+    ) -> Result<(), FilamentError> {
+        let texels = image.width as usize * image.height as usize;
+        if image.rgb.len() != texels * 3 || !lux.is_finite() || lux < 0.0 {
+            return Err(FilamentError::EnvironmentUnavailable);
+        }
+        let (direction, color, sun_lux) = sun_parameters(sun);
+        // SAFETY: `raw` is live; the slices are read during the call and the shim copies the
+        // image.
+        let applied = unsafe {
+            ffi::sc_renderer_set_environment(
+                self.raw.as_ptr(),
+                image.rgb.as_ptr(),
+                image.width,
+                image.height,
+                lux,
+                finite_or_zero(rotation),
+                sun.is_some(),
+                direction.as_ptr(),
+                color.as_ptr(),
+                sun_lux,
+            )
+        };
+        if applied {
+            Ok(())
+        } else {
+            Err(FilamentError::EnvironmentUnavailable)
+        }
+    }
+
+    /// Changes the strength and rotation of the environment last set, without prefiltering it
+    /// again.
+    pub fn set_environment_transform(&mut self, lux: f32, rotation: f32, sun: Option<SunLight>) {
+        let (direction, _, _) = sun_parameters(sun);
+        // SAFETY: `raw` is live and `direction` is a three-element array read during the call.
+        unsafe {
+            ffi::sc_renderer_set_environment_transform(
+                self.raw.as_ptr(),
+                finite_or_zero(lux).max(0.0),
+                finite_or_zero(rotation),
+                sun.is_some(),
+                direction.as_ptr(),
+            );
+        }
+    }
+
     /// Renders one frame and schedules an RGBA8 readback (rows top to bottom). Returns
     /// `Ok(false)` when Filament skipped the frame, in which case `readback` is dropped unused.
     /// Otherwise `readback` runs from a later [`FilamentRuntime::poll`] call.
@@ -664,6 +739,22 @@ fn build_mesh_buffers(
     })
 }
 
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// Direction, colour, and lux of `sun`, with harmless values when absent.
+fn sun_parameters(sun: Option<SunLight>) -> ([f32; 3], [f32; 3], f32) {
+    match sun {
+        Some(sun) => (
+            sun.direction.normalize_or(Vec3::NEG_Y).to_array(),
+            sun.color.to_array(),
+            finite_or_zero(sun.illuminance).max(0.0),
+        ),
+        None => ([0.0, -1.0, 0.0], [1.0; 3], 0.0),
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FilamentError {
     #[error("Filament could not initialize its OpenGL backend")]
@@ -680,6 +771,8 @@ pub enum FilamentError {
     TextureUnavailable,
     #[error("Base Color texture data has invalid dimensions or byte length")]
     InvalidTexture,
+    #[error("Filament could not prefilter the lighting environment")]
+    EnvironmentUnavailable,
 }
 
 #[cfg(test)]
@@ -958,5 +1051,112 @@ mod tests {
             background_pixels(&cut) > background_pixels(&glowing) + 100,
             "cut-out body shows the background"
         );
+    }
+
+    fn render_with_camera(renderer: &mut FilamentRuntime, camera: ViewportCamera) -> Vec<u8> {
+        let mut last = Vec::new();
+        // The first frames after an environment change may still show old lighting.
+        for _ in 0..4 {
+            let (sender, receiver) = sync_channel(1);
+            let rendered = renderer
+                .render(camera, 64, 64, 1.0, move |pixels| {
+                    let _ = sender.try_send(pixels);
+                })
+                .expect("Filament frame submission");
+            assert!(rendered);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            last = loop {
+                renderer.poll();
+                if let Ok(pixels) = receiver.try_recv() {
+                    break pixels;
+                }
+                assert!(Instant::now() < deadline, "Filament readback timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+        }
+        last
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0313_environment_lights_faces_from_their_own_direction() {
+        use glam::Vec3;
+        use substancecraft_core::{EnvironmentImage, LightingPreset};
+
+        // Red from +X, green from +Y, blue from +Z, black elsewhere, laid
+        // out as the presets lay out their images.
+        let image = EnvironmentImage::from_fn(128, |d| d.max(Vec3::ZERO).powf(4.0) * 3.0);
+
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        renderer
+            .set_mesh(&PrimitivePreset::Cube.build_mesh(), 0.0)
+            .expect("cube mesh upload");
+        renderer.set_preview_mode(false);
+        renderer
+            .set_environment(&image, 30_000.0, 0.0, None)
+            .expect("environment");
+
+        // Cameras looking straight at the +X, +Y, and +Z faces.
+        let looking_along = |axis: Vec3| {
+            let cameras = (0..4).flat_map(|yaw| {
+                [0.0, 1.55, -1.55].map(move |pitch| ViewportCamera {
+                    yaw: yaw as f32 * std::f32::consts::FRAC_PI_2,
+                    pitch,
+                    ..ViewportCamera::default()
+                })
+            });
+            cameras
+                .filter(|camera| (camera.rotation().inverse() * Vec3::Z).dot(axis) > 0.99)
+                .next()
+                .expect("a camera along the axis")
+        };
+        let center = (32 * 64 + 32) * 4;
+        for (label, orm) in [("diffuse", [255, 230, 0, 255]), ("mirror", [255, 8, 255, 255])] {
+            renderer
+                .set_map(0, MaterialMap::Orm, 10 + orm[1] as usize, 1, 1, &orm)
+                .expect("ORM upload");
+            for (axis, channel) in [(Vec3::X, 0), (Vec3::Y, 1), (Vec3::Z, 2)] {
+                let pixels = render_with_camera(&mut renderer, looking_along(axis));
+                let texel = &pixels[center..center + 3];
+                let others = (0..3).filter(|other| *other != channel);
+                for other in others {
+                    assert!(
+                        texel[channel] > texel[other] + 20,
+                        "{label}: the face towards {axis} should take channel {channel}: {texel:?}"
+                    );
+                }
+            }
+        }
+
+        // Every preset prefilters and renders; rotating changes the frame.
+        renderer
+            .set_map(0, MaterialMap::Orm, 99, 1, 1, &[255, 140, 0, 255])
+            .expect("ORM upload");
+        let camera = ViewportCamera::default();
+        let mut frames = Vec::new();
+        for preset in LightingPreset::ALL {
+            renderer
+                .set_environment(
+                    &preset.equirect(256),
+                    preset.environment_lux(),
+                    0.0,
+                    preset.sun(),
+                )
+                .expect("preset environment");
+            frames.push(render_with_camera(&mut renderer, camera));
+        }
+        let brightness = |frame: &[u8]| -> f32 {
+            frame[center..center + 3].iter().map(|v| f32::from(*v)).sum()
+        };
+        let night = brightness(&frames[5]);
+        assert!(frames.iter().take(5).all(|frame| brightness(frame) > night));
+        let unrotated = render_with_camera(&mut renderer, camera);
+        renderer.set_environment_transform(
+            LightingPreset::Night.environment_lux(),
+            std::f32::consts::PI,
+            LightingPreset::Night.sun(),
+        );
+        let rotated = render_with_camera(&mut renderer, camera);
+        assert!(mean_difference(&unrotated, &rotated) > 0.5, "rotation turns the lighting");
     }
 }
