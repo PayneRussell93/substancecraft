@@ -453,7 +453,7 @@ pub fn export_preflight(
 }
 
 /// Files in `folder` that exporting `preset` for `texture_set` as `format`
-/// would overwrite.
+/// would overwrite; outputs with their own format keep it.
 pub fn existing_export_files(
     folder: &Path,
     texture_set: &TextureSet,
@@ -461,13 +461,14 @@ pub fn existing_export_files(
     format: TextureFormat,
 ) -> Vec<std::path::PathBuf> {
     preset
+        .resolved(format.extension())
         .outputs
         .iter()
         .map(|output| {
+            let extension = output.format.as_deref().unwrap_or(format.extension());
             folder.join(format!(
-                "{}.{}",
-                output.resolved_file_name(&texture_set.name),
-                format.extension()
+                "{}.{extension}",
+                output.resolved_file_name(&texture_set.name)
             ))
         })
         .filter(|path| path.exists())

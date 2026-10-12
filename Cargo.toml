@@ -16,6 +16,7 @@ fbxcel-dom = "0.0.10"
 glam = { version = "0.30", features = ["serde"] }
 gltf = { version = "1.4.1", default-features = false, features = ["import", "utils", "names"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga"] }
+exr = { version = "1.74", default-features = false }
 resvg = { version = "0.45", default-features = false }
 ab_glyph = "0.2"
 quick-xml = "0.41"

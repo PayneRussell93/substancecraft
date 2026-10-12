@@ -3559,11 +3559,11 @@ impl SubstanceCraftApp {
         preset: &ExportPreset,
         folder: &std::path::Path,
     ) -> Result<Vec<std::path::PathBuf>, String> {
+        let format = self.format_for(texture_set);
         let files = self
             .bake_inputs(texture_set.id)
-            .bake_export(texture_set, preset)?;
-        write_exported_textures(folder, &files, self.format_for(texture_set))
-            .map_err(|error| error.to_string())
+            .bake_export(texture_set, &preset.resolved(format.extension()))?;
+        write_exported_textures(folder, &files, format).map_err(|error| error.to_string())
     }
 
     /// Writes `texture_set`'s OpenPBR textures and a MaterialX document
@@ -3606,9 +3606,10 @@ impl SubstanceCraftApp {
                 materials.push(substancecraft_api::GltfMaterialFiles::default());
                 continue;
             };
+            // glTF images are PNG.
             let files = self
                 .bake_inputs(texture_set.id)
-                .bake_export(texture_set, &preset)?;
+                .bake_export(texture_set, &preset.resolved("png"))?;
             let blend = files.first().is_some_and(|file| {
                 file.texture
                     .rgba8
@@ -3617,7 +3618,7 @@ impl SubstanceCraftApp {
                     .iter()
                     .any(|texel| texel[3] < 255)
             });
-            let written = write_exported_textures(folder, &files, self.format_for(texture_set))
+            let written = write_exported_textures(folder, &files, TextureFormat::Png)
                 .map_err(|error| error.to_string())?;
             let name_of = |suffix: &str| {
                 written
@@ -3661,6 +3662,8 @@ impl SubstanceCraftApp {
         }
         let needs_maps = texture_set.requires_mesh_maps() || preset.reads_mesh_maps();
         let resources = self.resource_images.clone();
+        let format = self.format_for(texture_set);
+        let preset = &preset.resolved(format.extension());
         let mut written = Vec::new();
         for tile in tiles {
             let shifted = geometry.shifted_uvs(tile.offset());
@@ -3686,8 +3689,7 @@ impl SubstanceCraftApp {
                 )
                 .map_err(|error| error.to_string())?;
             written.extend(
-                write_exported_textures(folder, &files, self.format_for(texture_set))
-                    .map_err(|error| error.to_string())?,
+                write_exported_textures(folder, &files, format).map_err(|error| error.to_string())?,
             );
         }
         Ok(written)

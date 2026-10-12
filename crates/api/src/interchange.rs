@@ -77,6 +77,7 @@ pub fn openpbr_preset() -> ExportPreset {
     };
     ExportPreset {
         name: "OpenPBR (MaterialX)".to_owned(),
+        max_resolution: None,
         outputs: OPENPBR_INPUTS
             .iter()
             .map(|(_, channel, kind, _)| {

@@ -881,33 +881,37 @@ impl TextureSet {
         tiles: &[TexelRect],
         mut bake: impl FnMut(TexelRect) -> Result<[Vec<u8>; N], BakeError>,
     ) -> Result<[Vec<u8>; N], BakeError> {
-        let textures = self.bake_tiles_into(tiles, N, |region| Ok(bake(region)?.to_vec()))?;
+        let textures = self.bake_tiles_into(tiles, &[4; N], |region| Ok(bake(region)?.to_vec()))?;
         textures.try_into().map_err(|_| BakeError::AllocationFailed)
     }
 
     /// [`Self::bake_in_tiles`] for `count` textures known at run time.
+    ///
+    /// `texel_bytes` gives each texture's bytes per texel (4 for RGBA8, 8 for
+    /// RGBA16).
     pub(crate) fn bake_tiles_into(
         &self,
         tiles: &[TexelRect],
-        count: usize,
+        texel_bytes: &[usize],
         mut bake: impl FnMut(TexelRect) -> Result<Vec<Vec<u8>>, BakeError>,
     ) -> Result<Vec<Vec<u8>>, BakeError> {
         let full = self.texel_rect();
         if tiles == [full] {
             return bake(full);
         }
-        let byte_count = checked_bake_pixel_count(self.resolution)?
-            .checked_mul(4)
-            .ok_or(BakeError::AllocationFailed)?;
-        let mut textures = Vec::with_capacity(count);
-        for _ in 0..count {
+        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let mut textures = Vec::with_capacity(texel_bytes.len());
+        for bytes in texel_bytes {
+            let byte_count = pixel_count
+                .checked_mul(*bytes)
+                .ok_or(BakeError::AllocationFailed)?;
             textures.push(try_filled(byte_count, 0_u8)?);
         }
         for tile in tiles {
             let grown = self.composited_region(*tile);
             let parts = bake(grown)?;
-            for (texture, part) in textures.iter_mut().zip(&parts) {
-                patch_rgba8(texture, full.width, part, grown, *tile);
+            for ((texture, part), bytes) in textures.iter_mut().zip(&parts).zip(texel_bytes) {
+                patch_texels(texture, full.width, part, grown, *tile, *bytes);
             }
         }
         Ok(textures)
@@ -1450,7 +1454,7 @@ impl TextureSet {
             .into_iter()
             .filter(|channel| contributes(layer, &[*channel]))
             .collect();
-        let textures = self.bake_tiles_into(&self.bake_tiles()?, channels.len(), |region| {
+        let textures = self.bake_tiles_into(&self.bake_tiles()?, &vec![4; channels.len()], |region| {
             let id_map = self.validate_for_region(region)?;
             let masks = self.layer_masks_in(&channels, context, id_map.as_deref(), region)?;
             let mut textures = Vec::new();
@@ -1627,10 +1631,22 @@ fn patch_rgba8(
     source_region: TexelRect,
     region: TexelRect,
 ) {
-    let span = region.width as usize * 4;
+    patch_texels(target, width, source, source_region, region, 4);
+}
+
+/// [`patch_rgba8`] for texels of `texel_bytes` bytes each.
+fn patch_texels(
+    target: &mut [u8],
+    width: u32,
+    source: &[u8],
+    source_region: TexelRect,
+    region: TexelRect,
+    texel_bytes: usize,
+) {
+    let span = region.width as usize * texel_bytes;
     for y in region.y..region.bottom() {
-        let from = source_region.local_index(region.x, y) * 4;
-        let to = (y as usize * width as usize + region.x as usize) * 4;
+        let from = source_region.local_index(region.x, y) * texel_bytes;
+        let to = (y as usize * width as usize + region.x as usize) * texel_bytes;
         target[to..to + span].copy_from_slice(&source[from..from + span]);
     }
 }

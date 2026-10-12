@@ -187,6 +187,7 @@ mod tests {
             export: None,
         };
         let preset = ExportPreset {
+            max_resolution: None,
             name: "Tiles".to_owned(),
             outputs: vec![
                 ExportOutput::new(

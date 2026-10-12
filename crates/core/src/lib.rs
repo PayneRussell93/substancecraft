@@ -32,7 +32,8 @@ pub use compositing::{
     MaterialSample, MaterialTextures,
 };
 pub use export::{
-    ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource, ExportedTexture,
+    BitDepth, ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource,
+    ExportedTexture,
     MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS, OutputLayout,
     PreflightIssue, PreflightSeverity, SourceComponent, TEXTURE_SET_TOKEN,
 };
@@ -1809,7 +1810,7 @@ pub struct TextureSet {
 }
 
 /// Image file formats texture exports can be written in, by extension.
-pub const EXPORT_FILE_FORMATS: [&str; 2] = ["png", "tga"];
+pub const EXPORT_FILE_FORMATS: [&str; 3] = ["png", "tga", "exr"];
 
 /// How one texture set exports: its preset, file format, and whether it
 /// writes one file set per UDIM tile.

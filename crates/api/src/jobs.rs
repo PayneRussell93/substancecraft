@@ -255,6 +255,8 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
             .format
             .or_else(|| saved.and_then(|export| TextureFormat::from_extension(&export.format)))
             .unwrap_or(TextureFormat::Png);
+        // Outputs without their own format take the job's.
+        let preset = preset.resolved(format.extension());
         let udim = job.udim || saved.is_some_and(|export| export.udim);
         let geometry = mesh.as_ref().map(|(mesh, _)| set_geometry(mesh, set));
         let settings = MeshMapSettings {

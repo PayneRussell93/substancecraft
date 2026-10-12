@@ -71,6 +71,15 @@ impl ExportSource {
         Self::MeshMap(MeshMapKind::Skew),
     ];
 
+    /// True when the source holds sRGB-encoded colour (Base Color and
+    /// Emissive), which linear file formats such as EXR store decoded.
+    pub const fn is_srgb(self) -> bool {
+        matches!(
+            self,
+            Self::Channel(MaterialChannel::BaseColor | MaterialChannel::Emissive)
+        )
+    }
+
     /// True when the source carries different data in R, G, and B.
     pub const fn is_color(self) -> bool {
         match self {
@@ -108,6 +117,31 @@ impl SourceComponent {
             Self::Green => 1,
             Self::Blue => 2,
         }
+    }
+}
+
+/// Bits per channel of an output file. PNG stores either; TGA holds 8 bits
+/// and EXR always stores half floats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BitDepth {
+    #[default]
+    Eight,
+    Sixteen,
+}
+
+impl BitDepth {
+    pub const ALL: [Self; 2] = [Self::Eight, Self::Sixteen];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Eight => "8-bit",
+            Self::Sixteen => "16-bit",
+        }
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_eight(&self) -> bool {
+        matches!(self, Self::Eight)
     }
 }
 
@@ -195,6 +229,13 @@ pub struct ExportOutput {
     /// emissive map of a material that does not glow.
     #[serde(default)]
     pub skip_if_black: bool,
+    /// File format (one of [`crate::EXPORT_FILE_FORMATS`]) this output is
+    /// always written in; `None` follows the format chosen for the export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Bits per channel when written as PNG.
+    #[serde(default, skip_serializing_if = "BitDepth::is_eight")]
+    pub bit_depth: BitDepth,
 }
 
 impl ExportOutput {
@@ -204,6 +245,8 @@ impl ExportOutput {
             layout,
             slots,
             skip_if_black: false,
+            format: None,
+            bit_depth: BitDepth::Eight,
         }
     }
 
@@ -234,6 +277,10 @@ impl ExportOutput {
 pub struct ExportPreset {
     pub name: String,
     pub outputs: Vec<ExportOutput>,
+    /// Largest texture set edge the target accepts, e.g. a mobile profile;
+    /// preflight blocks larger sets. `None` accepts any size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_resolution: Option<u32>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -251,6 +298,12 @@ pub enum ExportPresetError {
     DuplicateFileName(String),
     #[error("output `{0}` has a constant outside 0..=1")]
     InvalidConstant(String),
+    #[error("output `{0}` names an unsupported file format")]
+    UnknownFormat(String),
+    #[error("output `{0}` is 16-bit, which TGA cannot store; write it as PNG or EXR")]
+    DepthNeedsPng(String),
+    #[error("the maximum resolution must be 1 to {max} texels", max = crate::MAX_TEXTURE_DIMENSION)]
+    InvalidMaxResolution,
 }
 
 impl ExportPreset {
@@ -296,6 +349,7 @@ impl ExportPreset {
         vec![
             Self {
                 name: "Metal/Rough (ORM)".to_owned(),
+                max_resolution: None,
                 outputs: vec![
                     ExportOutput::new("$textureSet_BaseColor", Rgba, base_with_opacity),
                     ExportOutput::new("$textureSet_ORM", Rgb, orm),
@@ -305,6 +359,7 @@ impl ExportPreset {
             },
             Self {
                 name: "Unreal Engine".to_owned(),
+                max_resolution: None,
                 outputs: vec![
                     ExportOutput::new("T_$textureSet_BC", Rgba, base_with_opacity),
                     ExportOutput::new("T_$textureSet_ORM", Rgb, orm),
@@ -324,6 +379,7 @@ impl ExportPreset {
             },
             Self {
                 name: "Unity (URP Lit)".to_owned(),
+                max_resolution: None,
                 outputs: vec![
                     ExportOutput::new("$textureSet_BaseMap", Rgba, base_with_opacity),
                     ExportOutput::new(
@@ -343,6 +399,7 @@ impl ExportPreset {
             },
             Self {
                 name: "Separate channels".to_owned(),
+                max_resolution: None,
                 outputs: vec![
                     ExportOutput::new("$textureSet_BaseColor", Rgb, rgb(BaseColor)),
                     ExportOutput::new("$textureSet_Roughness", Gray, gray(Roughness)),
@@ -365,6 +422,12 @@ impl ExportPreset {
         if self.outputs.is_empty() || self.outputs.len() > MAX_EXPORT_OUTPUTS {
             return Err(ExportPresetError::InvalidOutputCount);
         }
+        if self
+            .max_resolution
+            .is_some_and(|edge| edge == 0 || edge > crate::MAX_TEXTURE_DIMENSION)
+        {
+            return Err(ExportPresetError::InvalidMaxResolution);
+        }
         let mut file_names = BTreeSet::new();
         for output in &self.outputs {
             if !valid_file_name_template(&output.file_name) {
@@ -383,8 +446,30 @@ impl ExportPreset {
             if !output.slots.iter().all(constant_ok) {
                 return Err(ExportPresetError::InvalidConstant(output.file_name.clone()));
             }
+            if let Some(format) = &output.format
+                && !crate::EXPORT_FILE_FORMATS.contains(&format.as_str())
+            {
+                return Err(ExportPresetError::UnknownFormat(output.file_name.clone()));
+            }
+            if output.bit_depth == BitDepth::Sixteen && output.format.as_deref() == Some("tga") {
+                return Err(ExportPresetError::DepthNeedsPng(output.file_name.clone()));
+            }
         }
         Ok(())
+    }
+
+    /// The preset with every output's file format settled: outputs without
+    /// their own format take `default_format`, except that 16-bit outputs
+    /// stay PNG when the default (TGA) cannot hold them.
+    pub fn resolved(&self, default_format: &str) -> Self {
+        let mut resolved = self.clone();
+        for output in &mut resolved.outputs {
+            if output.format.is_none() {
+                let keeps_png = output.bit_depth == BitDepth::Sixteen && default_format == "tga";
+                output.format = Some(if keeps_png { "png" } else { default_format }.to_owned());
+            }
+        }
+        resolved
     }
 
     /// True when any output reads a baked mesh map directly.
@@ -430,6 +515,47 @@ pub struct ExportedTexture {
     /// RGBA8 rows top to bottom. Gray outputs repeat their value in R, G,
     /// and B; Gray and RGB outputs are opaque.
     pub texture: BakedTexture,
+    /// File format the output is written in (an extension); `None` uses
+    /// the format the writer is given.
+    pub format: Option<String>,
+    /// Bits per channel when written as PNG.
+    pub bit_depth: BitDepth,
+    /// RGBA16 samples laid out like `texture`, present when the output is
+    /// 16-bit or EXR. They come from the unquantized composite, so they
+    /// keep detail the 8-bit texture rounds away.
+    pub rgba16: Option<Vec<u16>>,
+    /// Channels (R, G, B, A) holding sRGB-encoded colour, which linear
+    /// formats such as EXR store decoded.
+    pub srgb: [bool; 4],
+}
+
+/// True when an output needs more than 8 bits per channel.
+fn needs_high_precision(output: &ExportOutput) -> bool {
+    output.bit_depth == BitDepth::Sixteen || output.format.as_deref() == Some("exr")
+}
+
+fn unit_to_word(value: f32) -> u16 {
+    (value.clamp(0.0, 1.0) * 65_535.0).round() as u16
+}
+
+/// One texel of an output from its slot samples: Gray repeats slot 0, and
+/// Gray and RGB are opaque.
+fn pack<T: Copy>(layout: OutputLayout, opaque: T, sample: impl Fn(usize) -> T) -> [T; 4] {
+    match layout {
+        OutputLayout::Gray => {
+            let gray = sample(0);
+            [gray, gray, gray, opaque]
+        }
+        OutputLayout::Rgb => [sample(0), sample(1), sample(2), opaque],
+        OutputLayout::Rgba => [sample(0), sample(1), sample(2), sample(3)],
+    }
+}
+
+/// One export source over a region: RGBA8 (row-major), plus the
+/// unquantized values when a high-precision output reads it.
+struct SourcePlane {
+    rgba8: Vec<u8>,
+    values: Option<Vec<Vec3>>,
 }
 
 impl TextureSet {
@@ -483,12 +609,35 @@ impl TextureSet {
             }
         }
         let channels: Vec<MaterialChannel> = channels.into_iter().collect();
-        let textures = self.bake_tiles_into(tiles, preset.outputs.len(), |region| {
-            self.export_region(preset, &sources, &channels, context, region)
-        })?;
+        // An RGBA8 texture per output, then an RGBA16 one per high-precision
+        // output.
+        let high = preset
+            .outputs
+            .iter()
+            .filter(|output| needs_high_precision(output))
+            .count();
+        let mut texel_bytes = vec![4; preset.outputs.len()];
+        texel_bytes.extend(std::iter::repeat_n(8, high));
+        let mut textures = self
+            .bake_tiles_into(tiles, &texel_bytes, |region| {
+                self.export_region(preset, &sources, &channels, context, region)
+            })?
+            .into_iter();
+        let eight: Vec<Vec<u8>> = textures.by_ref().take(preset.outputs.len()).collect();
+        let mut sixteen = textures;
 
         let mut exported = Vec::new();
-        for (output, rgba8) in preset.outputs.iter().zip(textures) {
+        for (output, rgba8) in preset.outputs.iter().zip(eight) {
+            let rgba16 = needs_high_precision(output).then(|| {
+                sixteen
+                    .next()
+                    .unwrap_or_default()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| u16::from_le_bytes(*bytes))
+                    .collect::<Vec<u16>>()
+            });
             if output.skip_if_black
                 && rgba8
                     .as_chunks::<4>()
@@ -498,17 +647,42 @@ impl TextureSet {
             {
                 continue;
             }
+            let srgb_slot = |slot: &ChannelSlot| slot.source().is_some_and(ExportSource::is_srgb);
+            let srgb = match output.layout {
+                OutputLayout::Gray => {
+                    let gray = srgb_slot(&output.slots[0]);
+                    [gray, gray, gray, false]
+                }
+                OutputLayout::Rgb => [
+                    srgb_slot(&output.slots[0]),
+                    srgb_slot(&output.slots[1]),
+                    srgb_slot(&output.slots[2]),
+                    false,
+                ],
+                OutputLayout::Rgba => [
+                    srgb_slot(&output.slots[0]),
+                    srgb_slot(&output.slots[1]),
+                    srgb_slot(&output.slots[2]),
+                    srgb_slot(&output.slots[3]),
+                ],
+            };
             exported.push(ExportedTexture {
                 file_stem: output.resolved_file_name(&self.name),
                 layout: output.layout,
                 texture: self.texture(rgba8),
+                format: output.format.clone(),
+                bit_depth: output.bit_depth,
+                rgba16,
+                srgb,
             });
         }
         Ok(exported)
     }
 
-    /// Every output of `preset` over `region`, RGBA row-major within it.
-    /// Each of `sources` (reading `channels`) is baked once and shared.
+    /// Every output of `preset` over `region`, row-major within it: an
+    /// RGBA8 buffer per output, then little-endian RGBA16 buffers for the
+    /// high-precision outputs in order. Each of `sources` (reading
+    /// `channels`) is baked once and shared.
     fn export_region(
         &self,
         preset: &ExportPreset,
@@ -521,16 +695,22 @@ impl TextureSet {
         let id_map = id_map.as_deref();
         let masks = self.layer_masks_in(channels, context, id_map, region)?;
         let pixel_count = region.len();
+        let precise: BTreeSet<ExportSource> = preset
+            .outputs
+            .iter()
+            .filter(|output| needs_high_precision(output))
+            .flat_map(|output| output.used_slots().iter().filter_map(|slot| slot.source()))
+            .collect();
 
         let mut planes = BTreeMap::new();
         for batch in sources.chunks(SOURCE_WORKERS) {
-            let baked: Vec<Result<Vec<u8>, BakeError>> = std::thread::scope(|scope| {
+            let baked: Vec<Result<SourcePlane, BakeError>> = std::thread::scope(|scope| {
                 let workers: Vec<_> = batch
                     .iter()
                     .map(|&source| {
-                        let masks = &masks;
+                        let (masks, keep_values) = (&masks, precise.contains(&source));
                         scope.spawn(move || {
-                            self.export_source(source, context, masks, id_map, region)
+                            self.export_source(source, context, masks, id_map, region, keep_values)
                         })
                     })
                     .collect();
@@ -539,57 +719,82 @@ impl TextureSet {
                     .map(|worker| worker.join().unwrap_or(Err(BakeError::AllocationFailed)))
                     .collect()
             });
-            for (source, rgba8) in batch.iter().zip(baked) {
-                planes.insert(*source, rgba8?);
+            for (source, plane) in batch.iter().zip(baked) {
+                planes.insert(*source, plane?);
             }
         }
 
-        let mut outputs = Vec::new();
+        let slot_byte = |slot: &ChannelSlot, index: usize| -> u8 {
+            match *slot {
+                ChannelSlot::Constant(value) => unit_to_byte(value),
+                ChannelSlot::Source {
+                    source,
+                    component,
+                    invert,
+                } => {
+                    let value = planes.get(&source).map_or(0, |plane: &SourcePlane| {
+                        plane.rgba8[index * 4 + component.index()]
+                    });
+                    if invert { 255 - value } else { value }
+                }
+            }
+        };
+        let slot_word = |slot: &ChannelSlot, index: usize| -> u16 {
+            match *slot {
+                ChannelSlot::Constant(value) => unit_to_word(value),
+                ChannelSlot::Source {
+                    source,
+                    component,
+                    invert,
+                } => {
+                    let value = planes.get(&source).map_or(0, |plane: &SourcePlane| {
+                        match &plane.values {
+                            Some(values) => unit_to_word(values[index][component.index()]),
+                            // Discrete data (the ID map) widens exactly.
+                            None => u16::from(plane.rgba8[index * 4 + component.index()]) * 257,
+                        }
+                    });
+                    if invert { u16::MAX - value } else { value }
+                }
+            }
+        };
+        let mut buffers = Vec::new();
         for output in &preset.outputs {
             let mut rgba8 = Vec::new();
             rgba8
                 .try_reserve_exact(pixel_count * 4)
                 .map_err(|_| BakeError::AllocationFailed)?;
-            let slot_byte = |slot: &ChannelSlot, index: usize| -> u8 {
-                match *slot {
-                    ChannelSlot::Constant(value) => unit_to_byte(value),
-                    ChannelSlot::Source {
-                        source,
-                        component,
-                        invert,
-                    } => {
-                        let value = planes
-                            .get(&source)
-                            .map_or(0, |plane: &Vec<u8>| plane[index * 4 + component.index()]);
-                        if invert { 255 - value } else { value }
-                    }
-                }
-            };
             for index in 0..pixel_count {
-                let texel = match output.layout {
-                    OutputLayout::Gray => {
-                        let gray = slot_byte(&output.slots[0], index);
-                        [gray, gray, gray, 255]
-                    }
-                    OutputLayout::Rgb | OutputLayout::Rgba => [
-                        slot_byte(&output.slots[0], index),
-                        slot_byte(&output.slots[1], index),
-                        slot_byte(&output.slots[2], index),
-                        if output.layout == OutputLayout::Rgba {
-                            slot_byte(&output.slots[3], index)
-                        } else {
-                            255
-                        },
-                    ],
-                };
-                rgba8.extend(texel);
+                rgba8.extend(pack(output.layout, 255, |slot| {
+                    slot_byte(&output.slots[slot], index)
+                }));
             }
-            outputs.push(rgba8);
+            buffers.push(rgba8);
         }
-        Ok(outputs)
+        for output in preset
+            .outputs
+            .iter()
+            .filter(|output| needs_high_precision(output))
+        {
+            let mut rgba16 = Vec::new();
+            rgba16
+                .try_reserve_exact(pixel_count * 8)
+                .map_err(|_| BakeError::AllocationFailed)?;
+            for index in 0..pixel_count {
+                let words = pack(output.layout, u16::MAX, |slot| {
+                    slot_word(&output.slots[slot], index)
+                });
+                for word in words {
+                    rgba16.extend(word.to_le_bytes());
+                }
+            }
+            buffers.push(rgba16);
+        }
+        Ok(buffers)
     }
 
-    /// One source as RGBA8 over `region`, row-major within it.
+    /// One source over `region`, row-major within it, keeping its
+    /// unquantized values when `keep_values`.
     fn export_source(
         &self,
         source: ExportSource,
@@ -597,15 +802,16 @@ impl TextureSet {
         masks: &LayerMasks,
         id_map: Option<&[u8]>,
         region: TexelRect,
-    ) -> Result<Vec<u8>, BakeError> {
+        keep_values: bool,
+    ) -> Result<SourcePlane, BakeError> {
         let (width, height) = (self.resolution.width, self.resolution.height);
         let pixel_count = region.len();
-        let to_rgba8 = |values: &[Vec3]| -> Result<Vec<u8>, BakeError> {
+        let plane = |values: Vec<Vec3>| -> Result<SourcePlane, BakeError> {
             let mut rgba8 = Vec::new();
             rgba8
                 .try_reserve_exact(values.len() * 4)
                 .map_err(|_| BakeError::AllocationFailed)?;
-            for value in values {
+            for value in &values {
                 rgba8.extend([
                     unit_to_byte(value.x),
                     unit_to_byte(value.y),
@@ -613,7 +819,10 @@ impl TextureSet {
                     255,
                 ]);
             }
-            Ok(rgba8)
+            Ok(SourcePlane {
+                rgba8,
+                values: keep_values.then_some(values),
+            })
         };
         let channel = match source {
             ExportSource::MeshMap(kind) => {
@@ -634,15 +843,18 @@ impl TextureSet {
                         MeshMapKind::Skew => Vec3::splat(sample.skew),
                     }
                 });
-                return to_rgba8(&values);
+                return plane(values);
             }
             ExportSource::Channel(channel) => channel,
         };
         match channel {
-            MaterialChannel::Id => match id_map {
-                Some(id_map) => Ok(id_map.to_vec()),
-                None => self.id_map_region(region),
-            },
+            MaterialChannel::Id => Ok(SourcePlane {
+                rgba8: match id_map {
+                    Some(id_map) => id_map.to_vec(),
+                    None => self.id_map_region(region)?,
+                },
+                values: None,
+            }),
             MaterialChannel::AmbientOcclusion => {
                 let mut values = try_filled(pixel_count, Vec3::ONE)?;
                 if let Some(maps) = context.mesh_maps {
@@ -655,35 +867,33 @@ impl TextureSet {
                         })
                     });
                 }
-                to_rgba8(&values)
+                plane(values)
             }
             MaterialChannel::Normal => {
                 let normals = self.normal_region(context, masks, region)?;
-                let values: Vec<Vec3> = normals
-                    .iter()
-                    .map(|normal| normal.truncate() * 0.5 + 0.5)
-                    .collect();
-                to_rgba8(&values)
+                plane(
+                    normals
+                        .iter()
+                        .map(|normal| normal.truncate() * 0.5 + 0.5)
+                        .collect(),
+                )
             }
             MaterialChannel::BaseColor => {
                 let default_base = rgb_unit(DEFAULT_BASE_COLOR);
-                let plane = self.optional_plane(channel, context, masks, region)?;
-                let values: Vec<Vec3> = match plane {
-                    Some(plane) => plane
+                plane(match self.optional_plane(channel, context, masks, region)? {
+                    Some(composite) => composite
                         .iter()
                         .map(|texel| texel.truncate() * texel.w + default_base * (1.0 - texel.w))
                         .collect(),
                     None => try_filled(pixel_count, default_base)?,
-                };
-                to_rgba8(&values)
+                })
             }
             channel => {
-                let plane = match self.optional_plane(channel, context, masks, region)? {
-                    Some(plane) => plane,
+                let composite = match self.optional_plane(channel, context, masks, region)? {
+                    Some(composite) => composite,
                     None => try_filled(pixel_count, base_texel(channel)?)?,
                 };
-                let values: Vec<Vec3> = plane.iter().map(|texel| texel.truncate()).collect();
-                to_rgba8(&values)
+                plane(composite.iter().map(|texel| texel.truncate()).collect())
             }
         }
     }
@@ -765,6 +975,14 @@ impl TextureSet {
             issues.push(PreflightIssue::warning(format!(
                 "{width} × {height} is not a power of two; engines may not mip-map or \
                  compress it."
+            )));
+        }
+        if let Some(limit) = preset.max_resolution
+            && width.max(height) > limit
+        {
+            issues.push(PreflightIssue::error(format!(
+                "{width} × {height} is larger than {limit} × {limit}, the most `{}` accepts.",
+                preset.name
             )));
         }
 
@@ -1036,6 +1254,7 @@ mod tests {
         // Gray outputs take their first slot; constants pack as bytes; the
         // texture set name replaces the token and unsafe characters become _.
         let custom = ExportPreset {
+            max_resolution: None,
             name: "Custom".to_owned(),
             outputs: vec![
                 gray_output(
@@ -1069,6 +1288,7 @@ mod tests {
 
         // Mesh-map sources need baked maps.
         let curvature = ExportPreset {
+            max_resolution: None,
             name: "Maps".to_owned(),
             outputs: vec![gray_output(
                 "curvature",
@@ -1096,6 +1316,7 @@ mod tests {
     fn tc_0112_invalid_presets_are_rejected_with_typed_errors() {
         let output = |name: &str| ExportOutput::new(name, OutputLayout::Rgb, [ChannelSlot::ONE; 4]);
         let preset = |name: &str, outputs: Vec<ExportOutput>| ExportPreset {
+            max_resolution: None,
             name: name.to_owned(),
             outputs,
         };
@@ -1212,6 +1433,7 @@ mod tests {
             };
         }
         let clashing = ExportPreset {
+            max_resolution: None,
             name: "Clash".to_owned(),
             outputs: vec![
                 gray_output(
@@ -1237,6 +1459,7 @@ mod tests {
         assert_eq!(issues[0].severity, PreflightSeverity::Error);
 
         let invalid = ExportPreset {
+            max_resolution: None,
             name: String::new(),
             outputs: Vec::new(),
         };

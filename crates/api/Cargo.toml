@@ -15,6 +15,7 @@ tempfile.workspace = true
 substancecraft-core = { path = "../core" }
 thiserror.workspace = true
 image.workspace = true
+exr.workspace = true
 resvg.workspace = true
 ab_glyph.workspace = true
 quick-xml.workspace = true
