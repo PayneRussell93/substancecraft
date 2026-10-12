@@ -15,7 +15,20 @@ $build = Join-Path $root 'third_party\filament-build'
 $install = Join-Path $root 'third_party\filament-install'
 
 if (-not (Test-Path (Join-Path $source 'CMakeLists.txt'))) {
-    git -C $root submodule update --init --depth 1 third_party/filament
+    # Filament's third-party tests have paths past Windows' 260-character limit.
+    git -C $root -c core.longpaths=true submodule update --init --depth 1 third_party/filament
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    git -C $source config core.longpaths true
+}
+
+# Use the CMake bundled with Visual Studio (Build Tools) when none is on PATH.
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $bundled = & $vswhere -latest -products * -find 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' |
+            Select-Object -First 1
+        if ($bundled) { $env:Path = "$(Split-Path -Parent $bundled);$env:Path" }
+    }
 }
 
 if ($Clean) {

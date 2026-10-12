@@ -1,9 +1,10 @@
 //! Finding moved or renamed project files so a project can be relinked
 //! instead of failing to load.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use substancecraft_core::{MaterialProject, ResourceId};
+use substancecraft_core::{ContentHash, ContentHasher, MaterialProject, ResourceId};
 
 /// Directory entries scanned at most per search, so a search started from
 /// a large folder stays quick.
@@ -58,17 +59,44 @@ pub fn missing_project_files(project: &MaterialProject, base: Option<&Path>) -> 
     }
 }
 
+/// Size and FNV-1a hash of a file's bytes, read in chunks.
+pub fn file_content_hash(path: &Path) -> std::io::Result<ContentHash> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut hasher = ContentHasher::default();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finish());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 /// Files under `roots` with the same name as `missing` (ignoring case),
 /// shallowest first, then by path. Searches at most [`MAX_RELINK_DEPTH`]
 /// levels and [`MAX_RELINK_SCAN`] entries in total.
 pub fn find_relink_candidates(missing: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let Some(name) = missing
+    find_relink_candidates_by_content(missing, None, roots)
+}
+
+/// Like [`find_relink_candidates`], and when the file's `content` hash is
+/// known, also renamed copies with the same bytes. Files whose content
+/// matches come first (whatever their name), then files that only share
+/// the name; each group shallowest first, then by path.
+pub fn find_relink_candidates_by_content(
+    missing: &Path,
+    content: Option<&ContentHash>,
+    roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let name = missing
         .file_name()
-        .map(|name| name.to_string_lossy().to_lowercase())
-    else {
+        .map(|name| name.to_string_lossy().to_lowercase());
+    if name.is_none() && content.is_none() {
         return Vec::new();
-    };
-    let mut found: Vec<(usize, PathBuf)> = Vec::new();
+    }
+    // (rank, depth, path): rank 0 matches the content, 1 only the name.
+    let mut found: Vec<(u8, usize, PathBuf)> = Vec::new();
     let mut scanned = 0;
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
         roots.iter().map(|root| (root.clone(), 0)).collect();
@@ -96,8 +124,21 @@ pub fn find_relink_candidates(missing: &Path, roots: &[PathBuf]) -> Vec<PathBuf>
                 if depth < MAX_RELINK_DEPTH {
                     queue.push_back((path, depth + 1));
                 }
-            } else if entry.file_name().to_string_lossy().to_lowercase() == name {
-                found.push((depth, path));
+                continue;
+            }
+            let same_content = content.is_some_and(|content| {
+                entry
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() == content.size)
+                    && file_content_hash(&path).is_ok_and(|hash| hash == *content)
+            });
+            let same_name = name
+                .as_ref()
+                .is_some_and(|name| entry.file_name().to_string_lossy().to_lowercase() == *name);
+            if same_content {
+                found.push((0, depth, path));
+            } else if same_name {
+                found.push((1, depth, path));
             }
         }
         if scanned > MAX_RELINK_SCAN {
@@ -105,8 +146,8 @@ pub fn find_relink_candidates(missing: &Path, roots: &[PathBuf]) -> Vec<PathBuf>
         }
     }
     found.sort();
-    found.dedup_by(|a, b| a.1 == b.1);
-    found.into_iter().map(|(_, path)| path).collect()
+    found.dedup_by(|a, b| a.2 == b.2);
+    found.into_iter().map(|(_, _, path)| path).collect()
 }
 
 #[cfg(test)]
@@ -133,6 +174,8 @@ mod tests {
                 scale: 1.0,
                 smoothing: MeshSmoothing::default(),
                 high_poly_source: Some("sculpt.fbx".to_owned()),
+                content_hash: None,
+                high_poly_hash: None,
             }),
             resources: vec![
                 ProjectResource::new(ResourceId(1), "Grunge", "textures/old/grunge.png"),
@@ -173,6 +216,49 @@ mod tests {
             )
             .len(),
             2
+        );
+    }
+
+    #[test]
+    fn tc_0292_renamed_copies_are_found_by_content_before_same_named_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().to_path_buf();
+        // The hash is stable, chunk-independent, and counts the size.
+        let bytes = b"rust grunge pixels".repeat(5000);
+        let path = root.join("grunge.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let hash = file_content_hash(&path).unwrap();
+        assert_eq!(hash, ContentHash::of(&bytes));
+        assert_eq!(hash.size, bytes.len() as u64);
+        assert_eq!(hash.fnv1a.len(), 16);
+        let mut hasher = ContentHasher::default();
+        for chunk in bytes.chunks(777) {
+            hasher.update(chunk);
+        }
+        assert_eq!(hasher.finish(), hash);
+        assert_ne!(ContentHash::of(b"a"), ContentHash::of(b"b"));
+
+        // The file is renamed and moved; a different file takes its name
+        // and another has the same size but other bytes.
+        std::fs::create_dir_all(root.join("textures/old")).unwrap();
+        let renamed = root.join("textures").join("rust_v2.png");
+        std::fs::rename(&path, &renamed).unwrap();
+        std::fs::write(root.join("textures/old/grunge.png"), b"something else").unwrap();
+        let mut decoy = bytes.clone();
+        decoy[0] ^= 1;
+        std::fs::write(root.join("decoy.png"), &decoy).unwrap();
+
+        let roots = [root.clone()];
+        let found = find_relink_candidates_by_content(&path, Some(&hash), &roots);
+        assert_eq!(
+            found,
+            [renamed.clone(), root.join("textures/old/grunge.png")],
+            "the content match first, then the name match; never the decoy"
+        );
+        // Without a recorded hash only the name is used.
+        assert_eq!(
+            find_relink_candidates(&path, &roots),
+            [root.join("textures/old/grunge.png")]
         );
     }
 }

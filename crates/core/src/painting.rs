@@ -183,6 +183,42 @@ impl MeshGeometry {
         }
         best.map(|(_, hit)| hit)
     }
+
+    /// The object-space outline a UV-space brush of `uv_radius` (per axis)
+    /// covers around `center` on triangle `triangle`: `segments` points of
+    /// the UV circle mapped through the triangle's UV-to-surface mapping.
+    /// `None` when the triangle's UVs are degenerate. This is the brush
+    /// footprint as it lands on the surface, stretched where the UVs are.
+    pub fn uv_brush_outline(
+        &self,
+        triangle: u32,
+        center: Vec3,
+        uv_radius: Vec2,
+        segments: usize,
+    ) -> Option<Vec<Vec3>> {
+        let corners = self.triangles.get(triangle as usize)?;
+        let [a, b, c] = corners.map(|corner| self.vertices.get(corner as usize).copied());
+        let (a, b, c) = (a?, b?, c?);
+        // Solve dP = du * U + dv * V from the two triangle edges.
+        let (e1, e2) = (b.position - a.position, c.position - a.position);
+        let (t1, t2) = (b.uv - a.uv, c.uv - a.uv);
+        let determinant = t1.x * t2.y - t2.x * t1.y;
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            return None;
+        }
+        let along_u = (e1 * t2.y - e2 * t1.y) / determinant;
+        let along_v = (e2 * t1.x - e1 * t2.x) / determinant;
+        Some(
+            (0..segments.max(3))
+                .map(|index| {
+                    let angle = index as f32 / segments.max(3) as f32 * std::f32::consts::TAU;
+                    center
+                        + along_u * (uv_radius.x * angle.cos())
+                        + along_v * (uv_radius.y * angle.sin())
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Lazy-mouse stabilization: the brush trails the cursor on a string of
@@ -303,6 +339,43 @@ impl PathSpec {
 mod tests {
     use super::*;
     use crate::PrimitivePreset;
+
+    #[test]
+    fn tc_0301_brush_outlines_follow_the_uv_scale_of_the_surface() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let hit = cube
+            .closest_surface_point(Vec3::new(0.1, 0.1, 0.9))
+            .unwrap();
+        // The cube's faces take a third of U and half of V each, minus
+        // padding, so a round UV brush lands as an ellipse on a face.
+        let outline = cube
+            .uv_brush_outline(hit.triangle, hit.position, Vec2::splat(0.05), 16)
+            .unwrap();
+        assert_eq!(outline.len(), 16);
+        let reach = |direction: Vec3| {
+            outline
+                .iter()
+                .map(|point| (*point - hit.position).dot(direction).abs())
+                .fold(0.0_f32, f32::max)
+        };
+        // Every point stays on the face's plane.
+        assert!(outline.iter().all(|point| (point.z - 0.5).abs() < 1e-5));
+        let (across, up) = (reach(Vec3::X), reach(Vec3::Y));
+        assert!(across > 0.0 && up > 0.0);
+        assert!(
+            (across / up - 1.5).abs() < 0.1,
+            "stretched by the UV layout: {across} {up}"
+        );
+        // Degenerate UVs give no outline.
+        let mut flat = cube.clone();
+        for vertex in &mut flat.vertices {
+            vertex.uv = Vec2::ZERO;
+        }
+        assert!(
+            flat.uv_brush_outline(0, Vec3::ZERO, Vec2::splat(0.1), 8)
+                .is_none()
+        );
+    }
 
     #[test]
     fn tc_0160_symmetry_mirrors_surface_hits_onto_the_opposite_side() {

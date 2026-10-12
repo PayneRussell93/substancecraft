@@ -12,12 +12,12 @@ use substancecraft_api::TextureFormat;
 use substancecraft_core::MIN_TILE_SIZE;
 use substancecraft_core::{
     Axis, BitDepth, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction,
-    ExportOutput, ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS,
+    ExportOutput, ExportSource, InstanceField, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS,
     MAX_BRUSH_SPACING, MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS,
-    MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer,
-    MeshAsset, MeshId, MeshMapKind, MeshSmoothing, OutputLayout, PreflightSeverity,
-    PrimitivePreset, ProjectionMode, ResourceId, SelectionMode, SourceComponent, TextureProjection,
-    TextureSetId, ViewportCamera,
+    MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialId,
+    MaterialLayer, MaterialLink, MeshAsset, MeshId, MeshMapKind, MeshSmoothing, OutputLayout,
+    PreflightSeverity, PrimitivePreset, ProjectionMode, ResourceId, SelectionMode, SourceComponent,
+    TextureProjection, TextureSetId, ViewportCamera,
 };
 
 use super::resource_watch::ReloadMode;
@@ -58,10 +58,11 @@ pub enum Drawer {
     Poses,
     Environment,
     Preferences,
+    Diagnostics,
 }
 
 impl Drawer {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Scene,
         Self::Brush,
         Self::Assets,
@@ -69,6 +70,7 @@ impl Drawer {
         Self::Poses,
         Self::Environment,
         Self::Preferences,
+        Self::Diagnostics,
     ];
 
     fn icon(self) -> Icon {
@@ -80,6 +82,7 @@ impl Drawer {
             Self::Poses => Icon::Figure,
             Self::Environment => Icon::Sun,
             Self::Preferences => Icon::Sliders,
+            Self::Diagnostics => Icon::Alert,
         }
     }
 
@@ -92,6 +95,7 @@ impl Drawer {
             Self::Poses => "Poses",
             Self::Environment => "Light",
             Self::Preferences => "Prefs",
+            Self::Diagnostics => "Checks",
         }
     }
 
@@ -104,6 +108,7 @@ impl Drawer {
             Self::Poses => "Poses",
             Self::Environment => "Camera & Light",
             Self::Preferences => "Preferences",
+            Self::Diagnostics => "Diagnostics",
         }
     }
 }
@@ -249,6 +254,8 @@ impl SubstanceCraftApp {
             scale: 1.0,
             smoothing: self.mesh_smoothing,
             high_poly_source: None,
+            content_hash: None,
+            high_poly_hash: None,
         });
         self.set_base_geometry(Some(preset.build_mesh()));
         self.high_poly = None;
@@ -393,7 +400,7 @@ impl SubstanceCraftApp {
                 let selected_text = self.preview_label();
                 let mut chosen = None;
                 let mut material = false;
-                egui::ComboBox::from_id_salt("toolbar_channel")
+                let combo = egui::ComboBox::from_id_salt("toolbar_channel")
                     .width(118.0)
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
@@ -423,6 +430,7 @@ impl SubstanceCraftApp {
                     })
                     .response
                     .on_hover_text("Viewport preview");
+                widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
                 if material {
                     self.set_material_preview();
                 } else if let Some(channel) = chosen {
@@ -528,12 +536,34 @@ impl SubstanceCraftApp {
                                 Drawer::Poses => self.poses_drawer(ui),
                                 Drawer::Environment => self.environment_drawer(ui),
                                 Drawer::Preferences => self.preferences_drawer(ui),
+                                Drawer::Diagnostics => self.diagnostics_drawer(ui),
                             });
                     });
             });
     }
 
     fn scene_drawer(&mut self, ui: &mut Ui) {
+        self.template_controls(ui);
+        if self.mesh_file_missing() {
+            let name = self
+                .project
+                .mesh
+                .as_ref()
+                .map(|mesh| super::path_label(std::path::Path::new(&mesh.source)))
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!("The mesh file {name} is missing."))
+                    .size(12.0)
+                    .color(WARNING),
+            );
+            if widgets::pill_button(ui, None, "Locate mesh…", true, true)
+                .on_hover_text("Point the project at the moved or renamed file (undoable)")
+                .clicked()
+            {
+                self.choose_mesh_location();
+            }
+            ui.add_space(4.0);
+        }
         if widgets::pill_button(ui, Some(Icon::Import), "Import mesh…", true, true)
             .on_hover_text("FBX, glTF, or GLB. glTF materials become texture sets.")
             .clicked()
@@ -878,27 +908,29 @@ impl SubstanceCraftApp {
                     );
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(name).size(11.5).color(theme::TEXT));
-                    egui::ComboBox::from_id_salt(("import_channel", assignment.resource.0))
-                        .width(ui.available_width().min(132.0))
-                        .selected_text(assignment.channel.map_or("Skip", channel_label))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut assignment.channel, None, "Skip");
-                            for channel in [
-                                MaterialChannel::BaseColor,
-                                MaterialChannel::Normal,
-                                MaterialChannel::Roughness,
-                                MaterialChannel::Metallic,
-                                MaterialChannel::Height,
-                                MaterialChannel::Emissive,
-                                MaterialChannel::Opacity,
-                            ] {
-                                ui.selectable_value(
-                                    &mut assignment.channel,
-                                    Some(channel),
-                                    channel_label(channel),
-                                );
-                            }
-                        });
+                    let combo =
+                        egui::ComboBox::from_id_salt(("import_channel", assignment.resource.0))
+                            .width(ui.available_width().min(132.0))
+                            .selected_text(assignment.channel.map_or("Skip", channel_label))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut assignment.channel, None, "Skip");
+                                for channel in [
+                                    MaterialChannel::BaseColor,
+                                    MaterialChannel::Normal,
+                                    MaterialChannel::Roughness,
+                                    MaterialChannel::Metallic,
+                                    MaterialChannel::Height,
+                                    MaterialChannel::Emissive,
+                                    MaterialChannel::Opacity,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut assignment.channel,
+                                        Some(channel),
+                                        channel_label(channel),
+                                    );
+                                }
+                            });
+                    widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
                     if widgets::icon_button(ui, Icon::Close, true, "Remove from assignment")
                         .clicked()
                     {
@@ -932,6 +964,8 @@ impl SubstanceCraftApp {
             self.new_text_resource();
         }
         self.asset_search(ui);
+        self.project_materials(ui);
+        self.project_smart_masks(ui);
         hint(
             ui,
             "Bitmaps are referenced by path, like the mesh. Assign them to fill channels \
@@ -1858,7 +1892,9 @@ impl SubstanceCraftApp {
 
     fn layer_properties(&mut self, ui: &mut Ui) {
         let mesh_maps_needed = self.selected_layer().is_some_and(|layer| {
-            layer.mask_generator.is_some()
+            layer
+                .mask_generator
+                .is_some_and(|generator| generator.needs_mesh_maps())
                 || layer
                     .fill
                     .is_some_and(|fill| fill.projection.needs_mesh_maps())
@@ -1895,6 +1931,31 @@ impl SubstanceCraftApp {
                     .collect()
             })
             .unwrap_or_default();
+        let mesh_tiles: Vec<substancecraft_core::UdimTile> = self
+            .mesh_geometry
+            .as_deref()
+            .map(|mesh| mesh.udim_tiles().into_iter().collect())
+            .unwrap_or_default();
+        let smart_masks = self.smart_mask_library();
+        let mut save_smart_mask = false;
+        let recording = self
+            .evolution_start
+            .as_ref()
+            .is_some_and(|(set, layer, _)| {
+                Some(*set) == self.selected_texture_set && Some(*layer) == self.selected_layer
+            });
+        let mut evolution_name = self.evolution_name.clone();
+        let instance = self.selected_layer().and_then(|layer| {
+            let link = layer.material_link.clone()?;
+            let master = self
+                .project
+                .material(link.material)
+                .map_or_else(|| "Missing material".to_owned(), |m| m.name.clone());
+            let shared = self.project.material_instances(link.material).len();
+            Some((link, master, shared))
+        });
+        let overrides = instance.as_ref().map(|(link, ..)| link.overrides.clone());
+        let mut instance_action = None;
         let Some(layer) = self.selected_layer_mut() else {
             return;
         };
@@ -1909,7 +1970,7 @@ impl SubstanceCraftApp {
         });
         slider_row(ui, "Opacity", &mut layer.opacity, 0.0..=1.0, false, 2);
         widgets::property_row(ui, "Blend", |ui| {
-            egui::ComboBox::from_id_salt(("blend_mode", layer.id.0))
+            let combo = egui::ComboBox::from_id_salt(("blend_mode", layer.id.0))
                 .width(ui.available_width() - 8.0)
                 .selected_text(layer.blend_mode.name())
                 .show_ui(ui, |ui| {
@@ -1926,8 +1987,62 @@ impl SubstanceCraftApp {
                 })
                 .response
                 .on_hover_text("How this layer combines with the layers beneath; normals always blend normally");
+            widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
         });
-        widgets::property_row(ui, "Channels", |ui| {
+        if layer.blend_mode != substancecraft_core::BlendMode::PassThrough {
+            egui::CollapsingHeader::new(
+                RichText::new(if layer.channel_blend_modes.is_empty() {
+                    "Blend per channel".to_owned()
+                } else {
+                    format!("Blend per channel ({})", layer.channel_blend_modes.len())
+                })
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+            )
+            .id_salt(("channel_blend", layer.id.0))
+            .show(ui, |ui| {
+                for channel in [
+                    MaterialChannel::BaseColor,
+                    MaterialChannel::Roughness,
+                    MaterialChannel::Metallic,
+                    MaterialChannel::Height,
+                    MaterialChannel::Emissive,
+                    MaterialChannel::Opacity,
+                ] {
+                    let current = layer.channel_blend_modes.get(&channel).copied();
+                    let mut chosen = current;
+                    widgets::property_row(ui, channel_label(channel), |ui| {
+                        let combo = egui::ComboBox::from_id_salt((
+                            "channel_blend_mode",
+                            layer.id.0,
+                            channel,
+                        ))
+                        .width(ui.available_width() - 8.0)
+                        .selected_text(current.map_or("Layer mode", |mode| mode.name()))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut chosen, None, "Layer mode");
+                            for mode in substancecraft_core::BlendMode::ALL {
+                                ui.selectable_value(&mut chosen, Some(mode), mode.name());
+                            }
+                        });
+                        widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
+                    });
+                    if chosen != current {
+                        match chosen {
+                            Some(mode) => {
+                                layer.channel_blend_modes.insert(channel, mode);
+                            }
+                            None => {
+                                layer.channel_blend_modes.remove(&channel);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let channels_label =
+            override_label(overrides.as_ref(), InstanceField::Channels, "Channels");
+        widgets::property_row(ui, &channels_label, |ui| {
             // Wrap so the chips never widen the inspector column.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -1952,6 +2067,7 @@ impl SubstanceCraftApp {
                 }
             });
         });
+        let evolution_action = evolution_controls(ui, layer, recording, &mut evolution_name);
         if layer.is_group() {
             hint(
                 ui,
@@ -1959,7 +2075,17 @@ impl SubstanceCraftApp {
                  apply to the result. Only enabled channels pass through.",
             );
         } else if let Some(fill) = layer.fill.as_mut() {
-            fill_controls(ui, layer.id, fill, &resources);
+            if let Some((link, master, shared)) = &instance {
+                instance_action = instance_controls(ui, link, master, *shared);
+            }
+            fill_controls(
+                ui,
+                Id::new(("layer_fill", layer.id.0)),
+                fill,
+                &resources,
+                overrides.as_ref(),
+            );
+            projection_controls(ui, &mut fill.projection, 0);
         } else {
             ui.add_space(2.0);
             if widgets::pill_button(ui, Some(Icon::Plus), "Add fill", false, true)
@@ -1979,11 +2105,45 @@ impl SubstanceCraftApp {
             Id::new(("layer_filters", layer.id.0)),
             &mut layer.filters,
         );
+        if !layer.filters.is_empty() {
+            widgets::property_row(ui, "On channels", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    if widgets::chip(ui, "All", layer.filter_channels.is_empty())
+                        .on_hover_text("Filter every channel the layer writes")
+                        .clicked()
+                    {
+                        layer.filter_channels.clear();
+                    }
+                    for (channel, label) in [
+                        (MaterialChannel::BaseColor, "Color"),
+                        (MaterialChannel::Roughness, "Rough"),
+                        (MaterialChannel::Metallic, "Metal"),
+                        (MaterialChannel::Height, "Hgt"),
+                        (MaterialChannel::Normal, "Nrm"),
+                        (MaterialChannel::Emissive, "Emit"),
+                        (MaterialChannel::Opacity, "Opac"),
+                    ] {
+                        let on = layer.filter_channels.contains(&channel);
+                        if widgets::chip(ui, label, on)
+                            .on_hover_text("Limit the filters to the chosen channels")
+                            .clicked()
+                        {
+                            if on {
+                                layer.filter_channels.remove(&channel);
+                            } else {
+                                layer.filter_channels.insert(channel);
+                            }
+                        }
+                    }
+                });
+            });
+        }
 
         widgets::caption(ui, "Mask generator");
         let current = layer.mask_generator;
         let mut chosen = current;
-        egui::ComboBox::from_id_salt(("generator_kind", layer.id.0))
+        let combo = egui::ComboBox::from_id_salt(("generator_kind", layer.id.0))
             .width(ui.available_width() - 8.0)
             .selected_text(current.map_or("None", |generator| generator.name()))
             .show_ui(ui, |ui| {
@@ -1997,6 +2157,7 @@ impl SubstanceCraftApp {
                     }
                 }
             });
+        widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
         if chosen != current {
             layer.mask_generator = chosen;
         }
@@ -2008,9 +2169,46 @@ impl SubstanceCraftApp {
                 ui.label(RichText::new(text).size(12.0).color(color));
             });
         }
-        if let Some(generator) = layer.mask_generator.as_mut() {
-            generator_controls(ui, generator);
-        }
+        let pick_id_color = layer
+            .mask_generator
+            .as_mut()
+            .is_some_and(|generator| generator_controls(ui, generator));
+        widgets::property_row(ui, "Smart mask", |ui| {
+            let mut applied = None;
+            let combo = egui::ComboBox::from_id_salt(("smart_mask", layer.id.0))
+                .width((ui.available_width() - 60.0).max(60.0))
+                .selected_text("Apply…")
+                .show_ui(ui, |ui| {
+                    for mask in &smart_masks {
+                        if ui
+                            .selectable_label(false, &mask.name)
+                            .on_hover_text(&mask.description)
+                            .clicked()
+                        {
+                            applied = Some(mask);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Replace the generator, bitmap mask, mask filters, and inversion; \
+                     painted mask strokes and selections stay",
+                );
+            widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
+            if let Some(mask) = applied {
+                mask.apply_to(layer);
+            }
+            let reusable = layer.mask_generator.is_some()
+                || layer.mask_bitmap.is_some()
+                || !layer.mask_filters.is_empty();
+            save_smart_mask = ui
+                .add_enabled_ui(reusable, |ui| {
+                    widgets::chip(ui, "Save", false)
+                        .on_hover_text("Keep this mask setup as a smart mask in the project")
+                        .clicked()
+                })
+                .inner;
+        });
 
         widgets::caption(ui, "Bitmap mask");
         let mut bitmap = layer.mask_bitmap.map(|mask| mask.resource);
@@ -2072,6 +2270,36 @@ impl SubstanceCraftApp {
             }
         }
 
+        if mesh_tiles.len() > 1 || !layer.uv_tiles.is_empty() {
+            widgets::caption(ui, "UV tiles");
+            widgets::property_row(ui, "Paints in", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 4.0);
+                    if widgets::chip(ui, "All", layer.uv_tiles.is_empty())
+                        .on_hover_text("Paint in every UDIM tile")
+                        .clicked()
+                    {
+                        layer.uv_tiles.clear();
+                    }
+                    let tiles: std::collections::BTreeSet<_> =
+                        mesh_tiles.iter().chain(&layer.uv_tiles).copied().collect();
+                    for tile in tiles {
+                        let on = layer.uv_tiles.contains(&tile);
+                        if widgets::chip(ui, &tile.0.to_string(), on)
+                            .on_hover_text("Limit this layer to the chosen tiles")
+                            .clicked()
+                        {
+                            if on {
+                                layer.uv_tiles.remove(&tile);
+                            } else {
+                                layer.uv_tiles.insert(tile);
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
         widgets::caption(ui, "ID clip");
         let mut enabled = layer.id_mask_color.is_some();
         let color = layer
@@ -2082,13 +2310,45 @@ impl SubstanceCraftApp {
             let mut changed = widgets::toggle(ui, &mut enabled).changed();
             if enabled {
                 ui.add_space(4.0);
-                changed |= ui.color_edit_button_srgba(&mut color).changed();
+                changed |= widgets::labeled_color_button(ui, &mut color).changed();
             }
             changed
         });
         if changed {
             let channels = color.to_array();
             layer.id_mask_color = enabled.then_some([channels[0], channels[1], channels[2]]);
+        }
+
+        if pick_id_color {
+            self.picking_id_color = true;
+        }
+        self.evolution_name = evolution_name;
+        match evolution_action {
+            Some(EvolutionAction::Move(index, amount)) => self.evolve_selected_layer(index, amount),
+            Some(EvolutionAction::Remove(index)) => {
+                if let Some(layer) = self.selected_layer_mut()
+                    && index < layer.evolutions.len()
+                {
+                    layer.evolutions.remove(index);
+                    self.invalidate_preview();
+                }
+            }
+            Some(EvolutionAction::Start) => self.start_evolution_recording(),
+            Some(EvolutionAction::Finish) => self.finish_evolution_recording(),
+            Some(EvolutionAction::Cancel) => self.evolution_start = None,
+            None => {}
+        }
+        if save_smart_mask {
+            self.save_layer_as_smart_mask();
+        }
+        match instance_action {
+            Some(InstanceAction::Reset(field)) => self.reset_instance_override(field),
+            Some(InstanceAction::Unlink) => self.unlink_selected_layer(),
+            Some(InstanceAction::EditMaster(id)) => {
+                self.editing_material = Some(id);
+                self.drawer = Some(Drawer::Assets);
+            }
+            None => {}
         }
     }
 
@@ -2267,19 +2527,20 @@ impl SubstanceCraftApp {
 }
 
 /// Parameter sliders for one mask generator.
-fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
+/// Settings of a mask generator. Returns true when the ID generator asks
+/// to pick its colour from the model.
+fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) -> bool {
+    let mut pick = false;
     match generator {
         MaskGenerator::EdgeWear(settings) => {
             slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
             slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
             slider_row(ui, "Breakup", &mut settings.breakup, 0.0..=1.0, false, 2);
-            slider_row(
+            noise_size_rows(
                 ui,
                 "Breakup scale",
                 &mut settings.breakup_scale,
-                0.5..=64.0,
-                true,
-                1,
+                &mut settings.feature_size,
             );
             seed_row(ui, &mut settings.seed);
         }
@@ -2295,13 +2556,11 @@ fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
                 2,
             );
             slider_row(ui, "Breakup", &mut settings.breakup, 0.0..=1.0, false, 2);
-            slider_row(
+            noise_size_rows(
                 ui,
                 "Breakup scale",
                 &mut settings.breakup_scale,
-                0.5..=64.0,
-                true,
-                1,
+                &mut settings.feature_size,
             );
             seed_row(ui, &mut settings.seed);
         }
@@ -2341,7 +2600,7 @@ fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
             slider_row(ui, "End", &mut settings.end, 0.0..=1.0, false, 2);
         }
         MaskGenerator::Noise(settings) => {
-            slider_row(ui, "Scale", &mut settings.scale, 0.5..=64.0, true, 1);
+            noise_size_rows(ui, "Scale", &mut settings.scale, &mut settings.feature_size);
             slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
             slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
             seed_row(ui, &mut settings.seed);
@@ -2358,6 +2617,86 @@ fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
             });
             slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
             slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
+        }
+        MaskGenerator::Pattern(settings) => {
+            widgets::property_row(ui, "Kind", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 4.0);
+                    for kind in substancecraft_core::PatternKind::ALL {
+                        if widgets::chip(ui, kind.name(), settings.kind == kind).clicked() {
+                            settings.kind = kind;
+                        }
+                    }
+                });
+            });
+            if matches!(
+                settings.kind,
+                substancecraft_core::PatternKind::Stripes
+                    | substancecraft_core::PatternKind::Scratches
+            ) {
+                widgets::property_row(ui, "Axis", |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for axis in Axis::ALL {
+                        if widgets::chip(ui, axis.name(), settings.axis == axis).clicked() {
+                            settings.axis = axis;
+                        }
+                    }
+                });
+            }
+            noise_size_rows(ui, "Scale", &mut settings.scale, &mut settings.feature_size);
+            slider_row(ui, "Width", &mut settings.width, 0.0..=1.0, false, 2);
+            slider_row(ui, "Softness", &mut settings.softness, 0.0..=1.0, false, 2);
+            seed_row(ui, &mut settings.seed);
+        }
+        MaskGenerator::IdColor(settings) => {
+            let [r, g, b] = settings.color;
+            let mut color = Color32::from_rgb(r, g, b);
+            widgets::property_row(ui, "ID colour", |ui| {
+                if widgets::labeled_color_button(ui, &mut color).changed() {
+                    let [r, g, b, _] = color.to_array();
+                    settings.color = [r, g, b];
+                }
+                ui.add_space(4.0);
+                pick = widgets::chip(ui, "Pick", false)
+                    .on_hover_text("Click the model to take the ID colour under the cursor")
+                    .clicked();
+            });
+            slider_row(
+                ui,
+                "Tolerance",
+                &mut settings.tolerance,
+                0.0..=1.0,
+                false,
+                2,
+            );
+            slider_row(ui, "Softness", &mut settings.softness, 0.0..=1.0, false, 2);
+            hint(
+                ui,
+                "Selects texels of this set's ID map near the colour. Paint IDs in ID mode.",
+            );
+        }
+    }
+    pick
+}
+
+/// Noise size: a frequency relative to the mesh, or with Real size on, a
+/// feature size in scene units (metres).
+fn noise_size_rows(ui: &mut Ui, label: &str, scale: &mut f32, size: &mut Option<f32>) {
+    let mut physical = size.is_some();
+    widgets::property_row(ui, "Real size", |ui| {
+        widgets::toggle(ui, &mut physical).on_hover_text(
+            "Size the noise in scene units (metres) so it keeps its real size on any mesh",
+        );
+    });
+    if physical != size.is_some() {
+        *size = physical.then_some(0.1);
+    }
+    match size {
+        Some(size) => {
+            slider_row(ui, "Feature m", size, MIN_TILE_SIZE..=10.0, true, 3);
+        }
+        None => {
+            slider_row(ui, label, scale, 0.5..=64.0, true, 1);
         }
     }
 }
@@ -2440,12 +2779,13 @@ fn slider_row(
 ) -> bool {
     widgets::property_row(ui, label, |ui| {
         ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(48.0);
-        ui.add(
+        let response = ui.add(
             egui::Slider::new(value, range)
                 .logarithmic(logarithmic)
                 .fixed_decimals(decimals),
-        )
-        .changed()
+        );
+        widgets::label_from_row(ui, &response, egui::WidgetType::Slider);
+        response.changed()
     })
 }
 
@@ -2554,33 +2894,211 @@ fn filtered_layer_rows(
 }
 
 /// Uniform values, per-channel bitmaps, and projection of a fill.
+/// `label`, marked with `*` when an instance overrides `field`.
+fn override_label(
+    overrides: Option<&std::collections::BTreeSet<InstanceField>>,
+    field: InstanceField,
+    label: &str,
+) -> String {
+    if overrides.is_some_and(|overrides| overrides.contains(&field)) {
+        format!("{label}*")
+    } else {
+        label.to_owned()
+    }
+}
+
+/// What the evolution controls asked for.
+enum EvolutionAction {
+    Move(usize, f32),
+    Remove(usize),
+    Start,
+    Finish,
+    Cancel,
+}
+
+/// A slider per evolution control of `layer`; on groups, recording a new
+/// control from a start and an end look.
+fn evolution_controls(
+    ui: &mut Ui,
+    layer: &MaterialLayer,
+    recording: bool,
+    name: &mut String,
+) -> Option<EvolutionAction> {
+    if layer.evolutions.is_empty() && !layer.is_group() {
+        return None;
+    }
+    let mut action = None;
+    widgets::caption(ui, "Controls");
+    for (index, evolution) in layer.evolutions.iter().enumerate() {
+        let mut amount = evolution.amount;
+        if slider_row(ui, &evolution.name, &mut amount, 0.0..=1.0, false, 2) {
+            action = Some(EvolutionAction::Move(index, amount));
+        }
+    }
+    if !layer.evolutions.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for (index, evolution) in layer.evolutions.iter().enumerate() {
+                if widgets::chip(ui, &format!("{} ×", evolution.name), false)
+                    .on_hover_text("Remove this control; the layers keep their current values")
+                    .clicked()
+                {
+                    action = Some(EvolutionAction::Remove(index));
+                }
+            }
+        });
+    }
+    if !layer.is_group() {
+        return action;
+    }
+    if recording {
+        hint(
+            ui,
+            "Now change the layers inside to the look at 1 (for example worn): fill values, \
+             opacity, or generator amounts. Then name the control and finish.",
+        );
+        widgets::property_row(ui, "Name", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(name)
+                    .desired_width(ui.available_width())
+                    .margin(vec2(8.0, 3.0)),
+            );
+        });
+        ui.horizontal(|ui| {
+            if widgets::pill_button(ui, None, "Finish control", true, false).clicked() {
+                action = Some(EvolutionAction::Finish);
+            }
+            if widgets::pill_button(ui, None, "Cancel", false, false).clicked() {
+                action = Some(EvolutionAction::Cancel);
+            }
+        });
+    } else if layer.evolutions.len() < substancecraft_core::MAX_EVOLUTIONS
+        && widgets::pill_button(ui, None, "Record control…", false, true)
+            .on_hover_text(
+                "Record this group as it is now (the look at 0), change it, and finish: one \
+                 slider then moves every changed value between the two looks",
+            )
+            .clicked()
+    {
+        action = Some(EvolutionAction::Start);
+    }
+    action
+}
+
+/// What the material-instance controls asked for.
+enum InstanceAction {
+    Reset(InstanceField),
+    Unlink,
+    EditMaster(MaterialId),
+}
+
+/// The master a linked fill follows, its overrides (each resettable), and
+/// unlinking.
+fn instance_controls(
+    ui: &mut Ui,
+    link: &MaterialLink,
+    master: &str,
+    shared: usize,
+) -> Option<InstanceAction> {
+    let mut action = None;
+    widgets::caption(ui, "Material instance");
+    widgets::property_row(ui, "Master", |ui| {
+        if ui
+            .link(RichText::new(master).color(theme::ACCENT))
+            .on_hover_text("Edit the master in the Assets drawer; every instance follows it")
+            .clicked()
+        {
+            action = Some(InstanceAction::EditMaster(link.material));
+        }
+    });
+    let layers = if shared == 1 {
+        "this layer".to_owned()
+    } else {
+        format!("{shared} layers")
+    };
+    hint(
+        ui,
+        &format!(
+            "Shared by {layers}. Fields marked * are overridden here; editing any other \
+             material field overrides it too."
+        ),
+    );
+    if !link.overrides.is_empty() {
+        widgets::property_row(ui, "Overrides", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for field in &link.overrides {
+                    if widgets::chip(ui, &format!("{} ×", field.name()), true)
+                        .on_hover_text("Reset to the master's value")
+                        .clicked()
+                    {
+                        action = Some(InstanceAction::Reset(*field));
+                    }
+                }
+            });
+        });
+    }
+    if widgets::pill_button(ui, None, "Unlink from master", false, true)
+        .on_hover_text("Keep the current values as a plain fill that no longer follows the master")
+        .clicked()
+    {
+        action = Some(InstanceAction::Unlink);
+    }
+    action
+}
+
+/// Uniform values and per-channel bitmaps of a fill (a layer's or a master
+/// material's). `overrides` marks the fields an instance overrides.
 fn fill_controls(
     ui: &mut Ui,
-    layer_id: LayerId,
+    id_salt: Id,
     fill: &mut LayerFill,
     resources: &[(ResourceId, String)],
+    overrides: Option<&std::collections::BTreeSet<InstanceField>>,
 ) {
+    let marked = |field, label| override_label(overrides, field, label);
     widgets::caption(ui, "Fill");
     let mut color =
         Color32::from_rgba_unmultiplied(fill.color[0], fill.color[1], fill.color[2], fill.color[3]);
-    widgets::property_row(ui, "Color", |ui| {
-        if ui.color_edit_button_srgba(&mut color).changed() {
+    widgets::property_row(ui, &marked(InstanceField::BaseColor, "Color"), |ui| {
+        if widgets::labeled_color_button(ui, &mut color).changed() {
             fill.color = color.to_srgba_unmultiplied();
         }
     });
-    slider_row(ui, "Roughness", &mut fill.roughness, 0.0..=1.0, false, 2);
-    slider_row(ui, "Metallic", &mut fill.metallic, 0.0..=1.0, false, 2);
-    slider_row(ui, "Height", &mut fill.height, 0.0..=1.0, false, 2);
+    slider_row(
+        ui,
+        &marked(InstanceField::Roughness, "Roughness"),
+        &mut fill.roughness,
+        0.0..=1.0,
+        false,
+        2,
+    );
+    slider_row(
+        ui,
+        &marked(InstanceField::Metallic, "Metallic"),
+        &mut fill.metallic,
+        0.0..=1.0,
+        false,
+        2,
+    );
+    slider_row(
+        ui,
+        &marked(InstanceField::Height, "Height"),
+        &mut fill.height,
+        0.0..=1.0,
+        false,
+        2,
+    );
     let mut emissive = Color32::from_rgb(fill.emissive[0], fill.emissive[1], fill.emissive[2]);
-    widgets::property_row(ui, "Emissive", |ui| {
-        if ui.color_edit_button_srgba(&mut emissive).changed() {
+    widgets::property_row(ui, &marked(InstanceField::Emissive, "Emissive"), |ui| {
+        if widgets::labeled_color_button(ui, &mut emissive).changed() {
             let rgba = emissive.to_array();
             fill.emissive = [rgba[0], rgba[1], rgba[2]];
         }
     });
     slider_row(
         ui,
-        "Opacity ch.",
+        &marked(InstanceField::Opacity, "Opacity ch."),
         &mut fill.material_opacity,
         0.0..=1.0,
         false,
@@ -2607,16 +3125,14 @@ fn fill_controls(
         let Some(slot) = fill.textures.slot_mut(channel) else {
             continue;
         };
-        widgets::property_row(ui, channel_label(channel), |ui| {
-            resource_picker(
-                ui,
-                Id::new(("fill_texture", layer_id.0, channel)),
-                slot,
-                resources,
-            );
+        let label = InstanceField::for_channel(channel).map_or_else(
+            || channel_label(channel).to_owned(),
+            |field| marked(field, channel_label(channel)),
+        );
+        widgets::property_row(ui, &label, |ui| {
+            resource_picker(ui, id_salt.with(("fill_texture", channel)), slot, resources);
         });
     }
-    projection_controls(ui, &mut fill.projection, 0);
 }
 
 /// Combo box choosing a bitmap resource or none. Returns true on change.
@@ -2630,7 +3146,7 @@ fn resource_picker(
         .and_then(|id| resources.iter().find(|(resource, _)| *resource == id))
         .map_or("None", |(_, name)| name.as_str());
     let mut chosen = *current;
-    egui::ComboBox::from_id_salt(id_salt)
+    let combo = egui::ComboBox::from_id_salt(id_salt)
         .width(ui.available_width() - 8.0)
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
@@ -2643,6 +3159,7 @@ fn resource_picker(
                 }
             }
         });
+    widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
     let changed = chosen != *current;
     *current = chosen;
     changed
@@ -2684,6 +3201,44 @@ fn projection_controls(ui: &mut Ui, projection: &mut TextureProjection, decal_ta
         {
             ui.ctx()
                 .data_mut(|data| data.insert_temp(Id::new(PLACE_DECAL_KEY), decal_target));
+        }
+        // Keyboard placement: centre, facing, and spin without the mouse.
+        widgets::property_row(ui, "Centre", |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (axis, value) in ["X", "Y", "Z"].into_iter().zip(decal.center.as_mut()) {
+                let response = ui.add(
+                    egui::DragValue::new(value)
+                        .speed(0.005)
+                        .fixed_decimals(3)
+                        .prefix(format!("{axis} ")),
+                );
+                response.widget_info(|| egui::WidgetInfo::drag_value(true, f64::from(*value)));
+            }
+        });
+        widgets::property_row(ui, "Facing", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(3.0, 4.0);
+                for (label, direction) in [
+                    ("+X", glam::Vec3::X),
+                    ("−X", glam::Vec3::NEG_X),
+                    ("+Y", glam::Vec3::Y),
+                    ("−Y", glam::Vec3::NEG_Y),
+                    ("+Z", glam::Vec3::Z),
+                    ("−Z", glam::Vec3::NEG_Z),
+                ] {
+                    let facing = decal.normal.normalize_or_zero().dot(direction) > 0.999;
+                    if widgets::chip(ui, label, facing)
+                        .on_hover_text("Face the decal along this axis")
+                        .clicked()
+                    {
+                        decal.face(direction);
+                    }
+                }
+            });
+        });
+        let mut spin = decal.spin_degrees();
+        if slider_row(ui, "Spin°", &mut spin, -180.0..=180.0, false, 0) {
+            decal.set_spin_degrees(spin);
         }
         slider_row(ui, "Width", &mut decal.size.x, 0.01..=4.0, true, 3);
         slider_row(ui, "Height", &mut decal.size.y, 0.01..=4.0, true, 3);
@@ -2797,7 +3352,7 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
         filters.swap(index, index - 1);
     }
     let mut added = None;
-    egui::ComboBox::from_id_salt(id_salt.with("add_filter"))
+    let combo = egui::ComboBox::from_id_salt(id_salt.with("add_filter"))
         .width(ui.available_width() - 8.0)
         .selected_text("+ Add filter")
         .show_ui(ui, |ui| {
@@ -2807,6 +3362,7 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
                 }
             }
         });
+    widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
     if let Some(filter) = added {
         filters.push(filter);
     }
@@ -2843,6 +3399,34 @@ fn filter_controls(ui: &mut Ui, filter: &mut LayerFilter) {
             slider_row(ui, "Hue", hue, -0.5..=0.5, false, 2);
             slider_row(ui, "Saturation", saturation, 0.0..=2.0, false, 2);
             slider_row(ui, "Lightness", lightness, -1.0..=1.0, false, 2);
+        }
+        LayerFilter::BrightnessContrast {
+            brightness,
+            contrast,
+        } => {
+            slider_row(ui, "Brightness", brightness, -1.0..=1.0, false, 2);
+            slider_row(ui, "Contrast", contrast, -1.0..=1.0, false, 2);
+        }
+        LayerFilter::Posterize { levels } => {
+            widgets::property_row(ui, "Levels", |ui| {
+                let response = ui.add(egui::Slider::new(levels, 2..=64));
+                widgets::label_from_row(ui, &response, egui::WidgetType::Slider);
+            });
+        }
+        LayerFilter::Threshold { level, softness } => {
+            slider_row(ui, "Level", level, 0.0..=1.0, false, 2);
+            slider_row(ui, "Softness", softness, 0.0..=1.0, false, 2);
+        }
+        LayerFilter::GradientMap { dark, light } => {
+            for (label, color) in [("Dark", dark), ("Light", light)] {
+                let mut swatch = Color32::from_rgb(color[0], color[1], color[2]);
+                widgets::property_row(ui, label, |ui| {
+                    if widgets::labeled_color_button(ui, &mut swatch).changed() {
+                        let [r, g, b, _] = swatch.to_array();
+                        *color = [r, g, b];
+                    }
+                });
+            }
         }
     }
 }
@@ -2883,7 +3467,7 @@ impl SubstanceCraftApp {
         let presets = self.export_presets();
         let selected = self.selected_export_preset();
         widgets::property_row(ui, "Preset", |ui| {
-            egui::ComboBox::from_id_salt("export_preset")
+            let combo = egui::ComboBox::from_id_salt("export_preset")
                 .width(ui.available_width() - 8.0)
                 .selected_text(selected.name.as_str())
                 .show_ui(ui, |ui| {
@@ -2901,6 +3485,7 @@ impl SubstanceCraftApp {
                         }
                     }
                 });
+            widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
         });
         let set_name = self
             .selected_texture_set_ref()
@@ -3257,7 +3842,7 @@ fn slot_label(slot: ChannelSlot) -> String {
 fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
     let current = slot.source();
     let mut chosen = current;
-    egui::ComboBox::from_id_salt(("slot_source", id_salt))
+    let combo = egui::ComboBox::from_id_salt(("slot_source", id_salt))
         .width(104.0)
         .selected_text(current.map_or_else(|| "Constant".to_owned(), source_label))
         .show_ui(ui, |ui| {
@@ -3273,6 +3858,7 @@ fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
                 }
             }
         });
+    widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
     if chosen != current {
         let invert = matches!(*slot, ChannelSlot::Source { invert: true, .. });
         *slot = chosen.map_or(ChannelSlot::ONE, |source| ChannelSlot::Source {
@@ -3297,7 +3883,7 @@ fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
                     SourceComponent::Green => "G",
                     SourceComponent::Blue => "B",
                 };
-                egui::ComboBox::from_id_salt(("slot_component", id_salt))
+                let combo = egui::ComboBox::from_id_salt(("slot_component", id_salt))
                     .width(38.0)
                     .selected_text(letter(*component))
                     .show_ui(ui, |ui| {
@@ -3307,6 +3893,7 @@ fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
                     })
                     .response
                     .on_hover_text("Component of the source to read");
+                widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
             }
             if widgets::chip(ui, "1−x", *invert)
                 .on_hover_text("Invert: store 1 − value")
@@ -3322,6 +3909,20 @@ impl SubstanceCraftApp {
     /// Symmetry, stabilization, path placement, and the eyedropper.
     fn stroke_assist(&mut self, ui: &mut Ui) {
         widgets::caption(ui, "Assist");
+        widgets::property_row(ui, "Projection", |ui| {
+            widgets::toggle(ui, &mut self.projection_painting)
+        })
+        .on_hover_text(
+            "Draw paint, erase, and mask strokes on screen and project them onto the \
+             visible surface: they cross UV seams and keep their on-screen size",
+        );
+        if self.projection_painting {
+            hint(
+                ui,
+                "Brush size is in screen pixels. Hidden and back-facing surfaces stay \
+                 unpainted. ID strokes, symmetry, and paths stay in UV space.",
+            );
+        }
         widgets::property_row(ui, "Symmetry", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if widgets::chip(ui, "Off", self.symmetry.is_none()).clicked() {
@@ -3453,7 +4054,7 @@ fn anchor_controls(
         .map_or("None", |(_, name)| name.as_str());
     let mut chosen = current;
     widgets::property_row(ui, "Read from", |ui| {
-        egui::ComboBox::from_id_salt(("anchor_layer", layer_id.0))
+        let combo = egui::ComboBox::from_id_salt(("anchor_layer", layer_id.0))
             .width(ui.available_width() - 8.0)
             .selected_text(label)
             .show_ui(ui, |ui| {
@@ -3466,6 +4067,7 @@ fn anchor_controls(
                     }
                 }
             });
+        widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
     });
     if chosen != current {
         *anchor = chosen.map(|id| match anchor {
@@ -3523,7 +4125,7 @@ impl SubstanceCraftApp {
             let materials = self.material_library();
             let mut applied = None;
             widgets::property_row(ui, "Material", |ui| {
-                egui::ComboBox::from_id_salt("apply_material")
+                let combo = egui::ComboBox::from_id_salt("apply_material")
                     .width(ui.available_width() - 8.0)
                     .selected_text("Apply…")
                     .show_ui(ui, |ui| {
@@ -3533,23 +4135,69 @@ impl SubstanceCraftApp {
                             }
                         }
                     });
+                widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
             });
             if let Some(material) = applied {
                 self.apply_material(&material);
             }
-            if layer.fill.is_some()
-                && widgets::pill_button(ui, None, "Save as material", false, true)
-                    .on_hover_text("Keep this fill's values in the project's material library")
-                    .clicked()
-            {
-                self.save_layer_as_material();
+            let mut linked = None;
+            let current = layer.material_link.as_ref().map(|link| link.material);
+            widgets::property_row(ui, "Instance", |ui| {
+                let combo = egui::ComboBox::from_id_salt("link_material")
+                    .width(ui.available_width() - 8.0)
+                    .selected_text("Link to…")
+                    .show_ui(ui, |ui| {
+                        for material in &materials {
+                            let in_project = self.project.material(material.id).is_some();
+                            let label = if in_project {
+                                material.name.clone()
+                            } else {
+                                format!("{} (new master)", material.name)
+                            };
+                            let selected = in_project && current == Some(material.id);
+                            if ui.selectable_label(selected, label).clicked() {
+                                linked = Some(material.clone());
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Follow a shared master material: editing the master updates every \
+                         linked layer, in every texture set",
+                    );
+                widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
+            });
+            if let Some(material) = linked {
+                self.link_selected_layer(&material);
+            }
+            if layer.fill.is_some() {
+                ui.horizontal(|ui| {
+                    if widgets::pill_button(ui, None, "Save as material", false, false)
+                        .on_hover_text(
+                            "Keep a copy of this fill's values in the project's materials",
+                        )
+                        .clicked()
+                    {
+                        self.save_layer_as_material();
+                    }
+                    if current.is_none()
+                        && widgets::pill_button(ui, None, "Make master", false, false)
+                            .on_hover_text(
+                                "Save this fill as a project material and link this layer to it, \
+                                 so other layers can share it",
+                            )
+                            .clicked()
+                    {
+                        self.make_selected_layer_master();
+                    }
+                });
             }
         }
 
         let smart = self.smart_material_library();
         let mut insert = None;
         widgets::property_row(ui, "Smart", |ui| {
-            egui::ComboBox::from_id_salt("insert_smart_material")
+            let combo = egui::ComboBox::from_id_salt("insert_smart_material")
                 .width(ui.available_width() - 8.0)
                 .selected_text("Insert…")
                 .show_ui(ui, |ui| {
@@ -3563,6 +4211,7 @@ impl SubstanceCraftApp {
                         }
                     }
                 });
+            widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
         });
         if let Some(material) = insert {
             self.insert_smart_material(&material);
@@ -3593,6 +4242,192 @@ impl SubstanceCraftApp {
 }
 
 impl SubstanceCraftApp {
+    /// New projects from templates (built-in or a file), and saving the
+    /// selected texture set as one. Starting from a template asks first.
+    fn template_controls(&mut self, ui: &mut Ui) {
+        if let Some(template) = self.pending_template.clone() {
+            ui.label(
+                RichText::new(format!(
+                    "Start a new project from \"{}\"? The current project closes; save it first \
+                     to keep its changes. The mesh stays.",
+                    template.name
+                ))
+                .size(12.0)
+                .color(WARNING),
+            );
+            ui.horizontal(|ui| {
+                if widgets::pill_button(ui, None, "Start new project", true, false).clicked() {
+                    self.pending_template = None;
+                    self.start_from_template(&template);
+                }
+                if widgets::pill_button(ui, None, "Cancel", false, false).clicked() {
+                    self.pending_template = None;
+                }
+            });
+            ui.add_space(4.0);
+            return;
+        }
+        let mut chosen = None;
+        let mut from_file = false;
+        widgets::property_row(ui, "New project", |ui| {
+            let combo = egui::ComboBox::from_id_salt("project_template")
+                .width(ui.available_width() - 8.0)
+                .selected_text("From template…")
+                .show_ui(ui, |ui| {
+                    for template in substancecraft_core::ProjectTemplate::built_in() {
+                        if ui
+                            .selectable_label(false, &template.name)
+                            .on_hover_text(&template.description)
+                            .clicked()
+                        {
+                            chosen = Some(template);
+                        }
+                    }
+                    if ui.selectable_label(false, "From file…").clicked() {
+                        from_file = true;
+                    }
+                });
+            widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
+        });
+        if from_file {
+            chosen = self.open_template_file();
+        }
+        if chosen.is_some() {
+            self.pending_template = chosen;
+        }
+        if self.selected_texture_set.is_some()
+            && widgets::pill_button(ui, None, "Save set as template…", false, true)
+                .on_hover_text(
+                    "Write this texture set's resolution, channels, export choice, and layers \
+                     to a .sctemplate file",
+                )
+                .clicked()
+        {
+            self.save_template_file();
+        }
+        ui.add_space(4.0);
+    }
+
+    /// Project materials and the editor of the open one. Each is a master:
+    /// editing it updates every fill layer linked to it.
+    fn project_materials(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Materials");
+        if self.project.materials.is_empty() {
+            hint(
+                ui,
+                "Save a fill as a material, or make it a master, from a layer's actions. \
+                 Layers linked to a master follow its edits.",
+            );
+            return;
+        }
+        let rows: Vec<(MaterialId, String, usize)> = self
+            .project
+            .materials
+            .iter()
+            .map(|material| {
+                let shared = self.project.material_instances(material.id).len();
+                (material.id, material.name.clone(), shared)
+            })
+            .collect();
+        let mut open = self.editing_material;
+        for (id, name, shared) in rows {
+            ui.horizontal(|ui| {
+                if widgets::chip(ui, &name, open == Some(id))
+                    .on_hover_text("Edit this master")
+                    .clicked()
+                {
+                    open = (open != Some(id)).then_some(id);
+                }
+                let usage = match shared {
+                    0 => "no instances".to_owned(),
+                    1 => "1 instance".to_owned(),
+                    count => format!("{count} instances"),
+                };
+                ui.label(RichText::new(usage).size(11.0).color(theme::TEXT_FAINT));
+            });
+        }
+        self.editing_material = open;
+        let Some(original) = open.and_then(|id| self.project.material(id)).cloned() else {
+            return;
+        };
+        let resources = self
+            .project
+            .resources
+            .iter()
+            .map(|resource| (resource.id, resource.name.clone()))
+            .collect::<Vec<_>>();
+        let mut edited = original.clone();
+        widgets::property_row(ui, "Name", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut edited.name)
+                    .desired_width(ui.available_width())
+                    .margin(vec2(8.0, 3.0)),
+            );
+        });
+        widgets::property_row(ui, "Channels", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (channel, label) in [
+                    (MaterialChannel::BaseColor, "Color"),
+                    (MaterialChannel::Roughness, "Rough"),
+                    (MaterialChannel::Metallic, "Metal"),
+                    (MaterialChannel::Height, "Hgt"),
+                    (MaterialChannel::Normal, "Nrm"),
+                    (MaterialChannel::Emissive, "Emit"),
+                    (MaterialChannel::Opacity, "Opac"),
+                ] {
+                    let enabled = edited.channels.contains(&channel);
+                    if widgets::chip(ui, label, enabled).clicked() {
+                        if enabled {
+                            edited.channels.remove(&channel);
+                        } else {
+                            edited.channels.insert(channel);
+                        }
+                    }
+                }
+            });
+        });
+        fill_controls(
+            ui,
+            Id::new(("master_fill", original.id.0)),
+            &mut edited.fill,
+            &resources,
+            None,
+        );
+        ui.add_space(4.0);
+        if widgets::pill_button(ui, Some(Icon::Trash), "Delete material", false, true)
+            .on_hover_text("Linked layers keep their current values as plain fills")
+            .clicked()
+        {
+            self.delete_project_material(original.id);
+        } else if edited != original {
+            self.edit_project_material(edited);
+        }
+    }
+
+    /// The project's smart masks, each removable. They are applied from a
+    /// layer's properties.
+    fn project_smart_masks(&mut self, ui: &mut Ui) {
+        if self.project.smart_masks.is_empty() {
+            return;
+        }
+        widgets::caption(ui, "Smart masks");
+        let mut remove = None;
+        for (index, mask) in self.project.smart_masks.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&mask.name).color(theme::TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::chip(ui, "Delete", false).clicked() {
+                        remove = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = remove {
+            self.delete_smart_mask(index);
+        }
+    }
+
     /// Search over every asset (project and built-in) by name, kind, tag,
     /// author, or licence.
     fn asset_search(&mut self, ui: &mut Ui) {
@@ -3643,7 +4478,7 @@ impl SubstanceCraftApp {
                 .id_salt(("resource_details", resource.id.0))
                 .show(ui, |ui| {
                     widgets::property_row(ui, "Colour", |ui| {
-                        egui::ComboBox::from_id_salt(("color_space", resource.id.0))
+                        let combo = egui::ComboBox::from_id_salt(("color_space", resource.id.0))
                             .width(ui.available_width() - 8.0)
                             .selected_text(resource.color_space.name())
                             .show_ui(ui, |ui| {
@@ -3661,6 +4496,7 @@ impl SubstanceCraftApp {
                                     }
                                 }
                             });
+                        widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
                     });
                     for (label, value) in [
                         ("Licence", &mut resource.provenance.license),

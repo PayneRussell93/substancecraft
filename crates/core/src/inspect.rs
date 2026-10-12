@@ -155,6 +155,8 @@ pub fn mask_drivers(layer: &MaterialLayer, set: &TextureSet) -> Vec<String> {
             MaskGenerator::Gradient(_) => "position map",
             MaskGenerator::Noise(_) => "position map",
             MaskGenerator::Thickness(_) => "thickness map",
+            MaskGenerator::IdColor(_) => "ID map",
+            MaskGenerator::Pattern(_) => "position map",
         };
         drivers.push(format!("{} generator ({source})", generator.name()));
     }
@@ -310,7 +312,7 @@ impl TextureSet {
         let [rgba8] = self.bake_in_tiles(&self.bake_tiles()?, |region| {
             let id_map = self.validate_for_region(region)?;
             let values = match &alone {
-                Some(alone) => self.layer_mask_in(alone, context, None, region)?,
+                Some(alone) => self.layer_mask_in(alone, context, id_map.as_deref(), region)?,
                 None => self.layer_mask_in(layer, context, id_map.as_deref(), region)?,
             };
             let mut rgba8 = Vec::new();

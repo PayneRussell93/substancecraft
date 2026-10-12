@@ -35,6 +35,11 @@ impl UdimTile {
         (tile <= MAX_TILE).then_some(Self(tile))
     }
 
+    /// True for tile numbers in the UDIM range (1001 to 2000).
+    pub fn is_valid(self) -> bool {
+        (1001..=MAX_TILE).contains(&self.0)
+    }
+
     /// Lower-left corner of the tile in UV space.
     pub fn offset(self) -> Vec2 {
         let index = self.0.saturating_sub(1001);
@@ -70,31 +75,45 @@ impl MeshGeometry {
     }
 }
 
-fn shift_layer(layer: &mut MaterialLayer, offset: Vec2) {
+/// Shifts a layer's UV-space strokes. Projected strokes are in screen space
+/// and follow the surface, so they stay put.
+fn shift_layer(layer: &mut MaterialLayer, offset: Vec2, tile: UdimTile) {
+    // A layer limited to other tiles is hidden in this one.
+    if !layer.uv_tiles.is_empty() {
+        layer.visible &= layer.uv_tiles.contains(&tile);
+        layer.uv_tiles.clear();
+    }
     for stroke in &mut layer.paint_strokes {
+        if stroke.camera.is_some() {
+            continue;
+        }
         stroke.points.iter_mut().for_each(|point| *point -= offset);
         if let Some(path) = &mut stroke.path {
             path.controls.iter_mut().for_each(|point| *point -= offset);
         }
     }
     for stroke in &mut layer.mask_strokes {
+        if stroke.camera.is_some() {
+            continue;
+        }
         stroke.points.iter_mut().for_each(|point| *point -= offset);
     }
     for stroke in &mut layer.id_strokes {
         stroke.points.iter_mut().for_each(|point| *point -= offset);
     }
     for child in layer.children.iter_mut().flatten() {
-        shift_layer(child, offset);
+        shift_layer(child, offset, tile);
     }
 }
 
 impl TextureSet {
     /// A copy whose UV-space strokes are moved so `tile` covers the unit
-    /// square. UV-projected bitmaps tile, so they need no change.
+    /// square, and whose layers limited to other tiles are hidden.
+    /// UV-projected bitmaps tile, so they need no change.
     pub fn shifted_to_tile(&self, tile: UdimTile) -> TextureSet {
         let mut set = self.clone();
         for layer in &mut set.layers {
-            shift_layer(layer, tile.offset());
+            shift_layer(layer, tile.offset(), tile);
         }
         set
     }
@@ -221,5 +240,70 @@ mod tests {
         assert_eq!(second[1].file_stem, "Body_Mask.1002");
         assert_eq!(centre(&first), 128, "tile 1001 is unpainted grey");
         assert_eq!(centre(&second), 255, "tile 1002 holds the stroke");
+    }
+
+    #[test]
+    fn tc_0297_uv_tile_masks_limit_layers_to_their_udim_tiles() {
+        use std::collections::BTreeSet;
+
+        let fill = |id: u64, color: [u8; 4]| {
+            crate::MaterialLayer::new_fill(
+                LayerId(id),
+                "Fill",
+                crate::LayerFill {
+                    color,
+                    ..crate::LayerFill::default()
+                },
+            )
+        };
+        let base = fill(1, [0, 0, 255, 255]);
+        // A red fill only in tile 1002, inside a group only in 1001 and
+        // 1002.
+        let mut red = fill(2, [255, 0, 0, 255]);
+        red.uv_tiles = BTreeSet::from([UdimTile(1002)]);
+        let mut group = crate::MaterialLayer::new_group(LayerId(3), "Group");
+        group.uv_tiles = BTreeSet::from([UdimTile(1001), UdimTile(1002)]);
+        group.children = Some(vec![red]);
+        let set = TextureSet {
+            id: TextureSetId(1),
+            name: "Body".to_owned(),
+            material_slot: "Body".to_owned(),
+            resolution: TextureResolution {
+                width: 4,
+                height: 4,
+            },
+            channels: BTreeSet::from([MaterialChannel::BaseColor]),
+            layers: vec![base, group],
+            height_strength: crate::DEFAULT_HEIGHT_STRENGTH,
+            export: None,
+        };
+        let color = |set: &TextureSet| set.bake_base_color().unwrap().pixel(1, 1).unwrap();
+        // The plain bake is tile 1001: the red layer stays out.
+        assert_eq!(color(&set), [0, 0, 255, 255]);
+        assert!(!set.layers[1].children.as_ref().unwrap()[0].shown());
+        // Tile 1002 shows it; tile 1003 hides the whole group.
+        assert_eq!(
+            color(&set.shifted_to_tile(UdimTile(1002))),
+            [255, 0, 0, 255]
+        );
+        let far = set.shifted_to_tile(UdimTile(1003));
+        assert!(!far.layers[1].visible);
+        assert_eq!(color(&far), [0, 0, 255, 255]);
+        // Tile masks are layer settings; tiles outside the range are invalid.
+        let mut project = crate::MaterialProject {
+            texture_sets: vec![set],
+            ..crate::MaterialProject::empty()
+        };
+        project.validate().unwrap();
+        assert_eq!(
+            project.texture_sets[0].layers[1].settings().uv_tiles.len(),
+            2
+        );
+        project.texture_sets[0].layers[0].uv_tiles = BTreeSet::from([UdimTile(999)]);
+        assert_eq!(
+            project.validate(),
+            Err(crate::ProjectError::InvalidLayerSettings(LayerId(1)))
+        );
+        assert!(UdimTile(2000).is_valid() && !UdimTile(2001).is_valid());
     }
 }

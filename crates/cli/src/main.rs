@@ -8,12 +8,20 @@
 //!     [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]
 //! substancecraft-cli batch <jobs.txt> [--workers <n>]
 //! substancecraft-cli presets
+//! substancecraft-cli inspect <project.sproject>
+//! substancecraft-cli edit <project.sproject> '<edit as JSON>'
 //! ```
 //!
 //! A job file lists one export per line, written as the arguments after
 //! `export` (double quotes group paths with spaces; `#` starts a comment).
 //! Relative paths resolve against the job file. Every job runs even when
 //! others fail, and the batch fails if any job did.
+//!
+//! `inspect` prints a JSON summary of a project; `edit` applies one
+//! automation edit (for example
+//! `{"edit":"set_layer","texture_set":"Body","layer":"Dirt","opacity":0.5}`)
+//! through the project's undoable command model, saves the project, and
+//! prints the outcome as JSON.
 //!
 //! Exit status is 0 on success, 1 when the job fails, and 2 for bad
 //! arguments. The same project and options always write the same bytes.
@@ -22,17 +30,28 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use substancecraft_api::{
-    ExportJob, TextureFormat, list_export_presets, run_export_job, run_export_jobs,
+    AutomationEdit, ExportJob, TextureFormat, edit_project_file, list_export_presets,
+    load_project_file_with_report, project_summary, run_export_job, run_export_jobs,
 };
 
-const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets";
+const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets\n  substancecraft-cli inspect <project.sproject>\n  substancecraft-cli edit <project.sproject> '<edit as JSON>'";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Command {
     Export(ExportJob),
-    Batch { jobs: String, workers: usize },
+    Batch {
+        jobs: String,
+        workers: usize,
+    },
     Presets,
+    Inspect {
+        project: String,
+    },
+    Edit {
+        project: String,
+        edit: AutomationEdit,
+    },
     Help,
 }
 
@@ -41,6 +60,25 @@ fn parse(args: &[String]) -> Result<Command, String> {
     match args.next().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some("presets") => Ok(Command::Presets),
+        Some("inspect") => match (args.next(), args.next()) {
+            (Some(project), None) => Ok(Command::Inspect {
+                project: project.clone(),
+            }),
+            (None, _) => Err("inspect needs a project file".to_owned()),
+            (Some(_), Some(extra)) => Err(format!("unexpected argument `{extra}`")),
+        },
+        Some("edit") => match (args.next(), args.next(), args.next()) {
+            (Some(project), Some(json), None) => {
+                let edit = serde_json::from_str(json)
+                    .map_err(|error| format!("the edit is not valid JSON: {error}"))?;
+                Ok(Command::Edit {
+                    project: project.clone(),
+                    edit,
+                })
+            }
+            (Some(_), Some(_), Some(extra)) => Err(format!("unexpected argument `{extra}`")),
+            _ => Err("edit needs a project file and an edit as JSON".to_owned()),
+        },
         Some("batch") => {
             let mut jobs = None;
             let mut workers = 1;
@@ -202,6 +240,32 @@ fn run_batch(path: &Path, workers: usize) -> u8 {
     u8::from(failed > 0)
 }
 
+/// A project summary as JSON, or the error that stopped it.
+fn inspect(project: &Path) -> Result<String, String> {
+    let (project, _) = load_project_file_with_report(project).map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&project_summary(&project)).map_err(|error| error.to_string())
+}
+
+/// Applies `edit` to the project file and returns the outcome as JSON.
+fn edit(project: &Path, edit: &AutomationEdit) -> Result<String, String> {
+    let outcome = edit_project_file(project, edit).map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&outcome).map_err(|error| error.to_string())
+}
+
+/// Prints a command's JSON result, or its error with exit status 1.
+fn report(result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args) {
@@ -209,6 +273,11 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Inspect { project }) => report(inspect(Path::new(&project))),
+        Ok(Command::Edit {
+            project,
+            edit: change,
+        }) => report(edit(Path::new(&project), &change)),
         Ok(Command::Presets) => {
             for preset in list_export_presets() {
                 println!("{}", preset.name);
@@ -244,6 +313,68 @@ mod tests {
 
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn tc_0283_cli_inspects_and_edits_projects_with_json_edits() {
+        // Parsing: one project for inspect; a project and a JSON edit.
+        assert_eq!(
+            parse(&args("inspect a.sproject")),
+            Ok(Command::Inspect {
+                project: "a.sproject".to_owned()
+            })
+        );
+        assert!(parse(&args("inspect")).is_err());
+        assert!(parse(&args("inspect a b")).is_err());
+        let set_layer = r#"{"edit":"set_layer","texture_set":"Body","layer":"Base","opacity":0.5}"#;
+        let parsed = parse(&[
+            "edit".to_owned(),
+            "a.sproject".to_owned(),
+            set_layer.to_owned(),
+        ]);
+        assert!(matches!(
+            parsed,
+            Ok(Command::Edit {
+                edit: AutomationEdit::SetLayer {
+                    opacity: Some(0.5),
+                    ..
+                },
+                ..
+            })
+        ));
+        let bad = parse(&args("edit a.sproject {not-json}")).unwrap_err();
+        assert!(bad.starts_with("the edit is not valid JSON"), "{bad}");
+        assert!(parse(&args("edit a.sproject")).is_err());
+
+        // Running: a project on disk is summarized and edited in place.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("cli.sproject");
+        let project = substancecraft_core::MaterialProject {
+            texture_sets: vec![substancecraft_core::TextureSet {
+                id: substancecraft_core::TextureSetId(1),
+                name: "Body".to_owned(),
+                material_slot: "Body".to_owned(),
+                resolution: substancecraft_core::TextureResolution::new(8, 8).unwrap(),
+                channels: [substancecraft_core::MaterialChannel::BaseColor].into(),
+                layers: vec![substancecraft_core::MaterialLayer::new_paint(
+                    substancecraft_core::LayerId(1),
+                    "Base",
+                )],
+                height_strength: 1.0,
+                export: None,
+            }],
+            ..substancecraft_core::MaterialProject::empty()
+        };
+        substancecraft_api::save_project_file(&path, &project).unwrap();
+        let summary = inspect(&path).unwrap();
+        assert!(summary.contains("\"name\": \"Base\""));
+        let change: AutomationEdit = serde_json::from_str(set_layer).unwrap();
+        let outcome = edit(&path, &change).unwrap();
+        assert!(outcome.contains("\"changed\": true"), "{outcome}");
+        let reloaded = substancecraft_api::load_project_file(&path).unwrap();
+        assert_eq!(reloaded.texture_sets[0].layers[0].opacity, 0.5);
+        assert!(edit(&path, &change).unwrap().contains("\"changed\": false"));
+        assert!(inspect(&folder.path().join("missing.sproject")).is_err());
     }
 
     #[test]

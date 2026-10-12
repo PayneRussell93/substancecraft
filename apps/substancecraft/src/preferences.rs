@@ -158,8 +158,9 @@ pub struct BrushMaterial {
     pub opacity: f32,
 }
 
-/// A brush pinned to the favourites shelf. Bitmap alphas are remembered by
-/// file, since resource ids belong to one project.
+/// A brush pinned to the favourites shelf, or a built-in preset. Bitmap
+/// alphas are remembered by file, since resource ids belong to one project.
+/// A preset with a material sets every channel of the brush as well.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrushFavorite {
     pub name: String,
@@ -167,6 +168,73 @@ pub struct BrushFavorite {
     pub radius: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alpha: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<BrushMaterial>,
+}
+
+impl BrushFavorite {
+    /// Original presets bundling a tip, size, and material.
+    pub fn built_in() -> Vec<Self> {
+        let preset =
+            |name: &str, tip: BrushTip, radius: f32, color: [u8; 3], roughness, metallic| Self {
+                name: name.to_owned(),
+                tip,
+                radius,
+                alpha: None,
+                material: Some(BrushMaterial {
+                    color: [color[0], color[1], color[2], 255],
+                    roughness,
+                    metallic,
+                    height: substancecraft_core::DEFAULT_HEIGHT,
+                    emissive: [0, 0, 0],
+                    opacity: 1.0,
+                }),
+            };
+        vec![
+            preset(
+                "Chipped paint",
+                BrushTip {
+                    shape: BrushShape::Splatter,
+                    hardness: 0.6,
+                    size_jitter: 0.4,
+                    angle_jitter: 1.0,
+                    ..BrushTip::ROUND
+                },
+                18.0,
+                [196, 199, 199],
+                0.3,
+                1.0,
+            ),
+            preset(
+                "Rust spots",
+                BrushTip {
+                    shape: BrushShape::Splatter,
+                    spacing: 0.4,
+                    size_jitter: 0.6,
+                    scatter: 0.8,
+                    seed: 7,
+                    ..BrushTip::ROUND
+                },
+                30.0,
+                [120, 58, 30],
+                0.85,
+                0.0,
+            ),
+            preset("Grime", BrushTip::ROUND, 40.0, [60, 50, 40], 0.95, 0.0),
+            preset(
+                "Gold leaf",
+                BrushTip {
+                    shape: BrushShape::Square,
+                    hardness: 0.9,
+                    ..BrushTip::ROUND
+                },
+                12.0,
+                [255, 214, 140],
+                0.25,
+                1.0,
+            ),
+        ]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -345,6 +413,16 @@ impl SubstanceCraftApp {
 
     /// Pins the current brush tip and size to the favourites shelf.
     pub(super) fn pin_brush(&mut self) {
+        self.pin(false);
+    }
+
+    /// Pins the current tip, size, and every material channel as a preset.
+    pub(super) fn pin_brush_preset(&mut self) {
+        self.pin(true);
+    }
+
+    fn pin(&mut self, with_material: bool) {
+        let material = with_material.then(|| self.current_brush_material());
         let favorites = &self.preferences.values.favorites;
         if favorites.len() >= MAX_FAVORITES {
             self.project_error = Some(format!("The shelf holds at most {MAX_FAVORITES} brushes"));
@@ -373,12 +451,18 @@ impl SubstanceCraftApp {
             .iter()
             .map(|favorite| favorite.name.clone())
             .collect();
-        let name = Self::unique_name(&format!("{shape} {:.0}", self.brush_radius), &taken);
+        let base = if material.is_some() {
+            format!("{shape} {:.0} preset", self.brush_radius)
+        } else {
+            format!("{shape} {:.0}", self.brush_radius)
+        };
+        let name = Self::unique_name(&base, &taken);
         self.preferences.values.favorites.push(BrushFavorite {
             name,
             tip,
             radius: self.brush_radius,
             alpha,
+            material,
         });
         self.save_preferences();
     }
@@ -386,9 +470,14 @@ impl SubstanceCraftApp {
     /// Loads a pinned brush; a bitmap alpha is imported into the project
     /// unless it already uses that file.
     pub(super) fn apply_favorite(&mut self, index: usize) {
-        let Some(favorite) = self.preferences.values.favorites.get(index).cloned() else {
-            return;
-        };
+        if let Some(favorite) = self.preferences.values.favorites.get(index).cloned() {
+            self.apply_brush_preset(&favorite);
+        }
+    }
+
+    /// Sets the brush tip and size from a pinned brush or preset, and every
+    /// material channel when it carries a material.
+    pub(super) fn apply_brush_preset(&mut self, favorite: &BrushFavorite) {
         let mut tip = favorite.tip;
         if let Some(path) = &favorite.alpha {
             let existing = self
@@ -411,6 +500,9 @@ impl SubstanceCraftApp {
         }
         self.brush_tip = tip;
         self.brush_radius = favorite.radius;
+        if let Some(material) = favorite.material {
+            self.apply_brush_material(material);
+        }
     }
 
     pub(super) fn unpin_brush(&mut self, index: usize) {
@@ -433,7 +525,9 @@ impl SubstanceCraftApp {
                 self.release_override();
             }
         }
-        if context.egui_wants_keyboard_input() {
+        // Typing goes to text fields; buttons and the viewport focused from
+        // the keyboard still leave shortcuts working.
+        if context.text_edit_focused() {
             return;
         }
         let bindings = self.preferences.values.bindings.clone();
@@ -698,13 +792,32 @@ impl SubstanceCraftApp {
             self.apply_brush_material(material);
         }
 
+        let mut preset = None;
+        widgets::property_row(ui, "Presets", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for built_in in BrushFavorite::built_in() {
+                    if material_chip(ui, &built_in)
+                        .on_hover_text("Tip, size, and material together")
+                        .clicked()
+                    {
+                        preset = Some(built_in);
+                    }
+                }
+            });
+        });
+        if let Some(preset) = preset {
+            self.apply_brush_preset(&preset);
+        }
+
         let mut apply = None;
         let mut unpin = None;
+        let mut pin_preset = false;
         widgets::property_row(ui, "Shelf", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                 for (index, favorite) in self.preferences.values.favorites.iter().enumerate() {
-                    let response = widgets::chip(ui, &favorite.name, false)
+                    let response = material_chip(ui, favorite)
                         .on_hover_text("Click to use; right-click to unpin");
                     if response.clicked() {
                         apply = Some(index);
@@ -718,8 +831,14 @@ impl SubstanceCraftApp {
                 {
                     self.pin_brush();
                 }
+                pin_preset = widgets::chip(ui, "+ Material", false)
+                    .on_hover_text("Pin this tip and size with every material channel as a preset")
+                    .clicked();
             });
         });
+        if pin_preset {
+            self.pin_brush_preset();
+        }
         if let Some(index) = apply {
             self.apply_favorite(index);
         }
@@ -729,11 +848,35 @@ impl SubstanceCraftApp {
     }
 }
 
+/// A shelf chip; presets with a material show its colour first.
+fn material_chip(ui: &mut Ui, favorite: &BrushFavorite) -> egui::Response {
+    match favorite.material {
+        Some(material) => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let [r, g, b, _] = material.color;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 16.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect.shrink2(egui::vec2(0.0, 3.0)),
+                    2.0,
+                    egui::Color32::from_rgb(r, g, b),
+                );
+                widgets::chip(ui, &favorite.name, false)
+            })
+            .inner
+        }
+        None => widgets::chip(ui, &favorite.name, false),
+    }
+}
+
 fn shape_name(shape: BrushShape) -> &'static str {
     match shape {
         BrushShape::Round => "Round",
         BrushShape::Square => "Square",
         BrushShape::Splatter => "Splatter",
+        BrushShape::Streak => "Streak",
+        BrushShape::Ring => "Ring",
+        BrushShape::Cloud => "Cloud",
         BrushShape::Bitmap(_) => "Alpha",
     }
 }
@@ -838,5 +981,87 @@ mod tests {
         assert_eq!(app.brush_radius, 42.0);
         app.unpin_brush(0);
         assert!(app.preferences.values.favorites.is_empty());
+    }
+
+    #[test]
+    fn tc_0288_brush_presets_bundle_tip_size_and_material() {
+        use substancecraft_core::{
+            LayerId, MaterialLayer, MaterialProject, TextureResolution, TextureSet, TextureSetId,
+        };
+
+        let mut app = SubstanceCraftApp::default();
+        // A preset keeps tip, size, and every channel.
+        app.brush_tip.shape = BrushShape::Square;
+        app.brush_radius = 9.0;
+        app.brush_color = egui::Color32::from_rgb(10, 200, 30);
+        app.brush_roughness = 0.12;
+        app.brush_metallic = 1.0;
+        app.brush_height = 0.7;
+        app.pin_brush_preset();
+        app.pin_brush();
+        let favorites = &app.preferences.values.favorites;
+        assert_eq!(favorites[0].name, "Square 9 preset");
+        assert!(favorites[0].material.is_some());
+        assert_eq!(favorites[1].material, None, "plain pins keep the material");
+        let preset = app.current_brush_material();
+        app.brush_tip = BrushTip::ROUND;
+        app.brush_radius = 50.0;
+        app.brush_color = egui::Color32::WHITE;
+        app.brush_roughness = 0.9;
+        app.apply_favorite(1);
+        assert_eq!(app.brush_tip.shape, BrushShape::Square);
+        assert_eq!(app.brush_roughness, 0.9, "a plain pin leaves the material");
+        app.apply_favorite(0);
+        assert_eq!(app.current_brush_material(), preset);
+
+        // Presets survive a save, and older files without materials load.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("preferences.json");
+        app.preferences.values.save(&path).unwrap();
+        assert_eq!(
+            Preferences::load(&path).favorites,
+            app.preferences.values.favorites
+        );
+        let old = r#"{"favorites":[{"name":"Old","tip":{"shape":"Round","hardness":0.0,"spacing":0.1,"angle_degrees":0.0,"follow_path":false,"size_jitter":0.0,"angle_jitter":0.0,"scatter":0.0,"seed":0,"pressure_size":true,"pressure_opacity":false},"radius":4.0}]}"#;
+        std::fs::write(&path, old).unwrap();
+        let loaded = Preferences::load(&path);
+        assert_eq!(loaded.favorites[0].name, "Old");
+        assert_eq!(loaded.favorites[0].material, None);
+
+        // Built-in presets are valid tips with materials.
+        let built_in = BrushFavorite::built_in();
+        assert_eq!(built_in.len(), 4);
+        for preset in &built_in {
+            let stroke = substancecraft_core::PaintStroke {
+                tip: preset.tip,
+                ..substancecraft_core::PaintStroke::new(
+                    vec![glam::Vec2::splat(0.5)],
+                    preset.radius,
+                    [0, 0, 0, 255],
+                )
+            };
+            let mut layer = MaterialLayer::new_paint(LayerId(1), "Probe");
+            layer.paint_strokes.push(stroke);
+            let mut project = MaterialProject::empty();
+            project.texture_sets.push(TextureSet {
+                id: TextureSetId(1),
+                name: "Set".to_owned(),
+                material_slot: "Set".to_owned(),
+                resolution: TextureResolution {
+                    width: 8,
+                    height: 8,
+                },
+                channels: Default::default(),
+                layers: vec![layer],
+                height_strength: substancecraft_core::DEFAULT_HEIGHT_STRENGTH,
+                export: None,
+            });
+            project.validate().unwrap();
+            assert!(preset.material.is_some(), "{}", preset.name);
+        }
+        app.apply_brush_preset(&built_in[3]);
+        assert_eq!(app.brush_tip.shape, BrushShape::Square);
+        assert_eq!(app.brush_color, egui::Color32::from_rgb(255, 214, 140));
+        assert_eq!(app.brush_metallic, 1.0);
     }
 }

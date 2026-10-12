@@ -368,6 +368,8 @@ mod tests {
                 scale: 1.0,
                 smoothing: MeshSmoothing::default(),
                 high_poly_source: None,
+                content_hash: None,
+                high_poly_hash: None,
             }),
             texture_sets: vec![TextureSet {
                 id: TextureSetId(1),

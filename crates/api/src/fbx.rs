@@ -366,10 +366,47 @@ fn import_mesh(
             element.uv().ok()
         });
 
+    // Per-polygon material indices, into the materials connected to the
+    // model that owns this geometry (in connection order).
+    let material_data = mesh
+        .layers()
+        .flat_map(|layer| layer.layer_element_entries())
+        .find_map(|entry| {
+            let Ok(TypedLayerElementHandle::Material(element)) = entry.typed_layer_element() else {
+                return None;
+            };
+            element.materials().ok()
+        });
+    let connected_materials: Vec<String> = mesh
+        .models()
+        .next()
+        .map(|model| {
+            model
+                .materials()
+                .enumerate()
+                .map(|(index, material)| {
+                    material
+                        .name()
+                        .filter(|name| !name.is_empty())
+                        .map_or_else(|| format!("Material {}", index + 1), str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut triangle_materials = Vec::new();
+
     let generated_uvs = uv_data.is_none();
     let mut vertices = Vec::with_capacity(triangulated.len());
     let mut triangles = Vec::with_capacity(triangulated.len() / 3);
     for (vertex_index, triangle_vertex) in triangulated.triangle_vertex_indices().enumerate() {
+        if vertex_index % 3 == 0
+            && let Some(materials) = &material_data
+        {
+            let slot = materials
+                .material_index(&triangulated, triangle_vertex)
+                .map_err(|error| FbxImportError::InvalidMesh(error.to_string()))?;
+            triangle_materials.push(slot.to_u32());
+        }
         let point = triangulated
             .control_point(triangle_vertex)
             .ok_or(FbxImportError::InvalidControlPoint)?;
@@ -395,10 +432,31 @@ fn import_mesh(
         generate_planar_uvs(&mut vertices)?;
     }
 
+    // One slot per connected material, plus generated names for any index
+    // past them, so every triangle's slot exists.
+    let slot_count = triangle_materials
+        .iter()
+        .map(|slot| *slot as usize + 1)
+        .max()
+        .unwrap_or(0)
+        .max(connected_materials.len());
+    let material_slots: Vec<String> = (0..slot_count)
+        .map(|slot| {
+            connected_materials
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| format!("Material {}", slot + 1))
+        })
+        .collect();
     let geometry = MeshGeometry {
         vertices,
         triangles,
-        ..MeshGeometry::default()
+        triangle_materials: if material_slots.is_empty() {
+            Vec::new()
+        } else {
+            triangle_materials
+        },
+        material_slots,
     };
     geometry
         .validate()
@@ -570,6 +628,65 @@ mod tests {
         assert_eq!(meshes[0].geometry.triangles, vec![[0, 1, 2]]);
         assert_eq!(meshes[0].geometry.vertices[1].uv, Vec2::X);
         assert_eq!(meshes[0].geometry.vertices[2].uv, Vec2::Y);
+    }
+
+    #[test]
+    fn tc_0298_fbx_material_layers_become_named_material_slots() {
+        let mut writer = Writer::new(Cursor::new(Vec::new()), FbxVersion::V7_4).unwrap();
+        write_v7400_binary!(
+            writer = writer,
+            tree = {
+                Documents: {
+                    Document: [0_i64, "Scene\0\u{1}Document", "Scene"] {
+                        RootNode: [0_i64] {}
+                    }
+                }
+                Objects: {
+                    Geometry: [1_i64, "Crate\0\u{1}Geometry", "Mesh"] {
+                        Vertices: [&[
+                            0.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+                        ][..]] {}
+                        PolygonVertexIndex: [&[0_i32, 1, -3, 1, 3, -3][..]] {}
+                        LayerElementMaterial: [0_i32] {
+                            Version: [101_i32] {}
+                            Name: [""] {}
+                            MappingInformationType: ["ByPolygon"] {}
+                            ReferenceInformationType: ["IndexToDirect"] {}
+                            Materials: [&[0_i32, 1][..]] {}
+                        }
+                        Layer: [0_i32] {
+                            Version: [100_i32] {}
+                            LayerElement: [0_i32] {
+                                Type: ["LayerElementMaterial"] {}
+                                TypedIndex: [0_i32] {}
+                            }
+                        }
+                    }
+                    Model: [2_i64, "Crate\0\u{1}Model", "Mesh"] {}
+                    Material: [3_i64, "Paint\0\u{1}Material", ""] {}
+                    Material: [4_i64, "Metal\0\u{1}Material", ""] {}
+                }
+                Connections: {
+                    C: ["OO", 1_i64, 2_i64] {}
+                    C: ["OO", 3_i64, 2_i64] {}
+                    C: ["OO", 4_i64, 2_i64] {}
+                    C: ["OO", 2_i64, 0_i64] {}
+                }
+            },
+        )
+        .unwrap();
+        let bytes = writer
+            .finalize_and_flush(&Default::default())
+            .unwrap()
+            .into_inner();
+
+        let meshes = import_binary_fbx_meshes(&bytes).unwrap();
+        let geometry = &meshes[0].geometry;
+        assert_eq!(geometry.material_slots, ["Paint", "Metal"]);
+        assert_eq!(geometry.triangle_materials, [0, 1]);
+        assert_eq!(geometry.material_slot_count(), 2);
+        assert_eq!(geometry.submesh(1).triangles.len(), 1);
+        geometry.validate().unwrap();
     }
 
     #[test]

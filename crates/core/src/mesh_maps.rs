@@ -10,8 +10,8 @@
 //! settings, and seed, runs on all available cores, and can be cancelled.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,32 @@ const EDGE_ANGLE_RAMP_DEGREES: f32 = 40.0;
 /// is compressed into the curvature map.
 const SMOOTH_CURVATURE_SCALE: f32 = 0.08;
 const RASTER_FRINGE_PIXELS: f32 = 0.75;
+/// Edge length, in mesh-map texels, of the blocks
+/// [`MeshMaps::position_blocks`] bounds.
+pub(crate) const POSITION_BLOCK: u32 = 16;
+
+/// Object-space bounds of the positions in a block of mesh-map texels and
+/// the row and column after it, so every bilinear sample whose top-left
+/// texel lies in the block falls inside.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PositionBlock {
+    /// First column and row of the block.
+    pub x: u32,
+    pub y: u32,
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+/// Lazily built [`PositionBlock`]s. A cache only: it never makes two maps
+/// compare unequal.
+#[derive(Clone, Debug, Default)]
+struct BlockCache(OnceLock<Vec<PositionBlock>>);
+
+impl PartialEq for BlockCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshMapSettings {
@@ -275,6 +301,7 @@ pub struct MeshMaps {
     from_high_poly: bool,
     /// Covered texels whose cage ray found no high-poly surface.
     misses: usize,
+    blocks: BlockCache,
 }
 
 impl MeshMaps {
@@ -317,6 +344,36 @@ impl MeshMaps {
         (self.bounds_max - self.bounds_min)
             .length()
             .max(f32::EPSILON)
+    }
+
+    /// Position bounds of every [`POSITION_BLOCK`]-texel block holding
+    /// filled texels, built on first use.
+    pub(crate) fn position_blocks(&self) -> &[PositionBlock] {
+        self.blocks.0.get_or_init(|| {
+            let mut blocks = Vec::new();
+            let row = self.width as usize;
+            for y in (0..self.height).step_by(POSITION_BLOCK as usize) {
+                for x in (0..self.width).step_by(POSITION_BLOCK as usize) {
+                    let mut min = Vec3::splat(f32::INFINITY);
+                    let mut max = Vec3::splat(f32::NEG_INFINITY);
+                    for texel_y in y..(y + POSITION_BLOCK + 1).min(self.height) {
+                        for texel_x in x..(x + POSITION_BLOCK + 1).min(self.width) {
+                            let index = texel_y as usize * row + texel_x as usize;
+                            if self.filled.get(index).copied().unwrap_or(false)
+                                && let Some(texel) = self.texels.get(index)
+                            {
+                                min = min.min(texel.position);
+                                max = max.max(texel.position);
+                            }
+                        }
+                    }
+                    if min.cmple(max).all() {
+                        blocks.push(PositionBlock { x, y, min, max });
+                    }
+                }
+            }
+            blocks
+        })
     }
 
     /// Bilinearly samples every map at `uv`, ignoring texels outside UV
@@ -611,6 +668,7 @@ pub fn bake_mesh_maps_corrected(
         filled,
         from_high_poly: high.is_some(),
         misses: misses.into_inner(),
+        blocks: BlockCache::default(),
     })
 }
 

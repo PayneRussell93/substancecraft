@@ -1,6 +1,8 @@
-//! Procedural mask generators driven by baked mesh maps.
+//! Procedural mask generators driven by baked mesh maps (and, for the ID
+//! generator, the texture set's ID map).
 //!
-//! Each generator turns a [`MeshMapSample`] into a mask value in `0..=1`.
+//! Each mesh-map generator turns a [`MeshMapSample`] into a mask value in
+//! `0..=1`; the ID generator selects texels of the ID map by colour.
 //! Breakup noise is sampled in object space, so masks stay continuous across
 //! UV seams and scale with the mesh rather than with its UV layout.
 
@@ -8,7 +10,8 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::mesh_maps::MeshMapSample;
-use crate::noise::fbm3;
+use crate::noise::{fbm3, gradient_noise3};
+use crate::resources::{MAX_TILE_SIZE, MIN_TILE_SIZE};
 
 const BREAKUP_OCTAVES: u32 = 4;
 
@@ -23,17 +26,24 @@ pub enum MaskGenerator {
     /// Thin or thick parts from the thickness map: edges for subsurface
     /// glow, solid cores for dust.
     Thickness(Thickness),
+    /// Texels of the ID map near one colour.
+    IdColor(IdSelection),
+    /// A procedural pattern or grunge in object space: stripes, checker,
+    /// dots, scratches, or ridged grunge.
+    Pattern(Pattern),
 }
 
 impl MaskGenerator {
     /// One default instance of every generator, in menu order.
-    pub const PRESETS: [Self; 6] = [
+    pub const PRESETS: [Self; 8] = [
         Self::EdgeWear(EdgeWear::DEFAULT),
         Self::Dirt(Dirt::DEFAULT),
         Self::Orientation(Orientation::DEFAULT),
         Self::Gradient(Gradient::DEFAULT),
         Self::Noise(NoisePattern::DEFAULT),
         Self::Thickness(Thickness::DEFAULT),
+        Self::IdColor(IdSelection::DEFAULT),
+        Self::Pattern(Pattern::DEFAULT),
     ];
 
     pub const fn name(&self) -> &'static str {
@@ -44,7 +54,15 @@ impl MaskGenerator {
             Self::Gradient(_) => "Gradient",
             Self::Noise(_) => "Noise",
             Self::Thickness(_) => "Thickness",
+            Self::IdColor(_) => "ID",
+            Self::Pattern(_) => "Pattern",
         }
+    }
+
+    /// True when the generator reads baked mesh maps; the ID generator
+    /// reads the texture set's ID map instead.
+    pub const fn needs_mesh_maps(&self) -> bool {
+        !matches!(self, Self::IdColor(_))
     }
 
     pub fn same_kind(&self, other: &Self) -> bool {
@@ -58,6 +76,7 @@ impl MaskGenerator {
                     && unit(settings.contrast)
                     && unit(settings.breakup)
                     && noise_scale(settings.breakup_scale)
+                    && feature_size(settings.feature_size)
             }
             Self::Dirt(settings) => {
                 unit(settings.amount)
@@ -65,6 +84,7 @@ impl MaskGenerator {
                     && unit(settings.cavity_weight)
                     && unit(settings.breakup)
                     && noise_scale(settings.breakup_scale)
+                    && feature_size(settings.feature_size)
             }
             Self::Orientation(settings) => {
                 settings.spread_degrees.is_finite()
@@ -73,13 +93,25 @@ impl MaskGenerator {
             }
             Self::Gradient(settings) => unit(settings.start) && unit(settings.end),
             Self::Noise(settings) => {
-                noise_scale(settings.scale) && unit(settings.amount) && unit(settings.contrast)
+                noise_scale(settings.scale)
+                    && unit(settings.amount)
+                    && unit(settings.contrast)
+                    && feature_size(settings.feature_size)
             }
             Self::Thickness(settings) => unit(settings.amount) && unit(settings.contrast),
+            Self::IdColor(settings) => unit(settings.tolerance) && unit(settings.softness),
+            Self::Pattern(settings) => {
+                noise_scale(settings.scale)
+                    && unit(settings.width)
+                    && unit(settings.softness)
+                    && feature_size(settings.feature_size)
+            }
         }
     }
 
     /// Mask value at one mesh-map sample. Uncovered samples are always `0`.
+    /// The ID generator reads the ID map ([`IdSelection::select`]) and is
+    /// `0` here.
     pub fn evaluate(&self, sample: &MeshMapSample) -> f32 {
         if !sample.covered {
             return 0.0;
@@ -88,9 +120,8 @@ impl MaskGenerator {
             Self::EdgeWear(settings) => {
                 let convexity = ((sample.curvature - 0.5) * 2.0).clamp(0.0, 1.0);
                 let breakup = breakup(
-                    sample.relative_position,
+                    noise_point(sample, settings.breakup_scale, settings.feature_size),
                     settings.breakup,
-                    settings.breakup_scale,
                     settings.seed,
                 );
                 level(convexity * breakup, settings.amount, settings.contrast)
@@ -100,9 +131,8 @@ impl MaskGenerator {
                 let occlusion = 1.0 - sample.ambient_occlusion.clamp(0.0, 1.0);
                 let grime = occlusion + (cavity - occlusion) * settings.cavity_weight;
                 let breakup = breakup(
-                    sample.relative_position,
+                    noise_point(sample, settings.breakup_scale, settings.feature_size),
                     settings.breakup,
-                    settings.breakup_scale,
                     settings.seed,
                 );
                 level(grime * breakup, settings.amount, settings.contrast)
@@ -132,7 +162,7 @@ impl MaskGenerator {
             }
             Self::Noise(settings) => {
                 let noise = fbm3(
-                    sample.relative_position * settings.scale,
+                    noise_point(sample, settings.scale, settings.feature_size),
                     BREAKUP_OCTAVES,
                     settings.seed,
                 );
@@ -149,8 +179,178 @@ impl MaskGenerator {
                 };
                 level(selected, settings.amount, settings.contrast)
             }
+            Self::IdColor(_) => 0.0,
+            Self::Pattern(settings) => settings.evaluate(sample),
         };
         value.clamp(0.0, 1.0)
+    }
+}
+
+/// Shapes of the [`Pattern`] generator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PatternKind {
+    /// Parallel bands across `axis`.
+    #[default]
+    Stripes,
+    /// Alternating cells, solid in 3D so every face shows squares.
+    Checker,
+    /// Round spots on a grid.
+    Dots,
+    /// Long thin random lines running along `axis`.
+    Scratches,
+    /// Crackled ridges, for weathered and dried-out surfaces.
+    Grunge,
+}
+
+impl PatternKind {
+    pub const ALL: [Self; 5] = [
+        Self::Stripes,
+        Self::Checker,
+        Self::Dots,
+        Self::Scratches,
+        Self::Grunge,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Stripes => "Stripes",
+            Self::Checker => "Checker",
+            Self::Dots => "Dots",
+            Self::Scratches => "Scratches",
+            Self::Grunge => "Grunge",
+        }
+    }
+}
+
+/// A procedural pattern evaluated in object space, so it never seams at UV
+/// borders. One repetition spans `1 / scale` of the mesh, or `feature_size`
+/// scene units when set.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub axis: Axis,
+    pub scale: f32,
+    /// Fraction of each repetition the pattern covers (stripe width, dot
+    /// size, scratch or ridge density).
+    pub width: f32,
+    /// Edge softness.
+    pub softness: f32,
+    pub seed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_size: Option<f32>,
+}
+
+impl Pattern {
+    pub const DEFAULT: Self = Self {
+        kind: PatternKind::Stripes,
+        axis: Axis::Y,
+        scale: 12.0,
+        width: 0.5,
+        softness: 0.1,
+        seed: 5,
+        feature_size: None,
+    };
+
+    fn evaluate(&self, sample: &MeshMapSample) -> f32 {
+        let point = noise_point(sample, self.scale, self.feature_size);
+        // A soft step: 1 inside `edge`, fading over the softness band.
+        let band = (self.softness * 0.5).max(1e-3);
+        let inside =
+            |distance: f32, edge: f32| 1.0 - smoothstep(edge - band, edge + band, distance);
+        let along = point[self.axis.index()];
+        match self.kind {
+            PatternKind::Stripes => {
+                // Distance from the stripe's centre line, in periods.
+                let phase = (along - along.floor() - 0.5).abs();
+                inside(phase, self.width * 0.5)
+            }
+            PatternKind::Checker => {
+                let cells = point.floor();
+                let parity = (cells.x + cells.y + cells.z).rem_euclid(2.0);
+                // Soften cell borders by the distance to the nearest face.
+                let fraction = point - cells;
+                let border = fraction.min(Vec3::ONE - fraction).min_element();
+                let edge = smoothstep(0.0, band, border);
+                if parity < 0.5 {
+                    0.5 + 0.5 * edge
+                } else {
+                    0.5 - 0.5 * edge
+                }
+            }
+            PatternKind::Dots => {
+                let offset = point - point.floor() - Vec3::splat(0.5);
+                inside(offset.length(), self.width * 0.5)
+            }
+            PatternKind::Scratches => {
+                // Noise that varies slowly along the axis and quickly across
+                // it; its zero crossings are long thin lines.
+                let mut stretched = point * 3.0;
+                stretched[self.axis.index()] *= 0.08;
+                let noise = gradient_noise3(stretched, self.seed);
+                let ridge = 1.0 - noise.abs().min(1.0);
+                let density = gradient_noise3(point * 0.7, self.seed ^ 0x9e37) * 0.5 + 0.5;
+                inside(1.0 - ridge, self.width * 0.15) * smoothstep(0.35, 0.6, density)
+            }
+            PatternKind::Grunge => {
+                let noise = fbm3(point * 2.0, BREAKUP_OCTAVES, self.seed) * 2.0 - 1.0;
+                let ridge = 1.0 - noise.abs().min(1.0);
+                inside(1.0 - ridge, self.width * 0.3)
+            }
+        }
+    }
+}
+
+impl Default for Pattern {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Selects the texels of the ID map whose colour lies within `tolerance` of
+/// `color`, fading out over `softness` beyond it. Distances are measured
+/// in RGB scaled to `0..=1` (1 is black to white).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IdSelection {
+    pub color: [u8; 3],
+    pub tolerance: f32,
+    pub softness: f32,
+}
+
+impl IdSelection {
+    pub const DEFAULT: Self = Self {
+        color: [255, 0, 0],
+        tolerance: 0.05,
+        softness: 0.05,
+    };
+
+    /// Mask value for one RGBA texel of the ID map; unpainted (transparent)
+    /// texels are never selected.
+    pub fn select(&self, texel: [u8; 4]) -> f32 {
+        if texel[3] == 0 {
+            return 0.0;
+        }
+        let distance = (0..3)
+            .map(|channel| {
+                let difference =
+                    (f32::from(texel[channel]) - f32::from(self.color[channel])) / 255.0;
+                difference * difference
+            })
+            .sum::<f32>()
+            .sqrt()
+            / 3.0_f32.sqrt();
+        if distance <= self.tolerance {
+            1.0
+        } else if self.softness <= 0.0 {
+            0.0
+        } else {
+            (1.0 - (distance - self.tolerance) / self.softness).clamp(0.0, 1.0)
+        }
+    }
+}
+
+impl Default for IdSelection {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -166,6 +366,11 @@ pub struct EdgeWear {
     /// Breakup noise frequency relative to the mesh size.
     pub breakup_scale: f32,
     pub seed: u32,
+    /// Size of one breakup feature in scene units (metres after import
+    /// scale), replacing `breakup_scale` so the breakup keeps its real size
+    /// on any mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_size: Option<f32>,
 }
 
 impl EdgeWear {
@@ -175,6 +380,7 @@ impl EdgeWear {
         breakup: 0.6,
         breakup_scale: 14.0,
         seed: 1,
+        feature_size: None,
     };
 }
 
@@ -217,6 +423,9 @@ pub struct Dirt {
     pub breakup: f32,
     pub breakup_scale: f32,
     pub seed: u32,
+    /// Breakup feature size in scene units; see [`EdgeWear::feature_size`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_size: Option<f32>,
 }
 
 impl Dirt {
@@ -227,6 +436,7 @@ impl Dirt {
         breakup: 0.5,
         breakup_scale: 9.0,
         seed: 2,
+        feature_size: None,
     };
 }
 
@@ -362,6 +572,9 @@ pub struct NoisePattern {
     pub amount: f32,
     pub contrast: f32,
     pub seed: u32,
+    /// Blotch size in scene units; see [`EdgeWear::feature_size`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_size: Option<f32>,
 }
 
 impl NoisePattern {
@@ -370,6 +583,7 @@ impl NoisePattern {
         amount: 0.5,
         contrast: 0.5,
         seed: 3,
+        feature_size: None,
     };
 }
 
@@ -388,11 +602,24 @@ fn noise_scale(value: f32) -> bool {
 }
 
 /// Multiplicative noise factor averaging `1`, so zero-valued regions stay zero.
-fn breakup(position: Vec3, strength: f32, scale: f32, seed: u32) -> f32 {
+/// Where breakup noise is sampled: object-space position divided by a
+/// physical feature size, or the mesh-relative position times `scale`.
+fn noise_point(sample: &MeshMapSample, scale: f32, feature_size: Option<f32>) -> Vec3 {
+    match feature_size {
+        Some(size) => sample.position / size,
+        None => sample.relative_position * scale,
+    }
+}
+
+fn feature_size(size: Option<f32>) -> bool {
+    size.is_none_or(|size| size.is_finite() && (MIN_TILE_SIZE..=MAX_TILE_SIZE).contains(&size))
+}
+
+fn breakup(point: Vec3, strength: f32, seed: u32) -> f32 {
     if strength <= 0.0 {
         return 1.0;
     }
-    let noise = fbm3(position * scale, BREAKUP_OCTAVES, seed);
+    let noise = fbm3(point, BREAKUP_OCTAVES, seed);
     1.0 + (noise * 2.0 - 1.0) * strength * 1.5
 }
 
@@ -462,7 +689,7 @@ mod tests {
             })
             .is_valid()
         );
-        assert_eq!(MaskGenerator::PRESETS.len(), 6);
+        assert_eq!(MaskGenerator::PRESETS.len(), 8);
     }
 
     #[test]
@@ -530,5 +757,230 @@ mod tests {
             })
             .is_valid()
         );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn tc_0276_id_generator_selects_id_colours_with_tolerance_and_needs_no_mesh_maps() {
+        use std::collections::BTreeSet;
+
+        use crate::{
+            BakeContext, IdStroke, LayerFill, LayerId, MaterialChannel, MaterialLayer,
+            TextureResolution, TextureSet, TextureSetId, mask_drivers,
+        };
+
+        // Colour distance: exact and near colours are in, far ones out, a
+        // soft edge in between; unpainted texels are never selected.
+        let red = IdSelection::DEFAULT;
+        assert_eq!(red.select([255, 0, 0, 255]), 1.0);
+        assert_eq!(red.select([250, 8, 4, 255]), 1.0);
+        let fringe = red.select([255, 30, 20, 255]);
+        assert!(fringe > 0.0 && fringe < 1.0, "{fringe}");
+        assert_eq!(red.select([0, 0, 255, 255]), 0.0);
+        assert_eq!(red.select([255, 0, 0, 0]), 0.0);
+        let hard = IdSelection {
+            tolerance: 0.0,
+            softness: 0.0,
+            ..red
+        };
+        assert_eq!(hard.select([255, 0, 0, 255]), 1.0);
+        assert_eq!(hard.select([254, 0, 0, 255]), 0.0);
+        assert!(
+            !MaskGenerator::IdColor(IdSelection {
+                tolerance: 1.5,
+                ..red
+            })
+            .is_valid()
+        );
+        assert!(!MaskGenerator::IdColor(red).needs_mesh_maps());
+        assert_eq!(MaskGenerator::IdColor(red).name(), "ID");
+
+        // A red ID patch on the left; a blue fill selected by the ID
+        // generator shows only there, with no mesh maps.
+        let mut ids = MaterialLayer::new_paint(LayerId(1), "IDs");
+        ids.channels = BTreeSet::from([MaterialChannel::Id]);
+        ids.id_strokes.push(IdStroke {
+            points: vec![glam::Vec2::new(0.25, 0.5)],
+            radius_pixels: 5.0,
+            color: [255, 0, 0],
+            opacity: 1.0,
+            tip: crate::BrushTip {
+                hardness: 1.0,
+                ..crate::BrushTip::ROUND
+            },
+            pressures: Vec::new(),
+        });
+        let mut fill = MaterialLayer::new_fill(
+            LayerId(2),
+            "Selected",
+            LayerFill {
+                color: [0, 0, 255, 255],
+                ..LayerFill::default()
+            },
+        );
+        fill.channels = BTreeSet::from([MaterialChannel::BaseColor]);
+        fill.mask_generator = Some(MaskGenerator::IdColor(red));
+        let set = TextureSet {
+            id: TextureSetId(1),
+            name: "Body".to_owned(),
+            material_slot: "Body".to_owned(),
+            resolution: TextureResolution {
+                width: 32,
+                height: 32,
+            },
+            channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
+            layers: vec![ids, fill],
+            height_strength: crate::DEFAULT_HEIGHT_STRENGTH,
+            export: None,
+        };
+        assert!(!set.requires_mesh_maps());
+        let base = set
+            .bake_channel(MaterialChannel::BaseColor, BakeContext::default())
+            .unwrap();
+        let at = |u: f32| base.sample_uv(glam::Vec2::new(u, 0.5)).unwrap();
+        assert_eq!(at(0.25), [0, 0, 255, 255], "inside the red ID patch");
+        assert_eq!(at(0.75)[3], 0, "outside it");
+
+        // The generator alone (solo) and the inspector both read the ID map.
+        let alone = set
+            .bake_layer_mask(LayerId(2), true, BakeContext::default())
+            .unwrap();
+        assert_eq!(alone.sample_uv(glam::Vec2::new(0.25, 0.5)).unwrap()[0], 255);
+        assert_eq!(alone.sample_uv(glam::Vec2::new(0.75, 0.5)).unwrap()[0], 0);
+        assert_eq!(
+            mask_drivers(set.layer(LayerId(2)).unwrap(), &set),
+            ["ID generator (ID map)"]
+        );
+    }
+
+    #[test]
+    fn tc_0289_physical_feature_sizes_keep_noise_the_same_size_on_any_mesh() {
+        // One surface point seen on a small mesh and on one twice as large:
+        // the same object position, but different mesh-relative positions.
+        let on = |relative: Vec3| MeshMapSample {
+            covered: true,
+            position: Vec3::new(0.31, 0.47, 0.12),
+            relative_position: relative,
+            curvature: 1.0,
+            ambient_occlusion: 0.0,
+            ..MeshMapSample::default()
+        };
+        let small = on(Vec3::new(0.6, 0.7, 0.3));
+        let large = on(Vec3::new(0.3, 0.35, 0.15));
+        let noise = |feature_size| {
+            MaskGenerator::Noise(NoisePattern {
+                contrast: 0.0,
+                feature_size,
+                ..NoisePattern::DEFAULT
+            })
+        };
+        // Relative noise changes with the mesh; physical noise does not.
+        let relative = noise(None);
+        assert_ne!(relative.evaluate(&small), relative.evaluate(&large));
+        let physical = noise(Some(0.2));
+        assert_eq!(physical.evaluate(&small), physical.evaluate(&large));
+        for generator in [
+            MaskGenerator::EdgeWear(EdgeWear {
+                feature_size: Some(0.05),
+                ..EdgeWear::DEFAULT
+            }),
+            MaskGenerator::Dirt(Dirt {
+                feature_size: Some(0.05),
+                ..Dirt::DEFAULT
+            }),
+        ] {
+            assert!(generator.is_valid());
+            assert_eq!(generator.evaluate(&small), generator.evaluate(&large));
+        }
+        // Sizes outside the projection tile-size range are invalid; files
+        // without a size still load.
+        assert!(!noise(Some(0.0)).is_valid());
+        assert!(!noise(Some(f32::INFINITY)).is_valid());
+        assert!(!noise(Some(5000.0)).is_valid());
+        let old: MaskGenerator = serde_json::from_str(
+            r#"{"kind":"Noise","scale":6.0,"amount":0.5,"contrast":0.5,"seed":3}"#,
+        )
+        .unwrap_or(MaskGenerator::Noise(NoisePattern {
+            feature_size: Some(1.0),
+            ..NoisePattern::DEFAULT
+        }));
+        assert_eq!(old, MaskGenerator::Noise(NoisePattern::DEFAULT));
+    }
+
+    #[test]
+    fn tc_0290_pattern_generators_tile_in_object_space() {
+        let at = |position: Vec3| MeshMapSample {
+            covered: true,
+            position,
+            relative_position: position,
+            ..MeshMapSample::default()
+        };
+        let pattern = |kind, width| Pattern {
+            kind,
+            width,
+            softness: 0.0,
+            scale: 1.0,
+            ..Pattern::DEFAULT
+        };
+        // Stripes repeat along their axis and are constant across it.
+        let stripes = pattern(PatternKind::Stripes, 0.5);
+        assert_eq!(stripes.evaluate(&at(Vec3::new(0.0, 0.5, 0.0))), 1.0);
+        assert_eq!(stripes.evaluate(&at(Vec3::new(0.0, 0.0, 0.0))), 0.0);
+        assert_eq!(stripes.evaluate(&at(Vec3::new(0.0, 1.5, 0.0))), 1.0);
+        assert_eq!(stripes.evaluate(&at(Vec3::new(0.7, 0.5, 0.3))), 1.0);
+        // Checker cells alternate in every direction.
+        let checker = pattern(PatternKind::Checker, 0.5);
+        let cell = |x: f32, y: f32, z: f32| checker.evaluate(&at(Vec3::new(x, y, z)));
+        assert_eq!(cell(0.5, 0.5, 0.5), 1.0);
+        assert_eq!(cell(1.5, 0.5, 0.5), 0.0);
+        assert_eq!(cell(1.5, 1.5, 0.5), 1.0);
+        assert_eq!(cell(-0.5, 0.5, 0.5), 0.0);
+        // Dots fill cell centres, wider dots reach further.
+        let dots = pattern(PatternKind::Dots, 0.4);
+        assert_eq!(dots.evaluate(&at(Vec3::splat(0.5))), 1.0);
+        assert_eq!(dots.evaluate(&at(Vec3::splat(0.05))), 0.0);
+        let near = at(Vec3::new(0.5, 0.5, 0.75));
+        assert_eq!(dots.evaluate(&near), 0.0);
+        assert_eq!(pattern(PatternKind::Dots, 0.8).evaluate(&near), 1.0);
+        // Grunges cover part of the surface, deterministically per seed;
+        // more width covers more.
+        for kind in [PatternKind::Scratches, PatternKind::Grunge] {
+            let coverage = |width: f32, seed: u32| {
+                let generator = MaskGenerator::Pattern(Pattern {
+                    kind,
+                    width,
+                    seed,
+                    softness: 0.1,
+                    ..Pattern::DEFAULT
+                });
+                (0..400)
+                    .map(|index| {
+                        let position = Vec3::new(
+                            (index % 20) as f32 * 0.037,
+                            (index / 20) as f32 * 0.041,
+                            0.3,
+                        );
+                        generator.evaluate(&at(position))
+                    })
+                    .sum::<f32>()
+                    / 400.0
+            };
+            let (thin, wide) = (coverage(0.2, 5), coverage(0.8, 5));
+            assert!(
+                thin > 0.0 && thin < wide && wide < 1.0,
+                "{kind:?}: {thin} {wide}"
+            );
+            assert_eq!(coverage(0.5, 5), coverage(0.5, 5));
+            assert_ne!(coverage(0.5, 5), coverage(0.5, 6));
+        }
+        assert_eq!(MaskGenerator::Pattern(Pattern::DEFAULT).name(), "Pattern");
+        assert!(
+            !MaskGenerator::Pattern(Pattern {
+                width: 2.0,
+                ..Pattern::DEFAULT
+            })
+            .is_valid()
+        );
+        assert!(MaskGenerator::Pattern(Pattern::DEFAULT).needs_mesh_maps());
     }
 }

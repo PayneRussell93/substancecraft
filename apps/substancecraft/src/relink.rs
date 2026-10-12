@@ -1,10 +1,13 @@
 //! Relinking moved or renamed mesh and bitmap files. Missing files are
-//! looked up by name near the project; bitmap relinks are undoable edits,
+//! looked up near the project by content (when its hash was recorded on
+//! import) and by name; bitmap relinks and mesh locates are undoable edits,
 //! and every relink is written back on the next save.
 
 use std::path::{Path, PathBuf};
 
-use substancecraft_api::{find_relink_candidates, missing_project_files};
+use substancecraft_api::{
+    file_content_hash, find_relink_candidates_by_content, missing_project_files,
+};
 use substancecraft_core::{EditCommand, MaterialProject, ResourceId};
 
 use super::{SubstanceCraftApp, path_label};
@@ -22,8 +25,9 @@ pub fn search_roots(project_path: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
-/// Points a missing mesh or high-poly source at the first file with its
-/// name under `roots`. Returns one note per relinked file.
+/// Points a missing mesh or high-poly source at the best match under
+/// `roots`: the same content first, else the same name. Returns one note per
+/// relinked file.
 pub fn relink_mesh_sources(project: &mut MaterialProject, roots: &[PathBuf]) -> Vec<String> {
     let missing = missing_project_files(project, None);
     let mut notes = Vec::new();
@@ -31,13 +35,19 @@ pub fn relink_mesh_sources(project: &mut MaterialProject, roots: &[PathBuf]) -> 
         return notes;
     };
     if let Some(path) = missing.mesh
-        && let Some(found) = find_relink_candidates(&path, roots).into_iter().next()
+        && let Some(found) =
+            find_relink_candidates_by_content(&path, mesh.content_hash.as_ref(), roots)
+                .into_iter()
+                .next()
     {
         notes.push(format!("mesh → {}", found.display()));
         mesh.source = found.to_string_lossy().into_owned();
     }
     if let Some(path) = missing.high_poly
-        && let Some(found) = find_relink_candidates(&path, roots).into_iter().next()
+        && let Some(found) =
+            find_relink_candidates_by_content(&path, mesh.high_poly_hash.as_ref(), roots)
+                .into_iter()
+                .next()
     {
         notes.push(format!("high-poly mesh → {}", found.display()));
         mesh.high_poly_source = Some(found.to_string_lossy().into_owned());
@@ -54,7 +64,15 @@ impl SubstanceCraftApp {
         let commands: Vec<EditCommand> = missing
             .into_iter()
             .filter_map(|(id, path)| {
-                let found = find_relink_candidates(&path, &roots).into_iter().next()?;
+                let content = self
+                    .project
+                    .resources
+                    .iter()
+                    .find(|resource| resource.id == id)
+                    .and_then(|resource| resource.content_hash.as_ref());
+                let found = find_relink_candidates_by_content(&path, content, &roots)
+                    .into_iter()
+                    .next()?;
                 Some(EditCommand::RelinkResource {
                     resource: id,
                     before: self.resource_source(id)?,
@@ -101,6 +119,47 @@ impl SubstanceCraftApp {
             .pick_file()
         {
             self.relink_resource(id, &path);
+        }
+    }
+
+    /// True when the project's mesh is a file that is not where the project
+    /// says.
+    pub(super) fn mesh_file_missing(&self) -> bool {
+        self.project.mesh.as_ref().is_some_and(|mesh| {
+            !mesh.source.starts_with("builtin:") && !Path::new(&mesh.source).exists()
+        })
+    }
+
+    /// Points the project's mesh at `path` (a moved or renamed copy of the
+    /// missing file), undoably, and loads it.
+    pub(super) fn locate_project_mesh(&mut self, path: &Path) {
+        let before = self.project.mesh.clone();
+        let Some(mesh) = self.project.mesh.as_mut() else {
+            return;
+        };
+        mesh.source = path.to_string_lossy().into_owned();
+        mesh.content_hash = file_content_hash(path).ok();
+        self.history.end_merge();
+        self.record_mesh_edit(before, Vec::new());
+        self.history.end_merge();
+        self.project_error = None;
+        self.reload_project_mesh();
+    }
+
+    /// Asks where the missing mesh file went.
+    pub(super) fn choose_mesh_location(&mut self) {
+        let name = self
+            .project
+            .mesh
+            .as_ref()
+            .map(|mesh| path_label(Path::new(&mesh.source)))
+            .unwrap_or_default();
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title(format!("Locate {name}"))
+            .add_filter("3D mesh (FBX, glTF)", &super::MESH_EXTENSIONS)
+            .pick_file()
+        {
+            self.locate_project_mesh(&path);
         }
     }
 
@@ -181,6 +240,8 @@ mod tests {
                 scale: 1.0,
                 smoothing: substancecraft_core::MeshSmoothing::default(),
                 high_poly_source: None,
+                content_hash: None,
+                high_poly_hash: None,
             }),
             ..MaterialProject::empty()
         };
@@ -190,5 +251,65 @@ mod tests {
             project.mesh.unwrap().source,
             root.join("scene").join("crate.fbx").to_string_lossy()
         );
+    }
+
+    #[test]
+    fn tc_0293_bitmaps_relink_by_content_and_missing_meshes_are_located_undoably() {
+        let folder = tempfile::tempdir().unwrap();
+        let scene = folder.path().join("scene");
+        std::fs::create_dir_all(scene.join("renamed")).unwrap();
+        let bitmap = scene.join("stain.png");
+        let pixel = substancecraft_core::BakedTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![10, 20, 30, 255],
+        };
+        substancecraft_api::write_texture(&bitmap, &pixel).unwrap();
+        let mut app = SubstanceCraftApp {
+            project_path: Some(scene.join("scene.sproject")),
+            ..SubstanceCraftApp::default()
+        };
+        let id = app.add_resource(&bitmap).unwrap();
+        let recorded = app.project.resources[0].content_hash.clone().unwrap();
+        assert_eq!(recorded, file_content_hash(&bitmap).unwrap());
+
+        // Renamed as well as moved: only its content can find it.
+        let renamed = scene.join("renamed").join("stain_final.png");
+        std::fs::rename(&bitmap, &renamed).unwrap();
+        app.reload_resources();
+        assert_eq!(app.relink_missing_resources(), 1);
+        assert_eq!(app.resource_source(id).unwrap(), renamed.to_string_lossy());
+        assert!(app.resource_images.contains_key(&id));
+
+        // A missing mesh is reported and can be located, undoably.
+        let mesh_file = scene.join("crate.gltf");
+        std::fs::write(
+            &mesh_file,
+            r#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[]}],"scene":0}"#,
+        )
+        .unwrap();
+        app.project.mesh = Some(substancecraft_core::MeshAsset {
+            id: substancecraft_core::MeshId(1),
+            source: scene.join("gone.gltf").to_string_lossy().into_owned(),
+            scale: 1.0,
+            smoothing: substancecraft_core::MeshSmoothing::default(),
+            high_poly_source: None,
+            content_hash: None,
+            high_poly_hash: None,
+        });
+        app.loaded_mesh = app.project.mesh.clone();
+        assert!(app.mesh_file_missing());
+        app.locate_project_mesh(&mesh_file);
+        assert!(!app.mesh_file_missing());
+        let mesh = app.project.mesh.clone().unwrap();
+        assert_eq!(mesh.source, mesh_file.to_string_lossy());
+        assert_eq!(
+            mesh.content_hash,
+            Some(file_content_hash(&mesh_file).unwrap())
+        );
+        app.undo();
+        assert!(app.mesh_file_missing());
+        app.redo();
+        assert!(!app.mesh_file_missing());
     }
 }

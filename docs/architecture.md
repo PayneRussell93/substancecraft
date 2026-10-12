@@ -38,18 +38,22 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 - `smoothing.rs`: auto-smoothed corner/vertex normals and crease-aware Loop subdivision. Both weld by position, so unshared per-corner FBX vertices smooth correctly.
 - `topology.rs`: per-triangle connected-element and UV-island membership for polygon selection.
 - `mesh_maps.rs`: multi-threaded, cancellable baking of world normal, position, curvature, AO, and thickness into UV space. A BVH serves the occlusion rays, and a spatial grid of sharp edges gives curvature bands.
-- `generators.rs` and `noise.rs`: Edge Wear, Dirt, Orientation, Gradient, and Noise masks evaluated from mesh-map samples, with seeded object-space noise so breakup never seams.
+- `generators.rs` and `noise.rs`: Edge Wear, Dirt, Orientation, Gradient, Noise, and Thickness masks evaluated from mesh-map samples, with seeded object-space noise so breakup never seams, and the ID generator, which selects the set's ID map by colour.
 - `raster.rs`: shared UV triangle rasterisation.
 - `compositing.rs`, `export.rs`, and `filters.rs`: the layer compositor (including anchor masks and flattening), export presets and preflight, and layer filters.
 - `resources.rs` and `color.rs`: bitmap resources with colour-space tags and provenance, and UV, triplanar, planar, cylindrical, spherical, and decal projections with physical tile sizes.
-- `library.rs`: material resources, smart materials, and the searchable asset index.
+- `library.rs`: material resources, smart materials, smart masks, and the searchable asset index.
+- `templates.rs`: project templates (texture-set settings and starter layers) that instantiate a project with one set per material slot.
+- `evolution.rs`: evolution controls (for example clean to worn) on a layer that move recorded property ranges of the layers inside it as one batched edit.
+- `instances.rs`: material instances. A fill layer's `material_link` names a project material (its master) and the fields it overrides; the layer keeps the master's values resolved into its own fill, so compositing never needs the project. Commands that change a master are batched with the settings of every instance they re-resolve.
 - `painting.rs` and `udim.rs`: symmetry, stabilization, lines, seam detection, spline paths, and UDIM tile shifting.
+- `camera_paint.rs`: camera projection painting. A paint or mask stroke with a `camera` holds screen-space points; at bake time each texel's mesh-map position is projected into that view, tested against a depth buffer of the mesh and the surface's facing, and takes the brush coverage there.
 
-`substancecraft-api` adds file I/O (projects, textures, SVG and text resources, smart-material files), FBX and glTF import, OpenPBR MaterialX and glTF export, and headless export jobs. `substancecraft-cli` runs those jobs from the command line for pipelines; `substancecraft-mcp` exposes read-only tools.
+`substancecraft-api` adds file I/O (projects, textures, SVG and text resources, smart-material files), FBX and glTF import, OpenPBR MaterialX and glTF export, headless export jobs, and the versioned automation API (`automation.rs`: a project summary and typed edits applied as `EditCommand`s). `substancecraft-cli` runs export jobs and automation edits from the command line for pipelines; `substancecraft-mcp` exposes the same edits, project inspection, and exports as MCP tools confined to a root directory.
 
 A layer is a paint layer or a fill layer (`LayerFill`). Its mask is built in order: a generator base (or white), painted mask strokes blended over it, then polygon-mask and ID-colour clipping. Base Color composites as straight-alpha RGBA; Roughness and Metallic composite as scalars from defaults of 0.5 and 0. Polygon masks index triangles of the *smoothed* mesh. Subdivision children of triangle `t` are `4t..4t+4`, so masks are remapped when the subdivision level changes.
 
-Every user edit goes through `EditCommand`: strokes, layer-settings snapshots, and layer insert/remove/move. The desktop keeps a bounded 128-step in-memory history that resets when a project is opened. Inspector edits commit as one step when the pointer is released. `substancecraft-api` exposes channel and mesh-map bakes alongside bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project; scale and smoothing are stored on the mesh asset.
+Every user edit goes through `EditCommand`: strokes, layer-settings snapshots, layer insert/remove/move, texture-set and mesh edits, export presets, and project materials (with their instances, as one batch). The desktop keeps a bounded 128-step in-memory history that resets when a project is opened. Inspector edits commit as one step when the pointer is released. `substancecraft-api` exposes channel and mesh-map bakes alongside bounded JSON encode/decode and atomic `.sproject` file I/O. Imported FBX geometry is referenced by source path rather than embedded in the project; scale and smoothing are stored on the mesh asset.
 
 The core generates UV-mapped, outward-wound triangle meshes for cube (3×2 atlas), sphere, cylinder (side plus cap discs), and plane presets, with non-overlapping UV charts. The desktop shell can:
 

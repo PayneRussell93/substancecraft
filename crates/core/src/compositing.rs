@@ -19,7 +19,7 @@ use crate::resources::{ProjectionMode, ResourceImages, TextureImage, luminance};
 use crate::{
     DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_OPACITY, DEFAULT_ROUGHNESS,
     LayerFill, LayerId, MAX_BAKE_PIXELS, MAX_TEXTURE_DIMENSION, MAX_TEXTURE_SET_PIXELS,
-    MaterialChannel, MaterialLayer, MeshGeometry, MeshMaps, PaintStroke, ResourceId,
+    MaskGenerator, MaterialChannel, MaterialLayer, MeshGeometry, MeshMaps, PaintStroke, ResourceId,
     TextureResolution, TextureSet, raster, valid_height_strength, valid_layer_strokes,
 };
 
@@ -117,6 +117,8 @@ pub struct FlattenedLayer {
     pub channels: Vec<(MaterialChannel, TextureImage)>,
     /// The source layer's blend mode, which the replacement keeps.
     pub blend_mode: BlendMode,
+    /// The source layer's per-channel blend modes, kept likewise.
+    pub channel_blend_modes: BTreeMap<MaterialChannel, BlendMode>,
 }
 
 impl FlattenedLayer {
@@ -139,6 +141,9 @@ impl FlattenedLayer {
         let mut layer = MaterialLayer::new_fill(id, name, fill);
         layer.channels = channels;
         layer.blend_mode = self.blend_mode;
+        layer
+            .channel_blend_modes
+            .clone_from(&self.channel_blend_modes);
         layer
     }
 }
@@ -402,7 +407,7 @@ fn stroke_value(stroke: &PaintStroke, channel: MaterialChannel) -> (Vec3, f32) {
 
 /// True when `layer` adds anything to one of `channels`.
 pub(crate) fn contributes(layer: &MaterialLayer, channels: &[MaterialChannel]) -> bool {
-    layer.visible
+    layer.shown()
         && channels
             .iter()
             .any(|channel| layer.channels.contains(channel))
@@ -496,27 +501,33 @@ impl Compositor<'_> {
                     self.render_fill(fill, &mut local)?;
                 }
                 for stroke in &layer.paint_strokes {
-                    self.render_stroke(stroke, &mut local);
+                    self.render_stroke(stroke, &mut local)?;
                 }
             }
-            filters::apply_to_plane(&mut local, self.grid(), self.data, &layer.filters);
+            filters::apply_to_plane(
+                &mut local,
+                self.grid(),
+                self.data,
+                layer.filters_for(self.channel),
+            );
             let mask = self.masks.0.get(&layer.id);
             if let Some(probe) = self.probe {
                 probe.record(layer, &local, mask.map(Vec::as_slice));
             }
+            let blend_mode = layer.blend_mode_for(self.channel);
             for (index, (destination, source)) in target.iter_mut().zip(&local).enumerate() {
                 if source.w <= 0.0 {
                     continue;
                 }
                 let alpha = source.w * layer.opacity * mask.map_or(1.0, |values| values[index]);
                 let mut value = source.truncate();
-                if layer.blend_mode != BlendMode::Normal && self.data != PlaneData::Vector {
+                if blend_mode != BlendMode::Normal && self.data != PlaneData::Vector {
                     // W3C compositing: blend where the backdrop has coverage.
                     let backdrop = destination.truncate();
                     let blended = Vec3::new(
-                        layer.blend_mode.apply(backdrop.x, value.x),
-                        layer.blend_mode.apply(backdrop.y, value.y),
-                        layer.blend_mode.apply(backdrop.z, value.z),
+                        blend_mode.apply(backdrop.x, value.x),
+                        blend_mode.apply(backdrop.y, value.y),
+                        blend_mode.apply(backdrop.z, value.z),
                     );
                     value = value.lerp(blended, destination.w.clamp(0.0, 1.0));
                 }
@@ -538,7 +549,12 @@ impl Compositor<'_> {
         let mut through = try_filled(self.region.len(), Vec4::ZERO)?;
         through.copy_from_slice(target);
         self.composite(children, &mut through)?;
-        filters::apply_to_plane(&mut through, self.grid(), self.data, &layer.filters);
+        filters::apply_to_plane(
+            &mut through,
+            self.grid(),
+            self.data,
+            layer.filters_for(self.channel),
+        );
         let mask = self.masks.0.get(&layer.id);
         if let Some(probe) = self.probe {
             probe.record(layer, &through, mask.map(Vec::as_slice));
@@ -619,7 +635,7 @@ impl Compositor<'_> {
         Ok(())
     }
 
-    fn render_stroke(&self, stroke: &PaintStroke, local: &mut [Vec4]) {
+    fn render_stroke(&self, stroke: &PaintStroke, local: &mut [Vec4]) -> Result<(), BakeError> {
         let (value, color_alpha) = stroke_value(stroke, self.channel);
         let path = StrokePath {
             points: &stroke.points,
@@ -627,21 +643,22 @@ impl Compositor<'_> {
             radius_pixels: stroke.radius_pixels,
             tip: stroke.tip,
         };
-        brush::rasterize_stroke(
+        let apply = |index: usize, coverage: f32| {
+            let amount = (coverage * stroke.opacity).clamp(0.0, 1.0);
+            if stroke.erase {
+                local[index].w *= 1.0 - amount;
+            } else {
+                over(&mut local[index], value, amount * color_alpha, self.data);
+            }
+        };
+        rasterize_any_stroke(
             &path,
-            self.width(),
-            self.height(),
-            self.context.resources,
+            stroke.camera.as_ref(),
+            self.context,
+            (self.width(), self.height()),
             self.region,
-            |index, coverage| {
-                let amount = (coverage * stroke.opacity).clamp(0.0, 1.0);
-                if stroke.erase {
-                    local[index].w *= 1.0 - amount;
-                } else {
-                    over(&mut local[index], value, amount * color_alpha, self.data);
-                }
-            },
-        );
+            apply,
+        )
     }
 }
 
@@ -651,7 +668,7 @@ impl TextureSet {
     pub fn requires_mesh_maps(&self) -> bool {
         fn visible_need(layers: &[MaterialLayer]) -> bool {
             layers.iter().any(|layer| {
-                layer.visible
+                layer.shown()
                     && (layer.own_needs_mesh_maps()
                         || layer.children.as_deref().is_some_and(visible_need))
             })
@@ -693,7 +710,10 @@ impl TextureSet {
         }
         layers
             .iter()
-            .any(|layer| layer.id_mask_color.is_some())
+            .any(|layer| {
+                layer.id_mask_color.is_some()
+                    || matches!(layer.mask_generator, Some(MaskGenerator::IdColor(_)))
+            })
             .then(|| self.id_map_region(region))
             .transpose()
     }
@@ -1262,11 +1282,23 @@ impl TextureSet {
         checked_region(region)?;
         let mut values = try_filled(pixel_count, 1.0_f32)?;
 
-        if let Some(generator) = &layer.mask_generator {
-            let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
-            parallel_fill_region(&mut values, region, width, height, |uv| {
-                generator.evaluate(&maps.sample(uv))
-            });
+        match &layer.mask_generator {
+            Some(MaskGenerator::IdColor(selection)) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = id_map
+                        .and_then(|map| map.get(index * 4..index * 4 + 4))
+                        .map_or(0.0, |texel| {
+                            selection.select([texel[0], texel[1], texel[2], texel[3]])
+                        });
+                }
+            }
+            Some(generator) => {
+                let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
+                parallel_fill_region(&mut values, region, width, height, |uv| {
+                    generator.evaluate(&maps.sample(uv))
+                });
+            }
+            None => {}
         }
         if let Some(bitmap) = layer.mask_bitmap {
             let image = context.image(bitmap.resource)?;
@@ -1299,17 +1331,17 @@ impl TextureSet {
                 radius_pixels: stroke.radius_pixels,
                 tip: stroke.tip,
             };
-            brush::rasterize_stroke(
+            rasterize_any_stroke(
                 &path,
-                width,
-                height,
-                context.resources,
+                stroke.camera.as_ref(),
+                context,
+                (width, height),
                 region,
                 |index, coverage| {
                     let alpha = (stroke.opacity * coverage).clamp(0.0, 1.0);
                     values[index] += (stroke.value - values[index]) * alpha;
                 },
-            );
+            )?;
         }
         let grid = PlaneGrid {
             region,
@@ -1509,6 +1541,7 @@ impl TextureSet {
                 BlendMode::PassThrough => BlendMode::Normal,
                 mode => mode,
             },
+            channel_blend_modes: layer.channel_blend_modes.clone(),
         })
     }
 
@@ -1537,7 +1570,7 @@ impl TextureSet {
 
     fn paint_id_layers(&self, layers: &[MaterialLayer], rgba8: &mut [u8], region: TexelRect) {
         for layer in layers {
-            if !layer.visible || !layer.channels.contains(&MaterialChannel::Id) {
+            if !layer.shown() || !layer.channels.contains(&MaterialChannel::Id) {
                 continue;
             }
             if let Some(children) = &layer.children {
@@ -1572,6 +1605,35 @@ impl TextureSet {
             }
         }
     }
+}
+
+/// Rasterises a UV-space stroke, or a projected one through `camera` onto
+/// the surface the mesh maps describe.
+fn rasterize_any_stroke(
+    path: &StrokePath<'_>,
+    camera: Option<&crate::StrokeCamera>,
+    context: BakeContext<'_>,
+    (width, height): (u32, u32),
+    region: TexelRect,
+    apply: impl FnMut(usize, f32),
+) -> Result<(), BakeError> {
+    match camera {
+        None => brush::rasterize_stroke(path, width, height, context.resources, region, apply),
+        Some(camera) => crate::camera_paint::rasterize_projected_stroke(
+            path,
+            camera,
+            crate::camera_paint::ProjectionSurface {
+                maps: context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?,
+                mesh: context.mesh,
+            },
+            width,
+            height,
+            context.resources,
+            region,
+            apply,
+        ),
+    }
+    Ok(())
 }
 
 /// Below this many texels a fill runs on the calling thread.

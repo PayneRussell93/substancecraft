@@ -2,13 +2,58 @@
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Rect, Response, RichText, Sense, Stroke,
-    StrokeKind, Ui, UiBuilder, collapsing_header::CollapsingState, emath::lerp, vec2,
+    StrokeKind, Ui, UiBuilder, WidgetInfo, WidgetType, collapsing_header::CollapsingState,
+    emath::lerp, vec2,
 };
 
 use crate::icons::{self, Icon};
 use crate::theme;
 
 const ICON_BUTTON: f32 = 30.0;
+
+/// Width of the ring drawn around the widget with keyboard focus.
+const FOCUS_RING: f32 = 2.0;
+
+/// Draws the keyboard-focus ring around `rect` when `response` has focus.
+fn focus_ring(ui: &Ui, response: &Response, rect: Rect, corner: CornerRadius) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(FOCUS_RING),
+            corner,
+            Stroke::new(FOCUS_RING, theme::ACCENT),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+/// Memory key of the label a [`property_row`] gives the widgets inside it,
+/// so unlabelled controls (toggles, sliders) still have accessible names.
+fn row_label_id() -> Id {
+    Id::new("property_row_label")
+}
+
+/// The label of the enclosing [`property_row`], if any.
+fn row_label(ui: &Ui) -> String {
+    ui.ctx()
+        .data(|data| data.get_temp::<String>(row_label_id()))
+        .unwrap_or_default()
+}
+
+/// A colour swatch button named after its property row.
+pub fn labeled_color_button(ui: &mut Ui, color: &mut Color32) -> Response {
+    let response = ui.color_edit_button_srgba(color);
+    label_from_row(ui, &response, WidgetType::ColorButton);
+    response
+}
+
+/// Names `response` after the enclosing [`property_row`] for assistive
+/// technology (sliders and drag values have no visible label of their own).
+pub fn label_from_row(ui: &Ui, response: &Response, kind: WidgetType) {
+    let label = row_label(ui);
+    if !label.is_empty() {
+        response.widget_info(|| WidgetInfo::labeled(kind, ui.is_enabled(), &label));
+    }
+}
 
 /// Circular icon button. Disabled buttons never report clicks.
 pub fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> Response {
@@ -40,6 +85,14 @@ pub fn sized_icon_toggle(
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), sense);
+    response.widget_info(|| {
+        if selected {
+            WidgetInfo::selected(WidgetType::Button, enabled, true, tooltip)
+        } else {
+            WidgetInfo::labeled(WidgetType::Button, enabled, tooltip)
+        }
+    });
+    focus_ring(ui, &response, rect, CornerRadius::same((size * 0.5) as u8));
     if ui.is_rect_visible(rect) {
         let hover = ui
             .ctx()
@@ -166,6 +219,15 @@ pub fn chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
         .layout_no_wrap(label.to_owned(), font, theme::TEXT);
     let size = vec2(galley.size().x + 22.0, 26.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    focus_ring(ui, &response, rect, theme::PILL);
     if ui.is_rect_visible(rect) {
         let (fill, stroke, text) = if selected {
             (
@@ -211,6 +273,8 @@ pub fn pill_button(
         content_width + 28.0
     };
     let (rect, response) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+    focus_ring(ui, &response, rect, theme::PILL);
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let (fill, text) = match (primary, hovered) {
@@ -246,6 +310,10 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
         *on = !*on;
         response.mark_changed();
     }
+    let label = row_label(ui);
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, ui.is_enabled(), *on, &label));
+    focus_ring(ui, &response, rect, theme::PILL);
     if ui.is_rect_visible(rect) {
         let amount = ui.ctx().animate_bool_responsive(response.id, *on);
         let fill = lerp_color(theme::INPUT, theme::ACCENT, amount);
@@ -274,6 +342,24 @@ pub fn caption(ui: &mut Ui, text: &str) {
 
 /// A label column followed by right-aligned controls.
 pub fn property_row<R>(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    // Widgets inside take the row's label as their accessible name.
+    let outer = ui
+        .ctx()
+        .data_mut(|data| data.remove_temp::<String>(row_label_id()));
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(row_label_id(), label.to_owned()));
+    let inner = property_row_inner(ui, label, add_contents);
+    ui.ctx().data_mut(|data| {
+        if let Some(outer) = outer {
+            data.insert_temp(row_label_id(), outer);
+        } else {
+            data.remove::<String>(row_label_id());
+        }
+    });
+    inner
+}
+
+fn property_row_inner<R>(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(84.0, 26.0), Sense::hover());
         ui.painter().text(

@@ -24,18 +24,34 @@ pub enum BrushShape {
     Square,
     /// Clustered speckles, for grime and chipped paint.
     Splatter,
+    /// A thin tapered line along the stamp's angle, for scratches.
+    Streak,
+    /// A hollow circle, for rivets, rings, and water marks.
+    Ring,
+    /// A soft cloudy blob, for stains and smudges.
+    Cloud,
     /// Grayscale bitmap resource: white paints, black does not.
     Bitmap(ResourceId),
 }
 
 impl BrushShape {
-    pub const BUILT_IN: [Self; 3] = [Self::Round, Self::Square, Self::Splatter];
+    pub const BUILT_IN: [Self; 6] = [
+        Self::Round,
+        Self::Square,
+        Self::Splatter,
+        Self::Streak,
+        Self::Ring,
+        Self::Cloud,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Round => "Round",
             Self::Square => "Square",
             Self::Splatter => "Splatter",
+            Self::Streak => "Streak",
+            Self::Ring => "Ring",
+            Self::Cloud => "Cloud",
             Self::Bitmap(_) => "Bitmap",
         }
     }
@@ -164,6 +180,28 @@ impl BrushTip {
                         + 0.5;
                 disc * ((speckle - 0.52) * 8.0).clamp(0.0, 1.0)
             }
+            BrushShape::Streak => {
+                // Tapered at both ends, an eighth of the length wide.
+                let taper = (1.0 - local.x.abs()).clamp(0.0, 1.0);
+                let half_width = 0.125 * taper;
+                if half_width <= 0.0 {
+                    return 0.0;
+                }
+                self.falloff((local.y.abs() / half_width).min(1.0)) * taper.sqrt()
+            }
+            BrushShape::Ring => {
+                // A band around 0.75 of the radius, a quarter radius wide.
+                self.falloff(((local.length() - 0.75).abs() / 0.25).min(1.0))
+            }
+            BrushShape::Cloud => {
+                let disc = self.falloff(local.length());
+                if disc <= 0.0 {
+                    return 0.0;
+                }
+                let billow =
+                    crate::noise::fbm3(Vec3::new(local.x * 1.6, local.y * 1.6, 0.5), 4, stamp_seed);
+                disc * ((billow - 0.35) * 2.5).clamp(0.0, 1.0)
+            }
             BrushShape::Bitmap(id) => {
                 if local.x.abs() > 1.0 || local.y.abs() > 1.0 {
                     return 0.0;
@@ -225,15 +263,49 @@ pub(crate) fn valid_pressures(points: &[Vec2], pressures: &[f32]) -> bool {
 }
 
 /// A rectangle of per-pixel stroke coverage.
-struct CoverageTile {
-    min_x: i64,
-    min_y: i64,
-    width: i64,
-    height: i64,
+pub(crate) struct CoverageTile {
+    pub(crate) min_x: i64,
+    pub(crate) min_y: i64,
+    pub(crate) width: i64,
+    pub(crate) height: i64,
     values: Vec<f32>,
 }
 
 impl CoverageTile {
+    /// A zeroed tile over the inclusive pixel bounds, or `None` when the
+    /// allocation fails.
+    fn new((min_x, min_y, max_x, max_y): (i64, i64, i64, i64)) -> Option<Self> {
+        let mut tile = Self {
+            min_x,
+            min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+            values: Vec::new(),
+        };
+        let count = (tile.width * tile.height) as usize;
+        tile.values.try_reserve_exact(count).ok()?;
+        tile.values.resize(count, 0.0);
+        Some(tile)
+    }
+
+    fn get(&self, x: i64, y: i64) -> f32 {
+        let (local_x, local_y) = (x - self.min_x, y - self.min_y);
+        if local_x < 0 || local_y < 0 || local_x >= self.width || local_y >= self.height {
+            return 0.0;
+        }
+        self.values[(local_y * self.width + local_x) as usize]
+    }
+
+    /// Bilinear coverage at a fractional pixel position; zero outside.
+    pub(crate) fn sample(&self, point: Vec2) -> f32 {
+        let (x, y) = (point.x.floor(), point.y.floor());
+        let (tx, ty) = (point.x - x, point.y - y);
+        let (x, y) = (x as i64, y as i64);
+        let top = self.get(x, y) * (1.0 - tx) + self.get(x + 1, y) * tx;
+        let bottom = self.get(x, y + 1) * (1.0 - tx) + self.get(x + 1, y + 1) * tx;
+        (top * (1.0 - ty) + bottom * ty).min(1.0)
+    }
+
     fn deposit(&mut self, x: i64, y: i64, value: f32) {
         let (local_x, local_y) = (x - self.min_x, y - self.min_y);
         if local_x < 0 || local_y < 0 || local_x >= self.width || local_y >= self.height {
@@ -253,7 +325,7 @@ fn stroke_reach(radius_pixels: f32, tip: BrushTip) -> f32 {
 
 /// Inclusive texel bounds `(min_x, min_y, max_x, max_y)` a stroke over
 /// `pixels` can touch on a `width` × `height` texture.
-fn stroke_pixel_bounds(
+pub(crate) fn stroke_pixel_bounds(
     pixels: &[Vec2],
     radius_pixels: f32,
     tip: BrushTip,
@@ -333,24 +405,9 @@ pub(crate) fn rasterize_stroke(
     if min_x > max_x || min_y > max_y {
         return;
     }
-    let mut tile = CoverageTile {
-        min_x,
-        min_y,
-        width: max_x - min_x + 1,
-        height: max_y - min_y + 1,
-        values: Vec::new(),
-    };
-    let count = (tile.width * tile.height) as usize;
-    if tile.values.try_reserve_exact(count).is_err() {
+    let Some(tile) = coverage_tile(path, &pixels, (min_x, min_y, max_x, max_y), resources) else {
         return;
-    }
-    tile.values.resize(count, 0.0);
-
-    if path.tip.continuous() {
-        draw_capsules(path, &pixels, &mut tile);
-    } else {
-        draw_stamps(path, &pixels, &mut tile, resources);
-    }
+    };
 
     for local_y in 0..tile.height {
         for local_x in 0..tile.width {
@@ -362,6 +419,23 @@ pub(crate) fn rasterize_stroke(
             }
         }
     }
+}
+
+/// The stroke through `pixels` drawn into a tile over the inclusive pixel
+/// `bounds`. Coverage at a pixel does not depend on the bounds.
+pub(crate) fn coverage_tile(
+    path: &StrokePath<'_>,
+    pixels: &[Vec2],
+    bounds: (i64, i64, i64, i64),
+    resources: Option<&ResourceImages>,
+) -> Option<CoverageTile> {
+    let mut tile = CoverageTile::new(bounds)?;
+    if path.tip.continuous() {
+        draw_capsules(path, pixels, &mut tile);
+    } else {
+        draw_stamps(path, pixels, &mut tile, resources);
+    }
+    Some(tile)
 }
 
 /// Smooth round stroke: capsules between consecutive points whose radius
@@ -603,6 +677,73 @@ mod tests {
         let values = coverage(&bitmap, 65, Some(&resources));
         assert!(values[32 * 65 + 13 - 4] > 0.9, "left half paints");
         assert!(values[32 * 65 + 13 + 4] < 0.1, "right half does not");
+    }
+
+    #[test]
+    fn tc_0291_streak_ring_and_cloud_alphas_have_their_shapes() {
+        let tip = |shape| BrushTip {
+            shape,
+            hardness: 0.5,
+            ..BrushTip::ROUND
+        };
+        let streak = tip(BrushShape::Streak);
+        assert!(streak.stamp_coverage(Vec2::new(0.0, 0.0), 0, None) > 0.9);
+        assert!(
+            streak.stamp_coverage(Vec2::new(0.6, 0.0), 0, None) > 0.3,
+            "long"
+        );
+        assert_eq!(
+            streak.stamp_coverage(Vec2::new(0.0, 0.3), 0, None),
+            0.0,
+            "thin"
+        );
+        assert_eq!(streak.stamp_coverage(Vec2::new(1.0, 0.0), 0, None), 0.0);
+        let ring = tip(BrushShape::Ring);
+        assert_eq!(
+            ring.stamp_coverage(Vec2::new(0.0, 0.0), 0, None),
+            0.0,
+            "hollow"
+        );
+        assert!(ring.stamp_coverage(Vec2::new(0.75, 0.0), 0, None) > 0.9);
+        assert!(ring.stamp_coverage(Vec2::new(0.0, -0.75), 0, None) > 0.9);
+        let cloud = tip(BrushShape::Cloud);
+        let samples: Vec<f32> = (0..64)
+            .map(|index| {
+                let point = Vec2::new(
+                    (index % 8) as f32 / 8.0 - 0.45,
+                    (index / 8) as f32 / 8.0 - 0.45,
+                );
+                cloud.stamp_coverage(point, 3, None)
+            })
+            .collect();
+        assert!(samples.iter().any(|value| *value > 0.5), "dense parts");
+        assert!(samples.iter().any(|value| *value < 0.1), "gaps");
+        assert_eq!(
+            samples,
+            (0..64)
+                .map(|index| {
+                    let point = Vec2::new(
+                        (index % 8) as f32 / 8.0 - 0.45,
+                        (index / 8) as f32 / 8.0 - 0.45,
+                    );
+                    cloud.stamp_coverage(point, 3, None)
+                })
+                .collect::<Vec<_>>(),
+            "deterministic"
+        );
+        // The new shapes paint through the stamp path.
+        for shape in [BrushShape::Streak, BrushShape::Ring, BrushShape::Cloud] {
+            let path = StrokePath {
+                points: &[Vec2::splat(0.5)],
+                pressures: &[],
+                radius_pixels: 10.0,
+                tip: tip(shape),
+            };
+            assert!(
+                coverage(&path, 32, None).iter().any(|value| *value > 0.5),
+                "{shape:?}"
+            );
+        }
     }
 
     #[test]

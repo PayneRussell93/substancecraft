@@ -14,5 +14,9 @@ serde_json.workspace = true
 substancecraft-api = { path = "../api" }
 tokio.workspace = true
 
+[dev-dependencies]
+substancecraft-core = { path = "../core" }
+tempfile.workspace = true
+
 [lints]
 workspace = true

@@ -314,6 +314,7 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
             opacity,
             tip,
             pressures,
+            camera: None,
         };
         return grow_or_start(
             &mut layer.mask_strokes,

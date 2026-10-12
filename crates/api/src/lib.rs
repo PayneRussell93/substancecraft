@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
+mod automation;
 mod fbx;
 mod gltf_import;
 mod history_file;
@@ -12,6 +13,11 @@ mod relink;
 mod textures;
 mod vector;
 
+pub use automation::{
+    AUTOMATION_API_VERSION, AutomationEdit, AutomationError, EditOutcome, LayerSummary,
+    MaterialSummary, ProjectSummary, ResourceSummary, TextureSetSummary, apply_automation_edit,
+    edit_project_file, project_summary, texture_set_ids,
+};
 pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
 };
@@ -30,7 +36,8 @@ pub use jobs::{
 pub use project_format::{MigrationReport, decode_project_json_with_report};
 pub use recovery::{RecoveryCandidate, RecoveryStore};
 pub use relink::{
-    MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, find_relink_candidates, missing_project_files,
+    MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, file_content_hash, find_relink_candidates,
+    find_relink_candidates_by_content, missing_project_files,
 };
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
@@ -48,13 +55,13 @@ use std::{
     io::{self, Read, Write},
     path::Path,
 };
-use substancecraft_core::SmartMaterial;
 use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
     MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
     MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ProjectResource, ResourceId,
     ResourceImages, TexelRect, TextureImage, TextureSet,
 };
+use substancecraft_core::{ProjectTemplate, SmartMaterial};
 use thiserror::Error;
 
 pub const MAX_PROJECT_JSON_BYTES: usize = 128 * 1024 * 1024;
@@ -351,6 +358,58 @@ pub fn load_smart_material(path: &Path) -> Result<SmartMaterial, ProjectFileErro
     Ok(file.material)
 }
 
+pub const PROJECT_TEMPLATE_FORMAT: &str = "substancecraft-project-template";
+const PROJECT_TEMPLATE_VERSION: u32 = 1;
+/// File extension of project templates.
+pub const PROJECT_TEMPLATE_EXTENSION: &str = "sctemplate";
+
+#[derive(Serialize, Deserialize)]
+struct ProjectTemplateFile {
+    format: String,
+    version: u32,
+    template: ProjectTemplate,
+}
+
+/// Writes a project template as versioned JSON (`.sctemplate`).
+pub fn save_project_template(
+    path: &Path,
+    template: &ProjectTemplate,
+) -> Result<(), ProjectFileError> {
+    template
+        .validate()
+        .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
+    let json = serde_json::to_vec_pretty(&ProjectTemplateFile {
+        format: PROJECT_TEMPLATE_FORMAT.to_owned(),
+        version: PROJECT_TEMPLATE_VERSION,
+        template: template.clone(),
+    })
+    .map_err(|error| ProjectFileError::Encode(error.to_string()))?;
+    std::fs::write(path, json).map_err(|error| ProjectFileError::Io(error.to_string()))
+}
+
+/// Reads and validates a project template file.
+pub fn load_project_template(path: &Path) -> Result<ProjectTemplate, ProjectFileError> {
+    let file = File::open(path).map_err(|error| ProjectFileError::Io(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SMART_MATERIAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ProjectFileError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_SMART_MATERIAL_BYTES {
+        return Err(ProjectFileError::TooLarge(bytes.len()));
+    }
+    let file: ProjectTemplateFile = serde_json::from_slice(&bytes)
+        .map_err(|error| ProjectFileError::Decode(error.to_string()))?;
+    if file.format != PROJECT_TEMPLATE_FORMAT || file.version != PROJECT_TEMPLATE_VERSION {
+        return Err(ProjectFileError::Decode(format!(
+            "not a version {PROJECT_TEMPLATE_VERSION} {PROJECT_TEMPLATE_FORMAT} file"
+        )));
+    }
+    file.template
+        .validate()
+        .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
+    Ok(file.template)
+}
+
 /// Bakes the viewport/engine textures: Base Color (Opacity in alpha), packed
 /// ORM (occlusion, roughness, metallic), the combined tangent-space normal,
 /// and Emissive.
@@ -617,6 +676,7 @@ mod tests {
                                 controls: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
                                 closed: false,
                             }),
+                            camera: None,
                         }],
                         mask_strokes: vec![MaskStroke {
                             points: vec![Vec2::new(0.5, 0.5)],
@@ -625,6 +685,7 @@ mod tests {
                             opacity: 0.5,
                             tip: BrushTip::ROUND,
                             pressures: Vec::new(),
+                            camera: None,
                         }],
                         id_strokes: vec![IdStroke {
                             points: vec![Vec2::new(0.5, 0.5)],
@@ -660,9 +721,14 @@ mod tests {
                         filters: vec![LayerFilter::Blur { radius: 3.0 }],
                         mask_filters: vec![LayerFilter::Invert],
                         mask_anchor: None,
+                        material_link: None,
                         invert_final_mask: true,
                         blend_mode: substancecraft_core::BlendMode::Multiply,
                         children: None,
+                        evolutions: Vec::new(),
+                        channel_blend_modes: BTreeMap::new(),
+                        uv_tiles: BTreeSet::new(),
+                        filter_channels: BTreeSet::new(),
                     },
                     {
                         let mut group = MaterialLayer::new_group(LayerId(6), "Group");
@@ -766,6 +832,8 @@ mod tests {
                 scale: 1.0,
                 smoothing: MeshSmoothing::default(),
                 high_poly_source: Some("sculpt.fbx".to_owned()),
+                content_hash: None,
+                high_poly_hash: None,
             }),
             ..MaterialProject::empty()
         };

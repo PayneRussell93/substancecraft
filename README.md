@@ -15,6 +15,14 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+The desktop app links a vendored Filament build. On Windows, install Visual Studio 2022 Build Tools with the C++ workload (MSVC, the Windows SDK, and its bundled CMake) and Python 3, then build Filament once (about an hour):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-filament.ps1
+```
+
+The core, API, CLI, and MCP crates build and test without Filament (`cargo test -p substancecraft-core -p substancecraft-api -p substancecraft-cli -p substancecraft-mcp`).
+
 ## Direction
 
 The architecture and initial vertical slice are tracked in [the roadmap](ROADMAP.md), [the 50-area feature map](docs/feature-map.md), and [the architecture notes](docs/architecture.md). The API and MCP starter are described in [the API guide](docs/api-and-mcp.md). Quality records are in [Documentation/Quality](Documentation/Quality/mini-QualityPlan.md).

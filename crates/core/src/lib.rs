@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod brush;
+mod camera_paint;
 pub mod color;
 mod compositing;
+mod evolution;
 mod export;
 mod filters;
 mod generators;
 mod inspect;
+mod instances;
 pub mod library;
 mod mesh_maps;
 pub mod noise;
@@ -22,15 +25,18 @@ mod raster;
 mod region;
 mod resources;
 mod smoothing;
+mod templates;
 mod topology;
 pub mod udim;
 
 pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING, stroke_texel_bounds};
+pub use camera_paint::{MAX_STROKE_VIEWPORT, StrokeCamera, projected_stroke_texel_rects};
 pub use color::ColorSpace;
 pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
     MaterialSample, MaterialTextures,
 };
+pub use evolution::{Evolution, EvolutionDrive, MAX_EVOLUTION_DRIVES, MAX_EVOLUTIONS};
 pub use export::{
     BitDepth, ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource,
     ExportedTexture, MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS,
@@ -39,12 +45,14 @@ pub use export::{
 };
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
-    Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation, Thickness,
+    Axis, Direction, Dirt, EdgeWear, Gradient, IdSelection, MaskGenerator, NoisePattern,
+    Orientation, Pattern, PatternKind, Thickness,
 };
 pub use inspect::{MASK_SHOWN, OverlayPalette, TexelContribution, mask_drivers, mask_overlay};
+pub use instances::{InstanceField, MaterialLink};
 pub use library::{
     AssetEntry, AssetKind, BUILT_IN_LICENSE, ExposedParameter, ExposedProperty, LibraryError,
-    MapRequirements, MaterialResource, ParameterValue, SmartMaterial,
+    MapRequirements, MaterialResource, ParameterValue, SmartMask, SmartMaterial,
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
@@ -56,19 +64,20 @@ pub use painting::{
 };
 pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{
-    BitmapMask, DecalPlacement, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE,
-    MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource, ProjectionMode, ResourceImages,
-    ResourceProvenance, TextureImage, TextureProjection,
+    BitmapMask, ContentHash, ContentHasher, DecalPlacement, MAX_PROJECTION_SCALE,
+    MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource,
+    ProjectionMode, ResourceImages, ResourceProvenance, TextureImage, TextureProjection,
 };
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
     MeshSmoothing, corner_normals, remap_subdivided_triangles, subdivide, vertex_normals,
     vertex_tangents,
 };
+pub use templates::ProjectTemplate;
 pub use topology::{DiagnosticEdge, EdgeFlags, MeshTopology, SelectionMode, diagnostic_edges};
 pub use udim::{UDIM_TOKEN, UdimTile};
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 2;
+pub const PROJECT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
 /// Texels one bake works on at once (its f32 working buffers); larger
 /// texture sets bake in tiles of at most this many.
@@ -96,6 +105,7 @@ id_type!(LayerId);
 id_type!(BoneId);
 id_type!(PoseId);
 id_type!(ResourceId);
+id_type!(MaterialId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrimitivePreset {
@@ -752,6 +762,12 @@ pub struct MeshAsset {
     /// projects onto this mesh. Loaded with the same scale.
     #[serde(default)]
     pub high_poly_source: Option<String>,
+    /// The mesh file's size and hash when it was imported, for relinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    /// Likewise for the high-poly file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_poly_hash: Option<ContentHash>,
 }
 
 fn default_mesh_scale() -> f32 {
@@ -807,6 +823,9 @@ pub struct MaterialLayer {
     /// Filters applied, in order, to the layer's content before masking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<LayerFilter>,
+    /// Channels `filters` apply to; empty means every channel.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub filter_channels: BTreeSet<MaterialChannel>,
     /// Filters applied, in order, to the layer's mask.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask_filters: Vec<LayerFilter>,
@@ -817,11 +836,27 @@ pub struct MaterialLayer {
     /// How the layer combines with the stack beneath.
     #[serde(default, skip_serializing_if = "is_normal_blend")]
     pub blend_mode: BlendMode,
+    /// Per-channel replacements for `blend_mode` (never pass-through).
+    /// Normals always blend normally.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_blend_modes: BTreeMap<MaterialChannel, BlendMode>,
     /// `Some` makes this a group: its children composite together first and
     /// the result blends through the group's own opacity, mask, and filters.
     /// Groups ignore fill and paint strokes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<MaterialLayer>>,
+    /// Makes this fill layer an instance of a project material: its fill
+    /// and channels follow the master except where the link overrides them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_link: Option<MaterialLink>,
+    /// Controls (for example clean to worn) that move properties of this
+    /// layer and the layers inside it through recorded ranges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evolutions: Vec<Evolution>,
+    /// UDIM tiles the layer (with its children) paints in; empty means
+    /// every tile. A bake of the unit square is tile 1001.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub uv_tiles: BTreeSet<UdimTile>,
 }
 
 impl MaterialLayer {
@@ -847,10 +882,15 @@ impl MaterialLayer {
             mask_bitmap: None,
             invert_final_mask: false,
             filters: Vec::new(),
+            filter_channels: BTreeSet::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
             blend_mode: BlendMode::Normal,
+            channel_blend_modes: BTreeMap::new(),
             children: None,
+            material_link: None,
+            evolutions: Vec::new(),
+            uv_tiles: BTreeSet::new(),
         }
     }
 
@@ -887,6 +927,24 @@ impl MaterialLayer {
         layers
     }
 
+    /// The content filters that apply to `channel`: all of them unless the
+    /// layer limits them to other channels.
+    pub fn filters_for(&self, channel: MaterialChannel) -> &[LayerFilter] {
+        if self.filter_channels.is_empty() || self.filter_channels.contains(&channel) {
+            &self.filters
+        } else {
+            &[]
+        }
+    }
+
+    /// How this layer blends `channel`: its channel mode, else its mode.
+    pub fn blend_mode_for(&self, channel: MaterialChannel) -> BlendMode {
+        self.channel_blend_modes
+            .get(&channel)
+            .copied()
+            .unwrap_or(self.blend_mode)
+    }
+
     fn contains_layer(&self, layer_id: LayerId) -> bool {
         self.walk().iter().any(|layer| layer.id == layer_id)
     }
@@ -905,9 +963,14 @@ impl MaterialLayer {
             mask_bitmap: self.mask_bitmap,
             invert_final_mask: self.invert_final_mask,
             filters: self.filters.clone(),
+            filter_channels: self.filter_channels.clone(),
             mask_filters: self.mask_filters.clone(),
             mask_anchor: self.mask_anchor,
             blend_mode: self.blend_mode,
+            channel_blend_modes: self.channel_blend_modes.clone(),
+            material_link: self.material_link.clone(),
+            evolutions: self.evolutions.clone(),
+            uv_tiles: self.uv_tiles.clone(),
         }
     }
 
@@ -923,13 +986,43 @@ impl MaterialLayer {
         self.mask_bitmap = settings.mask_bitmap;
         self.invert_final_mask = settings.invert_final_mask;
         self.filters = settings.filters;
+        self.filter_channels = settings.filter_channels;
         self.mask_filters = settings.mask_filters;
         self.mask_anchor = settings.mask_anchor;
         self.blend_mode = settings.blend_mode;
+        self.channel_blend_modes = settings.channel_blend_modes;
+        self.material_link = settings.material_link;
+        self.evolutions = settings.evolutions;
+        self.uv_tiles = settings.uv_tiles;
+    }
+
+    /// True when the layer is visible in a bake of the unit square (tile
+    /// 1001): visible, and not limited to other UDIM tiles.
+    pub fn shown(&self) -> bool {
+        self.visible && (self.uv_tiles.is_empty() || self.uv_tiles.contains(&UdimTile::FIRST))
     }
 
     fn has_valid_settings(&self) -> bool {
         if self.blend_mode == BlendMode::PassThrough && !self.is_group() {
+            return false;
+        }
+        // Pass-through groups composite their children directly, so channel
+        // modes would be meaningless; channels never pass through on their
+        // own.
+        if !self.channel_blend_modes.is_empty()
+            && (self.blend_mode == BlendMode::PassThrough
+                || self
+                    .channel_blend_modes
+                    .values()
+                    .any(|mode| *mode == BlendMode::PassThrough))
+        {
+            return false;
+        }
+        // Only fill layers can be material instances.
+        if self.material_link.is_some() && (self.is_group() || self.fill.is_none()) {
+            return false;
+        }
+        if !self.uv_tiles.iter().all(|tile| tile.is_valid()) {
             return false;
         }
         self.fill.is_none_or(|fill| fill.is_valid())
@@ -953,6 +1046,17 @@ impl MaterialLayer {
                 .all(|filter| filter.is_valid())
     }
 
+    /// True when this layer's evolution controls fit its tree. Checked when
+    /// projects and smart materials are validated, not when baking: controls
+    /// never change a bake, and bakes may see a truncated tree.
+    pub(crate) fn has_valid_evolutions(&self) -> bool {
+        self.evolutions.len() <= MAX_EVOLUTIONS
+            && self
+                .evolutions
+                .iter()
+                .all(|evolution| evolution.is_valid(self))
+    }
+
     /// Bitmap resources this layer (not its children) reads.
     fn own_resources(&self) -> impl Iterator<Item = ResourceId> + '_ {
         let strokes = self
@@ -972,7 +1076,16 @@ impl MaterialLayer {
     /// True when this layer (not its children) projects bitmaps triplanarly
     /// or uses a generator, so baking needs mesh maps.
     fn own_needs_mesh_maps(&self) -> bool {
-        self.mask_generator.is_some()
+        self.mask_generator
+            .is_some_and(|generator| generator.needs_mesh_maps())
+            || self
+                .paint_strokes
+                .iter()
+                .any(|stroke| stroke.camera.is_some())
+            || self
+                .mask_strokes
+                .iter()
+                .any(|stroke| stroke.camera.is_some())
             || self
                 .mask_bitmap
                 .is_some_and(|bitmap| bitmap.projection.needs_mesh_maps())
@@ -1172,9 +1285,19 @@ pub struct LayerSettings {
     pub mask_bitmap: Option<BitmapMask>,
     pub invert_final_mask: bool,
     pub filters: Vec<LayerFilter>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub filter_channels: BTreeSet<MaterialChannel>,
     pub mask_filters: Vec<LayerFilter>,
     pub mask_anchor: Option<AnchorMask>,
     pub blend_mode: BlendMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_blend_modes: BTreeMap<MaterialChannel, BlendMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_link: Option<MaterialLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evolutions: Vec<Evolution>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub uv_tiles: BTreeSet<UdimTile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1210,6 +1333,11 @@ pub struct PaintStroke {
     /// editable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathSpec>,
+    /// Painted through this view (camera projection): `points` and
+    /// `radius_pixels` are in the viewport's pixels, and the stroke lands on
+    /// whatever surface showed there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<StrokeCamera>,
 }
 
 impl PaintStroke {
@@ -1220,6 +1348,7 @@ impl PaintStroke {
             points: path.sample(PATH_SAMPLES_PER_SEGMENT),
             pressures: Vec::new(),
             path: Some(path),
+            camera: None,
             ..template.clone()
         }
     }
@@ -1240,6 +1369,7 @@ impl PaintStroke {
             tip: BrushTip::ROUND,
             pressures: Vec::new(),
             path: None,
+            camera: None,
         }
     }
 }
@@ -1289,6 +1419,24 @@ pub struct MaskStroke {
     pub tip: BrushTip,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pressures: Vec<f32>,
+    /// Painted through this view; see [`PaintStroke::camera`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<StrokeCamera>,
+}
+
+impl MaskStroke {
+    /// A mask stroke writing `value` at full opacity with a soft round tip.
+    pub fn new(points: Vec<glam::Vec2>, radius_pixels: f32, value: f32) -> Self {
+        Self {
+            points,
+            radius_pixels,
+            value,
+            opacity: 1.0,
+            tip: BrushTip::ROUND,
+            pressures: Vec::new(),
+            camera: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1366,6 +1514,17 @@ pub enum EditCommand {
         before: Vec<ExportPreset>,
         after: Vec<ExportPreset>,
     },
+    /// Replaced the project's materials. Edits of a master travel in a
+    /// [`EditCommand::Batch`] with the settings of its instances.
+    Materials {
+        before: Vec<MaterialResource>,
+        after: Vec<MaterialResource>,
+    },
+    /// Replaced the project's smart masks.
+    SmartMasks {
+        before: Vec<SmartMask>,
+        after: Vec<SmartMask>,
+    },
     /// Replaced a texture set's own properties (all but its layers).
     TextureSetProperties {
         texture_set_id: TextureSetId,
@@ -1430,8 +1589,9 @@ impl EditHistory {
     }
 
     /// Records an applied command like [`Self::record`], joining it to the
-    /// last step when both are texture-set property edits of one set, or
-    /// mesh edits, made in one merging run that picks up where it left off.
+    /// last step when both are texture-set property edits of one set, mesh
+    /// edits, or material edits, made in one merging run that picks up
+    /// where it left off.
     pub fn record_merging(&mut self, command: EditCommand) {
         if self.merging
             && let Some(last) = self.undo_stack.last_mut()
@@ -1462,6 +1622,14 @@ impl EditHistory {
                     last_after.clone_from(after);
                     self.redo_stack.clear();
                     return;
+                }
+                (EditCommand::Batch(last), EditCommand::Batch(next)) => {
+                    if instances::merge_material_edits(last, next)
+                        || instances::merge_settings_batches(last, next)
+                    {
+                        self.redo_stack.clear();
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -1614,6 +1782,12 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
         EditCommand::ExportPresets { before, after } => {
             replace_value(&mut project.export_presets, before, after)
         }
+        EditCommand::Materials { before, after } => {
+            replace_value(&mut project.materials, before, after)
+        }
+        EditCommand::SmartMasks { before, after } => {
+            replace_value(&mut project.smart_masks, before, after)
+        }
         EditCommand::TextureSetProperties {
             texture_set_id,
             before,
@@ -1687,6 +1861,12 @@ fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool 
         } => relink_resource(project, *resource, after, before),
         EditCommand::ExportPresets { before, after } => {
             replace_value(&mut project.export_presets, after, before)
+        }
+        EditCommand::Materials { before, after } => {
+            replace_value(&mut project.materials, after, before)
+        }
+        EditCommand::SmartMasks { before, after } => {
+            replace_value(&mut project.smart_masks, after, before)
         }
         EditCommand::TextureSetProperties {
             texture_set_id,
@@ -1888,7 +2068,17 @@ pub(crate) fn valid_stroke(
     radius_pixels: f32,
     opacity: f32,
     tip: BrushTip,
+    camera: Option<&StrokeCamera>,
 ) -> bool {
+    let points_valid = match camera {
+        // Screen-space points of a projected stroke.
+        Some(camera) => camera.is_valid() && camera.valid_points(points),
+        // UDIM layouts place strokes beyond the unit square: up to ten tiles
+        // across and a hundred rows, either side once shifted to a tile.
+        None => points.iter().all(|point| {
+            point.is_finite() && point.abs().cmple(glam::Vec2::new(10.0, 100.0)).all()
+        }),
+    };
     !points.is_empty()
         && points.len() <= MAX_STROKE_POINTS
         && radius_pixels.is_finite()
@@ -1896,11 +2086,7 @@ pub(crate) fn valid_stroke(
         && radius_pixels <= MAX_TEXTURE_DIMENSION as f32
         && opacity.is_finite()
         && (0.0..=1.0).contains(&opacity)
-        // UDIM layouts place strokes beyond the unit square: up to ten tiles
-        // across and a hundred rows, either side once shifted to a tile.
-        && points
-            .iter()
-            .all(|point| point.is_finite() && point.abs().cmple(glam::Vec2::new(10.0, 100.0)).all())
+        && points_valid
         && brush::valid_pressures(points, pressures)
         && tip.is_valid()
 }
@@ -1919,6 +2105,7 @@ pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
                 stroke.radius_pixels,
                 stroke.opacity,
                 stroke.tip,
+                stroke.camera.as_ref(),
             ) && [
                 stroke.roughness,
                 stroke.metallic,
@@ -1935,6 +2122,7 @@ pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
                 stroke.radius_pixels,
                 stroke.opacity,
                 stroke.tip,
+                stroke.camera.as_ref(),
             ) && stroke.value.is_finite()
                 && (0.0..=1.0).contains(&stroke.value)
         })
@@ -1945,6 +2133,7 @@ pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
                 stroke.radius_pixels,
                 stroke.opacity,
                 stroke.tip,
+                None,
             )
         })
 }
@@ -2049,12 +2238,17 @@ impl TextureSet {
             return None;
         }
         fn scale(layers: &mut [MaterialLayer], factor: f32) {
+            // Projected strokes are sized in screen pixels, not texels.
             for layer in layers {
                 for stroke in &mut layer.paint_strokes {
-                    stroke.radius_pixels /= factor;
+                    if stroke.camera.is_none() {
+                        stroke.radius_pixels /= factor;
+                    }
                 }
                 for stroke in &mut layer.mask_strokes {
-                    stroke.radius_pixels /= factor;
+                    if stroke.camera.is_none() {
+                        stroke.radius_pixels /= factor;
+                    }
                 }
                 for stroke in &mut layer.id_strokes {
                     stroke.radius_pixels /= factor;
@@ -2171,6 +2365,9 @@ pub struct MaterialProject {
     /// Saved smart materials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub smart_materials: Vec<SmartMaterial>,
+    /// Saved smart masks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub smart_masks: Vec<SmartMask>,
     /// Saved inspection cameras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cameras: Vec<NamedCamera>,
@@ -2188,6 +2385,7 @@ impl MaterialProject {
             export_presets: Vec::new(),
             materials: Vec::new(),
             smart_materials: Vec::new(),
+            smart_masks: Vec::new(),
             cameras: Vec::new(),
         }
     }
@@ -2245,7 +2443,7 @@ impl MaterialProject {
                 if !valid_layer_strokes(layer) {
                     return Err(ProjectError::InvalidLayerPaintData(layer.id));
                 }
-                if !layer.has_valid_settings() {
+                if !layer.has_valid_settings() || !layer.has_valid_evolutions() {
                     return Err(ProjectError::InvalidLayerSettings(layer.id));
                 }
                 if layer
@@ -2281,12 +2479,40 @@ impl MaterialProject {
             }
         }
 
+        let mut material_ids = BTreeSet::new();
         for material in &self.materials {
             material.validate()?;
+            if material.id == MaterialId::UNASSIGNED || !material_ids.insert(material.id) {
+                return Err(ProjectError::InvalidMaterialId(material.name.clone()));
+            }
+        }
+        for texture_set in &self.texture_sets {
+            for layer in texture_set.walk_layers() {
+                if let Some(link) = &layer.material_link
+                    && !material_ids.contains(&link.material)
+                {
+                    return Err(ProjectError::MissingMaterial {
+                        layer: layer.id,
+                        material: link.material,
+                    });
+                }
+            }
         }
         for material in &self.smart_materials {
             material.validate()?;
             if let Some(missing) = material
+                .requirements()
+                .resources
+                .into_iter()
+                .find(|resource| !resource_ids.contains(resource))
+            {
+                return Err(ProjectError::MissingResource(missing));
+            }
+        }
+
+        for mask in &self.smart_masks {
+            mask.validate()?;
+            if let Some(missing) = mask
                 .requirements()
                 .resources
                 .into_iter()
@@ -2384,6 +2610,15 @@ pub enum ProjectError {
     DuplicateExportPresetName(String),
     #[error("camera `{0}` is unnamed, duplicated, or out of range")]
     InvalidCamera(String),
+    #[error("material `{0}` has a missing or duplicated id")]
+    InvalidMaterialId(String),
+    #[error(
+        "layer {layer:?} is an instance of material {material:?}, which the project does not have"
+    )]
+    MissingMaterial {
+        layer: LayerId,
+        material: MaterialId,
+    },
     #[error(transparent)]
     InvalidLibraryEntry(#[from] LibraryError),
     #[error(transparent)]
@@ -2519,6 +2754,8 @@ mod tests {
             scale: 2.0,
             smoothing: MeshSmoothing::default(),
             high_poly_source: None,
+            content_hash: None,
+            high_poly_hash: None,
         };
         let old_mesh = project.mesh.clone();
         assert!(history.apply(
@@ -2561,6 +2798,7 @@ mod tests {
             opacity: 1.0,
             tip: BrushTip::ROUND,
             pressures: Vec::new(),
+            camera: None,
         });
         group.children = Some(vec![masked]);
         set.layers = vec![layer, group];
@@ -2620,6 +2858,7 @@ mod tests {
                 opacity: 1.0,
                 tip: BrushTip::ROUND,
                 pressures: Vec::new(),
+                camera: None,
             }],
             id_strokes: Vec::new(),
             id_mask_color: None,
@@ -2631,8 +2870,13 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            material_link: None,
             blend_mode: BlendMode::Normal,
             children: None,
+            evolutions: Vec::new(),
+            channel_blend_modes: BTreeMap::new(),
+            uv_tiles: BTreeSet::new(),
+            filter_channels: BTreeSet::new(),
         });
 
         let baked = set.bake_base_color().unwrap();
@@ -2674,8 +2918,13 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            material_link: None,
             blend_mode: BlendMode::Normal,
             children: None,
+            evolutions: Vec::new(),
+            channel_blend_modes: BTreeMap::new(),
+            uv_tiles: BTreeSet::new(),
+            filter_channels: BTreeSet::new(),
         });
 
         let baked = set.bake_id_mask().unwrap();
@@ -2726,8 +2975,13 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            material_link: None,
             blend_mode: BlendMode::Normal,
             children: None,
+            evolutions: Vec::new(),
+            channel_blend_modes: BTreeMap::new(),
+            uv_tiles: BTreeSet::new(),
+            filter_channels: BTreeSet::new(),
         });
 
         let baked = set.bake_base_color().unwrap();
@@ -2755,6 +3009,7 @@ mod tests {
             opacity: 1.0,
             tip: BrushTip::ROUND,
             pressures: Vec::new(),
+            camera: None,
         };
         let id = IdStroke {
             points: vec![glam::Vec2::new(0.75, 0.25)],
@@ -2783,8 +3038,13 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            material_link: None,
             blend_mode: BlendMode::Normal,
             children: None,
+            evolutions: Vec::new(),
+            channel_blend_modes: BTreeMap::new(),
+            uv_tiles: BTreeSet::new(),
+            filter_channels: BTreeSet::new(),
         });
         let mut project = MaterialProject {
             texture_sets: vec![set],
@@ -2899,8 +3159,13 @@ mod tests {
             filters: Vec::new(),
             mask_filters: Vec::new(),
             mask_anchor: None,
+            material_link: None,
             blend_mode: BlendMode::Normal,
             children: None,
+            evolutions: Vec::new(),
+            channel_blend_modes: BTreeMap::new(),
+            uv_tiles: BTreeSet::new(),
+            filter_channels: BTreeSet::new(),
         });
         let project = MaterialProject {
             texture_sets: vec![set],
@@ -2937,8 +3202,13 @@ mod tests {
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
+                material_link: None,
                 blend_mode: BlendMode::Normal,
                 children: None,
+                evolutions: Vec::new(),
+                channel_blend_modes: BTreeMap::new(),
+                uv_tiles: BTreeSet::new(),
+                filter_channels: BTreeSet::new(),
             },
             MaterialLayer {
                 id: LayerId(4),
@@ -2958,8 +3228,13 @@ mod tests {
                 filters: Vec::new(),
                 mask_filters: Vec::new(),
                 mask_anchor: None,
+                material_link: None,
                 blend_mode: BlendMode::Normal,
                 children: None,
+                evolutions: Vec::new(),
+                channel_blend_modes: BTreeMap::new(),
+                uv_tiles: BTreeSet::new(),
+                filter_channels: BTreeSet::new(),
             },
         ];
         let project = MaterialProject {
@@ -3652,6 +3927,7 @@ mod tests {
                 ..BrushTip::ROUND
             },
             pressures: Vec::new(),
+            camera: None,
         });
         let set = small_set(size, group);
 
@@ -3777,6 +4053,7 @@ mod tests {
                 ..BrushTip::ROUND
             },
             pressures: Vec::new(),
+            camera: None,
         });
         // An inverted all-black mask shows the layer everywhere again.
         layer.mask_filters = vec![LayerFilter::Invert];
@@ -3807,6 +4084,7 @@ mod tests {
                 ..BrushTip::ROUND
             },
             pressures: Vec::new(),
+            camera: None,
         });
         layer.mask_filters = vec![LayerFilter::Invert];
         layer.invert_final_mask = true;
@@ -4262,5 +4540,152 @@ mod tests {
         settings.blend_mode = BlendMode::Normal;
         set.layers[1].apply_settings(settings);
         assert_eq!(set.layers[1].blend_mode, BlendMode::Normal);
+    }
+
+    #[test]
+    fn tc_0300_layer_filters_can_be_limited_to_chosen_channels() {
+        let mut fill = MaterialLayer::new_fill(
+            LayerId(1),
+            "Fill",
+            LayerFill {
+                color: [200, 100, 50, 255],
+                roughness: 0.25,
+                ..LayerFill::default()
+            },
+        );
+        fill.filters = vec![LayerFilter::Invert];
+        let set = small_set(8, fill.clone());
+        let context = BakeContext::default();
+        let pixel = |set: &TextureSet, channel| {
+            set.bake_channel(channel, context)
+                .unwrap()
+                .pixel(2, 2)
+                .unwrap()
+        };
+        // Unscoped, the filter inverts every channel.
+        assert_eq!(
+            &pixel(&set, MaterialChannel::BaseColor)[..3],
+            &[55, 155, 205]
+        );
+        assert_eq!(pixel(&set, MaterialChannel::Roughness)[0], 191);
+        // Limited to Roughness, colour is untouched.
+        fill.filter_channels = BTreeSet::from([MaterialChannel::Roughness]);
+        let scoped = small_set(8, fill.clone());
+        assert_eq!(
+            &pixel(&scoped, MaterialChannel::BaseColor)[..3],
+            &[200, 100, 50]
+        );
+        assert_eq!(pixel(&scoped, MaterialChannel::Roughness)[0], 191);
+        assert!(fill.filters_for(MaterialChannel::BaseColor).is_empty());
+        assert_eq!(fill.filters_for(MaterialChannel::Roughness).len(), 1);
+        // The scope is a layer setting.
+        assert_eq!(fill.settings().filter_channels.len(), 1);
+    }
+
+    #[test]
+    fn tc_0287_channel_blend_modes_override_the_layer_mode_per_channel() {
+        use std::sync::Arc;
+
+        let base = MaterialLayer::new_fill(
+            LayerId(1),
+            "Grey",
+            LayerFill {
+                color: [128, 128, 128, 255],
+                roughness: 0.5,
+                ..LayerFill::default()
+            },
+        );
+        let mut tint = MaterialLayer::new_fill(
+            LayerId(2),
+            "Tint",
+            LayerFill {
+                color: [255, 0, 0, 255],
+                roughness: 0.5,
+                ..LayerFill::default()
+            },
+        );
+        // Screen everywhere, except Multiply for Base Color.
+        tint.blend_mode = BlendMode::Screen;
+        tint.channel_blend_modes =
+            BTreeMap::from([(MaterialChannel::BaseColor, BlendMode::Multiply)]);
+        assert_eq!(
+            tint.blend_mode_for(MaterialChannel::BaseColor),
+            BlendMode::Multiply
+        );
+        assert_eq!(
+            tint.blend_mode_for(MaterialChannel::Roughness),
+            BlendMode::Screen
+        );
+        let mut set = small_set(8, base);
+        set.layers.push(tint);
+        let context = BakeContext::default();
+        let color = set.bake_base_color().unwrap();
+        assert_eq!(&color.pixel(2, 2).unwrap()[..3], &[128, 0, 0], "multiplied");
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, context)
+            .unwrap();
+        assert_eq!(roughness.pixel(2, 2).unwrap()[0], 191, "screened: 0.75");
+
+        // A Normal channel mode turns blending off for that channel only.
+        set.layers[1]
+            .channel_blend_modes
+            .insert(MaterialChannel::Roughness, BlendMode::Normal);
+        let roughness = set
+            .bake_channel(MaterialChannel::Roughness, context)
+            .unwrap();
+        assert_eq!(roughness.pixel(2, 2).unwrap()[0], 128);
+
+        // Flattening keeps the channel modes, so the rebuilt stack matches.
+        let flattened = set.flatten_layer(LayerId(2), context).unwrap();
+        assert_eq!(
+            flattened.channel_blend_modes,
+            set.layers[1].channel_blend_modes
+        );
+        let ids: Vec<ResourceId> = (0..flattened.channels.len() as u64)
+            .map(|index| ResourceId(50 + index))
+            .collect();
+        let images: ResourceImages = ids
+            .iter()
+            .zip(&flattened.channels)
+            .map(|(id, (_, image))| (*id, Arc::new(image.clone())))
+            .collect();
+        let mut rebuilt = set.clone();
+        rebuilt.layers[1] = flattened.to_fill_layer(LayerId(9), "Flat", &ids);
+        let with_images = BakeContext {
+            resources: Some(&images),
+            ..context
+        };
+        for channel in [MaterialChannel::BaseColor, MaterialChannel::Roughness] {
+            assert_eq!(
+                rebuilt.bake_channel(channel, with_images).unwrap(),
+                set.bake_channel(channel, context).unwrap(),
+                "{channel:?}"
+            );
+        }
+
+        // Validation: no pass-through per channel, none on pass-through
+        // groups; the modes round-trip and are layer settings.
+        let mut project = MaterialProject {
+            texture_sets: vec![set.clone()],
+            ..MaterialProject::empty()
+        };
+        project.validate().unwrap();
+        let decoded: MaterialProject =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(decoded, project);
+        project.texture_sets[0].layers[1]
+            .channel_blend_modes
+            .insert(MaterialChannel::Metallic, BlendMode::PassThrough);
+        assert_eq!(
+            project.validate(),
+            Err(ProjectError::InvalidLayerSettings(LayerId(2)))
+        );
+        let mut group = MaterialLayer::new_group(LayerId(5), "Group");
+        group.blend_mode = BlendMode::PassThrough;
+        group.channel_blend_modes =
+            BTreeMap::from([(MaterialChannel::BaseColor, BlendMode::Multiply)]);
+        assert!(!group.has_valid_settings());
+        let settings = set.layers[1].settings();
+        assert_eq!(settings.channel_blend_modes.len(), 2);
     }
 }

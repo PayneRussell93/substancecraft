@@ -1146,7 +1146,7 @@ impl TextureSet {
             && self
                 .walk_layers()
                 .iter()
-                .any(|layer| layer.visible && layer.polygon_mask.is_some())
+                .any(|layer| layer.shown() && layer.polygon_mask.is_some())
         {
             issues.push(PreflightIssue::error(
                 "A layer uses a polygon mask, but no mesh is loaded.",

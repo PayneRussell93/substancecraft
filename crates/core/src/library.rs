@@ -1,6 +1,6 @@
 //! Reusable library content: material resources (fill presets), smart
-//! materials (layer trees with exposed parameters), and a searchable index of
-//! every asset a project can use.
+//! materials (layer trees with exposed parameters), smart masks (reusable
+//! mask setups), and a searchable index of every asset a project can use.
 //!
 //! Built-in entries are original SubstanceCraft data, distributed under the
 //! project licence.
@@ -10,12 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::evolution::{Evolution, EvolutionDrive};
 use crate::export::ExportPreset;
-use crate::generators::{Dirt, EdgeWear, MaskGenerator, NoisePattern};
-use crate::resources::ResourceProvenance;
+use crate::generators::{Dirt, EdgeWear, MaskGenerator, NoisePattern, Orientation, Thickness};
+use crate::resources::{BitmapMask, ResourceProvenance};
 use crate::{
-    LayerFill, LayerFilter, LayerId, MaterialChannel, MaterialLayer, MaterialProject, ResourceId,
-    valid_layer_strokes,
+    LayerFill, LayerFilter, LayerId, MaterialChannel, MaterialId, MaterialLayer, MaterialProject,
+    ResourceId, valid_layer_strokes,
 };
 
 /// Licence recorded for built-in library entries.
@@ -23,7 +24,7 @@ pub const BUILT_IN_LICENSE: &str = "MIT OR Apache-2.0";
 const BUILT_IN_AUTHOR: &str = "SubstanceCraft";
 const MAX_LIBRARY_NAME_CHARS: usize = 64;
 
-fn built_in_provenance() -> ResourceProvenance {
+pub(crate) fn built_in_provenance() -> ResourceProvenance {
     ResourceProvenance {
         author: BUILT_IN_AUTHOR.to_owned(),
         license: BUILT_IN_LICENSE.to_owned(),
@@ -31,7 +32,11 @@ fn built_in_provenance() -> ResourceProvenance {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+fn unassigned() -> MaterialId {
+    MaterialId::UNASSIGNED
+}
+
+pub(crate) fn valid_name(name: &str) -> bool {
     let chars = name.trim().chars().count();
     chars > 0 && chars <= MAX_LIBRARY_NAME_CHARS
 }
@@ -46,6 +51,8 @@ pub enum LibraryError {
     InvalidLayers(String),
     #[error("smart material `{name}` exposes `{parameter}`, which no layer provides")]
     DanglingParameter { name: String, parameter: String },
+    #[error("smart mask `{0}` has an invalid generator, bitmap projection, or filter")]
+    InvalidMask(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -53,8 +60,14 @@ pub enum LibraryError {
 
 /// A reusable material: the values (and optional bitmaps, projection, and
 /// physical tile size) a fill layer writes, and which channels it enables.
+/// A project material is also a master that fill layers can link to as
+/// instances (see [`crate::MaterialLink`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterialResource {
+    /// Unique among the project's materials;
+    /// [`MaterialId::UNASSIGNED`] for built-ins and unsaved captures.
+    #[serde(default = "unassigned")]
+    pub id: MaterialId,
     pub name: String,
     pub fill: LayerFill,
     pub channels: BTreeSet<MaterialChannel>,
@@ -74,6 +87,7 @@ impl MaterialResource {
                         metallic: f32,
                         roughness: f32,
                         opacity: f32| Self {
+            id: MaterialId::UNASSIGNED,
             name: name.to_owned(),
             fill: LayerFill {
                 color: [color[0], color[1], color[2], 255],
@@ -151,6 +165,7 @@ impl MaterialResource {
     /// Captures a fill layer's values as a material.
     pub fn from_layer(layer: &MaterialLayer, name: impl Into<String>) -> Option<Self> {
         Some(Self {
+            id: MaterialId::UNASSIGNED,
             name: name.into(),
             fill: layer.fill?,
             channels: layer.channels.clone(),
@@ -160,10 +175,11 @@ impl MaterialResource {
     }
 
     /// Makes `layer` a fill of this material, keeping its masks and stack
-    /// position.
+    /// position. This copies the values: any link to a master is dropped.
     pub fn apply_to(&self, layer: &mut MaterialLayer) {
         layer.fill = Some(self.fill);
         layer.channels = self.channels.clone();
+        layer.material_link = None;
     }
 
     pub fn validate(&self) -> Result<(), LibraryError> {
@@ -193,6 +209,15 @@ pub enum ExposedProperty {
 }
 
 impl ExposedProperty {
+    pub const ALL: [Self; 6] = [
+        Self::Opacity,
+        Self::FillColor,
+        Self::FillRoughness,
+        Self::FillMetallic,
+        Self::FillHeight,
+        Self::GeneratorAmount,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Opacity => "opacity",
@@ -225,19 +250,22 @@ fn generator_amount(generator: &mut MaskGenerator) -> Option<&mut f32> {
         MaskGenerator::Dirt(settings) => Some(&mut settings.amount),
         MaskGenerator::Noise(settings) => Some(&mut settings.amount),
         MaskGenerator::Thickness(settings) => Some(&mut settings.amount),
-        MaskGenerator::Orientation(_) | MaskGenerator::Gradient(_) => None,
+        MaskGenerator::Orientation(_)
+        | MaskGenerator::Gradient(_)
+        | MaskGenerator::IdColor(_)
+        | MaskGenerator::Pattern(_) => None,
     }
 }
 
 impl ExposedProperty {
-    fn read(self, layer: &MaterialLayer) -> Option<ParameterValue> {
+    pub(crate) fn read(self, layer: &MaterialLayer) -> Option<ParameterValue> {
         let mut layer = layer.clone();
         self.access(&mut layer, None)
     }
 
     /// Reads the property, writing `value` first when given. `None` when the
     /// layer lacks the property or the value has the wrong type.
-    fn access(
+    pub(crate) fn access(
         self,
         layer: &mut MaterialLayer,
         value: Option<ParameterValue>,
@@ -301,8 +329,9 @@ pub struct SmartMaterial {
 }
 
 impl SmartMaterial {
-    /// Captures a layer tree. Polygon masks (tied to one mesh's triangles)
-    /// and anchors pointing outside the tree are dropped; every fill's
+    /// Captures a layer tree. Polygon masks (tied to one mesh's triangles),
+    /// links to project materials (kept as plain fills), and anchors
+    /// pointing outside the tree are dropped; every fill's
     /// colour, roughness, and metallic and every generator's amount are
     /// exposed.
     pub fn from_layer(layer: &MaterialLayer, name: impl Into<String>) -> Self {
@@ -310,6 +339,12 @@ impl SmartMaterial {
         let inside: BTreeSet<LayerId> = root.walk().iter().map(|layer| layer.id).collect();
         fn strip(layer: &mut MaterialLayer, inside: &BTreeSet<LayerId>) {
             layer.polygon_mask = None;
+            layer.material_link = None;
+            for evolution in &mut layer.evolutions {
+                evolution
+                    .drives
+                    .retain(|drive| inside.contains(&drive.layer));
+            }
             if layer
                 .mask_anchor
                 .is_some_and(|anchor| !inside.contains(&anchor.layer))
@@ -415,6 +450,15 @@ impl SmartMaterial {
             {
                 anchor.layer = *id;
             }
+            for drive in layer
+                .evolutions
+                .iter_mut()
+                .flat_map(|evolution| &mut evolution.drives)
+            {
+                if let Some(id) = mapping.get(&drive.layer) {
+                    drive.layer = *id;
+                }
+            }
             for child in layer.children.iter_mut().flatten() {
                 remap(child, mapping);
             }
@@ -431,7 +475,11 @@ impl SmartMaterial {
         let layers = self.root.walk();
         let mut ids = BTreeSet::new();
         if layers.iter().any(|layer| {
-            !ids.insert(layer.id) || !layer.has_valid_settings() || !valid_layer_strokes(layer)
+            !ids.insert(layer.id)
+                || !layer.has_valid_settings()
+                || !layer.has_valid_evolutions()
+                || !valid_layer_strokes(layer)
+                || layer.material_link.is_some()
         }) {
             return Err(LibraryError::InvalidLayers(self.name.clone()));
         }
@@ -472,7 +520,7 @@ impl SmartMaterial {
         paint.mask_filters = vec![LayerFilter::Invert];
         let mut grime = fill(4, "Grime", [60, 50, 40], 0.0, 0.9);
         grime.mask_generator = Some(MaskGenerator::Dirt(Dirt::DEFAULT));
-        let worn_paint = group(1, "Worn painted steel", vec![steel, paint, grime]);
+        let mut worn_paint = group(1, "Worn painted steel", vec![steel, paint, grime]);
 
         // Iron with blotchy rust and dirt.
         let iron = fill(2, "Iron", [135, 131, 126], 1.0, 0.45);
@@ -480,7 +528,46 @@ impl SmartMaterial {
         rust.mask_generator = Some(MaskGenerator::Noise(NoisePattern::DEFAULT));
         let mut dirt = fill(4, "Dirt", [70, 60, 48], 0.0, 0.95);
         dirt.mask_generator = Some(MaskGenerator::Dirt(Dirt::DEFAULT));
-        let rusty_iron = group(1, "Rusty iron", vec![iron, rust, dirt]);
+        let mut rusty_iron = group(1, "Rusty iron", vec![iron, rust, dirt]);
+
+        // Each finish has one control from clean (0) to heavily worn (1),
+        // starting halfway.
+        let control =
+            |root: &mut MaterialLayer, name: &str, drives: &[(u64, ExposedProperty, f32, f32)]| {
+                let evolution = Evolution {
+                    name: name.to_owned(),
+                    amount: 0.5,
+                    drives: drives
+                        .iter()
+                        .map(|(layer, property, from, to)| EvolutionDrive {
+                            layer: LayerId(*layer),
+                            property: *property,
+                            from: ParameterValue::Scalar(*from),
+                            to: ParameterValue::Scalar(*to),
+                        })
+                        .collect(),
+                };
+                evolution.apply(root, evolution.amount);
+                root.evolutions.push(evolution);
+            };
+        control(
+            &mut worn_paint,
+            "Wear",
+            &[
+                (3, ExposedProperty::GeneratorAmount, 0.25, 0.8),
+                (4, ExposedProperty::GeneratorAmount, 0.15, 0.75),
+                (3, ExposedProperty::FillRoughness, 0.45, 0.7),
+            ],
+        );
+        control(
+            &mut rusty_iron,
+            "Rust",
+            &[
+                (3, ExposedProperty::GeneratorAmount, 0.15, 0.85),
+                (2, ExposedProperty::FillRoughness, 0.4, 0.6),
+                (4, ExposedProperty::GeneratorAmount, 0.2, 0.6),
+            ],
+        );
 
         [
             (
@@ -505,6 +592,134 @@ impl SmartMaterial {
 }
 
 // ---------------------------------------------------------------------------
+// Smart masks
+
+/// A reusable mask setup: a layer's generator, bitmap mask, mask filters,
+/// and final inversion. Painted mask strokes, polygon selections, and ID
+/// clipping belong to one layer on one mesh and are not part of it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmartMask {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<MaskGenerator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitmap: Option<BitmapMask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<LayerFilter>,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub provenance: ResourceProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl SmartMask {
+    /// Captures a layer's mask setup, or `None` when it has no generator,
+    /// bitmap mask, or mask filters to reuse.
+    pub fn from_layer(layer: &MaterialLayer, name: impl Into<String>) -> Option<Self> {
+        if layer.mask_generator.is_none()
+            && layer.mask_bitmap.is_none()
+            && layer.mask_filters.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            name: name.into(),
+            description: String::new(),
+            generator: layer.mask_generator,
+            bitmap: layer.mask_bitmap,
+            filters: layer.mask_filters.clone(),
+            invert: layer.invert_final_mask,
+            provenance: ResourceProvenance::default(),
+            tags: Vec::new(),
+        })
+    }
+
+    /// Replaces `layer`'s generator, bitmap mask, mask filters, and final
+    /// inversion with this setup. Its content, painted mask strokes, polygon
+    /// selection, and ID clipping stay.
+    pub fn apply_to(&self, layer: &mut MaterialLayer) {
+        layer.mask_generator = self.generator;
+        layer.mask_bitmap = self.bitmap;
+        layer.mask_filters.clone_from(&self.filters);
+        layer.invert_final_mask = self.invert;
+    }
+
+    pub fn requirements(&self) -> MapRequirements {
+        MapRequirements {
+            mesh_maps: self
+                .generator
+                .is_some_and(|generator| generator.needs_mesh_maps())
+                || self
+                    .bitmap
+                    .is_some_and(|bitmap| bitmap.projection.needs_mesh_maps()),
+            resources: self.bitmap.iter().map(|bitmap| bitmap.resource).collect(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), LibraryError> {
+        if !valid_name(&self.name) {
+            return Err(LibraryError::InvalidName(self.name.clone()));
+        }
+        let mut layer = MaterialLayer::new_paint(LayerId(0), "");
+        self.apply_to(&mut layer);
+        if !layer.has_valid_settings() {
+            return Err(LibraryError::InvalidMask(self.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Original procedural masks for common wear and weathering.
+    pub fn built_in() -> Vec<Self> {
+        let mask = |name: &str, description: &str, generator, tags: &[&str]| Self {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            generator: Some(generator),
+            bitmap: None,
+            filters: Vec::new(),
+            invert: false,
+            provenance: built_in_provenance(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        };
+        vec![
+            mask(
+                "Worn edges",
+                "Convex edges and rims, chipped by noise.",
+                MaskGenerator::EdgeWear(EdgeWear::DEFAULT),
+                &["wear", "edges"],
+            ),
+            mask(
+                "Cavity dirt",
+                "Occluded crevices and concave corners.",
+                MaskGenerator::Dirt(Dirt::DEFAULT),
+                &["dirt", "cavity"],
+            ),
+            mask(
+                "Dust from above",
+                "Surfaces facing up, where dust settles.",
+                MaskGenerator::Orientation(Orientation::DEFAULT),
+                &["dust", "orientation"],
+            ),
+            mask(
+                "Thin parts",
+                "Thin geometry such as fins and edges, for light passing through.",
+                MaskGenerator::Thickness(Thickness::DEFAULT),
+                &["thickness"],
+            ),
+            mask(
+                "Blotches",
+                "Large irregular patches in object space.",
+                MaskGenerator::Noise(NoisePattern::DEFAULT),
+                &["noise", "breakup"],
+            ),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Asset index
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -512,14 +727,16 @@ pub enum AssetKind {
     Bitmap,
     Material,
     SmartMaterial,
+    SmartMask,
     ExportPreset,
 }
 
 impl AssetKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Bitmap,
         Self::Material,
         Self::SmartMaterial,
+        Self::SmartMask,
         Self::ExportPreset,
     ];
 
@@ -528,6 +745,7 @@ impl AssetKind {
             Self::Bitmap => "Bitmap",
             Self::Material => "Material",
             Self::SmartMaterial => "Smart material",
+            Self::SmartMask => "Smart mask",
             Self::ExportPreset => "Export preset",
         }
     }
@@ -565,7 +783,8 @@ impl AssetEntry {
 
 impl MaterialProject {
     /// Every asset available to the project: its own resources, materials,
-    /// smart materials, and export presets, then the built-in library.
+    /// smart materials, smart masks, and export presets, each followed by
+    /// the built-in library's.
     pub fn assets(&self) -> Vec<AssetEntry> {
         let entry =
             |kind, name: &str, built_in, provenance: &ResourceProvenance, tags: &[String]| {
@@ -617,6 +836,20 @@ impl MaterialProject {
                 ));
             }
         }
+        for (masks, is_built_in) in [
+            (self.smart_masks.clone(), false),
+            (SmartMask::built_in(), true),
+        ] {
+            for mask in &masks {
+                assets.push(entry(
+                    AssetKind::SmartMask,
+                    &mask.name,
+                    is_built_in,
+                    &mask.provenance,
+                    &mask.tags,
+                ));
+            }
+        }
         for preset in &self.export_presets {
             assets.push(entry(
                 AssetKind::ExportPreset,
@@ -654,6 +887,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::generators::Dirt;
     use crate::{
         AnchorMask, BakeContext, ColorSpace, MeshMapSettings, PrimitivePreset, ProjectResource,
         ResourceImages, TextureImage, TextureResolution, TextureSet, TextureSetId, bake_mesh_maps,
@@ -858,6 +1092,116 @@ mod tests {
                 .search_assets(BUILT_IN_LICENSE, Some(AssetKind::Material))
                 .iter()
                 .all(|asset| asset.built_in)
+        );
+    }
+
+    #[test]
+    fn tc_0278_smart_masks_capture_apply_validate_and_are_searchable() {
+        let library = SmartMask::built_in();
+        assert_eq!(library.len(), 5);
+        for mask in &library {
+            mask.validate().unwrap();
+            assert!(
+                mask.requirements().mesh_maps,
+                "{} reads mesh maps",
+                mask.name
+            );
+        }
+
+        // Capture: the procedural setup only, never strokes or selections.
+        let mut source = MaterialLayer::new_fill(LayerId(1), "Rust", LayerFill::default());
+        source.mask_generator = Some(MaskGenerator::Dirt(Dirt::DEFAULT));
+        source.mask_filters = vec![LayerFilter::Invert];
+        source.invert_final_mask = true;
+        source.mask_bitmap = Some(BitmapMask {
+            resource: ResourceId(4),
+            projection: crate::TextureProjection::default(),
+            invert: false,
+        });
+        source.mask_strokes.push(crate::MaskStroke::new(
+            vec![glam::Vec2::splat(0.5)],
+            4.0,
+            0.0,
+        ));
+        source.polygon_mask = Some(crate::PolygonMask::default());
+        let captured = SmartMask::from_layer(&source, "Inverted dirt").unwrap();
+        assert_eq!(
+            captured.requirements().resources,
+            BTreeSet::from([ResourceId(4)])
+        );
+        assert!(
+            SmartMask::from_layer(&MaterialLayer::new_paint(LayerId(2), "Plain"), "x").is_none(),
+            "a layer without a mask setup has nothing to capture"
+        );
+
+        // Applying replaces the setup and keeps the target's own strokes,
+        // selection, and content.
+        let mut target = MaterialLayer::new_paint(LayerId(3), "Paint");
+        target.mask_generator = Some(MaskGenerator::EdgeWear(EdgeWear::DEFAULT));
+        target.mask_strokes.push(crate::MaskStroke::new(
+            vec![glam::Vec2::splat(0.25)],
+            2.0,
+            1.0,
+        ));
+        target.id_mask_color = Some([1, 2, 3]);
+        captured.apply_to(&mut target);
+        assert_eq!(target.mask_generator, source.mask_generator);
+        assert_eq!(target.mask_filters, source.mask_filters);
+        assert_eq!(target.mask_bitmap, source.mask_bitmap);
+        assert!(target.invert_final_mask);
+        assert_eq!(target.mask_strokes.len(), 1);
+        assert_eq!(target.id_mask_color, Some([1, 2, 3]));
+        assert_eq!(target.polygon_mask, None);
+
+        // Validation: names, generator ranges, and the bitmap's resource.
+        let mut unnamed = captured.clone();
+        unnamed.name = " ".to_owned();
+        assert!(unnamed.validate().is_err());
+        let mut broken = captured.clone();
+        broken.generator = Some(MaskGenerator::Dirt(Dirt {
+            amount: 3.0,
+            ..Dirt::DEFAULT
+        }));
+        assert_eq!(
+            broken.validate(),
+            Err(LibraryError::InvalidMask("Inverted dirt".to_owned()))
+        );
+        let mut project = MaterialProject::empty();
+        project.smart_masks.push(captured.clone());
+        assert_eq!(
+            project.validate(),
+            Err(crate::ProjectError::MissingResource(ResourceId(4)))
+        );
+        project.resources.push(crate::ProjectResource::new(
+            ResourceId(4),
+            "Stains",
+            "stains.png",
+        ));
+        project.validate().unwrap();
+
+        // Saving and deleting masks is undoable; masks are searchable assets.
+        let mut history = crate::EditHistory::default();
+        let before = project.smart_masks.clone();
+        let mut after = before.clone();
+        after.push(library[2].clone());
+        assert!(history.apply(
+            &mut project,
+            crate::EditCommand::SmartMasks { before, after },
+        ));
+        assert_eq!(project.smart_masks.len(), 2);
+        assert!(history.undo(&mut project));
+        assert_eq!(project.smart_masks.len(), 1);
+        let names: Vec<String> = project
+            .search_assets("dust", Some(AssetKind::SmartMask))
+            .into_iter()
+            .map(|asset| asset.name)
+            .collect();
+        assert_eq!(names, ["Dust from above"]);
+        assert!(
+            project
+                .search_assets("smart mask project", None)
+                .iter()
+                .any(|asset| asset.name == "Inverted dirt")
         );
     }
 

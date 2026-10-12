@@ -70,7 +70,7 @@ impl MigrationReport {
 type Migration = fn(&mut Map<String, Value>) -> String;
 
 /// `MIGRATIONS[i]` upgrades schema `i + 1` to `i + 2`.
-const MIGRATIONS: &[Migration] = &[migrate_1_to_2];
+const MIGRATIONS: &[Migration] = &[migrate_1_to_2, migrate_2_to_3];
 
 /// Schema 2 adds optional project-level data (named cameras) and the
 /// stable text layout. Version 1 files need no rewriting: the new fields
@@ -78,6 +78,19 @@ const MIGRATIONS: &[Migration] = &[migrate_1_to_2];
 /// instead of silently dropping the fields they do not know.
 fn migrate_1_to_2(_project: &mut Map<String, Value>) -> String {
     "schema 1 → 2: no field changes".to_owned()
+}
+
+/// Schema 3 gives project materials stable ids, so fill layers can link to
+/// them as instances. Materials are numbered from 1 in file order.
+fn migrate_2_to_3(project: &mut Map<String, Value>) -> String {
+    let mut count = 0_u64;
+    if let Some(Value::Array(materials)) = project.get_mut("materials") {
+        for material in materials.iter_mut().filter_map(Value::as_object_mut) {
+            count += 1;
+            material.insert("id".to_owned(), Value::from(count));
+        }
+    }
+    format!("schema 2 → 3: numbered {count} material(s)")
 }
 
 /// Decodes project JSON of any supported schema, upgrading it in memory.
@@ -374,6 +387,50 @@ mod tests {
             object_with_version(&mut value, version);
             assert!(decode_project_json_with_report(&serde_json::to_vec(&value).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn tc_0270_schema_2_materials_get_ids_and_link_after_upgrade() {
+        let mut project = sample_project();
+        project.materials = substancecraft_core::MaterialResource::built_in()
+            .into_iter()
+            .take(2)
+            .collect();
+        let mut value = serde_json::to_value(&project).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schema_version".to_owned(), Value::from(2));
+        for material in object["materials"].as_array_mut().unwrap() {
+            material.as_object_mut().unwrap().remove("id");
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        let (mut upgraded, report) = decode_project_json_with_report(&bytes).unwrap();
+        let ids: Vec<u64> = upgraded.materials.iter().map(|m| m.id.0).collect();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(report.from_version, 2);
+        assert_eq!(
+            report.migrated,
+            ["schema 2 → 3: numbered 2 material(s)".to_owned()]
+        );
+        assert!(report.defaulted.is_empty() && report.unknown.is_empty());
+
+        // The upgraded project links an instance and round-trips it.
+        let link = upgraded
+            .link_material_command(
+                TextureSetId(1),
+                LayerId(3),
+                substancecraft_core::MaterialId(2),
+            )
+            .unwrap();
+        let mut history = substancecraft_core::EditHistory::default();
+        assert!(history.apply(&mut upgraded, link));
+        let saved = encode_project_json(&upgraded).unwrap();
+        let text = String::from_utf8(saved.clone()).unwrap();
+        assert!(text.contains(
+            "\"material_link\": {
+"
+        ));
+        assert_eq!(decode_project_json(&saved).unwrap(), upgraded);
     }
 
     fn object_with_version(value: &mut Value, version: Value) {

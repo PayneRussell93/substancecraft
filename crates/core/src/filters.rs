@@ -39,10 +39,31 @@ pub enum LayerFilter {
         /// Added lightness, `-1..=1`.
         lightness: f32,
     },
+    /// Adds `brightness` and scales the distance from mid-grey by
+    /// `1 + contrast` (both `-1..=1`).
+    BrightnessContrast {
+        brightness: f32,
+        contrast: f32,
+    },
+    /// Rounds values to `levels` evenly spaced steps (`2..=64`).
+    Posterize {
+        levels: u32,
+    },
+    /// Black below `level`, white above, over a `softness` wide ramp.
+    Threshold {
+        level: f32,
+        softness: f32,
+    },
+    /// Maps luminance to a ramp from `dark` to `light` (sRGB colours):
+    /// tints grayscale detail, or grays colour by the ramp's luminance.
+    GradientMap {
+        dark: [u8; 3],
+        light: [u8; 3],
+    },
 }
 
 impl LayerFilter {
-    pub const PRESETS: [Self; 5] = [
+    pub const PRESETS: [Self; 9] = [
         Self::Blur { radius: 4.0 },
         Self::Sharpen {
             radius: 2.0,
@@ -61,6 +82,19 @@ impl LayerFilter {
             saturation: 1.0,
             lightness: 0.0,
         },
+        Self::BrightnessContrast {
+            brightness: 0.0,
+            contrast: 0.0,
+        },
+        Self::Posterize { levels: 4 },
+        Self::Threshold {
+            level: 0.5,
+            softness: 0.05,
+        },
+        Self::GradientMap {
+            dark: [40, 30, 20],
+            light: [230, 210, 170],
+        },
     ];
 
     pub const fn name(self) -> &'static str {
@@ -70,6 +104,10 @@ impl LayerFilter {
             Self::Levels { .. } => "Levels",
             Self::Invert => "Invert",
             Self::HueSaturation { .. } => "Hue / Saturation",
+            Self::BrightnessContrast { .. } => "Brightness / Contrast",
+            Self::Posterize { .. } => "Posterize",
+            Self::Threshold { .. } => "Threshold",
+            Self::GradientMap { .. } => "Gradient map",
         }
     }
 
@@ -104,6 +142,15 @@ impl LayerFilter {
                     && finite_in(saturation, 0.0, 2.0)
                     && finite_in(lightness, -1.0, 1.0)
             }
+            Self::BrightnessContrast {
+                brightness,
+                contrast,
+            } => finite_in(brightness, -1.0, 1.0) && finite_in(contrast, -1.0, 1.0),
+            Self::Posterize { levels } => (2..=64).contains(&levels),
+            Self::Threshold { level, softness } => {
+                finite_in(level, 0.0, 1.0) && finite_in(softness, 0.0, 1.0)
+            }
+            Self::GradientMap { .. } => true,
         }
     }
 
@@ -126,6 +173,25 @@ impl LayerFilter {
             }
             Self::Invert => 1.0 - value,
             Self::HueSaturation { lightness, .. } => (value + lightness).clamp(0.0, 1.0),
+            Self::BrightnessContrast {
+                brightness,
+                contrast,
+            } => ((value - 0.5) * (1.0 + contrast) + 0.5 + brightness).clamp(0.0, 1.0),
+            Self::Posterize { levels } => {
+                let steps = (levels.max(2) - 1) as f32;
+                (value.clamp(0.0, 1.0) * steps).round() / steps
+            }
+            Self::Threshold { level, softness } => {
+                if softness <= 0.0 {
+                    f32::from(value >= level)
+                } else {
+                    ((value - (level - softness * 0.5)) / softness).clamp(0.0, 1.0)
+                }
+            }
+            Self::GradientMap { dark, light } => {
+                let ramp = gradient_color(dark, light, value);
+                luminance(ramp)
+            }
             _ => value,
         }
     }
@@ -144,6 +210,7 @@ impl LayerFilter {
                     (l + lightness).clamp(0.0, 1.0),
                 )
             }
+            Self::GradientMap { dark, light } => gradient_color(dark, light, luminance(color)),
             other => Vec3::new(
                 other.map_value(color.x),
                 other.map_value(color.y),
@@ -151,6 +218,18 @@ impl LayerFilter {
             ),
         }
     }
+}
+
+/// Rec. 709 luminance of a colour.
+fn luminance(color: Vec3) -> f32 {
+    color.dot(Vec3::new(0.2126, 0.7152, 0.0722))
+}
+
+/// The gradient map's colour at `amount` (`0..=1`) between two sRGB
+/// colours.
+fn gradient_color(dark: [u8; 3], light: [u8; 3], amount: f32) -> Vec3 {
+    let unit = |color: [u8; 3]| Vec3::from(color.map(|channel| f32::from(channel) / 255.0));
+    unit(dark).lerp(unit(light), amount.clamp(0.0, 1.0))
 }
 
 /// What the texels of a plane hold, which decides how filters treat them.
@@ -532,5 +611,56 @@ mod tests {
         let mut mask = vec![0.2, 0.8];
         apply_to_mask(&mut mask, PlaneGrid::full(2, 1), &[LayerFilter::Invert]);
         assert!((mask[0] - 0.8).abs() < 1e-6 && (mask[1] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tc_0299_tone_filters_map_values_and_gradients_tint() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        let contrast = LayerFilter::BrightnessContrast {
+            brightness: 0.1,
+            contrast: 1.0,
+        };
+        assert!(close(contrast.map_value(0.5), 0.6));
+        assert!(close(contrast.map_value(0.75), 1.0));
+        assert!(close(contrast.map_value(0.3), 0.2));
+        let posterize = LayerFilter::Posterize { levels: 3 };
+        assert_eq!(posterize.map_value(0.2), 0.0);
+        assert_eq!(posterize.map_value(0.3), 0.5);
+        assert_eq!(posterize.map_value(0.9), 1.0);
+        let hard = LayerFilter::Threshold {
+            level: 0.5,
+            softness: 0.0,
+        };
+        assert_eq!((hard.map_value(0.49), hard.map_value(0.5)), (0.0, 1.0));
+        let soft = LayerFilter::Threshold {
+            level: 0.5,
+            softness: 0.2,
+        };
+        assert!(close(soft.map_value(0.5), 0.5));
+        assert_eq!(soft.map_value(0.35), 0.0);
+        let map = LayerFilter::GradientMap {
+            dark: [0, 0, 255],
+            light: [255, 0, 0],
+        };
+        // Grey in, the ramp's middle out; black and white hit the ends.
+        let middle = map.map_color(Vec3::splat(0.5));
+        assert!(close(middle.x, 0.5) && close(middle.z, 0.5));
+        assert_eq!(map.map_color(Vec3::ZERO), Vec3::Z);
+        assert_eq!(map.map_color(Vec3::ONE), Vec3::X);
+        // On scalar data the ramp's luminance is used.
+        assert!(close(map.map_value(1.0), 0.2126));
+        // Validation and presets.
+        assert!(!LayerFilter::Posterize { levels: 1 }.is_valid());
+        assert!(
+            !LayerFilter::BrightnessContrast {
+                brightness: 2.0,
+                contrast: 0.0
+            }
+            .is_valid()
+        );
+        assert!(LayerFilter::PRESETS.iter().all(|filter| filter.is_valid()));
+        assert_eq!(LayerFilter::PRESETS.len(), 9);
+        // Per-texel filters need no region halo.
+        assert_eq!(spatial_halo(&LayerFilter::PRESETS[3..], 2048), 0);
     }
 }

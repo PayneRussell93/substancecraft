@@ -35,6 +35,61 @@ pub struct ProjectResource {
     /// Free-form search keywords.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The file's size and hash when it was imported, so a moved and
+    /// renamed copy can still be found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+}
+
+/// A file's size and 64-bit FNV-1a hash, recorded when it is imported so a
+/// moved and renamed copy can be recognised by its content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentHash {
+    pub size: u64,
+    /// The hash as 16 lowercase hexadecimal digits.
+    pub fnv1a: String,
+}
+
+impl ContentHash {
+    /// The hash of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut hasher = ContentHasher::default();
+        hasher.update(bytes);
+        hasher.finish()
+    }
+}
+
+/// Computes a [`ContentHash`] over bytes fed in pieces.
+#[derive(Clone, Copy, Debug)]
+pub struct ContentHasher {
+    state: u64,
+    size: u64,
+}
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self {
+            state: 0xcbf2_9ce4_8422_2325,
+            size: 0,
+        }
+    }
+}
+
+impl ContentHasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.size += bytes.len() as u64;
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    pub fn finish(self) -> ContentHash {
+        ContentHash {
+            size: self.size,
+            fnv1a: format!("{:016x}", self.state),
+        }
+    }
 }
 
 impl ProjectResource {
@@ -47,6 +102,7 @@ impl ProjectResource {
             color_space: ColorSpace::default(),
             provenance: ResourceProvenance::default(),
             tags: Vec::new(),
+            content_hash: None,
         }
     }
 }
@@ -219,6 +275,47 @@ impl Default for DecalPlacement {
 }
 
 impl DecalPlacement {
+    /// The up direction a decal facing `normal` starts with: world +Y, or
+    /// -Z when the decal faces nearly straight up or down.
+    pub fn default_up(normal: Vec3) -> Vec3 {
+        if normal.normalize_or(Vec3::Z).dot(Vec3::Y).abs() > 0.9 {
+            Vec3::NEG_Z
+        } else {
+            Vec3::Y
+        }
+    }
+
+    /// Turns the decal to face `normal`, with its default up direction.
+    pub fn face(&mut self, normal: Vec3) {
+        self.normal = normal.normalize_or(Vec3::Z);
+        self.up = Self::default_up(self.normal);
+    }
+
+    /// How far the image is turned about its normal from its default up,
+    /// in degrees (`-180..=180`, counter-clockwise looking at the decal).
+    pub fn spin_degrees(self) -> f32 {
+        let normal = self.normal.normalize_or(Vec3::Z);
+        let flatten = |vector: Vec3| (vector - normal * vector.dot(normal)).normalize_or_zero();
+        let reference = flatten(Self::default_up(normal));
+        let up = flatten(self.up);
+        reference
+            .cross(up)
+            .dot(normal)
+            .atan2(reference.dot(up))
+            .to_degrees()
+    }
+
+    /// Turns the image about its normal to `degrees` from its default up.
+    pub fn set_spin_degrees(&mut self, degrees: f32) {
+        if !degrees.is_finite() {
+            return;
+        }
+        let normal = self.normal.normalize_or(Vec3::Z);
+        let reference = Self::default_up(normal);
+        let reference = (reference - normal * reference.dot(normal)).normalize_or(Vec3::Y);
+        self.up = glam::Quat::from_axis_angle(normal, degrees.to_radians()) * reference;
+    }
+
     fn is_valid(self) -> bool {
         let unit = |value: Vec2| {
             value.is_finite() && value.cmpge(Vec2::ZERO).all() && value.cmple(Vec2::ONE).all()
@@ -459,6 +556,39 @@ pub struct BitmapMask {
     pub projection: TextureProjection,
     #[serde(default)]
     pub invert: bool,
+}
+
+#[cfg(test)]
+mod decal_keyboard_tests {
+    use super::*;
+
+    #[test]
+    fn tc_0295_decals_face_axes_and_spin_without_the_mouse() {
+        let mut decal = DecalPlacement::default();
+        assert!(decal.spin_degrees().abs() < 1e-4);
+        decal.face(Vec3::X);
+        assert_eq!(decal.normal, Vec3::X);
+        assert_eq!(decal.up, Vec3::Y);
+        decal.face(Vec3::NEG_Y);
+        assert_eq!(decal.up, Vec3::NEG_Z, "straight down keeps a usable up");
+        assert!(decal.is_valid());
+        decal.face(Vec3::Z);
+        for degrees in [90.0, -45.0, 170.0] {
+            decal.set_spin_degrees(degrees);
+            assert!((decal.spin_degrees() - degrees).abs() < 1e-3, "{degrees}");
+            assert!(
+                decal.up.dot(decal.normal).abs() < 1e-5,
+                "up stays on the surface"
+            );
+            assert!(decal.is_valid());
+        }
+        // A quarter turn counter-clockwise looking at the decal points up
+        // to -X.
+        decal.set_spin_degrees(90.0);
+        assert!((decal.up - Vec3::NEG_X).length() < 1e-5);
+        decal.set_spin_degrees(f32::NAN);
+        assert!(decal.is_valid());
+    }
 }
 
 #[cfg(test)]
