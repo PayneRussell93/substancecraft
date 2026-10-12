@@ -407,10 +407,65 @@ bool sc_renderer_resize(ScRenderer* r, uint32_t width, uint32_t height) {
 
 // Upload a map of primitive `primitive`: slot 0 Base Color (sRGB, opacity in alpha), 1 ORM
 // (linear), 2 tangent normal (linear), 3 emissive (sRGB).
-bool sc_renderer_set_map(ScRenderer* r, uint32_t primitive, uint32_t slot, uint32_t width,
-        uint32_t height, uint8_t const* rgba8) {
+// Replaces map `slot` of `primitive` with an empty `levels`-level texture; fill it with
+// sc_renderer_set_map_region.
+bool sc_renderer_create_map(ScRenderer* r, uint32_t primitive, uint32_t slot, uint32_t width,
+        uint32_t height, uint32_t levels) {
     try {
-        return uploadMap(r, primitive, slot, width, height, rgba8);
+        if (primitive >= r->instances.size() || slot >= MAP_COUNT || width == 0 || height == 0 ||
+                levels == 0 || levels > 16) {
+            return false;
+        }
+        Texture* texture = Texture::Builder()
+                                   .width(width)
+                                   .height(height)
+                                   .levels(uint8_t(levels))
+                                   .sampler(Texture::Sampler::SAMPLER_2D)
+                                   .format(isSrgbSlot(slot) ? Texture::InternalFormat::SRGB8_A8
+                                                            : Texture::InternalFormat::RGBA8)
+                                   .build(*r->engine);
+        if (!texture) {
+            return false;
+        }
+        TextureSampler sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
+                TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::REPEAT);
+        sampler.setAnisotropy(8.0f);
+        r->instances[primitive]->setParameter(MAP_PARAMETERS[slot], texture, sampler);
+        if (r->maps[primitive][slot]) {
+            r->engine->destroy(r->maps[primitive][slot]);
+        }
+        r->maps[primitive][slot] = texture;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Writes a `width` x `height` block of RGBA8 texels at (`x`, `y`) of mip `level` of a map
+// made by sc_renderer_create_map.
+bool sc_renderer_set_map_region(ScRenderer* r, uint32_t primitive, uint32_t slot,
+        uint32_t level, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+        uint8_t const* rgba8) {
+    try {
+        if (primitive >= r->instances.size() || slot >= MAP_COUNT || width == 0 || height == 0) {
+            return false;
+        }
+        Texture* texture = r->maps[primitive][slot];
+        if (!texture || level >= texture->getLevels() ||
+                uint64_t(x) + width > texture->getWidth(level) ||
+                uint64_t(y) + height > texture->getHeight(level)) {
+            return false;
+        }
+        size_t const bytes = size_t(width) * height * 4;
+        void* copy = copyBytes(rgba8, bytes);
+        if (!copy) {
+            return false;
+        }
+        // Filament takes ownership of `copy` and frees it once uploaded.
+        texture->setImage(*r->engine, level, x, y, width, height,
+                Texture::PixelBufferDescriptor(copy, bytes, Texture::Format::RGBA,
+                        Texture::Type::UBYTE, freeCallback));
+        return true;
     } catch (...) {
         return false;
     }

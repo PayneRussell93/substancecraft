@@ -17,8 +17,8 @@ use substancecraft_api::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
     bake_texture_set_material, existing_export_files, export_preflight, import_binary_fbx_meshes,
     import_gltf_file, load_project_file_with_report, load_project_resources, load_texture_image,
-    rebake_texture_set_channel_regions, rebake_texture_set_material_regions,
-    save_project_file, write_exported_textures, write_texture,
+    rebake_texture_set_channel_regions, rebake_texture_set_material_regions, save_project_file,
+    write_exported_textures, write_texture,
 };
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
@@ -29,8 +29,7 @@ use substancecraft_core::{
     MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PreflightIssue,
     PreflightSeverity, PrimitivePreset, ProjectResource, ResourceId, ResourceImages, SelectionMode,
     TexelRect, TextureImage, TextureResolution, TextureSet, TextureSetId, ViewportCamera,
-    ViewportLighting, stroke_texel_bounds,
-    remap_subdivided_triangles,
+    ViewportLighting, remap_subdivided_triangles, stroke_texel_bounds,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
@@ -295,6 +294,16 @@ fn render_size(viewport_width: f32, viewport_height: f32, long_edge: u32) -> (u3
 /// Largest still render edge the renderer accepts.
 const MAX_RENDER_EDGE: u32 = 2048;
 
+/// Longest edge the viewport shows a texture set at; larger sets preview a
+/// downscaled copy, while exports keep their full size.
+const PREVIEW_MAX_EDGE: u32 = 4096;
+
+/// `set` as the viewport bakes it: downscaled past [`PREVIEW_MAX_EDGE`].
+fn preview_copy(set: &TextureSet) -> std::borrow::Cow<'_, TextureSet> {
+    set.downscaled(PREVIEW_MAX_EDGE)
+        .map_or(std::borrow::Cow::Borrowed(set), std::borrow::Cow::Owned)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaintMode {
     View,
@@ -362,6 +371,8 @@ struct BakedPreview {
     textures: PreviewTextures,
     /// Revision of the texture set the textures were baked from.
     set_revision: u64,
+    /// Set when the textures were patched from the previous preview.
+    patch: Option<PreviewPatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,10 +386,23 @@ struct PreviewKey {
 }
 
 struct PreviewJob {
-    receiver: Receiver<Result<PreviewTextures, String>>,
+    /// The bake result, and whether it patched the shown preview.
+    receiver: Receiver<(Result<PreviewTextures, String>, bool)>,
     key: PreviewKey,
     /// Revision of the texture set when the bake started.
     set_revision: u64,
+    /// Content keys of the textures being patched and the regions rebaked,
+    /// when the job patches the shown preview.
+    patch: Option<(Vec<usize>, Vec<TexelRect>)>,
+}
+
+/// How a shown preview differs from the one before it: each texture's
+/// content key paired with the key of the texture it was patched from, and
+/// the texels rebaked. The viewport re-uploads only those texels.
+#[derive(Clone, Debug, PartialEq)]
+struct PreviewPatch {
+    keys: Vec<(usize, usize)>,
+    regions: Vec<TexelRect>,
 }
 
 /// Shared inputs of a background texture-set bake.
@@ -533,6 +557,30 @@ impl PreviewTextures {
             Self::Single(texture) => texture,
         }
     }
+
+    /// Viewport content keys of every texture, in upload order.
+    fn keys(&self) -> Vec<usize> {
+        match self {
+            Self::Material(textures) => [
+                &textures.base_color,
+                &textures.orm,
+                &textures.normal,
+                &textures.emissive,
+            ]
+            .into_iter()
+            .map(texture_key)
+            .collect(),
+            Self::Single(texture) => vec![texture_key(texture)],
+        }
+    }
+}
+
+/// Identifies a texture's content for the viewport: its buffer, which a
+/// bake never reuses for different content while the texture is alive.
+fn texture_key(texture: &BakedTexture) -> usize {
+    (texture.rgba8.as_ptr() as usize)
+        ^ (texture.width as usize).rotate_left(7)
+        ^ (texture.height as usize).rotate_left(17)
 }
 
 /// Identifies every input that can make a mesh-map bake stale.
@@ -898,21 +946,39 @@ impl SubstanceCraftApp {
             }
         }
 
+        let patch = self
+            .baked_preview
+            .as_ref()
+            .and_then(|preview| preview.patch.as_ref());
         let upload = |renderer: &mut FilamentRuntime,
                       slot: usize,
                       map: MaterialMap,
                       texture: &BakedTexture| {
-            let key = (texture.rgba8.as_ptr() as usize)
-                ^ (texture.width as usize).rotate_left(7)
-                ^ (texture.height as usize).rotate_left(17);
-            renderer.set_map(
-                slot,
-                map,
-                key,
-                texture.width,
-                texture.height,
-                &texture.rgba8,
-            )
+            let key = texture_key(texture);
+            // A patched preview re-uploads only the texels it rebaked.
+            match patch.and_then(|patch| {
+                let (_, base) = patch.keys.iter().find(|(patched, _)| *patched == key)?;
+                Some((*base, patch.regions.as_slice()))
+            }) {
+                Some((base_key, regions)) => renderer.patch_map(
+                    slot,
+                    map,
+                    key,
+                    base_key,
+                    regions,
+                    texture.width,
+                    texture.height,
+                    &texture.rgba8,
+                ),
+                None => renderer.set_map(
+                    slot,
+                    map,
+                    key,
+                    texture.width,
+                    texture.height,
+                    &texture.rgba8,
+                ),
+            }
         };
         // Neutral fallbacks: grey dielectric, AO 1 / roughness 0.58, flat
         // normal, no emission.
@@ -1994,7 +2060,11 @@ impl SubstanceCraftApp {
         else {
             return;
         };
-        let (set_width, set_height) = (texture_set.resolution.width, texture_set.resolution.height);
+        // Dirty texels are tracked on the preview, which may be downscaled.
+        let factor = texture_set.preview_factor(PREVIEW_MAX_EDGE);
+        let set_width = texture_set.resolution.width.div_ceil(factor);
+        let set_height = texture_set.resolution.height.div_ceil(factor);
+        let preview_radius = |radius: f32| radius / factor as f32;
         let Some(layer) = texture_set.layer_mut(layer_id) else {
             return;
         };
@@ -2053,7 +2123,13 @@ impl SubstanceCraftApp {
             }
             self.stroke_paths[path] = Some(stroke_count);
             self.active_stroke = Some(stroke_key);
-            let bounds = stroke_texel_bounds(&[uv], radius_pixels, tip, set_width, set_height);
+            let bounds = stroke_texel_bounds(
+                &[uv],
+                preview_radius(radius_pixels),
+                tip,
+                set_width,
+                set_height,
+            );
             self.invalidate_preview_texels(bounds);
             return;
         }
@@ -2063,10 +2139,12 @@ impl SubstanceCraftApp {
         };
         let target = match mode {
             PaintMode::View | PaintMode::Select => return,
-            PaintMode::Paint | PaintMode::Erase => layer.paint_strokes.get_mut(index).map(|stroke| {
-                let shape = (stroke.radius_pixels, stroke.tip);
-                (&mut stroke.points, &mut stroke.pressures, shape)
-            }),
+            PaintMode::Paint | PaintMode::Erase => {
+                layer.paint_strokes.get_mut(index).map(|stroke| {
+                    let shape = (stroke.radius_pixels, stroke.tip);
+                    (&mut stroke.points, &mut stroke.pressures, shape)
+                })
+            }
             PaintMode::Mask => layer.mask_strokes.get_mut(index).map(|stroke| {
                 let shape = (stroke.radius_pixels, stroke.tip);
                 (&mut stroke.points, &mut stroke.pressures, shape)
@@ -2088,8 +2166,13 @@ impl SubstanceCraftApp {
                 pressures.push(pressure.unwrap_or(1.0));
             }
             // Stamps are placed causally, so only the new segment changes.
-            let bounds =
-                stroke_texel_bounds(&points[points.len() - 2..], radius, tip, set_width, set_height);
+            let bounds = stroke_texel_bounds(
+                &points[points.len() - 2..],
+                preview_radius(radius),
+                tip,
+                set_width,
+                set_height,
+            );
             self.invalidate_preview_texels(bounds);
         }
     }
@@ -2821,11 +2904,11 @@ impl SubstanceCraftApp {
         {
             return None;
         }
-        let set = self.selected_texture_set_ref()?;
+        let set = preview_copy(self.selected_texture_set_ref()?);
         let regions = self
             .preview_dirty
             .as_ref()?
-            .regions(set, preview.set_revision)?;
+            .regions(&set, preview.set_revision)?;
         let textures = match (&preview.textures, key.target) {
             (PreviewTextures::Material(material), PreviewTarget::Material) => {
                 PreviewTextures::Material(Arc::clone(material))
@@ -2860,6 +2943,7 @@ impl SubstanceCraftApp {
                     key,
                     textures: PreviewTextures::Single(Arc::new(texture)),
                     set_revision: 0,
+                    patch: None,
                 });
             } else {
                 self.ensure_mesh_maps();
@@ -2880,6 +2964,9 @@ impl SubstanceCraftApp {
             Some(layer) => texture_set.soloed(layer).unwrap_or(texture_set),
             None => texture_set,
         };
+        let texture_set = texture_set
+            .downscaled(PREVIEW_MAX_EDGE)
+            .unwrap_or(texture_set);
         if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
             // Keep the previous preview until fresh maps arrive.
             self.ensure_mesh_maps();
@@ -2892,7 +2979,7 @@ impl SubstanceCraftApp {
         self.preview_dirty = match key.target {
             PreviewTarget::Material | PreviewTarget::Channel(_) => self
                 .selected_texture_set_ref()
-                .map(|set| incremental::PreviewDirty::new(set, set_revision)),
+                .map(|set| incremental::PreviewDirty::new(&preview_copy(set), set_revision)),
             _ => None,
         };
         if patch
@@ -2917,16 +3004,22 @@ impl SubstanceCraftApp {
             }
             return;
         }
+        let job_patch = patch
+            .as_ref()
+            .map(|(base, regions)| (base.keys(), regions.clone()));
         let (sender, receiver) = sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("preview-bake".to_owned())
             .spawn(move || {
-                let patched = patch.map(|(base, regions)| {
-                    inputs.patch_preview(&texture_set, key.target, &base, &regions)
+                let patched = patch.and_then(|(base, regions)| {
+                    inputs
+                        .patch_preview(&texture_set, key.target, &base, &regions)
+                        .ok()
                 });
+                let was_patched = patched.is_some();
                 let result = match (patched, key.target) {
                     // A patch that fails falls back to a full bake below.
-                    (Some(Ok(textures)), _) => Ok(textures),
+                    (Some(textures), _) => Ok(textures),
                     (_, PreviewTarget::Channel(channel)) => inputs
                         .bake_channel(&texture_set, channel)
                         .map(|texture| PreviewTextures::Single(Arc::new(texture))),
@@ -2960,7 +3053,7 @@ impl SubstanceCraftApp {
                         .bake_material(&texture_set)
                         .map(|textures| PreviewTextures::Material(Arc::new(textures))),
                 };
-                let _ = sender.send(result);
+                let _ = sender.send((result, was_patched));
             });
         match spawned {
             Ok(_) => {
@@ -2968,6 +3061,7 @@ impl SubstanceCraftApp {
                     receiver,
                     key,
                     set_revision,
+                    patch: job_patch,
                 });
             }
             Err(error) => {
@@ -2993,11 +3087,18 @@ impl SubstanceCraftApp {
             return;
         };
         match job.receiver.try_recv() {
-            Ok(result) => {
+            Ok((result, was_patched)) => {
                 let (key, set_revision) = (job.key, job.set_revision);
-                self.preview_job = None;
+                let job_patch = self.preview_job.take().and_then(|job| job.patch);
                 match result {
                     Ok(textures) => {
+                        let patch =
+                            job_patch
+                                .filter(|_| was_patched)
+                                .map(|(base, regions)| PreviewPatch {
+                                    keys: textures.keys().into_iter().zip(base).collect(),
+                                    regions,
+                                });
                         if let (PreviewTextures::Material(material), Some(set_id)) =
                             (&textures, key.texture_set)
                         {
@@ -3013,6 +3114,7 @@ impl SubstanceCraftApp {
                             key,
                             textures,
                             set_revision,
+                            patch,
                         });
                         self.bake_error = None;
                     }
@@ -3073,6 +3175,9 @@ impl SubstanceCraftApp {
             self.ensure_mesh_maps();
             return;
         }
+        let texture_set = texture_set
+            .downscaled(PREVIEW_MAX_EDGE)
+            .unwrap_or(texture_set);
         let revision = self.set_revision(set_id);
         let inputs = self.bake_inputs(set_id);
         let (sender, receiver) = sync_channel(1);
@@ -5292,7 +5397,8 @@ mod tests {
     }
 
     #[test]
-    fn tc_0302_painting_patches_the_preview_and_matches_a_full_bake() {
+    #[allow(clippy::unreachable)]
+    fn tc_0255_painting_patches_the_preview_and_matches_a_full_bake() {
         let context = egui::Context::default();
         let mut app = SubstanceCraftApp::default();
         small_sets(&mut app, 256);
@@ -5313,14 +5419,13 @@ mod tests {
         };
         let shown = |app: &SubstanceCraftApp| match &app.baked_preview.as_ref().unwrap().textures {
             PreviewTextures::Material(material) => MaterialTextures::clone(material),
-            PreviewTextures::Single(_) => panic!("material preview expected"),
+            PreviewTextures::Single(_) => unreachable!("material preview expected"),
         };
 
         for step in 0..6 {
             app.append_stroke_point(glam::Vec2::new(0.2 + step as f32 * 0.05, 0.4));
-            let (_, regions) = app
-                .preview_patch(&app.preview_key())
-                .expect("a stroke alone patches the preview");
+            // A stroke alone patches the preview.
+            let (_, regions) = app.preview_patch(&app.preview_key()).unwrap();
             assert!(!regions.is_empty() && regions.len() <= 2);
             pump_until(&mut app, &context, settled);
             assert!(shown(&app) == full_bake(&app), "step {step} differs");
@@ -5486,6 +5591,7 @@ mod tests {
                 rgba8: vec![0; 4],
             })),
             set_revision: 0,
+            patch: None,
         });
 
         // Auto: an outside save reloads the pixels and dirties only set A;

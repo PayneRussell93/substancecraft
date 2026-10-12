@@ -10,8 +10,9 @@ use thiserror::Error;
 
 use crate::compositing::{
     BakeContext, BakeError, BakedTexture, LayerMasks, base_texel, checked_bake_pixel_count,
-    contributes, parallel_fill, rgb_unit, try_filled, unit_to_byte,
+    contributes, parallel_fill_region, rgb_unit, try_filled, unit_to_byte,
 };
+use crate::region::TexelRect;
 use crate::{
     DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_ROUGHNESS, MaterialChannel,
     MeshMapKind, MeshMaps, TextureSet,
@@ -439,9 +440,18 @@ impl TextureSet {
         preset: &ExportPreset,
         context: BakeContext<'_>,
     ) -> Result<Vec<ExportedTexture>, BakeError> {
+        self.bake_export_in(preset, context, &self.bake_tiles()?)
+    }
+
+    /// [`Self::bake_export`] composited tile by tile.
+    pub(crate) fn bake_export_in(
+        &self,
+        preset: &ExportPreset,
+        context: BakeContext<'_>,
+        tiles: &[TexelRect],
+    ) -> Result<Vec<ExportedTexture>, BakeError> {
         preset.validate()?;
-        let id_map = self.validate_for_bake()?;
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        self.validate_for_region(TexelRect::full(1, 1))?;
         let sources: Vec<ExportSource> = preset.sources().into_iter().collect();
         if sources
             .iter()
@@ -473,7 +483,44 @@ impl TextureSet {
             }
         }
         let channels: Vec<MaterialChannel> = channels.into_iter().collect();
-        let masks = self.layer_masks(&channels, context, id_map.as_ref())?;
+        let textures = self.bake_tiles_into(tiles, preset.outputs.len(), |region| {
+            self.export_region(preset, &sources, &channels, context, region)
+        })?;
+
+        let mut exported = Vec::new();
+        for (output, rgba8) in preset.outputs.iter().zip(textures) {
+            if output.skip_if_black
+                && rgba8
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|texel| texel[..3] == [0, 0, 0])
+            {
+                continue;
+            }
+            exported.push(ExportedTexture {
+                file_stem: output.resolved_file_name(&self.name),
+                layout: output.layout,
+                texture: self.texture(rgba8),
+            });
+        }
+        Ok(exported)
+    }
+
+    /// Every output of `preset` over `region`, RGBA row-major within it.
+    /// Each of `sources` (reading `channels`) is baked once and shared.
+    fn export_region(
+        &self,
+        preset: &ExportPreset,
+        sources: &[ExportSource],
+        channels: &[MaterialChannel],
+        context: BakeContext<'_>,
+        region: TexelRect,
+    ) -> Result<Vec<Vec<u8>>, BakeError> {
+        let id_map = self.validate_for_region(region)?;
+        let id_map = id_map.as_deref();
+        let masks = self.layer_masks_in(channels, context, id_map, region)?;
+        let pixel_count = region.len();
 
         let mut planes = BTreeMap::new();
         for batch in sources.chunks(SOURCE_WORKERS) {
@@ -481,9 +528,9 @@ impl TextureSet {
                 let workers: Vec<_> = batch
                     .iter()
                     .map(|&source| {
-                        let (masks, id_map) = (&masks, id_map.as_ref());
+                        let masks = &masks;
                         scope.spawn(move || {
-                            self.export_source(source, context, masks, id_map, pixel_count)
+                            self.export_source(source, context, masks, id_map, region)
                         })
                     })
                     .collect();
@@ -497,7 +544,7 @@ impl TextureSet {
             }
         }
 
-        let mut exported = Vec::new();
+        let mut outputs = Vec::new();
         for output in &preset.outputs {
             let mut rgba8 = Vec::new();
             rgba8
@@ -537,34 +584,22 @@ impl TextureSet {
                 };
                 rgba8.extend(texel);
             }
-            if output.skip_if_black
-                && rgba8
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .all(|texel| texel[..3] == [0, 0, 0])
-            {
-                continue;
-            }
-            exported.push(ExportedTexture {
-                file_stem: output.resolved_file_name(&self.name),
-                layout: output.layout,
-                texture: self.texture(rgba8),
-            });
+            outputs.push(rgba8);
         }
-        Ok(exported)
+        Ok(outputs)
     }
 
-    /// One source as RGBA8 at the texture set's resolution.
+    /// One source as RGBA8 over `region`, row-major within it.
     fn export_source(
         &self,
         source: ExportSource,
         context: BakeContext<'_>,
         masks: &LayerMasks,
-        id_map: Option<&BakedTexture>,
-        pixel_count: usize,
+        id_map: Option<&[u8]>,
+        region: TexelRect,
     ) -> Result<Vec<u8>, BakeError> {
         let (width, height) = (self.resolution.width, self.resolution.height);
+        let pixel_count = region.len();
         let to_rgba8 = |values: &[Vec3]| -> Result<Vec<u8>, BakeError> {
             let mut rgba8 = Vec::new();
             rgba8
@@ -584,7 +619,7 @@ impl TextureSet {
             ExportSource::MeshMap(kind) => {
                 let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
                 let mut values = try_filled(pixel_count, Vec3::ZERO)?;
-                parallel_fill(&mut values, width, height, |uv| {
+                parallel_fill_region(&mut values, region, width, height, |uv| {
                     let sample = maps.sample(uv);
                     if !sample.covered {
                         return Vec3::ZERO;
@@ -604,14 +639,14 @@ impl TextureSet {
             ExportSource::Channel(channel) => channel,
         };
         match channel {
-            MaterialChannel::Id => Ok(match id_map {
-                Some(id_map) => id_map.rgba8.clone(),
-                None => self.bake_id_mask()?.rgba8,
-            }),
+            MaterialChannel::Id => match id_map {
+                Some(id_map) => Ok(id_map.to_vec()),
+                None => self.id_map_region(region),
+            },
             MaterialChannel::AmbientOcclusion => {
                 let mut values = try_filled(pixel_count, Vec3::ONE)?;
                 if let Some(maps) = context.mesh_maps {
-                    parallel_fill(&mut values, width, height, |uv| {
+                    parallel_fill_region(&mut values, region, width, height, |uv| {
                         let sample = maps.sample(uv);
                         Vec3::splat(if sample.covered {
                             sample.ambient_occlusion
@@ -623,7 +658,7 @@ impl TextureSet {
                 to_rgba8(&values)
             }
             MaterialChannel::Normal => {
-                let normals = self.normal_plane(context, masks)?;
+                let normals = self.normal_region(context, masks, region)?;
                 let values: Vec<Vec3> = normals
                     .iter()
                     .map(|normal| normal.truncate() * 0.5 + 0.5)
@@ -632,7 +667,7 @@ impl TextureSet {
             }
             MaterialChannel::BaseColor => {
                 let default_base = rgb_unit(DEFAULT_BASE_COLOR);
-                let plane = self.optional_plane(channel, context, masks)?;
+                let plane = self.optional_plane(channel, context, masks, region)?;
                 let values: Vec<Vec3> = match plane {
                     Some(plane) => plane
                         .iter()
@@ -643,7 +678,7 @@ impl TextureSet {
                 to_rgba8(&values)
             }
             channel => {
-                let plane = match self.optional_plane(channel, context, masks)? {
+                let plane = match self.optional_plane(channel, context, masks, region)? {
                     Some(plane) => plane,
                     None => try_filled(pixel_count, base_texel(channel)?)?,
                 };
@@ -659,13 +694,15 @@ impl TextureSet {
         channel: MaterialChannel,
         context: BakeContext<'_>,
         masks: &LayerMasks,
+        region: TexelRect,
     ) -> Result<Option<Vec<Vec4>>, BakeError> {
         if self
             .layers
             .iter()
             .any(|layer| contributes(layer, &[channel]))
         {
-            self.composite_plane(channel, context, masks).map(Some)
+            self.composite_region(channel, context, masks, None, region)
+                .map(Some)
         } else {
             Ok(None)
         }

@@ -2451,8 +2451,9 @@ fn brush_shape_samples(
     tip.preview(BRUSH_PREVIEW_CELLS, Some(resources))
 }
 
-/// Texture set sizes the bake budget allows.
-const TEXTURE_SET_RESOLUTIONS: [u32; 3] = [512, 1024, 2048];
+/// Texture set sizes offered. Sets above 2K bake in tiles; above 4K the
+/// viewport shows a downscaled preview while exports keep full size.
+const TEXTURE_SET_RESOLUTIONS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
 
 /// One row of the layer list: layers top first, each group followed by its
 /// children one level deeper.

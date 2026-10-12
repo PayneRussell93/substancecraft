@@ -42,6 +42,9 @@ pub(super) struct PreviewDirty {
     set_id: TextureSetId,
     base_revision: u64,
     shape: SetShape,
+    /// How far beyond its own texels an edit changes the bake (blur and
+    /// sharpen spread it); fixed while the shape is.
+    halo: u32,
     texels: DirtyTexels,
 }
 
@@ -52,6 +55,7 @@ impl PreviewDirty {
             set_id: set.id,
             base_revision: revision,
             shape: SetShape::of(set),
+            halo: set.region_halo(),
             texels: DirtyTexels::new(set.resolution.width, set.resolution.height),
         }
     }
@@ -60,8 +64,10 @@ impl PreviewDirty {
         self.set_id
     }
 
+    /// Records an edit of the texels in `bounds`.
     pub(super) fn mark(&mut self, bounds: TexelRect) {
-        self.texels.mark(bounds);
+        let (width, height) = self.texels.resolution();
+        self.texels.mark(bounds.grow(self.halo, width, height));
     }
 
     /// Regions to rebake to bring a preview baked at `base_revision` up to
@@ -73,13 +79,13 @@ impl PreviewDirty {
             && base_revision == self.base_revision
             && self.texels.resolution() == resolution
             && self.texels.dirty_fraction() <= MAX_DIRTY_FRACTION
-            && set.supports_region_rebake()
             && SetShape::of(set) == self.shape)
             .then(|| self.texels.rects())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use substancecraft_core::{LayerFilter, MaterialLayer};
@@ -120,18 +126,24 @@ mod tests {
             }])
         );
         // Strokes are tracked; anything else needs a full rebake.
-        set.layers[0].paint_strokes.push(substancecraft_core::PaintStroke::new(
-            vec![glam::Vec2::splat(0.05)],
-            4.0,
-            [255; 4],
-        ));
+        set.layers[0]
+            .paint_strokes
+            .push(substancecraft_core::PaintStroke::new(
+                vec![glam::Vec2::splat(0.05)],
+                4.0,
+                [255; 4],
+            ));
         assert!(dirty.regions(&set, 7).is_some());
         set.layers[0].opacity = 0.5;
         assert_eq!(dirty.regions(&set, 7), None);
         set.layers[0].opacity = 1.0;
-        set.layers[0].filters = vec![LayerFilter::Blur { radius: 1.0 }];
+        // Blur spreads an edit, so marks grow by the set's halo.
+        set.layers[0].filters = vec![LayerFilter::Blur { radius: 8.0 }];
         dirty = PreviewDirty::new(&set, 7);
-        assert_eq!(dirty.regions(&set, 7), None, "blur reads neighbours");
+        dirty.mark(dab);
+        let regions = dirty.regions(&set, 7).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].width > 64 && regions[0].x == 0);
     }
 
     #[test]

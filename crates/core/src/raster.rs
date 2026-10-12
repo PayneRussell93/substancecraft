@@ -32,7 +32,14 @@ pub(crate) fn rasterize_uv_triangle(
     fringe: f32,
     apply: impl FnMut(usize, Vec3, bool),
 ) {
-    rasterize_uv_triangle_in(uvs, width, height, fringe, TexelRect::full(width, height), apply);
+    rasterize_uv_triangle_in(
+        uvs,
+        width,
+        height,
+        fringe,
+        TexelRect::full(width, height),
+        apply,
+    );
 }
 
 /// [`rasterize_uv_triangle`] limited to the texels of `clip`; the index is
@@ -98,7 +105,11 @@ pub(crate) fn rasterize_uv_triangle_in(
             if sum <= f32::EPSILON {
                 continue;
             }
-            apply(clip.local_index(x as u32, y as u32), clamped / sum, interior);
+            apply(
+                clip.local_index(x as u32, y as u32),
+                clamped / sum,
+                interior,
+            );
         }
     }
 }

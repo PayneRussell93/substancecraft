@@ -126,9 +126,14 @@ impl DirtyTexels {
         let Some(rect) = rect.intersect(TexelRect::full(self.width, self.height)) else {
             return;
         };
-        let (first_column, last_column) =
-            (rect.x / DIRTY_TILE_SIZE, (rect.right() - 1) / DIRTY_TILE_SIZE);
-        let (first_row, last_row) = (rect.y / DIRTY_TILE_SIZE, (rect.bottom() - 1) / DIRTY_TILE_SIZE);
+        let (first_column, last_column) = (
+            rect.x / DIRTY_TILE_SIZE,
+            (rect.right() - 1) / DIRTY_TILE_SIZE,
+        );
+        let (first_row, last_row) = (
+            rect.y / DIRTY_TILE_SIZE,
+            (rect.bottom() - 1) / DIRTY_TILE_SIZE,
+        );
         for row in first_row..=last_row {
             for column in first_column..=last_column {
                 self.tiles[(row * self.columns + column) as usize] = true;
@@ -157,7 +162,8 @@ impl DirtyTexels {
                 while column < self.columns {
                     if self.tiles[(row * self.columns + column) as usize] {
                         let start = column;
-                        while column < self.columns && self.tiles[(row * self.columns + column) as usize]
+                        while column < self.columns
+                            && self.tiles[(row * self.columns + column) as usize]
                         {
                             column += 1;
                         }

@@ -3,6 +3,8 @@
 use glam::{Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
+use crate::region::TexelRect;
+
 /// Blur radii are given in texels of a 1024-wide texture and scale with the
 /// texture set's resolution, so a filter keeps its look when resolution
 /// changes.
@@ -69,12 +71,6 @@ impl LayerFilter {
             Self::Invert => "Invert",
             Self::HueSaturation { .. } => "Hue / Saturation",
         }
-    }
-
-    /// True when each output texel depends only on the same input texel
-    /// (blur and sharpen read their neighbours).
-    pub const fn is_per_texel(self) -> bool {
-        !matches!(self, Self::Blur { .. } | Self::Sharpen { .. })
     }
 
     pub(crate) fn is_valid(self) -> bool {
@@ -166,23 +162,66 @@ pub(crate) enum PlaneData {
     Vector,
 }
 
+/// Which texels a plane buffer holds: `region` (row-major) of a `width` ×
+/// `height` texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaneGrid {
+    pub region: TexelRect,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(test)]
+impl PlaneGrid {
+    const fn full(width: u32, height: u32) -> Self {
+        Self {
+            region: TexelRect::full(width, height),
+            width,
+            height,
+        }
+    }
+}
+
+/// Texels a region bake must add around a region so `filters` are exact
+/// inside it: spatial filters read neighbours, and the blur's running sums
+/// restart only at fixed block boundaries.
+pub(crate) fn spatial_halo(filters: &[LayerFilter], texture_width: u32) -> u32 {
+    filters
+        .iter()
+        .map(|filter| match *filter {
+            LayerFilter::Blur { radius } | LayerFilter::Sharpen { radius, .. } => {
+                let radius = blur_texels(scaled_radius(radius, texture_width));
+                if radius == 0 {
+                    0
+                } else {
+                    // Three box passes, each reaching `radius` beyond the
+                    // window plus a partial block before it.
+                    (3 * (radius + blur_block(radius))) as u32
+                }
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Applies `filters` in order to straight-alpha texels (`xyz` value, `w`
-/// alpha).
+/// alpha) laid out as `grid`. On a partial region, spatial filters are
+/// exact only at least [`spatial_halo`] texels inside its edges (or at the
+/// texture's own edges).
 pub(crate) fn apply_to_plane(
     texels: &mut [Vec4],
-    width: u32,
-    height: u32,
+    grid: PlaneGrid,
     data: PlaneData,
     filters: &[LayerFilter],
 ) {
     for filter in filters {
         match *filter {
             LayerFilter::Blur { radius } => {
-                blur_plane(texels, width, height, scaled_radius(radius, width));
+                blur_plane(texels, grid, scaled_radius(radius, grid.width));
             }
             LayerFilter::Sharpen { radius, amount } => {
                 let mut blurred = texels.to_vec();
-                blur_plane(&mut blurred, width, height, scaled_radius(radius, width));
+                blur_plane(&mut blurred, grid, scaled_radius(radius, grid.width));
                 for (texel, soft) in texels.iter_mut().zip(blurred) {
                     let value = texel.truncate() + (texel.truncate() - soft.truncate()) * amount;
                     *texel = match data {
@@ -211,7 +250,7 @@ pub(crate) fn apply_to_plane(
 }
 
 /// Applies `filters` to grayscale mask values.
-pub(crate) fn apply_to_mask(values: &mut [f32], width: u32, height: u32, filters: &[LayerFilter]) {
+pub(crate) fn apply_to_mask(values: &mut [f32], grid: PlaneGrid, filters: &[LayerFilter]) {
     if filters.is_empty() {
         return;
     }
@@ -219,7 +258,7 @@ pub(crate) fn apply_to_mask(values: &mut [f32], width: u32, height: u32, filters
         .iter()
         .map(|value| Vec4::new(*value, *value, *value, 1.0))
         .collect::<Vec<_>>();
-    apply_to_plane(&mut texels, width, height, PlaneData::Scalar, filters);
+    apply_to_plane(&mut texels, grid, PlaneData::Scalar, filters);
     for (value, texel) in values.iter_mut().zip(texels) {
         *value = texel.x.clamp(0.0, 1.0);
     }
@@ -229,29 +268,52 @@ fn scaled_radius(radius: f32, width: u32) -> f32 {
     radius * width as f32 / REFERENCE_WIDTH
 }
 
+/// Box radius in texels for a scaled blur radius.
+fn blur_texels(radius: f32) -> usize {
+    radius.round() as usize
+}
+
+/// Length of the blocks a box pass restarts its running sum at: long
+/// enough that restarts cost little, fixed per radius so any region of a
+/// texture sums each texel in the same order.
+fn blur_block(radius: usize) -> usize {
+    (radius * 4).max(16)
+}
+
 /// Separable box blur run three times (close to Gaussian) on premultiplied
 /// values, so transparent texels do not darken their neighbours.
-fn blur_plane(texels: &mut [Vec4], width: u32, height: u32, radius: f32) {
-    let radius = radius.round() as usize;
-    if radius == 0 || width == 0 || height == 0 {
+fn blur_plane(texels: &mut [Vec4], grid: PlaneGrid, radius: f32) {
+    let radius = blur_texels(radius);
+    let region = grid.region;
+    if radius == 0 || region.is_empty() {
         return;
     }
-    let (width, height) = (width as usize, height as usize);
+    let (width, height) = (region.width as usize, region.height as usize);
     let mut premultiplied = texels
         .iter()
         .map(|texel| (texel.truncate() * texel.w).extend(texel.w))
         .collect::<Vec<_>>();
     let mut scratch = vec![Vec4::ZERO; width.max(height)];
+    let rows = BlurLine {
+        start: region.x as usize,
+        extent: grid.width as usize,
+        radius,
+    };
+    let columns = BlurLine {
+        start: region.y as usize,
+        extent: grid.height as usize,
+        radius,
+    };
     for _ in 0..3 {
         for row in premultiplied.chunks_mut(width) {
-            box_blur_line(row, radius, &mut scratch);
+            rows.blur(row, &mut scratch);
         }
         let mut column = vec![Vec4::ZERO; height];
         for x in 0..width {
             for (y, slot) in column.iter_mut().enumerate() {
                 *slot = premultiplied[y * width + x];
             }
-            box_blur_line(&mut column, radius, &mut scratch);
+            columns.blur(&mut column, &mut scratch);
             for (y, value) in column.iter().enumerate() {
                 premultiplied[y * width + x] = *value;
             }
@@ -266,23 +328,49 @@ fn blur_plane(texels: &mut [Vec4], width: u32, height: u32, radius: f32) {
     }
 }
 
-/// Running-sum box blur with clamped edges.
-fn box_blur_line(line: &mut [Vec4], radius: usize, scratch: &mut [Vec4]) {
-    let length = line.len();
-    if length == 0 {
-        return;
+/// A row or column of a texture being box blurred: the line buffer holds
+/// texels `start..` of a line `extent` texels long.
+struct BlurLine {
+    start: usize,
+    extent: usize,
+    radius: usize,
+}
+
+impl BlurLine {
+    /// Running-sum box blur with edges clamped to the texture's. Reads past
+    /// the buffer's ends (in a partial region) clamp to them; those texels
+    /// lie in the halo a region bake discards.
+    fn blur(&self, line: &mut [Vec4], scratch: &mut [Vec4]) {
+        let length = line.len();
+        if length == 0 || self.extent == 0 {
+            return;
+        }
+        let radius = self.radius as isize;
+        let window = (self.radius * 2 + 1) as f32;
+        let last = self.extent as isize - 1;
+        let at = |texel: isize| {
+            let local = texel.clamp(0, last) - self.start as isize;
+            line[local.clamp(0, length as isize - 1) as usize]
+        };
+        let block = blur_block(self.radius);
+        let mut index = 0;
+        while index < length {
+            // The sum restarts at every block boundary of the texture.
+            let texel = self.start + index;
+            let end = ((texel / block + 1) * block - self.start).min(length);
+            let mut sum = Vec4::ZERO;
+            for offset in -radius..=radius {
+                sum += at(texel as isize + offset);
+            }
+            for (local, slot) in scratch.iter_mut().enumerate().take(end).skip(index) {
+                *slot = sum / window;
+                let texel = (self.start + local) as isize;
+                sum += at(texel + radius + 1) - at(texel - radius);
+            }
+            index = end;
+        }
+        line.copy_from_slice(&scratch[..length]);
     }
-    let window = (radius * 2 + 1) as f32;
-    let at = |index: isize| line[index.clamp(0, length as isize - 1) as usize];
-    let mut sum = Vec4::ZERO;
-    for offset in -(radius as isize)..=radius as isize {
-        sum += at(offset);
-    }
-    for (index, slot) in scratch.iter_mut().enumerate().take(length) {
-        *slot = sum / window;
-        sum += at(index as isize + radius as isize + 1) - at(index as isize - radius as isize);
-    }
-    line.copy_from_slice(&scratch[..length]);
 }
 
 fn rgb_to_hsl(color: Vec3) -> (f32, f32, f32) {
@@ -331,8 +419,7 @@ mod tests {
         texels[16] = Vec4::new(1.0, 0.5, 0.25, 1.0);
         apply_to_plane(
             &mut texels,
-            width,
-            height,
+            PlaneGrid::full(width, height),
             PlaneData::Color,
             // 2 texels at 32 wide is radius 64 at the 1024 reference.
             &[LayerFilter::Blur { radius: 64.0 }],
@@ -341,6 +428,76 @@ mod tests {
         // Colour is unpremultiplied, so it keeps its hue at the fringe.
         assert!((texels[14].x - 1.0).abs() < 1e-4);
         assert!((texels[14].y - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn region_blurs_match_the_full_blur_inside_their_halo() {
+        let (width, height) = (300_u32, 220_u32);
+        let texels: Vec<Vec4> = (0..width * height)
+            .map(|index| {
+                let value = ((index.wrapping_mul(2_654_435_761) >> 8) % 1000) as f32 / 1000.0;
+                Vec4::new(value, 1.0 - value, value * 0.5, (index % 7) as f32 / 6.0)
+            })
+            .collect();
+        let filters = [
+            LayerFilter::Blur { radius: 9.0 },
+            LayerFilter::Sharpen {
+                radius: 5.0,
+                amount: 0.7,
+            },
+        ];
+        let mut full = texels.clone();
+        apply_to_plane(
+            &mut full,
+            PlaneGrid::full(width, height),
+            PlaneData::Color,
+            &filters,
+        );
+        let halo = spatial_halo(&filters, width);
+        assert!(halo > 0);
+        for inner in [
+            TexelRect {
+                x: 140,
+                y: 100,
+                width: 5,
+                height: 3,
+            },
+            TexelRect {
+                x: 0,
+                y: 0,
+                width: 9,
+                height: 9,
+            },
+            TexelRect {
+                x: 287,
+                y: 211,
+                width: 13,
+                height: 9,
+            },
+        ] {
+            let region = inner.grow(halo, width, height);
+            let mut part: Vec<Vec4> = (region.y..region.bottom())
+                .flat_map(|y| {
+                    let start = (y * width + region.x) as usize;
+                    texels[start..start + region.width as usize].to_vec()
+                })
+                .collect();
+            let grid = PlaneGrid {
+                region,
+                width,
+                height,
+            };
+            apply_to_plane(&mut part, grid, PlaneData::Color, &filters);
+            for y in inner.y..inner.bottom() {
+                for x in inner.x..inner.right() {
+                    assert_eq!(
+                        part[region.local_index(x, y)],
+                        full[(y * width + x) as usize],
+                        "texel {x},{y} of {inner:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -373,7 +530,7 @@ mod tests {
         assert!((green - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4);
 
         let mut mask = vec![0.2, 0.8];
-        apply_to_mask(&mut mask, 2, 1, &[LayerFilter::Invert]);
+        apply_to_mask(&mut mask, PlaneGrid::full(2, 1), &[LayerFilter::Invert]);
         assert!((mask[0] - 0.8).abs() < 1e-6 && (mask[1] - 0.2).abs() < 1e-6);
     }
 }

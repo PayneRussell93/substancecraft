@@ -53,6 +53,7 @@ pub use mesh_maps::{
 pub use painting::{
     LazyStabilizer, MAX_RADIAL_COPIES, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points,
 };
+pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{
     BitmapMask, DecalPlacement, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE,
     MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource, ProjectionMode, ResourceImages,
@@ -64,12 +65,15 @@ pub use smoothing::{
     vertex_tangents,
 };
 pub use topology::{DiagnosticEdge, EdgeFlags, MeshTopology, SelectionMode, diagnostic_edges};
-pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use udim::{UDIM_TOKEN, UdimTile};
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
+/// Texels one bake works on at once (its f32 working buffers); larger
+/// texture sets bake in tiles of at most this many.
 pub const MAX_BAKE_PIXELS: usize = 4_194_304;
+/// Largest texture set a bake produces (8192 x 8192).
+pub const MAX_TEXTURE_SET_PIXELS: usize = 67_108_864;
 /// Upper bound on triangles referenced by one layer's polygon mask.
 pub const MAX_POLYGON_MASK_TRIANGLES: usize = 8_388_608;
 const MAX_LAYER_STROKES: usize = 8_192;
@@ -1834,6 +1838,51 @@ impl TextureSet {
         self.layers.iter().flat_map(MaterialLayer::walk).collect()
     }
 
+    /// The power-of-two factor that brings the set's longer edge down to at
+    /// most `max_edge` (1 when it already fits).
+    pub fn preview_factor(&self, max_edge: u32) -> u32 {
+        let edge = self.resolution.width.max(self.resolution.height);
+        let mut factor = 1_u32;
+        while edge.div_ceil(factor) > max_edge.max(1) {
+            factor *= 2;
+        }
+        factor
+    }
+
+    /// A copy at most `max_edge` texels on its longer edge for previews,
+    /// with stroke radii scaled to match, or `None` when the set already
+    /// fits. Positions, filters, and projections are relative to the
+    /// texture, so the copy looks like the full set filtered down.
+    pub fn downscaled(&self, max_edge: u32) -> Option<TextureSet> {
+        let factor = self.preview_factor(max_edge);
+        if factor == 1 {
+            return None;
+        }
+        fn scale(layers: &mut [MaterialLayer], factor: f32) {
+            for layer in layers {
+                for stroke in &mut layer.paint_strokes {
+                    stroke.radius_pixels /= factor;
+                }
+                for stroke in &mut layer.mask_strokes {
+                    stroke.radius_pixels /= factor;
+                }
+                for stroke in &mut layer.id_strokes {
+                    stroke.radius_pixels /= factor;
+                }
+                if let Some(children) = &mut layer.children {
+                    scale(children, factor);
+                }
+            }
+        }
+        let mut copy = self.clone();
+        copy.resolution = TextureResolution {
+            width: self.resolution.width.div_ceil(factor),
+            height: self.resolution.height.div_ceil(factor),
+        };
+        scale(&mut copy.layers, factor as f32);
+        Some(copy)
+    }
+
     pub fn layer(&self, layer_id: LayerId) -> Option<&MaterialLayer> {
         fn find(layers: &[MaterialLayer], layer_id: LayerId) -> Option<&MaterialLayer> {
             layers.iter().find_map(|layer| {
@@ -2170,6 +2219,48 @@ mod tests {
             height_strength: DEFAULT_HEIGHT_STRENGTH,
             export: None,
         }
+    }
+
+    #[test]
+    fn tc_0260_large_sets_preview_downscaled_with_matching_brush_radii() {
+        let mut set = texture_set(1);
+        let mut layer = MaterialLayer::new_paint(LayerId(1), "Paint");
+        layer.paint_strokes.push(PaintStroke::new(
+            vec![glam::Vec2::splat(0.5)],
+            64.0,
+            [255, 0, 0, 255],
+        ));
+        let mut group = MaterialLayer::new_group(LayerId(2), "Group");
+        let mut masked = MaterialLayer::new_paint(LayerId(3), "Masked");
+        masked.mask_strokes.push(MaskStroke {
+            points: vec![glam::Vec2::splat(0.25)],
+            radius_pixels: 32.0,
+            value: 0.0,
+            opacity: 1.0,
+            tip: BrushTip::ROUND,
+            pressures: Vec::new(),
+        });
+        group.children = Some(vec![masked]);
+        set.layers = vec![layer, group];
+
+        assert_eq!(set.preview_factor(4096), 1);
+        assert!(set.downscaled(4096).is_none(), "2K fits as it is");
+        set.resolution = TextureResolution::new(8192, 6000).unwrap();
+        assert_eq!(set.preview_factor(4096), 2);
+        assert_eq!(set.preview_factor(2048), 4);
+        let preview = set.downscaled(4096).unwrap();
+        assert_eq!(
+            preview.resolution,
+            TextureResolution::new(4096, 3000).unwrap()
+        );
+        assert_eq!(preview.layers[0].paint_strokes[0].radius_pixels, 32.0);
+        let nested = preview.layer(LayerId(3)).unwrap();
+        assert_eq!(nested.mask_strokes[0].radius_pixels, 16.0);
+        // Positions are in UV space and stay put.
+        assert_eq!(
+            preview.layers[0].paint_strokes[0].points,
+            set.layers[0].paint_strokes[0].points
+        );
     }
 
     #[test]

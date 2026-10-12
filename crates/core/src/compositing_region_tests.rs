@@ -11,8 +11,8 @@ use glam::Vec2;
 use super::*;
 use crate::{
     BrushShape, BrushTip, DEFAULT_HEIGHT_STRENGTH, DirtyTexels, Gradient, IdStroke, LayerFilter,
-    MaskGenerator, MaskStroke, MeshMapSettings, NoisePattern, PolygonMask, PrimitivePreset, TextureProjection,
-    TextureSetId, bake_mesh_maps, stroke_texel_bounds,
+    MaskGenerator, MaskStroke, MeshMapSettings, NoisePattern, PolygonMask, PrimitivePreset,
+    TextureProjection, TextureSetId, bake_mesh_maps, stroke_texel_bounds,
 };
 
 /// Deterministic generator so failures replay exactly.
@@ -347,7 +347,49 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
 }
 
 #[test]
-fn tc_0300_region_rebakes_of_random_edits_match_full_bakes_byte_for_byte() {
+fn tc_0253_region_rebakes_of_random_edits_match_full_bakes_byte_for_byte() {
+    let set = stack();
+    assert_eq!(set.region_halo(), 0, "no spatial filters");
+    check_random_edits(set, 0x5eed, 24);
+}
+
+#[test]
+fn tc_0257_region_rebakes_stay_exact_through_blur_and_sharpen() {
+    let mut set = stack();
+    set.resolution = TextureResolution {
+        width: 512,
+        height: 448,
+    };
+    // Spatial filters on a layer, a mask, and a group; anchors would
+    // multiply the halo past this texture's size.
+    set.layer_mut(PAINT).unwrap().filters = vec![LayerFilter::Blur { radius: 8.0 }];
+    set.layer_mut(MASKED).unwrap().mask_filters = vec![LayerFilter::Sharpen {
+        radius: 6.0,
+        amount: 0.8,
+    }];
+    set.layer_mut(LayerId(3)).unwrap().filters = vec![LayerFilter::Blur { radius: 4.0 }];
+    set.layer_mut(LayerId(6)).unwrap().mask_anchor = None;
+    let halo = set.region_halo();
+    assert!(halo > 0 && halo < 256, "halo {halo}");
+    check_random_edits(set, 0xb1, 4);
+}
+
+/// A stack with blur and sharpen on a layer, a mask, and a group (and no
+/// anchor, which would multiply the halo).
+fn blurred_stack() -> TextureSet {
+    let mut set = stack();
+    set.layer_mut(PAINT).unwrap().filters = vec![LayerFilter::Blur { radius: 30.0 }];
+    set.layer_mut(MASKED).unwrap().mask_filters = vec![LayerFilter::Sharpen {
+        radius: 20.0,
+        amount: 0.8,
+    }];
+    set.layer_mut(LayerId(3)).unwrap().filters = vec![LayerFilter::Blur { radius: 14.0 }];
+    set.layer_mut(LayerId(6)).unwrap().mask_anchor = None;
+    set
+}
+
+#[test]
+fn tc_0258_tiled_bakes_match_single_pass_bakes() {
     let mesh = PrimitivePreset::Cube.build_mesh();
     let maps = bake_mesh_maps(
         &mesh,
@@ -365,9 +407,111 @@ fn tc_0300_region_rebakes_of_random_edits_match_full_bakes_byte_for_byte() {
         mesh_maps: Some(&maps),
         resources: Some(&resources),
     };
-    let mut set = stack();
-    assert!(set.supports_region_rebake());
-    let mut rng = Lcg(0x5eed);
+    let presets = crate::ExportPreset::built_in();
+    for (name, mut set) in [("plain", stack()), ("blurred", blurred_stack())] {
+        let mut rng = Lcg(42);
+        for _ in 0..40 {
+            edit(&mut set, &mut rng);
+        }
+        let tiles = set.tiles_of(64);
+        assert_eq!(tiles.len(), 3 * 3, "{name}: 150 × 134 in 64-texel tiles");
+        assert!(
+            set.bake_material_in(context, &tiles).unwrap() == set.bake_material(context).unwrap(),
+            "{name}: tiled material differs"
+        );
+        for preset in &presets {
+            assert!(
+                set.bake_export_in(preset, context, &tiles).unwrap()
+                    == set.bake_export(preset, context).unwrap(),
+                "{name}: tiled {} export differs",
+                preset.name
+            );
+        }
+    }
+}
+
+#[test]
+fn tc_0259_sets_beyond_the_working_budget_bake_in_tiles() {
+    let mut set = TextureSet {
+        resolution: TextureResolution {
+            width: 2304,
+            height: 2048,
+        },
+        ..stack()
+    };
+    let mut rng = Lcg(9);
+    while set.layer(PAINT).unwrap().paint_strokes.len() < 6 {
+        edit(&mut set, &mut rng);
+    }
+    // Uniform fills and strokes: no mesh maps or bitmaps needed.
+    set.layers.truncate(2);
+    set.layers[0].mask_generator = None;
+    let fill = set.layers[0].fill.as_mut().unwrap();
+    fill.textures = Default::default();
+    fill.projection = TextureProjection::default();
+    let tiles = set.bake_tiles().unwrap();
+    assert!(tiles.len() > 1, "{} tiles", tiles.len());
+    assert!(
+        tiles
+            .iter()
+            .all(|tile| set.composited_region(*tile).len() <= crate::MAX_BAKE_PIXELS)
+    );
+    let context = BakeContext::default();
+    let material = set.bake_material(context).unwrap();
+    assert_eq!(
+        (material.base_color.width, material.base_color.height),
+        (2304, 2048)
+    );
+    // The inspector composites only a texel's neighbourhood, so it works
+    // past the working budget too; on either side of a tile seam it finds
+    // the base fill.
+    let seam = tiles[0].right();
+    for x in [seam - 1, seam] {
+        let uv = Vec2::new(x as f32 / 2303.0, 0.0);
+        let probe = set
+            .inspect_texel(MaterialChannel::Roughness, uv, context)
+            .unwrap();
+        assert!(probe.iter().any(|entry| entry.layer == LayerId(1)));
+    }
+    let exported = set
+        .bake_export(&crate::ExportPreset::built_in()[0], context)
+        .unwrap();
+    assert!(exported.iter().all(|texture| texture.texture.width == 2304));
+    // Past the texture budget a bake is refused before allocating.
+    set.resolution = TextureResolution {
+        width: 8192,
+        height: 8193,
+    };
+    assert!(matches!(
+        set.bake_material(context),
+        Err(BakeError::ResolutionExceedsBudget { .. })
+    ));
+}
+
+/// Applies seeded random stroke edits in rounds, patching each round's
+/// dirty tiles (grown by the set's halo) into earlier bakes, and checks
+/// the patched textures against full bakes byte for byte.
+fn check_random_edits(mut set: TextureSet, seed: u64, rounds: usize) {
+    let mesh = PrimitivePreset::Cube.build_mesh();
+    let maps = bake_mesh_maps(
+        &mesh,
+        &MeshMapSettings {
+            resolution: 64,
+            ao_samples: 4,
+            ..MeshMapSettings::default()
+        },
+        None,
+    )
+    .unwrap();
+    let resources = ResourceImages::from([(ResourceId(1), Arc::new(checker_image(32)))]);
+    let context = BakeContext {
+        mesh: Some(&mesh),
+        mesh_maps: Some(&maps),
+        resources: Some(&resources),
+    };
+    let (width, height) = (set.resolution.width, set.resolution.height);
+    let halo = set.region_halo();
+    let mut rng = Lcg(seed);
     let mut material = set.bake_material(context).unwrap();
     let channels = [
         MaterialChannel::BaseColor,
@@ -376,16 +520,19 @@ fn tc_0300_region_rebakes_of_random_edits_match_full_bakes_byte_for_byte() {
         MaterialChannel::Id,
     ];
     let mut singles = channels.map(|channel| set.bake_channel(channel, context).unwrap());
-    let mut patched = 0;
-    for round in 0..24 {
-        let mut dirty = DirtyTexels::new(set.resolution.width, set.resolution.height);
+    let (mut patched, mut partial) = (0, 0);
+    for round in 0..rounds {
+        let mut dirty = DirtyTexels::new(width, height);
         for _ in 0..1 + rng.below(4) {
             if let Some(bounds) = edit(&mut set, &mut rng) {
-                dirty.mark(bounds);
+                dirty.mark(bounds.grow(halo, width, height));
             }
         }
         for rect in dirty.rects() {
             patched += 1;
+            if rect != TexelRect::full(width, height) {
+                partial += 1;
+            }
             set.rebake_material_region(context, &mut material, rect)
                 .unwrap();
             for (channel, texture) in channels.iter().zip(&mut singles) {
@@ -404,7 +551,10 @@ fn tc_0300_region_rebakes_of_random_edits_match_full_bakes_byte_for_byte() {
             );
         }
     }
-    assert!(patched > 24, "edits must exercise several regions");
+    assert!(
+        patched > rounds && partial > rounds / 2,
+        "edits must exercise several partial regions ({patched}, {partial})"
+    );
 }
 
 /// Timing, not correctness: `cargo test --release -p substancecraft-core
@@ -427,6 +577,7 @@ fn region_rebake_timing() {
         edit(&mut set, &mut rng);
     }
     set.layers.truncate(3);
+    set.layer_mut(MASKED).unwrap().mask_generator = None;
     let context = BakeContext::default();
     let started = std::time::Instant::now();
     let mut material = set.bake_material(context).unwrap();
@@ -459,7 +610,7 @@ fn region_rebake_timing() {
 }
 
 #[test]
-fn tc_0301_region_rebake_refuses_spatial_filters_and_bad_targets() {
+fn tc_0254_region_rebake_refuses_bad_targets_and_measures_halos() {
     let mut set = stack();
     let context = BakeContext::default();
     set.layers.truncate(2);
@@ -494,10 +645,20 @@ fn tc_0301_region_rebake_refuses_spatial_filters_and_bad_targets() {
         set.rebake_material_region(context, &mut small, region),
         Err(BakeError::RegionMismatch)
     );
-    set.layers[1].filters = vec![LayerFilter::Blur { radius: 2.0 }];
-    assert!(!set.supports_region_rebake());
-    assert_eq!(
-        set.rebake_material_region(context, &mut material, region),
-        Err(BakeError::RegionMismatch)
-    );
+    assert_eq!(set.region_halo(), 0);
+    // Per-texel filters need no halo; spatial ones do, scaled with the
+    // texture, and each anchored layer can repeat them.
+    set.layers[1].filters = vec![LayerFilter::Invert];
+    assert_eq!(set.region_halo(), 0);
+    set.layers[1].filters = vec![LayerFilter::Blur { radius: 20.0 }];
+    let blur = set.region_halo();
+    assert!(blur > 0);
+    set.layers[1].mask_anchor = Some(AnchorMask {
+        layer: LayerId(1),
+        channel: MaterialChannel::Roughness,
+        low: 0.0,
+        high: 1.0,
+        invert: false,
+    });
+    assert_eq!(set.region_halo(), blur * 2);
 }

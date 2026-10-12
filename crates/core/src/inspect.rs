@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use glam::Vec4;
 
 use crate::compositing::{checked_bake_pixel_count, contributes, unit_to_byte};
+use crate::region::TexelRect;
 use crate::{
     BakeContext, BakeError, BakedTexture, LayerId, MaskGenerator, MaterialChannel, MaterialLayer,
     TextureSet,
@@ -185,15 +186,20 @@ pub fn mask_drivers(layer: &MaterialLayer, set: &TextureSet) -> Vec<String> {
     drivers
 }
 
-/// Texel index of `uv` on a `width` × `height` grid, matching
+/// The texel at `uv` on a `width` × `height` grid, matching
 /// [`BakedTexture::sample_uv`].
-fn texel_index(uv: glam::Vec2, width: u32, height: u32) -> Option<usize> {
+fn texel_at(uv: glam::Vec2, width: u32, height: u32) -> Option<TexelRect> {
     if !uv.is_finite() || !(0.0..=1.0).contains(&uv.x) || !(0.0..=1.0).contains(&uv.y) {
         return None;
     }
     let x = (uv.x * width.saturating_sub(1) as f32).round() as usize;
     let y = ((1.0 - uv.y) * height.saturating_sub(1) as f32).round() as usize;
-    Some(y * width as usize + x)
+    Some(TexelRect {
+        x: x as u32,
+        y: y as u32,
+        width: 1,
+        height: 1,
+    })
 }
 
 impl TextureSet {
@@ -205,16 +211,18 @@ impl TextureSet {
         uv: glam::Vec2,
         context: BakeContext<'_>,
     ) -> Result<Vec<TexelContribution>, BakeError> {
-        let index = texel_index(uv, self.resolution.width, self.resolution.height)
+        let texel = texel_at(uv, self.resolution.width, self.resolution.height)
             .ok_or(BakeError::InvalidLayerSettings)?;
         checked_bake_pixel_count(self.resolution)?;
-        let id_map = self.validate_for_bake()?;
-        let masks = self.layer_masks(&[channel], context, id_map.as_ref())?;
+        // Only the texel and the neighbourhood its filters read.
+        let region = self.composited_region(texel);
+        let id_map = self.validate_for_region(region)?;
+        let masks = self.layer_masks_in(&[channel], context, id_map.as_deref(), region)?;
         let probe = Probe {
-            index,
+            index: region.local_index(texel.x, texel.y),
             entries: Mutex::new(Vec::new()),
         };
-        self.composite_plane_probed(channel, context, &masks, Some(&probe))?;
+        self.composite_region(channel, context, &masks, Some(&probe), region)?;
         let recorded = probe.entries.into_inner().unwrap_or_default();
 
         let mut order = Vec::new();
@@ -288,33 +296,38 @@ impl TextureSet {
         let layer = self
             .layer(layer_id)
             .ok_or(BakeError::InvalidLayerSettings)?;
-        let id_map = self.validate_for_bake()?;
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let values = if generator_only {
+        let alone = if generator_only {
             let generator = layer
                 .mask_generator
                 .ok_or(BakeError::InvalidLayerSettings)?;
-            let alone = MaterialLayer {
+            Some(MaterialLayer {
                 mask_generator: Some(generator),
                 ..MaterialLayer::new_paint(layer.id, "")
-            };
-            self.layer_mask(&alone, context, None)?
+            })
         } else {
-            self.layer_mask(layer, context, id_map.as_ref())?
+            None
         };
-        let mut rgba8 = Vec::new();
-        rgba8
-            .try_reserve_exact(pixel_count * 4)
-            .map_err(|_| BakeError::AllocationFailed)?;
-        match values {
-            Some(values) => {
-                for value in values {
-                    let gray = unit_to_byte(value);
-                    rgba8.extend([gray, gray, gray, 255]);
+        let [rgba8] = self.bake_in_tiles(&self.bake_tiles()?, |region| {
+            let id_map = self.validate_for_region(region)?;
+            let values = match &alone {
+                Some(alone) => self.layer_mask_in(alone, context, None, region)?,
+                None => self.layer_mask_in(layer, context, id_map.as_deref(), region)?,
+            };
+            let mut rgba8 = Vec::new();
+            rgba8
+                .try_reserve_exact(region.len() * 4)
+                .map_err(|_| BakeError::AllocationFailed)?;
+            match values {
+                Some(values) => {
+                    for value in values {
+                        let gray = unit_to_byte(value);
+                        rgba8.extend([gray, gray, gray, 255]);
+                    }
                 }
+                None => rgba8.resize(region.len() * 4, 255),
             }
-            None => rgba8.resize(pixel_count * 4, 255),
-        }
+            Ok([rgba8])
+        })?;
         Ok(self.texture(rgba8))
     }
 }

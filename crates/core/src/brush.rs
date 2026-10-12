@@ -356,10 +356,8 @@ pub(crate) fn rasterize_stroke(
         for local_x in 0..tile.width {
             let coverage = tile.values[(local_y * tile.width + local_x) as usize];
             if coverage > 0.0 {
-                let index = clip.local_index(
-                    (tile.min_x + local_x) as u32,
-                    (tile.min_y + local_y) as u32,
-                );
+                let index =
+                    clip.local_index((tile.min_x + local_x) as u32, (tile.min_y + local_y) as u32);
                 apply(index, coverage.min(1.0));
             }
         }

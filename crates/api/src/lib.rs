@@ -364,10 +364,10 @@ pub fn bake_texture_set_material(
 }
 
 /// Rebakes only `regions` of `textures`, a [`bake_texture_set_material`]
-/// result for an earlier state of the set that differs from the current
-/// one only inside them. The result equals a full bake byte for byte; sets
-/// with spatial filters (blur, sharpen) are refused, see
-/// [`TextureSet::supports_region_rebake`].
+/// result for an earlier state of the set. When the states differ only
+/// inside some texels, passing those texels grown by
+/// [`TextureSet::region_halo`] (which blur and sharpen need) makes the
+/// result equal a full bake byte for byte.
 pub fn rebake_texture_set_material_regions(
     texture_set: &TextureSet,
     mesh: Option<&MeshGeometry>,

@@ -11,15 +11,24 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 
 use glam::{Mat3, Quat, Vec3};
-use substancecraft_core::{MeshGeometry, ViewportCamera, vertex_normals, vertex_tangents};
+use substancecraft_core::{
+    MeshGeometry, TexelRect, ViewportCamera, vertex_normals, vertex_tangents,
+};
 use thiserror::Error;
 
 const MAX_VIEWPORT_DIMENSION: u32 = 2048;
 const MAX_VIEWPORT_PIXELS: usize = 4_194_304;
+/// Largest material map the viewport takes (4096 x 4096); bigger texture
+/// sets preview downscaled.
+const MAX_MAP_PIXELS: usize = 16_777_216;
 const MAX_MESH_VERTICES: usize = 3_000_000;
 const FLOATS_PER_VERTEX: usize = 9;
 
 static VIEWPORT_MATERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/viewport.filamat"));
+
+mod mips;
+
+use mips::MipChain;
 
 mod ffi {
     use std::ffi::c_void;
@@ -40,10 +49,22 @@ mod ffi {
         ) -> *mut ScRenderer;
         pub fn sc_renderer_destroy(renderer: *mut ScRenderer);
         pub fn sc_renderer_resize(renderer: *mut ScRenderer, width: u32, height: u32) -> bool;
-        pub fn sc_renderer_set_map(
+        pub fn sc_renderer_create_map(
             renderer: *mut ScRenderer,
             primitive: u32,
             slot: u32,
+            width: u32,
+            height: u32,
+            levels: u32,
+        ) -> bool;
+        #[allow(clippy::too_many_arguments)]
+        pub fn sc_renderer_set_map_region(
+            renderer: *mut ScRenderer,
+            primitive: u32,
+            slot: u32,
+            level: u32,
+            x: u32,
+            y: u32,
             width: u32,
             height: u32,
             rgba8: *const u8,
@@ -118,10 +139,19 @@ pub enum MaterialMap {
 const MAP_COUNT: usize = 4;
 const MAX_PRIMITIVES: usize = 256;
 
+/// Mip chains kept for one primitive's maps.
+struct RetainedChains {
+    primitive: u32,
+    chains: [Option<MipChain>; MAP_COUNT],
+}
+
 pub struct FilamentRuntime {
     raw: NonNull<ffi::ScRenderer>,
     /// Last uploaded content key per primitive and map.
     map_keys: Vec<[Option<usize>; MAP_COUNT]>,
+    /// CPU mip chains of the slot last patched, so further patches update
+    /// them in place.
+    retained: Option<RetainedChains>,
     /// Primitive drawing each mesh material slot; `None` for slots without
     /// triangles.
     slot_primitives: Vec<Option<u32>>,
@@ -146,6 +176,7 @@ impl FilamentRuntime {
         let runtime = Self {
             raw,
             map_keys: vec![[None; MAP_COUNT]],
+            retained: None,
             slot_primitives: vec![Some(0)],
             preview_mode: None,
             mesh_bounds: None,
@@ -181,42 +212,168 @@ impl FilamentRuntime {
         height: u32,
         rgba8: &[u8],
     ) -> Result<(), FilamentError> {
+        self.upload_map(slot, map, key, None, width, height, rgba8)
+    }
+
+    /// Like [`Self::set_map`] for `rgba8` that differs from the content
+    /// uploaded under `base_key` only inside `regions`: when that content is
+    /// still on the map, only those texels (and the mips above them) are
+    /// re-uploaded. Otherwise the whole map is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_map(
+        &mut self,
+        slot: usize,
+        map: MaterialMap,
+        key: usize,
+        base_key: usize,
+        regions: &[TexelRect],
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+    ) -> Result<(), FilamentError> {
+        self.upload_map(
+            slot,
+            map,
+            key,
+            Some((base_key, regions)),
+            width,
+            height,
+            rgba8,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_map(
+        &mut self,
+        slot: usize,
+        map: MaterialMap,
+        key: usize,
+        patch: Option<(usize, &[TexelRect])>,
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+    ) -> Result<(), FilamentError> {
         let Some(primitive) = self.slot_primitives.get(slot).copied().flatten() else {
             return Ok(());
         };
         let map_index = map as usize;
-        let Some(keys) = self.map_keys.get_mut(primitive as usize) else {
+        let Some(keys) = self.map_keys.get(primitive as usize) else {
             return Ok(());
         };
-        if keys[map_index] == Some(key) {
+        let shown = keys[map_index];
+        if shown == Some(key) {
             return Ok(());
         }
         let byte_count = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
-            .filter(|bytes| *bytes <= MAX_VIEWPORT_PIXELS * 4)
+            .filter(|bytes| *bytes <= MAX_MAP_PIXELS * 4)
             .ok_or(FilamentError::InvalidTexture)?;
         if width == 0 || height == 0 || rgba8.len() != byte_count {
             return Err(FilamentError::InvalidTexture);
         }
-        // SAFETY: `rgba8` holds exactly width * height * 4 bytes; the shim copies them.
-        let uploaded = unsafe {
-            ffi::sc_renderer_set_map(
-                self.raw.as_ptr(),
-                primitive,
-                map_index as u32,
-                width,
-                height,
-                rgba8.as_ptr(),
-            )
-        };
-        if !uploaded {
-            return Err(FilamentError::TextureUnavailable);
+        let srgb = matches!(map, MaterialMap::BaseColor | MaterialMap::Emissive);
+        // Texel blocks to send when the map still shows `base_key` and its
+        // chain is retained.
+        let mut blocks = None;
+        if let Some((base_key, regions)) = patch
+            && shown == Some(base_key)
+            && let Some(retained) = self.retained.as_mut()
+            && retained.primitive == primitive
+            && let Some(chain) = retained.chains[map_index].as_mut()
+            && chain.matches(width, height, srgb)
+        {
+            let mut changed = Vec::new();
+            for region in regions {
+                for (level, rect) in chain.update(rgba8, *region).into_iter().enumerate() {
+                    changed.push((level, rect, chain.levels[level].extract(rect)));
+                }
+            }
+            blocks = Some(changed);
+        }
+        if let Some(blocks) = blocks {
+            for (level, rect, bytes) in blocks {
+                self.upload_region(primitive, map_index, level, rect, &bytes)?;
+            }
+        } else {
+            let chain = MipChain::build(width, height, rgba8, srgb);
+            // SAFETY: `raw` is a live renderer owned by `self`.
+            let created = unsafe {
+                ffi::sc_renderer_create_map(
+                    self.raw.as_ptr(),
+                    primitive,
+                    map_index as u32,
+                    width,
+                    height,
+                    chain.levels.len() as u32,
+                )
+            };
+            if !created {
+                return Err(FilamentError::TextureUnavailable);
+            }
+            for (level, data) in chain.levels.iter().enumerate() {
+                let rect = TexelRect::full(data.width, data.height);
+                self.upload_region(primitive, map_index, level, rect, &data.rgba8)?;
+            }
+            // Keep the chain of the slot being painted, so later patches
+            // only touch what changed; one slot's chains at a time bounds
+            // the memory this costs.
+            if patch.is_some() {
+                let retained = self
+                    .retained
+                    .take()
+                    .filter(|retained| retained.primitive == primitive)
+                    .unwrap_or(RetainedChains {
+                        primitive,
+                        chains: Default::default(),
+                    });
+                self.retained = Some(retained);
+            }
+            if let Some(retained) = self
+                .retained
+                .as_mut()
+                .filter(|retained| retained.primitive == primitive)
+            {
+                retained.chains[map_index] = patch.is_some().then_some(chain);
+            }
         }
         if let Some(keys) = self.map_keys.get_mut(primitive as usize) {
             keys[map_index] = Some(key);
         }
         Ok(())
+    }
+
+    fn upload_region(
+        &mut self,
+        primitive: u32,
+        map_index: usize,
+        level: usize,
+        rect: TexelRect,
+        rgba8: &[u8],
+    ) -> Result<(), FilamentError> {
+        if rgba8.len() != rect.len() * 4 {
+            return Err(FilamentError::InvalidTexture);
+        }
+        // SAFETY: `rgba8` holds exactly rect.width * rect.height * 4 bytes; the shim
+        // copies them.
+        let uploaded = unsafe {
+            ffi::sc_renderer_set_map_region(
+                self.raw.as_ptr(),
+                primitive,
+                map_index as u32,
+                level as u32,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                rgba8.as_ptr(),
+            )
+        };
+        if uploaded {
+            Ok(())
+        } else {
+            Err(FilamentError::TextureUnavailable)
+        }
     }
 
     pub fn set_base_color_map(
@@ -372,6 +529,7 @@ impl FilamentRuntime {
         }
         // Fresh instances start with neutral maps.
         self.map_keys = vec![[None; MAP_COUNT]; primitives.len()];
+        self.retained = None;
         self.slot_primitives = slot_primitives;
         self.mesh_bounds = Some(bounds);
         Ok(())
@@ -530,7 +688,7 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};
 
-    use substancecraft_core::{PrimitivePreset, ViewportCamera};
+    use substancecraft_core::{PrimitivePreset, TexelRect, ViewportCamera};
 
     use super::{FLOATS_PER_VERTEX, FilamentRuntime, MaterialMap, build_mesh_buffers};
 
@@ -688,6 +846,66 @@ mod tests {
         assert!(
             mean_difference(&baseline, &preview) < 0.5,
             "preview mode shows a neutral dielectric"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0256_patched_maps_render_like_full_uploads() {
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        renderer
+            .set_mesh(&PrimitivePreset::Cube.build_mesh(), 60.0)
+            .expect("cube mesh upload");
+        renderer.set_preview_mode(true);
+        let size = 64_u32;
+        let fill = |left: [u8; 4], right: [u8; 4]| -> Vec<u8> {
+            (0..size * size)
+                .flat_map(|index| if index % size < size / 2 { left } else { right })
+                .collect()
+        };
+        let red = fill([220, 30, 30, 255], [220, 30, 30, 255]);
+        let split = fill([220, 30, 30, 255], [30, 40, 220, 255]);
+        let right_half = TexelRect {
+            x: size / 2,
+            y: 0,
+            width: size / 2,
+            height: size,
+        };
+        let base = MaterialMap::BaseColor;
+        renderer.set_map(0, base, 1, size, size, &red).expect("red");
+        let all_red = render_frame(&mut renderer);
+        // The first patch has no retained chain, so it uploads whole and
+        // keeps the chain; the second updates only the right half.
+        let full = [TexelRect::full(size, size)];
+        renderer
+            .patch_map(0, base, 2, 1, &full, size, size, &red)
+            .expect("retaining upload");
+        assert!(renderer.retained.as_ref().is_some_and(|retained| {
+            retained.primitive == 0 && retained.chains[base as usize].is_some()
+        }));
+        renderer
+            .patch_map(0, base, 3, 2, &[right_half], size, size, &split)
+            .expect("patch");
+        let patched = render_frame(&mut renderer);
+        renderer
+            .set_map(0, base, 4, size, size, &split)
+            .expect("split");
+        let uploaded = render_frame(&mut renderer);
+        assert!(
+            mean_difference(&all_red, &patched) > 1.0,
+            "the patch must show"
+        );
+        assert!(
+            // Identical frames differ by about 0.35 (dithering).
+            mean_difference(&patched, &uploaded) < 0.5,
+            "a patched map renders like a full upload"
+        );
+        assert!(
+            renderer
+                .retained
+                .as_ref()
+                .is_some_and(|retained| retained.chains[base as usize].is_none()),
+            "a plain upload drops the stale chain"
         );
     }
 
