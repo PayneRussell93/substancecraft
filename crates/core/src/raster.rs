@@ -5,6 +5,8 @@
 
 use glam::{Vec2, Vec3};
 
+use crate::region::TexelRect;
+
 pub(crate) fn uv_to_pixel(uv: Vec2, width: u32, height: u32) -> Vec2 {
     Vec2::new(
         uv.x * width.saturating_sub(1) as f32,
@@ -28,6 +30,19 @@ pub(crate) fn rasterize_uv_triangle(
     width: u32,
     height: u32,
     fringe: f32,
+    apply: impl FnMut(usize, Vec3, bool),
+) {
+    rasterize_uv_triangle_in(uvs, width, height, fringe, TexelRect::full(width, height), apply);
+}
+
+/// [`rasterize_uv_triangle`] limited to the texels of `clip`; the index is
+/// row-major within `clip`.
+pub(crate) fn rasterize_uv_triangle_in(
+    uvs: [Vec2; 3],
+    width: u32,
+    height: u32,
+    fringe: f32,
+    clip: TexelRect,
     mut apply: impl FnMut(usize, Vec3, bool),
 ) {
     if width == 0 || height == 0 || uvs.iter().any(|uv| !uv.is_finite()) {
@@ -50,6 +65,9 @@ pub(crate) fn rasterize_uv_triangle(
     let min_y = (minimum.y.floor() as i64).max(0);
     let max_x = (maximum.x.ceil() as i64).min(i64::from(width) - 1);
     let max_y = (maximum.y.ceil() as i64).min(i64::from(height) - 1);
+    let (min_x, min_y) = (min_x.max(i64::from(clip.x)), min_y.max(i64::from(clip.y)));
+    let max_x = max_x.min(i64::from(clip.right()) - 1);
+    let max_y = max_y.min(i64::from(clip.bottom()) - 1);
     if min_x > max_x || min_y > max_y {
         return;
     }
@@ -80,8 +98,7 @@ pub(crate) fn rasterize_uv_triangle(
             if sum <= f32::EPSILON {
                 continue;
             }
-            let index = y as usize * width as usize + x as usize;
-            apply(index, clamped / sum, interior);
+            apply(clip.local_index(x as u32, y as u32), clamped / sum, interior);
         }
     }
 }

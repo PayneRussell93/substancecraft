@@ -18,16 +18,71 @@ pub struct SurfaceHit {
 }
 
 /// Mirror painting across an object-space plane perpendicular to `axis`.
+/// With `radial` of 2 or more it instead repeats strokes `radial` times
+/// around the `axis` line through the object origin.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Symmetry {
     pub axis: Axis,
     /// Position of the mirror plane along `axis`.
     pub offset: f32,
+    /// Radial copies around `axis` (including the original), at most
+    /// [`MAX_RADIAL_COPIES`]; 0 or 1 mirrors instead.
+    #[serde(default)]
+    pub radial: u32,
 }
+
+/// The most radial symmetry copies a stroke can have.
+pub const MAX_RADIAL_COPIES: u32 = 32;
 
 impl Symmetry {
     pub fn new(axis: Axis) -> Self {
-        Self { axis, offset: 0.0 }
+        Self {
+            axis,
+            offset: 0.0,
+            radial: 0,
+        }
+    }
+
+    /// `count` copies around `axis` (clamped to [`MAX_RADIAL_COPIES`]).
+    pub fn radial(axis: Axis, count: u32) -> Self {
+        Self {
+            axis,
+            offset: 0.0,
+            radial: count.min(MAX_RADIAL_COPIES),
+        }
+    }
+
+    pub fn is_radial(self) -> bool {
+        self.radial >= 2
+    }
+
+    /// Where the symmetric copies of `position` fall: the mirror image, or
+    /// the radial copies after the original, in turn order.
+    pub fn copies(self, position: Vec3) -> Vec<Vec3> {
+        if !self.is_radial() {
+            return vec![self.mirror(position)];
+        }
+        let count = self.radial.min(MAX_RADIAL_COPIES);
+        let axis = match self.axis {
+            Axis::X => Vec3::X,
+            Axis::Y => Vec3::Y,
+            Axis::Z => Vec3::Z,
+        };
+        (1..count)
+            .map(|turn| {
+                let angle = std::f32::consts::TAU * turn as f32 / count as f32;
+                glam::Quat::from_axis_angle(axis, angle) * position
+            })
+            .collect()
+    }
+
+    /// The surface points of every copy of `hit`, in [`Self::copies`] order;
+    /// `None` where a copy finds no surface.
+    pub fn symmetric_hits(self, mesh: &MeshGeometry, hit: &SurfaceHit) -> Vec<Option<SurfaceHit>> {
+        self.copies(hit.position)
+            .into_iter()
+            .map(|position| mesh.closest_surface_point(position))
+            .collect()
     }
 
     /// `position` reflected across the mirror plane.
@@ -272,6 +327,7 @@ mod tests {
         let offset = Symmetry {
             axis: Axis::X,
             offset: 0.1,
+            radial: 0,
         };
         assert!((offset.mirror(Vec3::new(0.3, 0.0, 0.0)).x - -0.1).abs() < 1e-6);
         assert_eq!(
@@ -283,6 +339,35 @@ mod tests {
                 .closest_surface_point(Vec3::ZERO)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn tc_0236_radial_symmetry_repeats_hits_around_the_axis() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let hit = cube
+            .closest_surface_point(Vec3::new(0.3, 0.1, 0.9))
+            .unwrap();
+        let radial = Symmetry::radial(Axis::Y, 4);
+        assert!(radial.is_radial());
+        let copies = radial.symmetric_hits(&cube, &hit);
+        assert_eq!(copies.len(), 3);
+        let normals: Vec<Vec3> = copies.iter().map(|copy| copy.unwrap().normal).collect();
+        assert_eq!(normals, [Vec3::X, Vec3::NEG_Z, Vec3::NEG_X]);
+        let first = copies[0].unwrap().position;
+        assert!(
+            (first - Vec3::new(0.5, 0.1, -0.3)).length() < 1e-5,
+            "{first}"
+        );
+        // Every copy keeps its distance from the axis and its height.
+        for copy in copies.iter().flatten() {
+            assert!((copy.position.y - 0.1).abs() < 1e-5);
+            let radius = |p: Vec3| Vec2::new(p.x, p.z).length();
+            assert!((radius(copy.position) - radius(hit.position)).abs() < 1e-4);
+        }
+        // Counts clamp; below two is plain mirroring.
+        assert_eq!(Symmetry::radial(Axis::Z, 99).copies(Vec3::X).len(), 31);
+        assert!(!Symmetry::radial(Axis::Z, 1).is_radial());
+        assert_eq!(Symmetry::radial(Axis::X, 1).copies(Vec3::X), [Vec3::NEG_X]);
     }
 
     #[test]

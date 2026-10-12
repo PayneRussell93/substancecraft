@@ -226,11 +226,150 @@ impl DisjointSet {
     }
 }
 
+/// Why the mesh diagnostics overlay draws an edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeFlags {
+    /// The two faces use different UVs along the edge.
+    pub uv_seam: bool,
+    /// The faces' shading normals do not match (a split-normal edge).
+    pub hard: bool,
+    /// The tangent frames differ, so tangent-space normal maps can show a
+    /// seam here.
+    pub tangent_split: bool,
+}
+
+impl EdgeFlags {
+    pub fn any(self) -> bool {
+        self.uv_seam || self.hard || self.tangent_split
+    }
+}
+
+/// An edge shared by two faces that the diagnostics overlay marks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiagnosticEdge {
+    pub a: Vec3,
+    pub b: Vec3,
+    /// The two triangles meeting at the edge.
+    pub faces: [u32; 2],
+    pub flags: EdgeFlags,
+}
+
+/// Edges where shading, UVs, or tangent frames split, found by welding
+/// positions and comparing the two faces at each shared edge. Normals and
+/// tangents are the ones the renderer uses for `smoothing_angle_degrees`.
+/// Open (one-face) and non-manifold edges are skipped.
+pub fn diagnostic_edges(mesh: &MeshGeometry, smoothing_angle_degrees: f32) -> Vec<DiagnosticEdge> {
+    let welded = weld_positions(mesh);
+    let corners = crate::corner_normals(mesh, smoothing_angle_degrees);
+    let vertex_normals = crate::vertex_normals(mesh, smoothing_angle_degrees);
+    let tangents = crate::vertex_tangents(mesh, &vertex_normals);
+    // Per welded edge (low, high): triangle, then for each end the vertex
+    // and the corner slot.
+    let mut edges = HashMap::<(u32, u32), Vec<(u32, [(u32, usize); 2])>>::new();
+    for (triangle_index, triangle) in mesh.triangles.iter().enumerate() {
+        for corner in 0..3 {
+            let next = (corner + 1) % 3;
+            let (Some(&a), Some(&b)) = (
+                welded.get(triangle[corner] as usize),
+                welded.get(triangle[next] as usize),
+            ) else {
+                continue;
+            };
+            if a == b {
+                continue;
+            }
+            let ends = if a < b {
+                [(triangle[corner], corner), (triangle[next], next)]
+            } else {
+                [(triangle[next], next), (triangle[corner], corner)]
+            };
+            edges
+                .entry((a.min(b), a.max(b)))
+                .or_default()
+                .push((triangle_index as u32, ends));
+        }
+    }
+    let normal_limit = 1.0_f32.to_radians().cos();
+    let tangent_limit = 5.0_f32.to_radians().cos();
+    let mut found: Vec<((u32, u32), DiagnosticEdge)> = edges
+        .into_iter()
+        .filter_map(|(key, sides)| {
+            let [(first, first_ends), (second, second_ends)] = sides.as_slice() else {
+                return None;
+            };
+            let mut flags = EdgeFlags::default();
+            for end in 0..2 {
+                let (vertex_a, corner_a) = first_ends[end];
+                let (vertex_b, corner_b) = second_ends[end];
+                let (va, vb) = (
+                    mesh.vertices.get(vertex_a as usize)?,
+                    mesh.vertices.get(vertex_b as usize)?,
+                );
+                flags.uv_seam |= (va.uv - vb.uv).length() > 1e-5;
+                let (na, nb) = (
+                    corners.get(*first as usize)?[corner_a],
+                    corners.get(*second as usize)?[corner_b],
+                );
+                flags.hard |= na.dot(nb) < normal_limit;
+                let (ta, tb) = (
+                    tangents.get(vertex_a as usize)?,
+                    tangents.get(vertex_b as usize)?,
+                );
+                flags.tangent_split |=
+                    ta.truncate().dot(tb.truncate()) < tangent_limit || ta.w != tb.w;
+            }
+            let (a, b) = (
+                mesh.vertices.get(first_ends[0].0 as usize)?.position,
+                mesh.vertices.get(first_ends[1].0 as usize)?.position,
+            );
+            flags.any().then_some((
+                key,
+                DiagnosticEdge {
+                    a,
+                    b,
+                    faces: [*first, *second],
+                    flags,
+                },
+            ))
+        })
+        .collect();
+    // Map order is random; sort so the overlay is stable.
+    found.sort_by_key(|(key, _)| *key);
+    found.into_iter().map(|(_, edge)| edge).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{MeshVertex, PrimitivePreset};
+
+    #[test]
+    fn tc_0247_diagnostic_edges_mark_seams_hard_edges_and_tangent_splits() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let edges = diagnostic_edges(&cube, 30.0);
+        // Every cube edge is both a UV seam and hard; face diagonals are not
+        // marked.
+        assert_eq!(edges.len(), 12);
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.flags.uv_seam && edge.flags.hard)
+        );
+        assert!(edges.iter().all(|edge| (edge.a - edge.b).length() > 0.99));
+        // Smoothing everything leaves the seams but no hard edges.
+        let smooth = diagnostic_edges(&cube, 180.0);
+        assert_eq!(smooth.len(), 12);
+        assert!(
+            smooth
+                .iter()
+                .all(|edge| edge.flags.uv_seam && !edge.flags.hard)
+        );
+        assert!(smooth.iter().any(|edge| edge.flags.tangent_split));
+        assert_eq!(diagnostic_edges(&cube, 30.0), edges);
+        // A flat plane has nothing to report.
+        assert!(diagnostic_edges(&PrimitivePreset::Plane.build_mesh(), 30.0).is_empty());
+    }
 
     #[test]
     fn tc_0030_cube_is_one_element_with_six_uv_islands() {

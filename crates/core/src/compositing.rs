@@ -14,10 +14,11 @@ use thiserror::Error;
 use crate::AnchorMask;
 use crate::brush::{self, StrokePath};
 use crate::filters::{self, PlaneData};
+use crate::region::TexelRect;
 use crate::resources::{ProjectionMode, ResourceImages, TextureImage, luminance};
 use crate::{
     DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_OPACITY, DEFAULT_ROUGHNESS,
-    LayerFill, LayerId, MAX_BAKE_PIXELS, MAX_TEXTURE_DIMENSION, MaskGenerator, MaterialChannel,
+    LayerFill, LayerId, MAX_BAKE_PIXELS, MAX_TEXTURE_DIMENSION, MaterialChannel,
     MaterialLayer, MeshGeometry, MeshMaps, PaintStroke, ResourceId, TextureResolution, TextureSet,
     raster, valid_height_strength, valid_layer_strokes,
 };
@@ -76,6 +77,8 @@ pub enum BakeError {
     MissingResource(ResourceId),
     #[error(transparent)]
     InvalidExportPreset(#[from] crate::export::ExportPresetError),
+    #[error("a region rebake needs a target the size of the texture set and a region inside it")]
+    RegionMismatch,
 }
 
 /// Data a texture bake may need: geometry for polygon masks, baked mesh
@@ -210,7 +213,7 @@ impl MaterialTextures {
 /// fully open.
 pub(crate) struct LayerMasks(BTreeMap<LayerId, Vec<f32>>);
 
-fn plane_data(channel: MaterialChannel) -> PlaneData {
+pub(crate) fn plane_data(channel: MaterialChannel) -> PlaneData {
     match channel {
         MaterialChannel::BaseColor | MaterialChannel::Emissive | MaterialChannel::Id => {
             PlaneData::Color
@@ -261,6 +264,10 @@ pub enum BlendMode {
     /// Linear dodge: sums values, clamped to 1.
     Add,
     Subtract,
+    /// Groups only: children blend straight onto the stack beneath, as if
+    /// ungrouped, and the group's opacity, mask, and filters fade that
+    /// result in.
+    PassThrough,
 }
 
 impl BlendMode {
@@ -289,6 +296,7 @@ impl BlendMode {
             Self::Difference => "Difference",
             Self::Add => "Add",
             Self::Subtract => "Subtract",
+            Self::PassThrough => "Pass through",
         }
     }
 
@@ -297,7 +305,7 @@ impl BlendMode {
     pub fn apply(self, backdrop: f32, source: f32) -> f32 {
         let (b, s) = (backdrop, source);
         let result = match self {
-            Self::Normal => s,
+            Self::Normal | Self::PassThrough => s,
             Self::Multiply => b * s,
             Self::Screen => b + s - b * s,
             Self::Overlay => {
@@ -445,7 +453,10 @@ struct Compositor<'a> {
     data: PlaneData,
     context: BakeContext<'a>,
     masks: &'a LayerMasks,
-    pixel_count: usize,
+    /// Texels composited; every buffer is row-major over this rectangle.
+    region: TexelRect,
+    /// Records each layer's values at one texel (the surface inspector).
+    probe: Option<&'a crate::inspect::Probe>,
 }
 
 impl Compositor<'_> {
@@ -463,7 +474,13 @@ impl Compositor<'_> {
             if !contributes(layer, &[self.channel]) {
                 continue;
             }
-            let mut local = try_filled(self.pixel_count, Vec4::ZERO)?;
+            if layer.blend_mode == BlendMode::PassThrough
+                && let Some(children) = &layer.children
+            {
+                self.pass_through(layer, children, target)?;
+                continue;
+            }
+            let mut local = try_filled(self.region.len(), Vec4::ZERO)?;
             if let Some(children) = &layer.children {
                 self.composite(children, &mut local)?;
             } else {
@@ -474,14 +491,19 @@ impl Compositor<'_> {
                     self.render_stroke(stroke, &mut local);
                 }
             }
+            // Partial regions only run per-texel filters (see
+            // `TextureSet::supports_region_rebake`).
             filters::apply_to_plane(
                 &mut local,
-                self.width(),
-                self.height(),
+                self.region.width,
+                self.region.height,
                 self.data,
                 &layer.filters,
             );
             let mask = self.masks.0.get(&layer.id);
+            if let Some(probe) = self.probe {
+                probe.record(layer, &local, mask.map(Vec::as_slice));
+            }
             for (index, (destination, source)) in target.iter_mut().zip(&local).enumerate() {
                 if source.w <= 0.0 {
                     continue;
@@ -504,6 +526,48 @@ impl Compositor<'_> {
         Ok(())
     }
 
+    /// Composites a pass-through group: its children go onto a copy of the
+    /// stack, which then fades in over the stack by the group's opacity and
+    /// mask.
+    fn pass_through(
+        &self,
+        layer: &MaterialLayer,
+        children: &[MaterialLayer],
+        target: &mut [Vec4],
+    ) -> Result<(), BakeError> {
+        let mut through = try_filled(self.region.len(), Vec4::ZERO)?;
+        through.copy_from_slice(target);
+        self.composite(children, &mut through)?;
+        filters::apply_to_plane(
+            &mut through,
+            self.region.width,
+            self.region.height,
+            self.data,
+            &layer.filters,
+        );
+        let mask = self.masks.0.get(&layer.id);
+        if let Some(probe) = self.probe {
+            probe.record(layer, &through, mask.map(Vec::as_slice));
+        }
+        for (index, (destination, passed)) in target.iter_mut().zip(&through).enumerate() {
+            let amount = (layer.opacity * mask.map_or(1.0, |values| values[index])).clamp(0.0, 1.0);
+            // Straight alpha: mix premultiplied colour, then divide back out.
+            let alpha = destination.w + (passed.w - destination.w) * amount;
+            let mut color = if alpha > 0.0 {
+                (destination.truncate() * destination.w * (1.0 - amount)
+                    + passed.truncate() * passed.w * amount)
+                    / alpha
+            } else {
+                destination.truncate()
+            };
+            if self.data == PlaneData::Vector {
+                color = color.normalize_or(Vec3::Z);
+            }
+            *destination = color.extend(alpha);
+        }
+        Ok(())
+    }
+
     fn render_fill(&self, fill: &LayerFill, local: &mut [Vec4]) -> Result<(), BakeError> {
         let Some(resource) = fill.textures.for_channel(self.channel) else {
             let texel = fill_texel(fill, self.channel);
@@ -511,7 +575,7 @@ impl Compositor<'_> {
                 // Uniform channels of a decal fill still stay inside its box.
                 let maps = self.context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
                 let projection = fill.projection;
-                parallel_fill(local, self.width(), self.height(), |uv| {
+                parallel_fill_region(local, self.region, self.width(), self.height(), |uv| {
                     let coverage = projection.coverage(Some(&maps.sample(uv)));
                     texel.truncate().extend(texel.w * coverage)
                 });
@@ -533,18 +597,24 @@ impl Compositor<'_> {
         {
             // Same grid as the bake: copy texels instead of resampling, so
             // exact-size bitmaps (and flattened layers) stay sharp.
-            for (texel, pixel) in local.iter_mut().zip(image.rgba8.as_chunks::<4>().0) {
-                let sample = Vec4::new(
-                    f32::from(pixel[0]),
-                    f32::from(pixel[1]),
-                    f32::from(pixel[2]),
-                    f32::from(pixel[3]),
-                ) / 255.0;
-                *texel = texture_texel(sample, data, image.color_space);
+            let pixels = image.rgba8.as_chunks::<4>().0;
+            let row = self.width() as usize;
+            let span = self.region.width as usize;
+            for (local_row, texels) in local.chunks_mut(span).enumerate() {
+                let start = (self.region.y as usize + local_row) * row + self.region.x as usize;
+                for (texel, pixel) in texels.iter_mut().zip(&pixels[start..start + span]) {
+                    let sample = Vec4::new(
+                        f32::from(pixel[0]),
+                        f32::from(pixel[1]),
+                        f32::from(pixel[2]),
+                        f32::from(pixel[3]),
+                    ) / 255.0;
+                    *texel = texture_texel(sample, data, image.color_space);
+                }
             }
             return Ok(());
         }
-        parallel_fill(local, self.width(), self.height(), |uv| {
+        parallel_fill_region(local, self.region, self.width(), self.height(), |uv| {
             let sample = maps.map(|maps| maps.sample(uv));
             texture_texel(
                 projection.sample(image, uv, sample.as_ref()),
@@ -568,6 +638,7 @@ impl Compositor<'_> {
             self.width(),
             self.height(),
             self.context.resources,
+            self.region,
             |index, coverage| {
                 let amount = (coverage * stroke.opacity).clamp(0.0, 1.0);
                 if stroke.erase {
@@ -607,6 +678,14 @@ impl TextureSet {
     }
 
     pub(crate) fn validate_for_bake(&self) -> Result<Option<BakedTexture>, BakeError> {
+        Ok(self
+            .validate_for_region(self.texel_rect())?
+            .map(|rgba8| self.texture(rgba8)))
+    }
+
+    /// Checks the set can bake and returns the ID map over `region` (RGBA,
+    /// row-major within it) when a layer clips to an ID colour.
+    fn validate_for_region(&self, region: TexelRect) -> Result<Option<Vec<u8>>, BakeError> {
         let layers = self.walk_layers();
         if layers.iter().any(|layer| !valid_layer_strokes(layer)) {
             return Err(BakeError::InvalidStrokeData);
@@ -617,11 +696,108 @@ impl TextureSet {
             return Err(BakeError::InvalidLayerSettings);
         }
         checked_bake_pixel_count(self.resolution)?;
+        if region.intersect(self.texel_rect()) != Some(region) {
+            return Err(BakeError::RegionMismatch);
+        }
         layers
             .iter()
             .any(|layer| layer.id_mask_color.is_some())
-            .then(|| self.bake_id_mask())
+            .then(|| self.id_map_region(region))
             .transpose()
+    }
+
+    /// Every texel of the set's textures.
+    pub(crate) fn texel_rect(&self) -> TexelRect {
+        TexelRect::full(self.resolution.width, self.resolution.height)
+    }
+
+    /// True when every layer's content and mask filters work per texel, so
+    /// rebaking a region reproduces a full bake there exactly. Blur and
+    /// sharpen read neighbouring texels, so sets using them rebake whole.
+    pub fn supports_region_rebake(&self) -> bool {
+        self.walk_layers().iter().all(|layer| {
+            layer
+                .filters
+                .iter()
+                .chain(&layer.mask_filters)
+                .all(|filter| filter.is_per_texel())
+        })
+    }
+
+    /// Rebakes only `region` of `textures`, a [`Self::bake_material`]
+    /// result for an earlier state of this set that differs from the
+    /// current one only inside `region`. The patched textures equal a full
+    /// bake byte for byte; sets that fail [`Self::supports_region_rebake`]
+    /// are rejected with [`BakeError::RegionMismatch`].
+    pub fn rebake_material_region(
+        &self,
+        context: BakeContext<'_>,
+        textures: &mut MaterialTextures,
+        region: TexelRect,
+    ) -> Result<(), BakeError> {
+        let (width, height) = (self.resolution.width, self.resolution.height);
+        if ![
+            &textures.base_color,
+            &textures.orm,
+            &textures.normal,
+            &textures.emissive,
+        ]
+        .into_iter()
+        .all(|texture| self.region_target_fits(texture, region))
+        {
+            return Err(BakeError::RegionMismatch);
+        }
+        if region.is_empty() {
+            return Ok(());
+        }
+        // The height-to-normal slope reads one texel around each texel.
+        let grown = region.grow(1, width, height);
+        let planes = self.material_rgba8(context, grown)?;
+        for (texture, rgba8) in [
+            &mut textures.base_color,
+            &mut textures.orm,
+            &mut textures.normal,
+            &mut textures.emissive,
+        ]
+        .into_iter()
+        .zip(&planes)
+        {
+            patch_rgba8(&mut texture.rgba8, width, rgba8, grown, region);
+        }
+        Ok(())
+    }
+
+    /// True when the set can rebake `region` of `texture`: spatial filters
+    /// are absent, the texture is the set's size, and `region` lies inside.
+    fn region_target_fits(&self, texture: &BakedTexture, region: TexelRect) -> bool {
+        let full = self.texel_rect();
+        self.supports_region_rebake()
+            && texture.width == full.width
+            && texture.height == full.height
+            && texture.rgba8.len() == full.len() * 4
+            && (region.is_empty() || region.intersect(full) == Some(region))
+    }
+
+    /// Rebakes only `region` of `texture`, a [`Self::bake_channel`] result
+    /// for `channel`; see [`Self::rebake_material_region`].
+    pub fn rebake_channel_region(
+        &self,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        texture: &mut BakedTexture,
+        region: TexelRect,
+    ) -> Result<(), BakeError> {
+        let (width, height) = (self.resolution.width, self.resolution.height);
+        if !self.region_target_fits(texture, region) {
+            return Err(BakeError::RegionMismatch);
+        }
+        if region.is_empty() {
+            return Ok(());
+        }
+        let grown = region.grow(1, width, height);
+        let rgba8 = self.channel_rgba8(channel, context, grown)?;
+        patch_rgba8(&mut texture.rgba8, width, &rgba8, grown, region);
+        Ok(())
     }
 
     /// Composites every visible layer that enables `channel`.
@@ -643,32 +819,74 @@ impl TextureSet {
         if channel == MaterialChannel::Id {
             return self.bake_id_mask();
         }
+        Ok(self.texture(self.channel_rgba8(channel, context, self.texel_rect())?))
+    }
+
+    /// [`Self::bake_channel`] over `region` only, as RGBA row-major within
+    /// it.
+    fn channel_rgba8(
+        &self,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        region: TexelRect,
+    ) -> Result<Vec<u8>, BakeError> {
+        if channel == MaterialChannel::Id {
+            if self
+                .walk_layers()
+                .iter()
+                .any(|layer| !valid_layer_strokes(layer))
+            {
+                return Err(BakeError::InvalidStrokeData);
+            }
+            checked_bake_pixel_count(self.resolution)?;
+            return self.id_map_region(region);
+        }
         base_texel(channel)?;
-        let id_map = self.validate_for_bake()?;
-        let rgba8 = if channel == MaterialChannel::Normal {
-            let masks = self.layer_masks(
+        let id_map = self.validate_for_region(region)?;
+        let id_map = id_map.as_deref();
+        Ok(if channel == MaterialChannel::Normal {
+            let masks = self.layer_masks_in(
                 &[MaterialChannel::Normal, MaterialChannel::Height],
                 context,
-                id_map.as_ref(),
+                id_map,
+                region,
             )?;
-            plane_to_rgba8(&self.normal_plane(context, &masks)?, PlaneData::Vector)
-        } else {
-            let masks = self.layer_masks(&[channel], context, id_map.as_ref())?;
             plane_to_rgba8(
-                &self.composite_plane(channel, context, &masks)?,
+                &self.normal_region(context, &masks, region)?,
+                PlaneData::Vector,
+            )
+        } else {
+            let masks = self.layer_masks_in(&[channel], context, id_map, region)?;
+            plane_to_rgba8(
+                &self.composite_region(channel, context, &masks, None, region)?,
                 plane_data(channel),
             )
-        };
-        Ok(self.texture(rgba8))
+        })
     }
 
     /// Bakes Base Color (with Opacity in alpha), packed ORM, Normal, and
     /// Emissive for display or engine export.
     pub fn bake_material(&self, context: BakeContext<'_>) -> Result<MaterialTextures, BakeError> {
-        let id_map = self.validate_for_bake()?;
+        let [base_color, orm, normal, emissive] = self.material_rgba8(context, self.texel_rect())?;
+        Ok(MaterialTextures {
+            base_color: self.texture(base_color),
+            orm: self.texture(orm),
+            normal: self.texture(normal),
+            emissive: self.texture(emissive),
+        })
+    }
+
+    /// [`Self::bake_material`]'s Base Color, ORM, Normal, and Emissive over
+    /// `region` only, each RGBA row-major within it.
+    fn material_rgba8(
+        &self,
+        context: BakeContext<'_>,
+        region: TexelRect,
+    ) -> Result<[Vec<u8>; 4], BakeError> {
+        let id_map = self.validate_for_region(region)?;
         // Masks (generators especially) are the expensive part; build each once
         // and share them across all channels.
-        let masks = self.layer_masks(
+        let masks = self.layer_masks_in(
             &[
                 MaterialChannel::BaseColor,
                 MaterialChannel::Roughness,
@@ -679,10 +897,11 @@ impl TextureSet {
                 MaterialChannel::Opacity,
             ],
             context,
-            id_map.as_ref(),
+            id_map.as_deref(),
+            region,
         )?;
         let masks = &masks;
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        let pixel_count = region.len();
         // Channels nothing paints stay at their defaults without compositing.
         let plane = |channel: MaterialChannel| -> Result<Option<Vec<Vec4>>, BakeError> {
             if self
@@ -690,7 +909,8 @@ impl TextureSet {
                 .iter()
                 .any(|layer| contributes(layer, &[channel]))
             {
-                self.composite_plane(channel, context, masks).map(Some)
+                self.composite_region(channel, context, masks, None, region)
+                    .map(Some)
             } else {
                 Ok(None)
             }
@@ -706,7 +926,7 @@ impl TextureSet {
                     plane(MaterialChannel::Opacity)?,
                 ))
             });
-            let normal = self.normal_plane(context, masks);
+            let normal = self.normal_region(context, masks, region);
             let base = base.join().unwrap_or(Err(BakeError::AllocationFailed));
             let scalars = scalars.join().unwrap_or(Err(BakeError::AllocationFailed));
             (base, scalars, normal)
@@ -719,8 +939,9 @@ impl TextureSet {
         };
         let mut occlusion = try_filled(pixel_count, 1.0_f32)?;
         if let Some(maps) = context.mesh_maps {
-            parallel_fill(
+            parallel_fill_region(
                 &mut occlusion,
+                region,
                 self.resolution.width,
                 self.resolution.height,
                 |uv| {
@@ -765,12 +986,12 @@ impl TextureSet {
                 255,
             ]);
         }
-        Ok(MaterialTextures {
-            base_color: self.texture(base_color),
-            orm: self.texture(orm),
-            normal: self.texture(plane_to_rgba8(&normal, PlaneData::Vector)),
-            emissive: self.texture(emission),
-        })
+        Ok([
+            base_color,
+            orm,
+            plane_to_rgba8(&normal, PlaneData::Vector),
+            emission,
+        ])
     }
 
     pub(crate) fn texture(&self, rgba8: Vec<u8>) -> BakedTexture {
@@ -789,8 +1010,20 @@ impl TextureSet {
         context: BakeContext<'_>,
         id_map: Option<&BakedTexture>,
     ) -> Result<LayerMasks, BakeError> {
+        let id_map = id_map.map(|map| map.rgba8.as_slice());
+        self.layer_masks_in(channels, context, id_map, self.texel_rect())
+    }
+
+    /// [`Self::layer_masks`] over `region`, with `id_map` covering it too.
+    fn layer_masks_in(
+        &self,
+        channels: &[MaterialChannel],
+        context: BakeContext<'_>,
+        id_map: Option<&[u8]>,
+        region: TexelRect,
+    ) -> Result<LayerMasks, BakeError> {
         let mut masks = BTreeMap::new();
-        self.collect_masks(&self.layers, channels, context, id_map, &mut masks)?;
+        self.collect_masks(&self.layers, channels, context, id_map, region, &mut masks)?;
         Ok(LayerMasks(masks))
     }
 
@@ -799,18 +1032,19 @@ impl TextureSet {
         layers: &[MaterialLayer],
         channels: &[MaterialChannel],
         context: BakeContext<'_>,
-        id_map: Option<&BakedTexture>,
+        id_map: Option<&[u8]>,
+        region: TexelRect,
         masks: &mut BTreeMap<LayerId, Vec<f32>>,
     ) -> Result<(), BakeError> {
         for layer in layers {
             if !contributes(layer, channels) {
                 continue;
             }
-            if let Some(mask) = self.layer_mask(layer, context, id_map)? {
+            if let Some(mask) = self.layer_mask_in(layer, context, id_map, region)? {
                 masks.insert(layer.id, mask);
             }
             if let Some(children) = &layer.children {
-                self.collect_masks(children, channels, context, id_map, masks)?;
+                self.collect_masks(children, channels, context, id_map, region, masks)?;
             }
         }
         Ok(())
@@ -822,13 +1056,37 @@ impl TextureSet {
         context: BakeContext<'_>,
         masks: &LayerMasks,
     ) -> Result<Vec<Vec4>, BakeError> {
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let mut plane = try_filled(pixel_count, base_texel(channel)?)?;
+        self.composite_plane_probed(channel, context, masks, None)
+    }
+
+    pub(crate) fn composite_plane_probed(
+        &self,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        masks: &LayerMasks,
+        probe: Option<&crate::inspect::Probe>,
+    ) -> Result<Vec<Vec4>, BakeError> {
+        self.composite_region(channel, context, masks, probe, self.texel_rect())
+    }
+
+    /// One channel composited over `region` (row-major within it); `masks`
+    /// must cover the same region.
+    fn composite_region(
+        &self,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        masks: &LayerMasks,
+        probe: Option<&crate::inspect::Probe>,
+        region: TexelRect,
+    ) -> Result<Vec<Vec4>, BakeError> {
+        checked_bake_pixel_count(self.resolution)?;
+        let mut plane = try_filled(region.len(), base_texel(channel)?)?;
         if channel == MaterialChannel::Normal
             && let Some(maps) = context.mesh_maps
         {
-            parallel_fill(
+            parallel_fill_region(
                 &mut plane,
+                region,
                 self.resolution.width,
                 self.resolution.height,
                 |uv| maps.sample(uv).tangent_normal.extend(1.0),
@@ -840,20 +1098,35 @@ impl TextureSet {
             data: plane_data(channel),
             context,
             masks,
-            pixel_count,
+            region,
+            probe,
         }
         .composite(&self.layers, &mut plane)?;
         Ok(plane)
     }
 
-    /// Normal-channel composite with Height-derived detail blended on top
-    /// (whiteout blend), so painted bumps and dents shade in the viewport.
+    /// The full-texture [`Self::normal_region`].
     pub(crate) fn normal_plane(
         &self,
         context: BakeContext<'_>,
         masks: &LayerMasks,
     ) -> Result<Vec<Vec4>, BakeError> {
-        let mut normals = self.composite_plane(MaterialChannel::Normal, context, masks)?;
+        self.normal_region(context, masks, self.texel_rect())
+    }
+
+    /// Normal-channel composite over `region` with Height-derived detail
+    /// blended on top (whiteout blend), so painted bumps and dents shade in
+    /// the viewport. The slope at a texel reads its neighbours, so only
+    /// texels whose neighbours lie inside `region` (or off the texture's
+    /// edge) are exact.
+    fn normal_region(
+        &self,
+        context: BakeContext<'_>,
+        masks: &LayerMasks,
+        region: TexelRect,
+    ) -> Result<Vec<Vec4>, BakeError> {
+        let mut normals =
+            self.composite_region(MaterialChannel::Normal, context, masks, None, region)?;
         if self.height_strength <= 0.0
             || !self
                 .layers
@@ -862,26 +1135,31 @@ impl TextureSet {
         {
             return Ok(normals);
         }
-        let height = self.composite_plane(MaterialChannel::Height, context, masks)?;
-        let width = self.resolution.width as usize;
-        let rows = self.resolution.height as usize;
+        let height =
+            self.composite_region(MaterialChannel::Height, context, masks, None, region)?;
         let scale = self.height_strength * self.resolution.width.max(self.resolution.height) as f32
             / HEIGHT_SLOPE_REFERENCE_TEXELS;
-        let at = |x: usize, y: usize| height[y * width + x].x;
-        for y in 0..rows {
-            for x in 0..width {
-                let du = (at((x + 1).min(width - 1), y) - at(x.saturating_sub(1), y)) * 0.5;
+        // Texture coordinates, clamped to the texture and then the region.
+        let (last_x, last_y) = (self.resolution.width - 1, self.resolution.height - 1);
+        let at = |x: u32, y: u32| {
+            let x = x.clamp(region.x, region.right() - 1);
+            let y = y.clamp(region.y, region.bottom() - 1);
+            height[region.local_index(x, y)].x
+        };
+        for y in region.y..region.bottom() {
+            for x in region.x..region.right() {
+                let du = (at((x + 1).min(last_x), y) - at(x.saturating_sub(1), y)) * 0.5;
                 // Rows run top to bottom, so +V is toward the previous row.
-                let dv = (at(x, y.saturating_sub(1)) - at(x, (y + 1).min(rows - 1))) * 0.5;
+                let dv = (at(x, y.saturating_sub(1)) - at(x, (y + 1).min(last_y))) * 0.5;
                 if du == 0.0 && dv == 0.0 {
                     continue;
                 }
                 let detail = Vec3::new(-du * scale, -dv * scale, 1.0).normalize_or(Vec3::Z);
-                let base = normals[y * width + x].truncate();
-                normals[y * width + x] =
-                    Vec3::new(base.x + detail.x, base.y + detail.y, base.z * detail.z)
-                        .normalize_or(Vec3::Z)
-                        .extend(1.0);
+                let index = region.local_index(x, y);
+                let base = normals[index].truncate();
+                normals[index] = Vec3::new(base.x + detail.x, base.y + detail.y, base.z * detail.z)
+                    .normalize_or(Vec3::Z)
+                    .extend(1.0);
             }
         }
         Ok(normals)
@@ -891,11 +1169,23 @@ impl TextureSet {
     /// generator (or white) is the base, a bitmap multiplies it, painted
     /// mask strokes blend over it, mask filters run, and polygon and
     /// ID-colour clipping multiply the result.
-    fn layer_mask(
+    pub(crate) fn layer_mask(
         &self,
         layer: &MaterialLayer,
         context: BakeContext<'_>,
         id_map: Option<&BakedTexture>,
+    ) -> Result<Option<Vec<f32>>, BakeError> {
+        let id_map = id_map.map(|map| map.rgba8.as_slice());
+        self.layer_mask_in(layer, context, id_map, self.texel_rect())
+    }
+
+    /// [`Self::layer_mask`] over `region`, with `id_map` covering it too.
+    fn layer_mask_in(
+        &self,
+        layer: &MaterialLayer,
+        context: BakeContext<'_>,
+        id_map: Option<&[u8]>,
+        region: TexelRect,
     ) -> Result<Option<Vec<f32>>, BakeError> {
         if layer.mask_generator.is_none()
             && layer.mask_strokes.is_empty()
@@ -910,12 +1200,15 @@ impl TextureSet {
         }
         let width = self.resolution.width;
         let height = self.resolution.height;
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
+        checked_bake_pixel_count(self.resolution)?;
+        let pixel_count = region.len();
         let mut values = try_filled(pixel_count, 1.0_f32)?;
 
         if let Some(generator) = &layer.mask_generator {
             let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
-            evaluate_generator(&mut values, generator, maps, width, height);
+            parallel_fill_region(&mut values, region, width, height, |uv| {
+                generator.evaluate(&maps.sample(uv))
+            });
         }
         if let Some(bitmap) = layer.mask_bitmap {
             let image = context.image(bitmap.resource)?;
@@ -925,7 +1218,7 @@ impl TextureSet {
                 None
             };
             let mut bitmap_values = try_filled(pixel_count, 0.0_f32)?;
-            parallel_fill(&mut bitmap_values, width, height, |uv| {
+            parallel_fill_region(&mut bitmap_values, region, width, height, |uv| {
                 let sample = maps.map(|maps| maps.sample(uv));
                 let texel = bitmap.projection.sample(image, uv, sample.as_ref());
                 let value = luminance(texel) * texel.w;
@@ -936,7 +1229,7 @@ impl TextureSet {
             }
         }
         if let Some(anchor) = layer.mask_anchor {
-            let anchored = self.anchor_values(layer.id, anchor, context)?;
+            let anchored = self.anchor_values(layer.id, anchor, context, region)?;
             for (value, anchored) in values.iter_mut().zip(anchored) {
                 *value *= anchored;
             }
@@ -953,13 +1246,19 @@ impl TextureSet {
                 width,
                 height,
                 context.resources,
+                region,
                 |index, coverage| {
                     let alpha = (stroke.opacity * coverage).clamp(0.0, 1.0);
                     values[index] += (stroke.value - values[index]) * alpha;
                 },
             );
         }
-        filters::apply_to_mask(&mut values, width, height, &layer.mask_filters);
+        filters::apply_to_mask(
+            &mut values,
+            region.width,
+            region.height,
+            &layer.mask_filters,
+        );
         if let Some(polygon_mask) = &layer.polygon_mask {
             let mesh = context.mesh.ok_or(BakeError::MissingMesh)?;
             let mut selected = try_filled(pixel_count, false)?;
@@ -974,11 +1273,12 @@ impl TextureSet {
                 else {
                     continue;
                 };
-                raster::rasterize_uv_triangle(
+                raster::rasterize_uv_triangle_in(
                     [uvs[0], uvs[1], uvs[2]],
                     width,
                     height,
                     0.5,
+                    region,
                     |index, _, _| selected[index] = true,
                 );
             }
@@ -991,7 +1291,7 @@ impl TextureSet {
         if let Some(target) = layer.id_mask_color {
             for (index, value) in values.iter_mut().enumerate() {
                 let matches = id_map
-                    .and_then(|map| map.rgba8.get(index * 4..index * 4 + 4))
+                    .and_then(|map| map.get(index * 4..index * 4 + 4))
                     .is_some_and(|pixel| pixel[0..3] == target && pixel[3] > 0);
                 if !matches {
                     *value = 0.0;
@@ -1058,6 +1358,7 @@ impl TextureSet {
         layer: LayerId,
         anchor: AnchorMask,
         context: BakeContext<'_>,
+        region: TexelRect,
     ) -> Result<Vec<f32>, BakeError> {
         if !self.anchor_is_valid(layer, anchor.layer) {
             return Err(BakeError::InvalidLayerSettings);
@@ -1065,9 +1366,9 @@ impl TextureSet {
         let stack = self
             .truncated_through(anchor.layer)
             .ok_or(BakeError::InvalidLayerSettings)?;
-        let id_map = stack.validate_for_bake()?;
-        let masks = stack.layer_masks(&[anchor.channel], context, id_map.as_ref())?;
-        let plane = stack.composite_plane(anchor.channel, context, &masks)?;
+        let id_map = stack.validate_for_region(region)?;
+        let masks = stack.layer_masks_in(&[anchor.channel], context, id_map.as_deref(), region)?;
+        let plane = stack.composite_region(anchor.channel, context, &masks, None, region)?;
         let read = |texel: &Vec4| match plane_data(anchor.channel) {
             // Colour reads luminance of what was painted; unpainted is 0.
             PlaneData::Color => luminance(*texel) * texel.w,
@@ -1108,7 +1409,8 @@ impl TextureSet {
                 data,
                 context,
                 masks: &masks,
-                pixel_count,
+                region: self.texel_rect(),
+                probe: None,
             }
             .composite(std::slice::from_ref(layer), &mut plane)?;
             let mut rgba8 = Vec::new();
@@ -1137,7 +1439,11 @@ impl TextureSet {
         }
         Ok(FlattenedLayer {
             channels: flattened,
-            blend_mode: layer.blend_mode,
+            // A flattened group is a plain layer; Normal is the closest match.
+            blend_mode: match layer.blend_mode {
+                BlendMode::PassThrough => BlendMode::Normal,
+                mode => mode,
+            },
         })
     }
 
@@ -1149,22 +1455,28 @@ impl TextureSet {
         {
             return Err(BakeError::InvalidStrokeData);
         }
-        let pixel_count = checked_bake_pixel_count(self.resolution)?;
-        let byte_count = pixel_count
+        checked_bake_pixel_count(self.resolution)?;
+        Ok(self.texture(self.id_map_region(self.texel_rect())?))
+    }
+
+    /// The ID map over `region`, RGBA row-major within it.
+    fn id_map_region(&self, region: TexelRect) -> Result<Vec<u8>, BakeError> {
+        let byte_count = region
+            .len()
             .checked_mul(4)
             .ok_or(BakeError::AllocationFailed)?;
         let mut rgba8 = try_filled(byte_count, 0_u8)?;
-        self.paint_id_layers(&self.layers, &mut rgba8);
-        Ok(self.texture(rgba8))
+        self.paint_id_layers(&self.layers, &mut rgba8, region);
+        Ok(rgba8)
     }
 
-    fn paint_id_layers(&self, layers: &[MaterialLayer], rgba8: &mut [u8]) {
+    fn paint_id_layers(&self, layers: &[MaterialLayer], rgba8: &mut [u8], region: TexelRect) {
         for layer in layers {
             if !layer.visible || !layer.channels.contains(&MaterialChannel::Id) {
                 continue;
             }
             if let Some(children) = &layer.children {
-                self.paint_id_layers(children, rgba8);
+                self.paint_id_layers(children, rgba8, region);
                 continue;
             }
             for stroke in &layer.id_strokes {
@@ -1179,6 +1491,7 @@ impl TextureSet {
                     self.resolution.width,
                     self.resolution.height,
                     None,
+                    region,
                     |index, coverage| {
                         if coverage * stroke.opacity * layer.opacity >= 0.5 {
                             let offset = index * 4;
@@ -1196,19 +1509,6 @@ impl TextureSet {
     }
 }
 
-/// Fills `values` with generator output, splitting rows across threads.
-fn evaluate_generator(
-    values: &mut [f32],
-    generator: &MaskGenerator,
-    maps: &MeshMaps,
-    width: u32,
-    height: u32,
-) {
-    parallel_fill(values, width, height, |uv| {
-        generator.evaluate(&maps.sample(uv))
-    });
-}
-
 /// Sets every texel from `value_at(uv)`, splitting rows across threads.
 pub(crate) fn parallel_fill<T: Send>(
     values: &mut [T],
@@ -1216,30 +1516,79 @@ pub(crate) fn parallel_fill<T: Send>(
     height: u32,
     value_at: impl Fn(Vec2) -> T + Sync,
 ) {
-    let row_len = width as usize;
+    parallel_fill_region(
+        values,
+        TexelRect::full(width, height),
+        width,
+        height,
+        value_at,
+    );
+}
+
+/// Below this many texels a fill runs on the calling thread.
+const PARALLEL_FILL_MIN_TEXELS: usize = 16_384;
+
+/// Sets every texel of `region` (with `values` row-major over it) of a
+/// `width` × `height` texture from `value_at(uv)`, splitting rows across
+/// threads.
+pub(crate) fn parallel_fill_region<T: Send>(
+    values: &mut [T],
+    region: TexelRect,
+    width: u32,
+    height: u32,
+    value_at: impl Fn(Vec2) -> T + Sync,
+) {
+    let row_len = region.width as usize;
     if row_len == 0 {
         return;
     }
-    let threads = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .clamp(1, 32);
-    let rows_per_chunk = (height as usize).div_ceil(threads).max(1);
+    let threads = if values.len() < PARALLEL_FILL_MIN_TEXELS {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 32)
+    };
+    let rows_per_chunk = (region.height as usize).div_ceil(threads).max(1);
     let chunk_len = rows_per_chunk * row_len;
     let value_at = &value_at;
+    let fill = move |chunk_index: usize, chunk: &mut [T]| {
+        let start = chunk_index * chunk_len;
+        for (offset, value) in chunk.iter_mut().enumerate() {
+            let index = start + offset;
+            let x = region.x + (index % row_len) as u32;
+            let y = region.y + (index / row_len) as u32;
+            *value = value_at(raster::pixel_to_uv(x, y, width, height));
+        }
+    };
+    if threads == 1 {
+        fill(0, values);
+        return;
+    }
     std::thread::scope(|scope| {
         for (chunk_index, chunk) in values.chunks_mut(chunk_len).enumerate() {
-            scope.spawn(move || {
-                let start = chunk_index * chunk_len;
-                for (offset, value) in chunk.iter_mut().enumerate() {
-                    let index = start + offset;
-                    let x = (index % row_len) as u32;
-                    let y = (index / row_len) as u32;
-                    *value = value_at(raster::pixel_to_uv(x, y, width, height));
-                }
-            });
+            scope.spawn(move || fill(chunk_index, chunk));
         }
     });
+}
+
+/// Copies the texels of `region` from `source` (RGBA row-major over
+/// `source_region`, which contains `region`) into `target`, a whole
+/// RGBA texture `width` texels wide.
+fn patch_rgba8(
+    target: &mut [u8],
+    width: u32,
+    source: &[u8],
+    source_region: TexelRect,
+    region: TexelRect,
+) {
+    let span = region.width as usize * 4;
+    for y in region.y..region.bottom() {
+        let from = source_region.local_index(region.x, y) * 4;
+        let to = (y as usize * width as usize + region.x as usize) * 4;
+        target[to..to + span].copy_from_slice(&source[from..from + span]);
+    }
 }
 
 pub(crate) fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
@@ -1270,3 +1619,7 @@ pub(crate) fn checked_bake_pixel_count(resolution: TextureResolution) -> Result<
             height: resolution.height,
         })
 }
+
+#[cfg(test)]
+#[path = "compositing_region_tests.rs"]
+mod region_tests;

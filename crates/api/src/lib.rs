@@ -5,6 +5,9 @@ mod fbx;
 mod gltf_import;
 mod interchange;
 mod jobs;
+mod project_format;
+mod recovery;
+mod relink;
 mod textures;
 mod vector;
 
@@ -18,7 +21,12 @@ pub use interchange::{
 };
 pub use jobs::{
     DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, load_mesh_file, load_project_mesh,
-    run_export_job,
+    run_export_job, run_export_jobs,
+};
+pub use project_format::{MigrationReport, decode_project_json_with_report};
+pub use recovery::{RecoveryCandidate, RecoveryStore};
+pub use relink::{
+    MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, find_relink_candidates, missing_project_files,
 };
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
@@ -41,7 +49,7 @@ use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
     MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
     MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ProjectResource, ResourceId,
-    ResourceImages, TextureImage, TextureSet,
+    ResourceImages, TexelRect, TextureImage, TextureSet,
 };
 use thiserror::Error;
 
@@ -62,19 +70,11 @@ pub fn encode_project_json(project: &MaterialProject) -> Result<Vec<u8>, Project
         }
         return Err(ProjectFileError::Encode(error.to_string()));
     }
-    Ok(writer.bytes)
+    project_format::stable_json(&writer.bytes)
 }
 
 pub fn decode_project_json(bytes: &[u8]) -> Result<MaterialProject, ProjectFileError> {
-    if bytes.len() > MAX_PROJECT_JSON_BYTES {
-        return Err(ProjectFileError::TooLarge(bytes.len()));
-    }
-    let project: MaterialProject = serde_json::from_slice(bytes)
-        .map_err(|error| ProjectFileError::Decode(error.to_string()))?;
-    project
-        .validate()
-        .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
-    Ok(project)
+    decode_project_json_with_report(bytes).map(|(project, _)| project)
 }
 
 pub fn save_project_file(
@@ -103,12 +103,19 @@ pub fn save_project_file(
 }
 
 pub fn load_project_file(path: impl AsRef<Path>) -> Result<MaterialProject, ProjectFileError> {
+    load_project_file_with_report(path).map(|(project, _)| project)
+}
+
+/// Loads a project of any supported schema, reporting what the upgrade did.
+pub fn load_project_file_with_report(
+    path: impl AsRef<Path>,
+) -> Result<(MaterialProject, MigrationReport), ProjectFileError> {
     let file = File::open(path).map_err(|error| ProjectFileError::Io(error.to_string()))?;
     let mut bytes = Vec::new();
     file.take((MAX_PROJECT_JSON_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| ProjectFileError::Io(error.to_string()))?;
-    decode_project_json(&bytes)
+    decode_project_json_with_report(&bytes)
 }
 
 struct BoundedJsonWriter {
@@ -354,6 +361,52 @@ pub fn bake_texture_set_material(
         mesh_maps,
         resources,
     })?)
+}
+
+/// Rebakes only `regions` of `textures`, a [`bake_texture_set_material`]
+/// result for an earlier state of the set that differs from the current
+/// one only inside them. The result equals a full bake byte for byte; sets
+/// with spatial filters (blur, sharpen) are refused, see
+/// [`TextureSet::supports_region_rebake`].
+pub fn rebake_texture_set_material_regions(
+    texture_set: &TextureSet,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+    textures: &mut MaterialTextures,
+    regions: &[TexelRect],
+) -> Result<(), ApiError> {
+    let context = BakeContext {
+        mesh,
+        mesh_maps,
+        resources,
+    };
+    for region in regions {
+        texture_set.rebake_material_region(context, textures, *region)?;
+    }
+    Ok(())
+}
+
+/// [`rebake_texture_set_material_regions`] for a
+/// [`bake_texture_set_channel`] result.
+pub fn rebake_texture_set_channel_regions(
+    texture_set: &TextureSet,
+    channel: MaterialChannel,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+    texture: &mut BakedTexture,
+    regions: &[TexelRect],
+) -> Result<(), ApiError> {
+    let context = BakeContext {
+        mesh,
+        mesh_maps,
+        resources,
+    };
+    for region in regions {
+        texture_set.rebake_channel_region(channel, context, texture, *region)?;
+    }
+    Ok(())
 }
 
 /// The built-in export presets, as serializable output descriptions.
@@ -602,6 +655,7 @@ mod tests {
                         filters: vec![LayerFilter::Blur { radius: 3.0 }],
                         mask_filters: vec![LayerFilter::Invert],
                         mask_anchor: None,
+                        invert_final_mask: true,
                         blend_mode: substancecraft_core::BlendMode::Multiply,
                         children: None,
                     },

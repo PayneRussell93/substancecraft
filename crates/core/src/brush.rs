@@ -7,6 +7,7 @@ use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::noise::{gradient_noise3, hash3, unit_float};
+use crate::region::TexelRect;
 use crate::resources::{ResourceImages, luminance};
 use crate::{MAX_STROKE_POINTS, ResourceId, raster};
 
@@ -243,28 +244,26 @@ impl CoverageTile {
     }
 }
 
-/// Visits every texel the stroke touches with its coverage in `0..=1`.
-pub(crate) fn rasterize_stroke(
-    path: &StrokePath<'_>,
+/// Farthest a texel can sit from the stroke's points and still be painted.
+fn stroke_reach(radius_pixels: f32, tip: BrushTip) -> f32 {
+    radius_pixels * (1.0 + tip.size_jitter) * std::f32::consts::SQRT_2
+        + radius_pixels * 2.0 * tip.scatter
+        + 1.0
+}
+
+/// Inclusive texel bounds `(min_x, min_y, max_x, max_y)` a stroke over
+/// `pixels` can touch on a `width` × `height` texture.
+fn stroke_pixel_bounds(
+    pixels: &[Vec2],
+    radius_pixels: f32,
+    tip: BrushTip,
     width: u32,
     height: u32,
-    resources: Option<&ResourceImages>,
-    mut apply: impl FnMut(usize, f32),
-) {
-    if path.points.is_empty() || width == 0 || height == 0 {
-        return;
-    }
-    let pixels = path
-        .points
-        .iter()
-        .map(|point| raster::uv_to_pixel(*point, width, height))
-        .collect::<Vec<_>>();
-    let tip = path.tip;
-    let reach = path.radius_pixels * (1.0 + tip.size_jitter) * std::f32::consts::SQRT_2
-        + path.radius_pixels * 2.0 * tip.scatter
-        + 1.0;
-    let (mut lower, mut upper) = (pixels[0], pixels[0]);
-    for pixel in &pixels {
+) -> Option<(i64, i64, i64, i64)> {
+    let first = *pixels.first()?;
+    let reach = stroke_reach(radius_pixels, tip);
+    let (mut lower, mut upper) = (first, first);
+    for pixel in pixels {
         lower = lower.min(*pixel);
         upper = upper.max(*pixel);
     }
@@ -272,6 +271,65 @@ pub(crate) fn rasterize_stroke(
     let min_y = ((lower.y - reach).floor() as i64).max(0);
     let max_x = ((upper.x + reach).ceil() as i64).min(i64::from(width) - 1);
     let max_y = ((upper.y + reach).ceil() as i64).min(i64::from(height) - 1);
+    (min_x <= max_x && min_y <= max_y).then_some((min_x, min_y, max_x, max_y))
+}
+
+/// Texels a stroke through UV `points` (with this radius and tip) can
+/// paint on a `width` × `height` texture, or `None` when it misses it.
+/// Stamps are placed causally along the path, so the texels that change
+/// when a point is appended are the bounds of the last two points alone.
+pub fn stroke_texel_bounds(
+    points: &[Vec2],
+    radius_pixels: f32,
+    tip: BrushTip,
+    width: u32,
+    height: u32,
+) -> Option<TexelRect> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixels = points
+        .iter()
+        .map(|point| raster::uv_to_pixel(*point, width, height))
+        .collect::<Vec<_>>();
+    let (min_x, min_y, max_x, max_y) =
+        stroke_pixel_bounds(&pixels, radius_pixels, tip, width, height)?;
+    Some(TexelRect {
+        x: min_x as u32,
+        y: min_y as u32,
+        width: (max_x - min_x + 1) as u32,
+        height: (max_y - min_y + 1) as u32,
+    })
+}
+
+/// Visits every texel of `clip` the stroke touches with its coverage in
+/// `0..=1`; the index is row-major within `clip`. Coverage at a texel does
+/// not depend on `clip`, so clipped and full rasterisation agree exactly.
+pub(crate) fn rasterize_stroke(
+    path: &StrokePath<'_>,
+    width: u32,
+    height: u32,
+    resources: Option<&ResourceImages>,
+    clip: TexelRect,
+    mut apply: impl FnMut(usize, f32),
+) {
+    if path.points.is_empty() || width == 0 || height == 0 || clip.is_empty() {
+        return;
+    }
+    let pixels = path
+        .points
+        .iter()
+        .map(|point| raster::uv_to_pixel(*point, width, height))
+        .collect::<Vec<_>>();
+    let Some((min_x, min_y, max_x, max_y)) =
+        stroke_pixel_bounds(&pixels, path.radius_pixels, path.tip, width, height)
+    else {
+        return;
+    };
+    let min_x = min_x.max(i64::from(clip.x));
+    let min_y = min_y.max(i64::from(clip.y));
+    let max_x = max_x.min(i64::from(clip.right()) - 1);
+    let max_y = max_y.min(i64::from(clip.bottom()) - 1);
     if min_x > max_x || min_y > max_y {
         return;
     }
@@ -288,18 +346,20 @@ pub(crate) fn rasterize_stroke(
     }
     tile.values.resize(count, 0.0);
 
-    if tip.continuous() {
+    if path.tip.continuous() {
         draw_capsules(path, &pixels, &mut tile);
     } else {
         draw_stamps(path, &pixels, &mut tile, resources);
     }
 
-    let row = width as usize;
     for local_y in 0..tile.height {
         for local_x in 0..tile.width {
             let coverage = tile.values[(local_y * tile.width + local_x) as usize];
             if coverage > 0.0 {
-                let index = (tile.min_y + local_y) as usize * row + (tile.min_x + local_x) as usize;
+                let index = clip.local_index(
+                    (tile.min_x + local_x) as u32,
+                    (tile.min_y + local_y) as u32,
+                );
                 apply(index, coverage.min(1.0));
             }
         }
@@ -447,7 +507,8 @@ mod tests {
 
     fn coverage(path: &StrokePath<'_>, size: u32, resources: Option<&ResourceImages>) -> Vec<f32> {
         let mut values = vec![0.0_f32; (size * size) as usize];
-        rasterize_stroke(path, size, size, resources, |index, value| {
+        let clip = TexelRect::full(size, size);
+        rasterize_stroke(path, size, size, resources, clip, |index, value| {
             values[index] = values[index].max(value);
         });
         values
@@ -495,7 +556,7 @@ mod tests {
             tip: BrushTip::ROUND,
         };
         let mut visits = std::collections::BTreeMap::new();
-        rasterize_stroke(&path, 64, 64, None, |index, _| {
+        rasterize_stroke(&path, 64, 64, None, TexelRect::full(64, 64), |index, _| {
             *visits.entry(index).or_insert(0) += 1;
         });
         assert!(visits.values().all(|count| *count == 1));

@@ -71,6 +71,12 @@ impl LayerFilter {
         }
     }
 
+    /// True when each output texel depends only on the same input texel
+    /// (blur and sharpen read their neighbours).
+    pub const fn is_per_texel(self) -> bool {
+        !matches!(self, Self::Blur { .. } | Self::Sharpen { .. })
+    }
+
     pub(crate) fn is_valid(self) -> bool {
         let finite_in =
             |value: f32, low: f32, high: f32| value.is_finite() && (low..=high).contains(&value);

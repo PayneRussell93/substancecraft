@@ -153,6 +153,48 @@ fn set_geometry(mesh: &MeshGeometry, set: &TextureSet) -> MeshGeometry {
     }
 }
 
+/// Runs every job, up to `workers` at once, and returns one result per job
+/// in the order given. A job that fails (or panics) does not stop the others.
+pub fn run_export_jobs(jobs: &[ExportJob], workers: usize) -> Vec<Result<Vec<PathBuf>, JobError>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = workers.clamp(1, jobs.len().max(1));
+    let mut results: Vec<Option<Result<Vec<PathBuf>, JobError>>> =
+        (0..jobs.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else {
+                            break done;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_export_job(job)
+                        }))
+                        .unwrap_or_else(|_| Err(JobError::Project("the job crashed".to_owned())));
+                        done.push((index, result));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Ok(done) = handle.join() {
+                for (index, result) in done {
+                    results[index] = Some(result);
+                }
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| Err(JobError::Project("the job did not run".to_owned())))
+        })
+        .collect()
+}
+
 /// Runs an export job and returns the files written, in a stable order.
 pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
     let project =
@@ -436,5 +478,33 @@ mod tests {
             export.format = "exr".to_owned();
         }
         assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn tc_0232_job_batches_run_in_parallel_and_continue_past_failures() {
+        let folder = tempfile::tempdir().unwrap();
+        let project_path = folder.path().join("crate.sproject");
+        save_project_file(&project_path, &project_with_edge_wear()).unwrap();
+        let job = |out: &str| {
+            let mut job = ExportJob::new(&project_path, folder.path().join(out));
+            job.mesh_maps.ao_samples = 2;
+            job
+        };
+        let mut missing = job("missing");
+        missing.project = folder.path().join("missing.sproject");
+        let jobs = [job("a"), missing, job("b")];
+
+        let results = run_export_jobs(&jobs, 3);
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[1], Err(JobError::Project(_))));
+        let (a, b) = (results[0].as_ref().unwrap(), results[2].as_ref().unwrap());
+        assert_eq!(a.len(), 3);
+        for (a, b) in a.iter().zip(b) {
+            assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
+        }
+        // One worker gives the same results in the same order.
+        let sequential = run_export_jobs(&jobs, 0);
+        assert_eq!(sequential.iter().filter(|result| result.is_ok()).count(), 2);
+        assert!(run_export_jobs(&[], 4).is_empty());
     }
 }

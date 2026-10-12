@@ -56,16 +56,18 @@ pub enum Drawer {
     Bake,
     Poses,
     Environment,
+    Preferences,
 }
 
 impl Drawer {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Scene,
         Self::Brush,
         Self::Assets,
         Self::Bake,
         Self::Poses,
         Self::Environment,
+        Self::Preferences,
     ];
 
     fn icon(self) -> Icon {
@@ -76,6 +78,7 @@ impl Drawer {
             Self::Bake => Icon::Bake,
             Self::Poses => Icon::Figure,
             Self::Environment => Icon::Sun,
+            Self::Preferences => Icon::Sliders,
         }
     }
 
@@ -87,6 +90,7 @@ impl Drawer {
             Self::Bake => "Bake",
             Self::Poses => "Poses",
             Self::Environment => "Light",
+            Self::Preferences => "Prefs",
         }
     }
 
@@ -98,6 +102,7 @@ impl Drawer {
             Self::Bake => "Mesh Maps",
             Self::Poses => "Poses",
             Self::Environment => "Camera & Light",
+            Self::Preferences => "Preferences",
         }
     }
 }
@@ -140,6 +145,7 @@ impl SubstanceCraftApp {
         self.show_status(context, screen);
         self.show_toasts(context, screen);
         self.show_overwrite_prompt(context);
+        self.show_recovery_prompt(context);
     }
 
     /// Asks before an export replaces files already in its folder.
@@ -516,6 +522,7 @@ impl SubstanceCraftApp {
                                 Drawer::Bake => self.bake_drawer(ui),
                                 Drawer::Poses => self.poses_drawer(ui),
                                 Drawer::Environment => self.environment_drawer(ui),
+                                Drawer::Preferences => self.preferences_drawer(ui),
                             });
                     });
             });
@@ -657,6 +664,7 @@ impl SubstanceCraftApp {
                     "Pick Paint, Erase, Mask, or ID to paint on the mesh or in the UV view, or \
                      Select to build a polygon mask from faces, elements, or UV islands.",
                 );
+                self.inspect_section(ui);
                 return;
             }
             PaintMode::Select => {
@@ -669,6 +677,7 @@ impl SubstanceCraftApp {
         self.stroke_assist(ui);
         widgets::caption(ui, "Brush");
         self.brush_preview(ui);
+        self.brush_shelves(ui);
         slider_row(ui, "Size", &mut self.brush_radius, 1.0..=256.0, true, 0);
         match self.paint_mode {
             PaintMode::Mask => {
@@ -958,6 +967,7 @@ impl SubstanceCraftApp {
             let is_brush = self.brush_tip.shape == BrushShape::Bitmap(id);
             let mut use_as_brush = false;
             let mut remove = false;
+            let mut relink = false;
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
                 ui.painter()
@@ -985,6 +995,11 @@ impl SubstanceCraftApp {
                         use_as_brush = widgets::chip(ui, "Brush alpha", is_brush)
                             .on_hover_text("Stamp this bitmap as the brush tip")
                             .clicked();
+                        if loaded.is_none() {
+                            relink = widgets::chip(ui, "Relink…", false)
+                                .on_hover_text("Point this bitmap at its moved or renamed file")
+                                .clicked();
+                        }
                         remove = ui
                             .add_enabled_ui(!in_use, |ui| {
                                 widgets::chip(ui, "Remove", false).clicked()
@@ -1002,6 +1017,9 @@ impl SubstanceCraftApp {
             }
             if remove {
                 self.remove_resource(id);
+            }
+            if relink {
+                self.choose_relink(id);
             }
         }
     }
@@ -1266,6 +1284,8 @@ impl SubstanceCraftApp {
         {
             self.export_mesh_map(kind);
         }
+        self.cache_section(ui);
+        self.bake_log_section(ui);
     }
 
     fn poses_drawer(&mut self, ui: &mut Ui) {
@@ -1370,6 +1390,8 @@ impl SubstanceCraftApp {
         if widgets::pill_button(ui, Some(Icon::Focus), "Reset view", false, true).clicked() {
             self.viewport_camera = ViewportCamera::default();
         }
+        self.saved_views_section(ui);
+        self.edge_overlay_controls(ui);
 
         widgets::caption(ui, "Environment light");
         slider_row(
@@ -1403,7 +1425,7 @@ impl SubstanceCraftApp {
             }
         });
         if let Some(edge) = long_edge {
-            self.request_render(edge);
+            self.request_render(edge, None);
         }
         if let Some(status) = &self.render_status {
             hint(ui, status);
@@ -1887,6 +1909,13 @@ impl SubstanceCraftApp {
                     for mode in substancecraft_core::BlendMode::ALL {
                         ui.selectable_value(&mut layer.blend_mode, mode, mode.name());
                     }
+                    if layer.children.is_some() {
+                        let mode = substancecraft_core::BlendMode::PassThrough;
+                        ui.selectable_value(&mut layer.blend_mode, mode, mode.name())
+                            .on_hover_text(
+                                "Children blend straight onto the layers beneath, as if ungrouped",
+                            );
+                    }
                 })
                 .response
                 .on_hover_text("How this layer combines with the layers beneath; normals always blend normally");
@@ -2309,6 +2338,19 @@ fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) {
             slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
             slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
             seed_row(ui, &mut settings.seed);
+        }
+        MaskGenerator::Thickness(settings) => {
+            widgets::property_row(ui, "Select", |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if widgets::chip(ui, "Thin", settings.thin).clicked() {
+                    settings.thin = true;
+                }
+                if widgets::chip(ui, "Thick", !settings.thin).clicked() {
+                    settings.thin = false;
+                }
+            });
+            slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
+            slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
         }
     }
 }
@@ -3205,24 +3247,47 @@ impl SubstanceCraftApp {
                 let selected = self.symmetry.is_some_and(|symmetry| symmetry.axis == axis);
                 if widgets::chip(ui, axis.name(), selected)
                     .on_hover_text(format!(
-                        "Mirror strokes across the {} = 0 plane",
+                        "Mirror strokes across the {} = 0 plane, or repeat them around the {} axis",
+                        axis.name(),
                         axis.name()
                     ))
                     .clicked()
                 {
-                    self.symmetry = Some(substancecraft_core::Symmetry::new(axis));
+                    let radial = self.symmetry.map_or(0, |symmetry| symmetry.radial);
+                    self.symmetry = Some(substancecraft_core::Symmetry::radial(axis, radial));
                 }
             }
         });
         if let Some(symmetry) = &mut self.symmetry {
-            slider_row(
-                ui,
-                "Mirror offset",
-                &mut symmetry.offset,
-                -2.0..=2.0,
-                false,
-                3,
-            );
+            widgets::property_row(ui, "Copies", |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if widgets::chip(ui, "Mirror", !symmetry.is_radial())
+                    .on_hover_text("Mirror strokes across a plane")
+                    .clicked()
+                {
+                    symmetry.radial = 0;
+                }
+                for count in [3, 4, 6, 8, 12] {
+                    if widgets::chip(ui, &count.to_string(), symmetry.radial == count)
+                        .on_hover_text(format!(
+                            "Repeat strokes {count} times around the axis through the origin"
+                        ))
+                        .clicked()
+                    {
+                        symmetry.radial = count;
+                    }
+                }
+            });
+            if !symmetry.is_radial() {
+                slider_row(
+                    ui,
+                    "Mirror offset",
+                    &mut symmetry.offset,
+                    -2.0..=2.0,
+                    false,
+                    3,
+                );
+            }
         }
         slider_row(
             ui,

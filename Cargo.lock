@@ -2725,6 +2725,8 @@ dependencies = [
  "eframe",
  "glam",
  "rfd",
+ "serde",
+ "serde_json",
  "substancecraft-api",
  "substancecraft-core",
  "substancecraft-filament",

@@ -20,16 +20,20 @@ pub enum MaskGenerator {
     Orientation(Orientation),
     Gradient(Gradient),
     Noise(NoisePattern),
+    /// Thin or thick parts from the thickness map: edges for subsurface
+    /// glow, solid cores for dust.
+    Thickness(Thickness),
 }
 
 impl MaskGenerator {
     /// One default instance of every generator, in menu order.
-    pub const PRESETS: [Self; 5] = [
+    pub const PRESETS: [Self; 6] = [
         Self::EdgeWear(EdgeWear::DEFAULT),
         Self::Dirt(Dirt::DEFAULT),
         Self::Orientation(Orientation::DEFAULT),
         Self::Gradient(Gradient::DEFAULT),
         Self::Noise(NoisePattern::DEFAULT),
+        Self::Thickness(Thickness::DEFAULT),
     ];
 
     pub const fn name(&self) -> &'static str {
@@ -39,6 +43,7 @@ impl MaskGenerator {
             Self::Orientation(_) => "Orientation",
             Self::Gradient(_) => "Gradient",
             Self::Noise(_) => "Noise",
+            Self::Thickness(_) => "Thickness",
         }
     }
 
@@ -70,6 +75,7 @@ impl MaskGenerator {
             Self::Noise(settings) => {
                 noise_scale(settings.scale) && unit(settings.amount) && unit(settings.contrast)
             }
+            Self::Thickness(settings) => unit(settings.amount) && unit(settings.contrast),
         }
     }
 
@@ -134,6 +140,15 @@ impl MaskGenerator {
                 let threshold = 1.0 - settings.amount;
                 smoothstep(threshold - half_width, threshold + half_width, noise)
             }
+            Self::Thickness(settings) => {
+                let thickness = sample.thickness.clamp(0.0, 1.0);
+                let selected = if settings.thin {
+                    1.0 - thickness
+                } else {
+                    thickness
+                };
+                level(selected, settings.amount, settings.contrast)
+            }
         };
         value.clamp(0.0, 1.0)
     }
@@ -164,6 +179,29 @@ impl EdgeWear {
 }
 
 impl Default for EdgeWear {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Selects thin (or, with `thin` off, thick) parts of the mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Thickness {
+    pub amount: f32,
+    pub contrast: f32,
+    /// Select thin parts (true) or thick parts (false).
+    pub thin: bool,
+}
+
+impl Thickness {
+    pub const DEFAULT: Self = Self {
+        amount: 0.5,
+        contrast: 0.5,
+        thin: true,
+    };
+}
+
+impl Default for Thickness {
     fn default() -> Self {
         Self::DEFAULT
     }
@@ -391,6 +429,40 @@ mod tests {
             relative_position: Vec3::new(0.1, 0.4, 0.2),
             ..MeshMapSample::default()
         }
+    }
+
+    #[test]
+    fn tc_0245_thickness_generator_selects_thin_or_thick_parts() {
+        let at = |thickness: f32| MeshMapSample {
+            covered: true,
+            thickness,
+            ..MeshMapSample::default()
+        };
+        let thin = MaskGenerator::Thickness(Thickness::DEFAULT);
+        assert!(thin.evaluate(&at(0.05)) > 0.9);
+        assert_eq!(thin.evaluate(&at(1.0)), 0.0);
+        let thick = MaskGenerator::Thickness(Thickness {
+            thin: false,
+            ..Thickness::DEFAULT
+        });
+        assert!(thick.evaluate(&at(0.95)) > 0.9);
+        assert_eq!(thick.evaluate(&at(0.0)), 0.0);
+        assert_eq!(
+            thin.evaluate(&MeshMapSample {
+                covered: false,
+                ..at(0.0)
+            }),
+            0.0
+        );
+        assert!(thin.is_valid());
+        assert!(
+            !MaskGenerator::Thickness(Thickness {
+                amount: 2.0,
+                ..Thickness::DEFAULT
+            })
+            .is_valid()
+        );
+        assert_eq!(MaskGenerator::PRESETS.len(), 6);
     }
 
     #[test]

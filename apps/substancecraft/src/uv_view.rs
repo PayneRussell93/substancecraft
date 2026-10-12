@@ -84,7 +84,9 @@ impl SubstanceCraftApp {
             let uv = self.uv_view.to_uv(area, position);
             if (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y) {
                 self.append_stroke_point(uv);
-                if self.symmetry.is_some() {
+                // Radial copies have no UV-space equivalent; only mirroring
+                // applies here.
+                if self.symmetry.is_some_and(|symmetry| !symmetry.is_radial()) {
                     self.stroke_point(1, substancecraft_core::Symmetry::mirror_uv(uv), false);
                 }
             }

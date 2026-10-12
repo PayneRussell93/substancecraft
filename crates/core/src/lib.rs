@@ -13,17 +13,19 @@ mod compositing;
 mod export;
 mod filters;
 mod generators;
+mod inspect;
 pub mod library;
 mod mesh_maps;
 pub mod noise;
 pub mod painting;
 mod raster;
+mod region;
 mod resources;
 mod smoothing;
 mod topology;
 pub mod udim;
 
-pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING};
+pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING, stroke_texel_bounds};
 pub use color::ColorSpace;
 pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
@@ -36,8 +38,9 @@ pub use export::{
 };
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
-    Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation,
+    Axis, Direction, Dirt, EdgeWear, Gradient, MaskGenerator, NoisePattern, Orientation, Thickness,
 };
+pub use inspect::{MASK_SHOWN, OverlayPalette, TexelContribution, mask_drivers, mask_overlay};
 pub use library::{
     AssetEntry, AssetKind, BUILT_IN_LICENSE, ExposedParameter, ExposedProperty, LibraryError,
     MapRequirements, MaterialResource, ParameterValue, SmartMaterial,
@@ -47,7 +50,9 @@ pub use mesh_maps::{
     MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
     bake_mesh_maps_corrected, bake_mesh_maps_from, cage_ray_direction,
 };
-pub use painting::{LazyStabilizer, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points};
+pub use painting::{
+    LazyStabilizer, MAX_RADIAL_COPIES, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points,
+};
 pub use resources::{
     BitmapMask, DecalPlacement, MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE,
     MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource, ProjectionMode, ResourceImages,
@@ -58,10 +63,11 @@ pub use smoothing::{
     MeshSmoothing, corner_normals, remap_subdivided_triangles, subdivide, vertex_normals,
     vertex_tangents,
 };
-pub use topology::{MeshTopology, SelectionMode};
+pub use topology::{DiagnosticEdge, EdgeFlags, MeshTopology, SelectionMode, diagnostic_edges};
+pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use udim::{UDIM_TOKEN, UdimTile};
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+pub const PROJECT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
 pub const MAX_BAKE_PIXELS: usize = 4_194_304;
 /// Upper bound on triangles referenced by one layer's polygon mask.
@@ -257,7 +263,7 @@ pub enum MeshError {
     InvalidMaterialSlots,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViewportCamera {
     pub yaw: f32,
     pub pitch: f32,
@@ -300,6 +306,25 @@ impl ViewportCamera {
     pub fn rotation(self) -> Quat {
         Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
     }
+
+    /// Finite, with pitch and zoom in the ranges the controls allow.
+    pub fn is_valid(self) -> bool {
+        self.yaw.is_finite()
+            && (-1.55..=1.55).contains(&self.pitch)
+            && (0.1..=20.0).contains(&self.zoom)
+            && self.pan.is_finite()
+    }
+}
+
+/// The most named cameras a project keeps.
+pub const MAX_NAMED_CAMERAS: usize = 64;
+
+/// A viewport camera saved in the project under a name, for returning to
+/// the same inspection angle and rendering from it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NamedCamera {
+    pub name: String,
+    pub camera: ViewportCamera,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -899,6 +924,9 @@ impl MaterialLayer {
     }
 
     fn has_valid_settings(&self) -> bool {
+        if self.blend_mode == BlendMode::PassThrough && !self.is_group() {
+            return false;
+        }
         self.fill.is_none_or(|fill| fill.is_valid())
             && self.mask_anchor.is_none_or(AnchorMask::is_valid)
             && self
@@ -1322,6 +1350,12 @@ pub enum EditCommand {
         from: LayerSlot,
         to: LayerSlot,
     },
+    /// Points a bitmap resource at another file (a moved or renamed asset).
+    RelinkResource {
+        resource: ResourceId,
+        before: String,
+        after: String,
+    },
     /// Several commands applied in order and undone in reverse as one step,
     /// e.g. a symmetric stroke or a flatten. All or none apply.
     Batch(Vec<EditCommand>),
@@ -1408,6 +1442,15 @@ fn find_layer(
     find_texture_set(project, texture_set_id)?.layer_mut(layer_id)
 }
 
+fn relink_resource(project: &mut MaterialProject, id: ResourceId, from: &str, to: &str) -> bool {
+    project
+        .resources
+        .iter_mut()
+        .find(|resource| resource.id == id && resource.source == from)
+        .map(|resource| resource.source = to.to_owned())
+        .is_some()
+}
+
 fn layer_id_in_use(project: &MaterialProject, layer: &MaterialLayer) -> bool {
     layer.walk().iter().any(|candidate| {
         project
@@ -1474,6 +1517,11 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
             from,
             to,
         } => move_layer(project, *texture_set_id, *from, *to),
+        EditCommand::RelinkResource {
+            resource,
+            before,
+            after,
+        } => relink_resource(project, *resource, before, after),
     }
 }
 
@@ -1532,6 +1580,11 @@ fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool 
             from,
             to,
         } => move_layer(project, *texture_set_id, *to, *from),
+        EditCommand::RelinkResource {
+            resource,
+            before,
+            after,
+        } => relink_resource(project, *resource, after, before),
     }
 }
 
@@ -1879,6 +1932,9 @@ pub struct MaterialProject {
     /// Saved smart materials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub smart_materials: Vec<SmartMaterial>,
+    /// Saved inspection cameras.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras: Vec<NamedCamera>,
 }
 
 impl MaterialProject {
@@ -1893,6 +1949,7 @@ impl MaterialProject {
             export_presets: Vec::new(),
             materials: Vec::new(),
             smart_materials: Vec::new(),
+            cameras: Vec::new(),
         }
     }
 
@@ -2000,6 +2057,19 @@ impl MaterialProject {
             }
         }
 
+        if self.cameras.len() > MAX_NAMED_CAMERAS {
+            return Err(ProjectError::InvalidCamera(format!(
+                "more than {MAX_NAMED_CAMERAS} cameras"
+            )));
+        }
+        let mut camera_names = BTreeSet::new();
+        for camera in &self.cameras {
+            let name = camera.name.trim().to_lowercase();
+            if name.is_empty() || !camera.camera.is_valid() || !camera_names.insert(name) {
+                return Err(ProjectError::InvalidCamera(camera.name.clone()));
+            }
+        }
+
         let built_in_names: BTreeSet<String> = ExportPreset::built_in()
             .iter()
             .map(|preset| preset.name.trim().to_lowercase())
@@ -2073,6 +2143,8 @@ pub enum ProjectError {
     },
     #[error("export preset name `{0}` is duplicated or taken by a built-in preset")]
     DuplicateExportPresetName(String),
+    #[error("camera `{0}` is unnamed, duplicated, or out of range")]
+    InvalidCamera(String),
     #[error(transparent)]
     InvalidLibraryEntry(#[from] LibraryError),
     #[error(transparent)]
@@ -2501,6 +2573,40 @@ mod tests {
                 PROJECT_SCHEMA_VERSION + 1
             ))
         );
+    }
+
+    #[test]
+    fn tc_0237_named_cameras_validate_names_and_ranges() {
+        let camera = |name: &str, zoom: f32| NamedCamera {
+            name: name.to_owned(),
+            camera: ViewportCamera {
+                zoom,
+                ..ViewportCamera::default()
+            },
+        };
+        let mut project = MaterialProject {
+            cameras: vec![camera("Front", 1.0), camera("Detail", 4.0)],
+            ..MaterialProject::empty()
+        };
+        assert_eq!(project.validate(), Ok(()));
+        let json = serde_json::to_string(&project).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MaterialProject>(&json).unwrap(),
+            project
+        );
+
+        for bad in [camera(" front ", 1.0), camera("", 1.0), camera("Far", 50.0)] {
+            project.cameras.push(bad);
+            assert!(matches!(
+                project.validate(),
+                Err(ProjectError::InvalidCamera(_))
+            ));
+            project.cameras.pop();
+        }
+        let mut wild = camera("Wild", 1.0);
+        wild.camera.yaw = f32::NAN;
+        project.cameras.push(wild);
+        assert!(project.validate().is_err());
     }
 
     #[test]
@@ -3592,6 +3698,62 @@ mod tests {
             set.flatten_layer(LayerId(77), BakeContext::default()),
             Err(BakeError::InvalidLayerSettings)
         );
+    }
+
+    #[test]
+    fn tc_0244_pass_through_groups_blend_children_onto_the_stack_beneath() {
+        let base = MaterialLayer::new_fill(
+            LayerId(1),
+            "Base",
+            LayerFill {
+                roughness: 0.8,
+                ..LayerFill::default()
+            },
+        );
+        let mut darken = MaterialLayer::new_fill(
+            LayerId(2),
+            "Darken",
+            LayerFill {
+                color: [255, 0, 0, 255],
+                roughness: 0.5,
+                ..LayerFill::default()
+            },
+        );
+        darken.blend_mode = BlendMode::Multiply;
+        let mut group = MaterialLayer::new_group(LayerId(3), "Group");
+        group.children = Some(vec![darken]);
+        let mut set = small_set(4, base);
+        set.layers.push(group);
+        let roughness = |set: &TextureSet| {
+            set.bake_channel(MaterialChannel::Roughness, BakeContext::default())
+                .unwrap()
+                .rgba8[0]
+        };
+
+        // Isolated, the Multiply child has nothing beneath it inside the
+        // group, so it shows as itself: 0.5.
+        assert_eq!(roughness(&set), compositing::unit_to_byte(0.5));
+        // Passed through, it multiplies the base: 0.8 × 0.5.
+        set.layers[1].blend_mode = BlendMode::PassThrough;
+        assert_eq!(roughness(&set), compositing::unit_to_byte(0.4));
+        // Group opacity fades the passed-through result in.
+        set.layers[1].opacity = 0.5;
+        assert_eq!(roughness(&set), compositing::unit_to_byte(0.6));
+
+        // Over empty Base Color the colour is not darkened by the fade.
+        let mut lone = set.clone();
+        lone.layers.remove(0);
+        if let Some(child) = lone.layers[0].children.as_mut() {
+            child[0].blend_mode = BlendMode::Normal;
+        }
+        let color = lone.bake_base_color().unwrap();
+        assert_eq!(color.rgba8[..4], [255, 0, 0, 128]);
+
+        // Only groups may pass through.
+        let mut paint = MaterialLayer::new_paint(LayerId(9), "Paint");
+        paint.blend_mode = BlendMode::PassThrough;
+        assert!(!paint.has_valid_settings());
+        assert!(set.layers[1].has_valid_settings());
     }
 
     #[test]

@@ -224,6 +224,7 @@ fn generator_amount(generator: &mut MaskGenerator) -> Option<&mut f32> {
         MaskGenerator::EdgeWear(settings) => Some(&mut settings.amount),
         MaskGenerator::Dirt(settings) => Some(&mut settings.amount),
         MaskGenerator::Noise(settings) => Some(&mut settings.amount),
+        MaskGenerator::Thickness(settings) => Some(&mut settings.amount),
         MaskGenerator::Orientation(_) | MaskGenerator::Gradient(_) => None,
     }
 }
