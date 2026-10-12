@@ -48,11 +48,48 @@ pub enum ExportSource {
     /// A baked mesh map resampled to the texture set's resolution; black
     /// outside UV islands. Requires mesh maps.
     MeshMap(MeshMapKind),
+    /// A specular/glossiness-workflow map converted from the metallic/
+    /// roughness material, for engines that expect one.
+    SpecGloss(SpecGlossMap),
+}
+
+/// Colour maps of the specular/glossiness workflow. Both are sRGB and are
+/// mixed from Base Color and Metallic in linear light; glossiness is
+/// inverted Roughness, which any slot can already produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SpecGlossMap {
+    /// Base Color without the metal: black where fully metallic.
+    Diffuse,
+    /// Reflectance at normal incidence: 4 % grey for dielectrics, the Base
+    /// Color for metals.
+    Specular,
+}
+
+impl SpecGlossMap {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Diffuse => "Diffuse",
+            Self::Specular => "Specular",
+        }
+    }
+
+    /// The map's sRGB colour for sRGB `base` and `metallic` (`0..=1`).
+    pub fn convert(self, base: Vec3, metallic: f32) -> Vec3 {
+        use crate::color::{linear_to_srgb, srgb_to_linear};
+        let linear = base.to_array().map(srgb_to_linear);
+        let metallic = metallic.clamp(0.0, 1.0);
+        linear
+            .map(|value| match self {
+                Self::Diffuse => linear_to_srgb(value * (1.0 - metallic)),
+                Self::Specular => linear_to_srgb(0.04 + (value - 0.04) * metallic),
+            })
+            .into()
+    }
 }
 
 impl ExportSource {
     /// Every source, in menu order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Channel(MaterialChannel::BaseColor),
         Self::Channel(MaterialChannel::Roughness),
         Self::Channel(MaterialChannel::Metallic),
@@ -69,6 +106,8 @@ impl ExportSource {
         Self::MeshMap(MeshMapKind::AmbientOcclusion),
         Self::MeshMap(MeshMapKind::Thickness),
         Self::MeshMap(MeshMapKind::Skew),
+        Self::SpecGloss(SpecGlossMap::Diffuse),
+        Self::SpecGloss(SpecGlossMap::Specular),
     ];
 
     /// True when the source holds sRGB-encoded colour (Base Color and
@@ -77,6 +116,7 @@ impl ExportSource {
         matches!(
             self,
             Self::Channel(MaterialChannel::BaseColor | MaterialChannel::Emissive)
+                | Self::SpecGloss(_)
         )
     }
 
@@ -94,6 +134,7 @@ impl ExportSource {
                 kind,
                 MeshMapKind::Normal | MeshMapKind::WorldNormal | MeshMapKind::Position
             ),
+            Self::SpecGloss(_) => true,
         }
     }
 }
@@ -346,6 +387,11 @@ impl ExportPreset {
             skip_if_black: true,
             ..ExportOutput::new(name, Rgb, rgb(Emissive))
         };
+        let spec_gloss = |map, component| ChannelSlot::Source {
+            source: ExportSource::SpecGloss(map),
+            component,
+            invert: false,
+        };
         vec![
             Self {
                 name: "Metal/Rough (ORM)".to_owned(),
@@ -395,6 +441,68 @@ impl ExportPreset {
                     ExportOutput::new("$textureSet_Normal", Rgb, rgb(Normal)),
                     ExportOutput::new("$textureSet_Occlusion", Gray, gray(AmbientOcclusion)),
                     emissive("$textureSet_Emission"),
+                ],
+            },
+            // Godot 4 reads OpenGL normals and packs occlusion, roughness,
+            // and metallic like glTF.
+            Self {
+                name: "Godot 4 (StandardMaterial3D)".to_owned(),
+                max_resolution: None,
+                outputs: vec![
+                    ExportOutput::new("$textureSet_albedo", Rgba, base_with_opacity),
+                    ExportOutput::new("$textureSet_orm", Rgb, orm),
+                    ExportOutput::new("$textureSet_normal", Rgb, rgb(Normal)),
+                    ExportOutput::new("$textureSet_height", Gray, gray(Height)),
+                    emissive("$textureSet_emission"),
+                ],
+            },
+            Self {
+                name: "glTF 2.0 (metallic-roughness)".to_owned(),
+                max_resolution: None,
+                outputs: vec![
+                    ExportOutput::new("$textureSet_baseColor", Rgba, base_with_opacity),
+                    ExportOutput::new("$textureSet_occlusionRoughnessMetallic", Rgb, orm),
+                    ExportOutput::new("$textureSet_normal", Rgb, rgb(Normal)),
+                    emissive("$textureSet_emissive"),
+                ],
+            },
+            Self {
+                name: "Specular/Glossiness".to_owned(),
+                max_resolution: None,
+                outputs: vec![
+                    ExportOutput::new(
+                        "$textureSet_Diffuse",
+                        Rgba,
+                        [
+                            spec_gloss(SpecGlossMap::Diffuse, Red),
+                            spec_gloss(SpecGlossMap::Diffuse, Green),
+                            spec_gloss(SpecGlossMap::Diffuse, Blue),
+                            ChannelSlot::channel(Opacity, Red),
+                        ],
+                    ),
+                    ExportOutput::new(
+                        "$textureSet_Specular",
+                        Rgb,
+                        [
+                            spec_gloss(SpecGlossMap::Specular, Red),
+                            spec_gloss(SpecGlossMap::Specular, Green),
+                            spec_gloss(SpecGlossMap::Specular, Blue),
+                            ChannelSlot::ONE,
+                        ],
+                    ),
+                    ExportOutput::new(
+                        "$textureSet_Glossiness",
+                        Gray,
+                        [
+                            ChannelSlot::inverted(Roughness, Red),
+                            ChannelSlot::ZERO,
+                            ChannelSlot::ZERO,
+                            ChannelSlot::ONE,
+                        ],
+                    ),
+                    ExportOutput::new("$textureSet_Normal", Rgb, rgb(Normal)),
+                    ExportOutput::new("$textureSet_AmbientOcclusion", Gray, gray(AmbientOcclusion)),
+                    emissive("$textureSet_Emissive"),
                 ],
             },
             Self {
@@ -595,6 +703,9 @@ impl TextureSet {
                 }
                 ExportSource::Channel(MaterialChannel::BaseColor) => {
                     channels.insert(MaterialChannel::BaseColor);
+                }
+                ExportSource::SpecGloss(_) => {
+                    channels.extend([MaterialChannel::BaseColor, MaterialChannel::Metallic]);
                 }
                 ExportSource::Channel(
                     channel @ (MaterialChannel::Roughness
@@ -845,6 +956,22 @@ impl TextureSet {
                 });
                 return plane(values);
             }
+            ExportSource::SpecGloss(map) => {
+                let base = self.base_color_values(context, masks, region)?;
+                let metallic =
+                    self.optional_plane(MaterialChannel::Metallic, context, masks, region)?;
+                let values = base
+                    .iter()
+                    .enumerate()
+                    .map(|(index, color)| {
+                        let metal = metallic
+                            .as_ref()
+                            .map_or(DEFAULT_METALLIC, |plane| plane[index].x);
+                        map.convert(*color, metal)
+                    })
+                    .collect();
+                return plane(values);
+            }
             ExportSource::Channel(channel) => channel,
         };
         match channel {
@@ -880,13 +1007,17 @@ impl TextureSet {
             }
             MaterialChannel::BaseColor => {
                 let default_base = rgb_unit(DEFAULT_BASE_COLOR);
-                plane(match self.optional_plane(channel, context, masks, region)? {
-                    Some(composite) => composite
-                        .iter()
-                        .map(|texel| texel.truncate() * texel.w + default_base * (1.0 - texel.w))
-                        .collect(),
-                    None => try_filled(pixel_count, default_base)?,
-                })
+                plane(
+                    match self.optional_plane(channel, context, masks, region)? {
+                        Some(composite) => composite
+                            .iter()
+                            .map(|texel| {
+                                texel.truncate() * texel.w + default_base * (1.0 - texel.w)
+                            })
+                            .collect(),
+                        None => try_filled(pixel_count, default_base)?,
+                    },
+                )
             }
             channel => {
                 let composite = match self.optional_plane(channel, context, masks, region)? {
@@ -896,6 +1027,25 @@ impl TextureSet {
                 plane(composite.iter().map(|texel| texel.truncate()).collect())
             }
         }
+    }
+
+    /// Base Color over the neutral default, as the material bake shows it.
+    fn base_color_values(
+        &self,
+        context: BakeContext<'_>,
+        masks: &LayerMasks,
+        region: TexelRect,
+    ) -> Result<Vec<Vec3>, BakeError> {
+        let default_base = rgb_unit(DEFAULT_BASE_COLOR);
+        Ok(
+            match self.optional_plane(MaterialChannel::BaseColor, context, masks, region)? {
+                Some(composite) => composite
+                    .iter()
+                    .map(|texel| texel.truncate() * texel.w + default_base * (1.0 - texel.w))
+                    .collect(),
+                None => try_filled(region.len(), default_base)?,
+            },
+        )
     }
 
     /// The composited plane, or `None` when no layer paints `channel`.
@@ -1050,6 +1200,7 @@ impl TextureSet {
                     continue;
                 }
                 ExportSource::MeshMap(_) => None,
+                ExportSource::SpecGloss(_) => None,
                 ExportSource::Channel(channel) => match channel {
                     MaterialChannel::BaseColor if !painted(&[channel]) => {
                         Some("Base Color is the neutral default grey".to_owned())
@@ -1171,6 +1322,200 @@ mod tests {
 
     fn gray_output(name: &str, slot: ChannelSlot) -> ExportOutput {
         ExportOutput::new(name, OutputLayout::Gray, [slot; 4])
+    }
+
+    #[test]
+    fn tc_0264_engine_profiles_and_spec_gloss_maps_convert_the_material() {
+        // Conversions: a dielectric keeps its colour as diffuse and reflects
+        // 4 %; a metal has no diffuse and reflects its colour.
+        let base = Vec3::new(0.8, 0.4, 0.2);
+        assert!(
+            (SpecGlossMap::Diffuse.convert(base, 0.0) - base)
+                .abs()
+                .max_element()
+                < 1e-5
+        );
+        let four_percent = crate::color::linear_to_srgb(0.04);
+        assert!(
+            (SpecGlossMap::Specular.convert(base, 0.0) - Vec3::splat(four_percent))
+                .abs()
+                .max_element()
+                < 1e-5
+        );
+        assert_eq!(SpecGlossMap::Diffuse.convert(base, 1.0), Vec3::ZERO);
+        assert!(
+            (SpecGlossMap::Specular.convert(base, 1.0) - base)
+                .abs()
+                .max_element()
+                < 1e-5
+        );
+
+        let set = set_with(4, metal_layer([0, 0, 0]));
+        let context = BakeContext::default();
+        let files = set
+            .bake_export(&built_in("Specular/Glossiness"), context)
+            .unwrap();
+        let file = |suffix: &str| {
+            files
+                .iter()
+                .find(|file| file.file_stem.ends_with(suffix))
+                .unwrap()
+        };
+        // Fully metallic: black diffuse with the opacity in alpha, the
+        // base colour as specular, glossiness 1 - 0.2.
+        assert_eq!(file("_Diffuse").texture.rgba8[..4], [0, 0, 0, 128]);
+        assert_eq!(file("_Specular").texture.rgba8[..3], [200, 100, 50]);
+        assert_eq!(file("_Glossiness").texture.rgba8[0], 204);
+        assert!(file("_Diffuse").srgb[..3].iter().all(|srgb| *srgb));
+
+        for (preset, stems) in [
+            (
+                "Godot 4 (StandardMaterial3D)",
+                &["_albedo", "_orm", "_normal", "_height"][..],
+            ),
+            (
+                "glTF 2.0 (metallic-roughness)",
+                &["_baseColor", "_occlusionRoughnessMetallic", "_normal"][..],
+            ),
+        ] {
+            let preset = built_in(preset);
+            assert_eq!(preset.validate(), Ok(()));
+            let files = set.bake_export(&preset, context).unwrap();
+            for stem in stems {
+                assert!(
+                    files.iter().any(|file| file.file_stem.ends_with(stem)),
+                    "{} writes {stem}",
+                    preset.name
+                );
+            }
+            // Packed like the ORM preset: occlusion, roughness, metallic.
+            let orm = files
+                .iter()
+                .find(|file| file.file_stem.contains("orm") || file.file_stem.contains("Metallic"))
+                .unwrap();
+            assert_eq!(orm.texture.rgba8[..3], [255, 51, 255]);
+        }
+    }
+
+    #[test]
+    fn tc_0262_outputs_carry_their_own_format_depth_and_size_limit() {
+        // A soft stroke gives a gradient whose values fall between 8-bit
+        // steps.
+        let mut paint = MaterialLayer::new_paint(LayerId(1), "Paint");
+        paint.channels = BTreeSet::from([MaterialChannel::Roughness]);
+        paint.paint_strokes.push(crate::PaintStroke {
+            roughness: 0.9,
+            ..crate::PaintStroke::new(vec![glam::Vec2::splat(0.5)], 20.0, [255, 255, 255, 255])
+        });
+        let set = set_with(64, paint);
+        let gray = |name: &str| ExportOutput {
+            ..ExportOutput::new(
+                name,
+                OutputLayout::Gray,
+                [
+                    ChannelSlot::channel(MaterialChannel::Roughness, SourceComponent::Red),
+                    ChannelSlot::ZERO,
+                    ChannelSlot::ZERO,
+                    ChannelSlot::ONE,
+                ],
+            )
+        };
+        let preset = ExportPreset {
+            name: "Deep".to_owned(),
+            outputs: vec![
+                gray("Plain"),
+                ExportOutput {
+                    bit_depth: BitDepth::Sixteen,
+                    ..gray("Deep")
+                },
+                ExportOutput {
+                    format: Some("exr".to_owned()),
+                    ..gray("Float")
+                },
+            ],
+            max_resolution: None,
+        };
+        let files = set.bake_export(&preset, BakeContext::default()).unwrap();
+        assert!(files[0].rgba16.is_none(), "8-bit outputs carry no samples");
+        let words = files[1].rgba16.as_ref().unwrap();
+        assert_eq!(files[1].texture, files[0].texture, "8-bit view unchanged");
+        assert!(
+            words.iter().any(|word| word % 257 != 0),
+            "16-bit samples keep detail between 8-bit steps"
+        );
+        // Every 16-bit sample rounds to its 8-bit texel.
+        for (word, byte) in words.iter().zip(&files[1].texture.rgba8) {
+            assert_eq!(((f32::from(*word) / 257.0).round()) as u8, *byte);
+        }
+        assert_eq!(files[2].format.as_deref(), Some("exr"));
+        assert!(files[2].rgba16.is_some(), "EXR outputs get full precision");
+
+        // Formats settle against the export's choice; 16-bit outputs stay
+        // PNG when the choice is TGA.
+        let resolved = preset.resolved("tga");
+        let formats: Vec<_> = resolved
+            .outputs
+            .iter()
+            .map(|output| output.format.clone().unwrap())
+            .collect();
+        assert_eq!(formats, ["tga", "png", "exr"]);
+        assert_eq!(
+            preset.resolved("exr").outputs[0].format.as_deref(),
+            Some("exr")
+        );
+
+        let invalid = |output: ExportOutput| ExportPreset {
+            outputs: vec![output],
+            ..preset.clone()
+        };
+        assert_eq!(
+            invalid(ExportOutput {
+                format: Some("bmp".to_owned()),
+                ..gray("Odd")
+            })
+            .validate(),
+            Err(ExportPresetError::UnknownFormat("Odd".to_owned()))
+        );
+        assert_eq!(
+            invalid(ExportOutput {
+                format: Some("tga".to_owned()),
+                bit_depth: BitDepth::Sixteen,
+                ..gray("Deep")
+            })
+            .validate(),
+            Err(ExportPresetError::DepthNeedsPng("Deep".to_owned()))
+        );
+
+        // A preset's size limit blocks larger sets in preflight.
+        let mobile = ExportPreset {
+            max_resolution: Some(32),
+            ..preset.clone()
+        };
+        let issues = set.export_preflight(&mobile, BakeContext::default());
+        assert!(issues.iter().any(|issue| {
+            issue.severity == PreflightSeverity::Error && issue.message.contains("32 × 32")
+        }));
+        assert!(
+            set.export_preflight(&preset, BakeContext::default())
+                .iter()
+                .all(|issue| issue.severity != PreflightSeverity::Error)
+        );
+        assert_eq!(
+            ExportPreset {
+                max_resolution: Some(0),
+                ..preset.clone()
+            }
+            .validate(),
+            Err(ExportPresetError::InvalidMaxResolution)
+        );
+        // Saved presets read without the new fields.
+        let old: ExportPreset = serde_json::from_str(
+            r#"{"name":"Old","outputs":[{"file_name":"X","layout":"Gray","slots":[{"Constant":0.0},{"Constant":0.0},{"Constant":0.0},{"Constant":1.0}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.max_resolution, None);
+        assert_eq!(old.outputs[0].bit_depth, BitDepth::Eight);
+        assert_eq!(old.outputs[0].format, None);
     }
 
     #[test]

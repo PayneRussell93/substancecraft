@@ -1454,44 +1454,45 @@ impl TextureSet {
             .into_iter()
             .filter(|channel| contributes(layer, &[*channel]))
             .collect();
-        let textures = self.bake_tiles_into(&self.bake_tiles()?, &vec![4; channels.len()], |region| {
-            let id_map = self.validate_for_region(region)?;
-            let masks = self.layer_masks_in(&channels, context, id_map.as_deref(), region)?;
-            let mut textures = Vec::new();
-            for channel in &channels {
-                let data = plane_data(*channel);
-                let mut plane = try_filled(region.len(), Vec4::ZERO)?;
-                Compositor {
-                    set: self,
-                    channel: *channel,
-                    data,
-                    context,
-                    masks: &masks,
-                    region,
-                    probe: None,
+        let textures =
+            self.bake_tiles_into(&self.bake_tiles()?, &vec![4; channels.len()], |region| {
+                let id_map = self.validate_for_region(region)?;
+                let masks = self.layer_masks_in(&channels, context, id_map.as_deref(), region)?;
+                let mut textures = Vec::new();
+                for channel in &channels {
+                    let data = plane_data(*channel);
+                    let mut plane = try_filled(region.len(), Vec4::ZERO)?;
+                    Compositor {
+                        set: self,
+                        channel: *channel,
+                        data,
+                        context,
+                        masks: &masks,
+                        region,
+                        probe: None,
+                    }
+                    .composite(std::slice::from_ref(layer), &mut plane)?;
+                    let mut rgba8 = Vec::new();
+                    rgba8
+                        .try_reserve_exact(region.len() * 4)
+                        .map_err(|_| BakeError::AllocationFailed)?;
+                    for texel in &plane {
+                        let rgb = match data {
+                            PlaneData::Vector if texel.w > 0.0 => texel.truncate() * 0.5 + 0.5,
+                            PlaneData::Vector => Vec3::new(0.5, 0.5, 1.0),
+                            _ => texel.truncate(),
+                        };
+                        rgba8.extend([
+                            unit_to_byte(rgb.x),
+                            unit_to_byte(rgb.y),
+                            unit_to_byte(rgb.z),
+                            unit_to_byte(texel.w),
+                        ]);
+                    }
+                    textures.push(rgba8);
                 }
-                .composite(std::slice::from_ref(layer), &mut plane)?;
-                let mut rgba8 = Vec::new();
-                rgba8
-                    .try_reserve_exact(region.len() * 4)
-                    .map_err(|_| BakeError::AllocationFailed)?;
-                for texel in &plane {
-                    let rgb = match data {
-                        PlaneData::Vector if texel.w > 0.0 => texel.truncate() * 0.5 + 0.5,
-                        PlaneData::Vector => Vec3::new(0.5, 0.5, 1.0),
-                        _ => texel.truncate(),
-                    };
-                    rgba8.extend([
-                        unit_to_byte(rgb.x),
-                        unit_to_byte(rgb.y),
-                        unit_to_byte(rgb.z),
-                        unit_to_byte(texel.w),
-                    ]);
-                }
-                textures.push(rgba8);
-            }
-            Ok(textures)
-        })?;
+                Ok(textures)
+            })?;
         let mut flattened = Vec::new();
         for (channel, rgba8) in channels.into_iter().zip(textures) {
             let image = TextureImage::new(self.resolution.width, self.resolution.height, rgba8)

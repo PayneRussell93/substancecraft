@@ -477,7 +477,7 @@ mod tests {
         // Saved settings must name a known preset and format.
         let mut broken = project.clone();
         if let Some(export) = &mut broken.texture_sets[1].export {
-            export.format = "exr".to_owned();
+            export.format = "bmp".to_owned();
         }
         assert!(broken.validate().is_err());
     }

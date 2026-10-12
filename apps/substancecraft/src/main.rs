@@ -20,6 +20,7 @@ use substancecraft_api::{
     rebake_texture_set_channel_regions, rebake_texture_set_material_regions, save_project_file,
     write_exported_textures, write_texture,
 };
+use substancecraft_api::{load_project_history, save_project_history};
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
     DEFAULT_HEIGHT_STRENGTH, DEFAULT_OPACITY, Dirt, EdgeWear, EditCommand, EditHistory,
@@ -146,6 +147,9 @@ struct SubstanceCraftApp {
     render_result: Arc<std::sync::Mutex<Option<FilamentFrame>>>,
     /// Outcome of the last still render, for the Light drawer.
     render_status: Option<String>,
+    /// The project mesh reference the loaded geometry reflects; undo and redo
+    /// reload the mesh when the project's stops matching it.
+    loaded_mesh: Option<MeshAsset>,
     imported_meshes: Vec<ImportedMesh>,
     selected_imported_mesh: Option<usize>,
     import_error: Option<String>,
@@ -666,6 +670,7 @@ impl Default for SubstanceCraftApp {
             render_request: None,
             render_result: Arc::new(std::sync::Mutex::new(None)),
             render_status: None,
+            loaded_mesh: None,
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
             import_error: None,
@@ -759,6 +764,7 @@ impl Default for SubstanceCraftApp {
             cache: cache::CacheState::default(),
         };
         app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.loaded_mesh = app.project.mesh.clone();
         app
     }
 }
@@ -879,18 +885,32 @@ impl SubstanceCraftApp {
         if smoothing == self.mesh_smoothing || !smoothing.is_valid() {
             return;
         }
+        let before = self.project.mesh.clone();
         let from = self.mesh_smoothing.subdivision_levels;
         let to = smoothing.subdivision_levels;
+        let mut remapped = Vec::new();
         if from != to {
-            // Polygon masks index subdivided triangles; carry them across.
+            // Polygon masks index subdivided triangles; carry them across,
+            // recording each change so undo restores the old indices.
             for set in &mut self.project.texture_sets {
+                let set_id = set.id;
                 for_each_layer_mut(&mut set.layers, &mut |layer| {
+                    if layer.polygon_mask.is_none() {
+                        return;
+                    }
+                    let before = layer.settings();
                     if let Some(mask) = layer.polygon_mask.as_mut() {
                         mask.triangles =
                             remap_subdivided_triangles(mask.triangles.iter().copied(), from, to)
                                 .into_iter()
                                 .collect();
                     }
+                    remapped.push(EditCommand::LayerSettings {
+                        texture_set_id: set_id,
+                        layer_id: layer.id,
+                        before: Box::new(before),
+                        after: Box::new(layer.settings()),
+                    });
                 });
             }
             self.layer_settled = None;
@@ -899,7 +919,91 @@ impl SubstanceCraftApp {
         if let Some(mesh) = self.project.mesh.as_mut() {
             mesh.smoothing = smoothing;
         }
+        self.record_mesh_edit(before, remapped);
         self.rebuild_mesh();
+    }
+
+    /// Records the change of the project's mesh reference from `before`
+    /// (plus any layer edits it caused) as one undo step. Successive edits
+    /// in one drag join that step.
+    fn record_mesh_edit(&mut self, before: Option<MeshAsset>, mut extra: Vec<EditCommand>) {
+        let after = self.project.mesh.clone();
+        self.loaded_mesh = after.clone();
+        if before == after && extra.is_empty() {
+            return;
+        }
+        let mesh = EditCommand::Mesh { before, after };
+        if extra.is_empty() {
+            self.history.record_merging(mesh);
+        } else {
+            extra.insert(0, mesh);
+            self.history.record(EditCommand::Batch(extra));
+        }
+    }
+
+    /// Reloads the mesh the project names (after undo or redo changed it),
+    /// keeping texture sets and layers.
+    fn reload_project_mesh(&mut self) {
+        match Self::restore_project_mesh(&self.project) {
+            Ok(scene) => {
+                self.selected_primitive = scene.selected_primitive;
+                self.imported_meshes = scene.imported_meshes;
+                self.selected_imported_mesh = scene.selected_imported_mesh;
+                self.import_scale = scene.scale;
+                self.mesh_smoothing = scene.smoothing;
+                self.set_base_geometry(scene.geometry);
+                self.restore_high_poly();
+            }
+            Err(error) => self.project_error = Some(error),
+        }
+        self.loaded_mesh = self.project.mesh.clone();
+    }
+
+    /// Replaces the mesh with the file at `path` while keeping every texture
+    /// set and layer (painting is in UV space), as one undoable edit.
+    /// Polygon masks index triangles, so they only survive when the new mesh
+    /// keeps the old triangle order.
+    fn replace_mesh_with(&mut self, path: &std::path::Path) {
+        let meshes = match load_mesh_file(path) {
+            Ok(meshes) => meshes,
+            Err(error) => {
+                self.import_error = Some(error);
+                return;
+            }
+        };
+        let Some(first_mesh) = meshes.first() else {
+            self.import_error = Some("the file contains no mesh geometry".to_owned());
+            return;
+        };
+        let before = self.project.mesh.clone();
+        let geometry = scaled_geometry(&first_mesh.geometry, self.import_scale);
+        self.project.mesh = Some(MeshAsset {
+            id: MeshId(1),
+            source: path.to_string_lossy().into_owned(),
+            scale: self.import_scale,
+            smoothing: self.mesh_smoothing,
+            high_poly_source: None,
+        });
+        self.imported_meshes = meshes;
+        self.selected_imported_mesh = Some(0);
+        self.selected_primitive = None;
+        self.set_base_geometry(Some(geometry));
+        self.high_poly = None;
+        self.high_poly_changed();
+        self.import_error = None;
+        self.history.end_merge();
+        self.record_mesh_edit(before, Vec::new());
+        self.history.end_merge();
+    }
+
+    fn replace_mesh(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
+            .pick_file()
+        else {
+            return;
+        };
+        self.replace_mesh_with(&path);
     }
 
     fn update_filament_frame(&mut self, context: &egui::Context, viewport: egui::Rect) {
@@ -1179,8 +1283,10 @@ impl SubstanceCraftApp {
 
         match save_project_file(&path, &self.project) {
             Ok(()) => {
+                self.project_error = save_project_history(&path, &self.history)
+                    .err()
+                    .map(|error| format!("Saved, but the undo history was not: {error}"));
                 self.project_path = Some(path);
-                self.project_error = None;
                 self.mark_project_settled();
                 self.discard_autosave();
             }
@@ -1226,6 +1332,7 @@ impl SubstanceCraftApp {
         self.mesh_smoothing = scene.smoothing;
         self.set_base_geometry(scene.geometry);
         self.restore_high_poly();
+        self.loaded_mesh = self.project.mesh.clone();
         self.project_error = None;
         self.reload_resources();
         self.selected_texture_set = self.project.active_texture_set;
@@ -1268,7 +1375,9 @@ impl SubstanceCraftApp {
         self.pose_name = format!("Pose {}", self.project.saved_poses.len() + 1);
         self.pose_transition = None;
         self.active_stroke = None;
-        self.history = EditHistory::default();
+        // Undo steps saved with the project come back when the file is
+        // unchanged since.
+        self.history = load_project_history(&path).unwrap_or_default();
         self.layer_settled = None;
         self.invalidate_preview();
         self.bake_error = None;
@@ -1397,6 +1506,7 @@ impl SubstanceCraftApp {
         self.history = EditHistory::default();
         self.layer_settled = None;
         self.set_materials.clear();
+        self.loaded_mesh = self.project.mesh.clone();
         self.current_pose.name = display_name;
         for slot in &slots {
             self.add_texture_set_for_slot(slot.clone());
@@ -1963,6 +2073,10 @@ impl SubstanceCraftApp {
     /// Changes accumulate while the pointer is held (slider drags) and are
     /// committed on release.
     fn sync_layer_history(&mut self, context: &egui::Context) {
+        // A slider drag's property edits stop merging once it ends.
+        if !context.input(|input| input.pointer.any_down()) {
+            self.history.end_merge();
+        }
         let current =
             self.selected_texture_set
                 .zip(self.selected_layer)
@@ -2509,6 +2623,9 @@ impl SubstanceCraftApp {
     }
 
     fn after_history_change(&mut self) {
+        if self.project.mesh != self.loaded_mesh {
+            self.reload_project_mesh();
+        }
         // The settled snapshot must not see undo/redo as a new user edit.
         self.layer_settled = None;
         self.reload_relinked_resources();
@@ -2744,9 +2861,13 @@ impl SubstanceCraftApp {
         };
         match load_merged_mesh(&path, self.import_scale) {
             Ok(geometry) => {
+                let before = self.project.mesh.clone();
                 if let Some(mesh) = self.project.mesh.as_mut() {
                     mesh.high_poly_source = Some(path.to_string_lossy().into_owned());
                 }
+                self.history.end_merge();
+                self.record_mesh_edit(before, Vec::new());
+                self.history.end_merge();
                 self.high_poly = Some(HighPolySource { path, geometry });
                 self.high_poly_changed();
                 self.start_mesh_map_bake();
@@ -2756,10 +2877,14 @@ impl SubstanceCraftApp {
     }
 
     fn clear_high_poly(&mut self) {
+        let before = self.project.mesh.clone();
         self.high_poly = None;
         if let Some(mesh) = self.project.mesh.as_mut() {
             mesh.high_poly_source = None;
         }
+        self.history.end_merge();
+        self.record_mesh_edit(before, Vec::new());
+        self.history.end_merge();
         self.high_poly_changed();
     }
 
@@ -3315,30 +3440,96 @@ impl SubstanceCraftApp {
         )
     }
 
-    fn selected_export_settings_mut(
+    /// True when the selected set keeps its own export choice.
+    fn selected_set_remembers_export(&self) -> bool {
+        self.selected_texture_set_ref()
+            .is_some_and(|set| set.export.is_some())
+    }
+
+    /// Applies `edit` to texture set `id`'s own properties as one undoable
+    /// edit; returns false when nothing changed.
+    fn edit_set_properties(
         &mut self,
-    ) -> Option<&mut substancecraft_core::TextureSetExport> {
-        let id = self.selected_texture_set?;
-        self.project
-            .texture_sets
-            .iter_mut()
-            .find(|set| set.id == id)?
-            .export
-            .as_mut()
+        id: TextureSetId,
+        edit: impl FnOnce(&mut substancecraft_core::TextureSetProperties),
+    ) -> bool {
+        self.edit_set_properties_with(id, edit, false)
+    }
+
+    /// [`Self::edit_set_properties`] that joins the previous undo step when
+    /// it continues it, as successive frames of a slider drag do.
+    fn edit_set_properties_merging(
+        &mut self,
+        id: TextureSetId,
+        edit: impl FnOnce(&mut substancecraft_core::TextureSetProperties),
+    ) -> bool {
+        self.edit_set_properties_with(id, edit, true)
+    }
+
+    fn edit_set_properties_with(
+        &mut self,
+        id: TextureSetId,
+        edit: impl FnOnce(&mut substancecraft_core::TextureSetProperties),
+        merge: bool,
+    ) -> bool {
+        let Some(set) = self.project.texture_sets.iter().find(|set| set.id == id) else {
+            return false;
+        };
+        let before = set.properties();
+        let mut after = before.clone();
+        edit(&mut after);
+        if after == before {
+            return false;
+        }
+        let looks_changed = after.resolution != before.resolution
+            || after.height_strength != before.height_strength
+            || after.channels != before.channels;
+        let command = EditCommand::TextureSetProperties {
+            texture_set_id: id,
+            before: Box::new(before),
+            after: Box::new(after),
+        };
+        let applied = if merge {
+            self.history.apply_merging(&mut self.project, command)
+        } else {
+            self.history.apply(&mut self.project, command)
+        };
+        if applied && looks_changed {
+            self.invalidate_sets(&BTreeSet::from([id]));
+        }
+        applied
     }
 
     /// Changes the selected set's saved format when it has one, else the
     /// app-wide format.
     fn set_format_choice(&mut self, format: TextureFormat) {
-        match self.selected_export_settings_mut() {
-            Some(export) => export.format = format.extension().to_owned(),
+        match self
+            .selected_texture_set
+            .filter(|_| self.selected_set_remembers_export())
+        {
+            Some(id) => {
+                self.edit_set_properties(id, |properties| {
+                    if let Some(export) = &mut properties.export {
+                        export.format = format.extension().to_owned();
+                    }
+                });
+            }
             None => self.export_format = format,
         }
     }
 
     fn set_preset_choice(&mut self, name: String) {
-        match self.selected_export_settings_mut() {
-            Some(export) => export.preset = name,
+        match self
+            .selected_texture_set
+            .filter(|_| self.selected_set_remembers_export())
+        {
+            Some(id) => {
+                self.edit_set_properties(id, |properties| {
+                    if let Some(export) = &mut properties.export {
+                        export.preset = name;
+                    }
+                });
+            }
             None => self.export_preset = name,
         }
     }
@@ -3351,18 +3542,14 @@ impl SubstanceCraftApp {
         let Some(id) = self.selected_texture_set else {
             return;
         };
-        if let Some(set) = self
-            .project
-            .texture_sets
-            .iter_mut()
-            .find(|set| set.id == id)
-        {
-            set.export = remember.then(|| substancecraft_core::TextureSetExport {
+        self.edit_set_properties(id, |properties| {
+            let udim = properties.export.as_ref().is_some_and(|export| export.udim);
+            properties.export = remember.then(|| substancecraft_core::TextureSetExport {
                 preset,
                 format: format.extension().to_owned(),
-                udim: set.export.as_ref().is_some_and(|export| export.udim),
+                udim,
             });
-        }
+        });
     }
 
     /// Exports every texture set into `folder` with its own preset, format,
@@ -3689,7 +3876,8 @@ impl SubstanceCraftApp {
                 )
                 .map_err(|error| error.to_string())?;
             written.extend(
-                write_exported_textures(folder, &files, format).map_err(|error| error.to_string())?,
+                write_exported_textures(folder, &files, format)
+                    .map_err(|error| error.to_string())?,
             );
         }
         Ok(written)
@@ -3784,27 +3972,58 @@ impl SubstanceCraftApp {
         let Some(draft) = self.preset_draft.clone() else {
             return Ok(());
         };
-        let mut project = self.project.clone();
-        match draft.original.as_ref().and_then(|original| {
-            project
-                .export_presets
-                .iter()
-                .position(|preset| &preset.name == original)
-        }) {
-            Some(index) => project.export_presets[index] = draft.preset.clone(),
-            None => project.export_presets.push(draft.preset.clone()),
+        let before = self.project.export_presets.clone();
+        let mut after = before.clone();
+        match draft
+            .original
+            .as_ref()
+            .and_then(|original| after.iter().position(|preset| &preset.name == original))
+        {
+            Some(index) => after[index] = draft.preset.clone(),
+            None => after.push(draft.preset.clone()),
         }
+        let mut project = self.project.clone();
+        project.export_presets = after.clone();
         project.validate().map_err(|error| error.to_string())?;
-        self.project = project;
+        self.history.apply(
+            &mut self.project,
+            EditCommand::ExportPresets { before, after },
+        );
         self.set_preset_choice(draft.preset.name);
         self.preset_draft = None;
         Ok(())
     }
 
+    /// Deletes a custom preset (undoably); texture sets that remembered it
+    /// go back to the app-wide choice.
     fn delete_export_preset(&mut self, name: &str) {
-        self.project
-            .export_presets
-            .retain(|preset| preset.name != name);
+        let before = self.project.export_presets.clone();
+        let after: Vec<ExportPreset> = before
+            .iter()
+            .filter(|preset| preset.name != name)
+            .cloned()
+            .collect();
+        let mut commands = vec![EditCommand::ExportPresets { before, after }];
+        for set in &self.project.texture_sets {
+            if set
+                .export
+                .as_ref()
+                .is_some_and(|export| export.preset == name)
+            {
+                let before = set.properties();
+                let after = substancecraft_core::TextureSetProperties {
+                    export: None,
+                    ..before.clone()
+                };
+                commands.push(EditCommand::TextureSetProperties {
+                    texture_set_id: set.id,
+                    before: Box::new(before),
+                    after: Box::new(after),
+                });
+            }
+        }
+        self.history
+            .apply(&mut self.project, EditCommand::Batch(commands));
         if self
             .preset_draft
             .as_ref()
@@ -4186,6 +4405,7 @@ impl SubstanceCraftApp {
     }
 
     fn set_import_scale(&mut self, scale: f32) {
+        let before = self.project.mesh.clone();
         self.import_scale = sanitize_mesh_scale(scale);
         if let Some(mesh_asset) = self.project.mesh.as_mut()
             && !mesh_asset.source.starts_with("builtin:")
@@ -4195,6 +4415,7 @@ impl SubstanceCraftApp {
         if let Some(index) = self.selected_imported_mesh {
             self.select_imported_mesh(index);
         }
+        self.record_mesh_edit(before, Vec::new());
     }
 
     fn update_pose_transition(&mut self, context: &egui::Context) {
@@ -5267,6 +5488,87 @@ mod tests {
         path
     }
 
+    #[test]
+    fn tc_0265_mesh_edits_and_replacement_undo_and_history_survives_saving() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_paint_layer();
+        let triangles =
+            |app: &SubstanceCraftApp| app.mesh_geometry.as_ref().unwrap().triangles.len();
+        let cube_triangles = triangles(&app);
+
+        // Switching primitive is undoable and reloads the old mesh.
+        app.select_primitive(PrimitivePreset::Sphere);
+        assert_ne!(triangles(&app), cube_triangles);
+        app.undo();
+        assert_eq!(app.project.mesh.as_ref().unwrap().source, "builtin:Cube");
+        assert_eq!(triangles(&app), cube_triangles);
+        app.redo();
+        assert_eq!(app.selected_primitive, Some(PrimitivePreset::Sphere));
+        app.undo();
+
+        // Subdividing remaps polygon masks; undo restores both the
+        // smoothing and the original triangle indices.
+        let layer_id = app.selected_layer.unwrap();
+        app.selected_layer_mut().unwrap().polygon_mask = Some(substancecraft_core::PolygonMask {
+            triangles: [0, 1].into_iter().collect(),
+            inverted: false,
+        });
+        let smoothing = MeshSmoothing {
+            subdivision_levels: 1,
+            ..app.mesh_smoothing
+        };
+        app.set_mesh_smoothing(smoothing);
+        let mask = |app: &SubstanceCraftApp| {
+            app.selected_texture_set_ref()
+                .unwrap()
+                .layer(layer_id)
+                .unwrap()
+                .polygon_mask
+                .clone()
+                .unwrap()
+                .triangles
+        };
+        assert_eq!(mask(&app).len(), 8, "each triangle splits in four");
+        app.undo();
+        assert_eq!(app.mesh_smoothing.subdivision_levels, 0);
+        assert_eq!(mask(&app), [0, 1].into_iter().collect());
+        assert_eq!(triangles(&app), cube_triangles);
+
+        // Replacing the mesh keeps the texture sets and layers.
+        let sets = app.project.texture_sets.clone();
+        let quad = write_two_material_gltf(folder.path());
+        app.replace_mesh_with(&quad);
+        assert_eq!(triangles(&app), 2);
+        assert_eq!(app.project.texture_sets, sets);
+        app.undo();
+        assert_eq!(triangles(&app), cube_triangles);
+        app.redo();
+        assert_eq!(triangles(&app), 2);
+
+        // Saving keeps the undo steps for the next open of the same file.
+        let project = folder.path().join("scene.sproject");
+        app.project_path = Some(project.clone());
+        app.save_project();
+        assert_eq!(app.project_error, None);
+        assert!(substancecraft_api::history_path(&project).exists());
+        let mut reopened = SubstanceCraftApp::default();
+        reopened.open_project_path(project.clone());
+        assert!(reopened.history.can_undo());
+        reopened.undo();
+        assert_eq!(
+            triangles(&reopened),
+            cube_triangles,
+            "undo crosses sessions"
+        );
+        // A project changed behind the history's back drops it.
+        let edited = std::fs::read_to_string(&project).unwrap() + "\n";
+        std::fs::write(&project, edited).unwrap();
+        let mut stale = SubstanceCraftApp::default();
+        stale.open_project_path(project);
+        assert!(!stale.history.can_undo());
+    }
+
     fn small_sets(app: &mut SubstanceCraftApp, size: u32) {
         for set in &mut app.project.texture_sets {
             set.resolution = TextureResolution {
@@ -5544,9 +5846,52 @@ mod tests {
         let loaded = load_project_file(&project).unwrap();
         assert_eq!(loaded.export_presets, app.project.export_presets);
 
+        // An output with its own format and depth writes that way whatever
+        // the export format is.
+        app.edit_export_preset("Unreal Engine copy");
+        let draft = app.preset_draft.as_mut().unwrap();
+        draft.preset.outputs[0].bit_depth = substancecraft_core::BitDepth::Sixteen;
+        draft.preset.max_resolution = Some(4096);
+        app.apply_preset_draft().unwrap();
+        let written = app
+            .write_export(&set, &app.selected_export_preset(), folder.path())
+            .unwrap();
+        // PNG header: bit depth at byte 24, colour type (0 = gray) at 25.
+        let png = std::fs::read(&written[0]).unwrap();
+        assert_eq!((png[24], png[25]), (16, 0));
+
+        // Preset edits undo and redo like any other edit.
+        let edited = app.project.export_presets.clone();
+        app.undo();
+        assert_eq!(
+            app.project.export_presets[0].outputs[0].bit_depth,
+            substancecraft_core::BitDepth::Eight
+        );
+        app.redo();
+        assert_eq!(app.project.export_presets, edited);
+
+        // Deleting a preset a set remembered sends that set back to the
+        // app-wide choice, and undo restores both.
+        let set_id = set.id;
+        app.remember_export_for_selected(true);
         app.delete_export_preset("Unreal Engine copy");
         assert!(app.project.export_presets.is_empty());
         assert_eq!(app.selected_export_preset().name, DEFAULT_EXPORT_PRESET);
+        let remembered = |app: &SubstanceCraftApp| {
+            app.project
+                .texture_sets
+                .iter()
+                .find(|candidate| candidate.id == set_id)
+                .and_then(|candidate| candidate.export.clone())
+        };
+        assert_eq!(remembered(&app), None);
+        assert!(app.project.validate().is_ok());
+        app.undo();
+        assert_eq!(app.project.export_presets, edited);
+        assert_eq!(
+            remembered(&app).map(|export| export.preset),
+            Some("Unreal Engine copy".to_owned())
+        );
     }
 
     #[test]
@@ -6083,6 +6428,18 @@ mod tests {
                 name.to_string_lossy()
                     .starts_with(&format!("{stem}_BaseMap"))
             })
+        }));
+
+        let godot = app
+            .select_engine_preset("Godot 4 (StandardMaterial3D)")
+            .unwrap();
+        assert_eq!(app.selected_preset_name(), "Godot 4 (StandardMaterial3D)");
+        let godot_folder = folder.path().join("godot");
+        std::fs::create_dir(&godot_folder).unwrap();
+        let godot_files = app.write_export(&set, &godot, &godot_folder).unwrap();
+        assert!(godot_files.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy() == format!("{stem}_orm.png"))
         }));
     }
 

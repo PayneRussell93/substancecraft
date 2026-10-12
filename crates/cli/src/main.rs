@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! substancecraft-cli export <project.sproject> --out <dir>
-//!     [--preset <name>] [--format png|tga] [--udim] [--ao-samples <n>]
+//!     [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]
 //! substancecraft-cli batch <jobs.txt> [--workers <n>]
 //! substancecraft-cli presets
 //! ```
@@ -25,7 +25,7 @@ use substancecraft_api::{
     ExportJob, TextureFormat, list_export_presets, run_export_job, run_export_jobs,
 };
 
-const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga] [--udim] [--ao-samples <n>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets";
+const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -268,7 +268,7 @@ mod tests {
             "export scene.sproject",
             "export --out build",
             "export a b --out c",
-            "export a --out b --format exr",
+            "export a --out b --format bmp",
             "export a --out b --ao-samples many",
             "export a --out b --nope",
             "render a",

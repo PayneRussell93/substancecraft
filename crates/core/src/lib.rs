@@ -33,9 +33,9 @@ pub use compositing::{
 };
 pub use export::{
     BitDepth, ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource,
-    ExportedTexture,
-    MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS, OutputLayout,
-    PreflightIssue, PreflightSeverity, SourceComponent, TEXTURE_SET_TOKEN,
+    ExportedTexture, MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS,
+    OutputLayout, PreflightIssue, PreflightSeverity, SourceComponent, SpecGlossMap,
+    TEXTURE_SET_TOKEN,
 };
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
@@ -1159,7 +1159,7 @@ impl AnchorMask {
 }
 
 /// Snapshot of a layer's non-stroke, non-structural state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerSettings {
     pub name: String,
     pub visible: bool,
@@ -1305,7 +1305,7 @@ pub struct IdStroke {
 
 /// Where a layer sits: inside the group `parent` (or the texture set's top
 /// level when `None`) at `index`, counted from the bottom.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerSlot {
     pub parent: Option<LayerId>,
     pub index: usize,
@@ -1313,7 +1313,7 @@ pub struct LayerSlot {
 
 /// One undoable project edit. Commands are recorded after they have been
 /// applied; undo reverts them and redo applies them again.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EditCommand {
     Paint {
         texture_set_id: TextureSetId,
@@ -1361,21 +1361,46 @@ pub enum EditCommand {
         before: String,
         after: String,
     },
+    /// Replaced the project's custom export presets.
+    ExportPresets {
+        before: Vec<ExportPreset>,
+        after: Vec<ExportPreset>,
+    },
+    /// Replaced a texture set's own properties (all but its layers).
+    TextureSetProperties {
+        texture_set_id: TextureSetId,
+        before: Box<TextureSetProperties>,
+        after: Box<TextureSetProperties>,
+    },
+    /// Inserted a texture set at `index`.
+    InsertTextureSet { index: usize, set: Box<TextureSet> },
+    /// Removed the texture set at `index`.
+    RemoveTextureSet { index: usize, set: Box<TextureSet> },
+    /// Replaced the project's mesh reference (its source, scale, smoothing,
+    /// or high-poly source).
+    Mesh {
+        before: Option<MeshAsset>,
+        after: Option<MeshAsset>,
+    },
     /// Several commands applied in order and undone in reverse as one step,
     /// e.g. a symmetric stroke or a flatten. All or none apply.
     Batch(Vec<EditCommand>),
 }
 
 /// Bounded undo/redo stacks of [`EditCommand`]s.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditHistory {
     undo_stack: Vec<EditCommand>,
     redo_stack: Vec<EditCommand>,
+    /// The last step came from [`Self::apply_merging`] and may still grow.
+    #[serde(skip)]
+    merging: bool,
 }
 
 impl EditHistory {
     /// Records a command the caller has already applied.
     pub fn record(&mut self, command: EditCommand) {
+        self.merging = false;
         if self.undo_stack.len() == MAX_EDIT_HISTORY {
             self.undo_stack.remove(0);
         }
@@ -1393,6 +1418,63 @@ impl EditHistory {
         true
     }
 
+    /// Like [`Self::apply`], but successive texture-set property edits of
+    /// one set made this way (the frames of a slider drag) join a single
+    /// undo step until [`Self::end_merge`] or any other edit.
+    pub fn apply_merging(&mut self, project: &mut MaterialProject, command: EditCommand) -> bool {
+        if !apply_command(project, &command) {
+            return false;
+        }
+        self.record_merging(command);
+        true
+    }
+
+    /// Records an applied command like [`Self::record`], joining it to the
+    /// last step when both are texture-set property edits of one set, or
+    /// mesh edits, made in one merging run that picks up where it left off.
+    pub fn record_merging(&mut self, command: EditCommand) {
+        if self.merging
+            && let Some(last) = self.undo_stack.last_mut()
+        {
+            match (last, &command) {
+                (
+                    EditCommand::TextureSetProperties {
+                        texture_set_id: last_set,
+                        after: last_after,
+                        ..
+                    },
+                    EditCommand::TextureSetProperties {
+                        texture_set_id,
+                        before,
+                        after,
+                    },
+                ) if last_set == texture_set_id && last_after == before => {
+                    last_after.clone_from(after);
+                    self.redo_stack.clear();
+                    return;
+                }
+                (
+                    EditCommand::Mesh {
+                        after: last_after, ..
+                    },
+                    EditCommand::Mesh { before, after },
+                ) if last_after == before => {
+                    last_after.clone_from(after);
+                    self.redo_stack.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.record(command);
+        self.merging = true;
+    }
+
+    /// Ends a run of [`Self::apply_merging`] edits, e.g. when a drag ends.
+    pub fn end_merge(&mut self) {
+        self.merging = false;
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
@@ -1402,6 +1484,7 @@ impl EditHistory {
     }
 
     pub fn undo(&mut self, project: &mut MaterialProject) -> bool {
+        self.merging = false;
         let Some(command) = self.undo_stack.pop() else {
             return false;
         };
@@ -1414,6 +1497,7 @@ impl EditHistory {
     }
 
     pub fn redo(&mut self, project: &mut MaterialProject) -> bool {
+        self.merging = false;
         let Some(command) = self.redo_stack.pop() else {
             return false;
         };
@@ -1527,6 +1611,17 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
             before,
             after,
         } => relink_resource(project, *resource, before, after),
+        EditCommand::ExportPresets { before, after } => {
+            replace_value(&mut project.export_presets, before, after)
+        }
+        EditCommand::TextureSetProperties {
+            texture_set_id,
+            before,
+            after,
+        } => replace_set_properties(project, *texture_set_id, before, after),
+        EditCommand::InsertTextureSet { index, set } => insert_texture_set(project, *index, set),
+        EditCommand::RemoveTextureSet { index, set } => remove_texture_set(project, *index, set),
+        EditCommand::Mesh { before, after } => replace_value(&mut project.mesh, before, after),
     }
 }
 
@@ -1590,7 +1685,70 @@ fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool 
             before,
             after,
         } => relink_resource(project, *resource, after, before),
+        EditCommand::ExportPresets { before, after } => {
+            replace_value(&mut project.export_presets, after, before)
+        }
+        EditCommand::TextureSetProperties {
+            texture_set_id,
+            before,
+            after,
+        } => replace_set_properties(project, *texture_set_id, after, before),
+        EditCommand::InsertTextureSet { index, set } => remove_texture_set(project, *index, set),
+        EditCommand::RemoveTextureSet { index, set } => insert_texture_set(project, *index, set),
+        EditCommand::Mesh { before, after } => replace_value(&mut project.mesh, after, before),
     }
+}
+
+/// Sets `value` to `replacement` when it still equals `expected`.
+fn replace_value<T: Clone + PartialEq>(value: &mut T, expected: &T, replacement: &T) -> bool {
+    if value != expected {
+        return false;
+    }
+    *value = replacement.clone();
+    true
+}
+
+fn replace_set_properties(
+    project: &mut MaterialProject,
+    texture_set_id: TextureSetId,
+    expected: &TextureSetProperties,
+    replacement: &TextureSetProperties,
+) -> bool {
+    let Some(set) = find_texture_set(project, texture_set_id) else {
+        return false;
+    };
+    if set.properties() != *expected {
+        return false;
+    }
+    set.apply_properties(replacement.clone());
+    true
+}
+
+fn insert_texture_set(project: &mut MaterialProject, index: usize, set: &TextureSet) -> bool {
+    let id_taken = project
+        .texture_sets
+        .iter()
+        .any(|existing| existing.id == set.id);
+    let layer_taken = set
+        .layers
+        .iter()
+        .any(|layer| layer_id_in_use(project, layer));
+    if id_taken || layer_taken || index > project.texture_sets.len() {
+        return false;
+    }
+    project.texture_sets.insert(index, set.clone());
+    true
+}
+
+fn remove_texture_set(project: &mut MaterialProject, index: usize, set: &TextureSet) -> bool {
+    if project.texture_sets.get(index) != Some(set) {
+        return false;
+    }
+    project.texture_sets.remove(index);
+    if project.active_texture_set == Some(set.id) {
+        project.active_texture_set = project.texture_sets.first().map(|set| set.id);
+    }
+    true
 }
 
 fn replace_layer_settings(
@@ -1833,10 +1991,41 @@ fn default_height_strength() -> f32 {
     DEFAULT_HEIGHT_STRENGTH
 }
 
+/// A texture set's own properties: everything but its id and layers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextureSetProperties {
+    pub name: String,
+    pub material_slot: String,
+    pub resolution: TextureResolution,
+    pub channels: BTreeSet<MaterialChannel>,
+    pub height_strength: f32,
+    pub export: Option<TextureSetExport>,
+}
+
 impl TextureSet {
     /// Every layer in the tree, depth first, groups before their children.
     pub fn walk_layers(&self) -> Vec<&MaterialLayer> {
         self.layers.iter().flat_map(MaterialLayer::walk).collect()
+    }
+
+    pub fn properties(&self) -> TextureSetProperties {
+        TextureSetProperties {
+            name: self.name.clone(),
+            material_slot: self.material_slot.clone(),
+            resolution: self.resolution,
+            channels: self.channels.clone(),
+            height_strength: self.height_strength,
+            export: self.export.clone(),
+        }
+    }
+
+    pub fn apply_properties(&mut self, properties: TextureSetProperties) {
+        self.name = properties.name;
+        self.material_slot = properties.material_slot;
+        self.resolution = properties.resolution;
+        self.channels = properties.channels;
+        self.height_strength = properties.height_strength;
+        self.export = properties.export;
     }
 
     /// The power-of-two factor that brings the set's longer edge down to at
@@ -2220,6 +2409,138 @@ mod tests {
             height_strength: DEFAULT_HEIGHT_STRENGTH,
             export: None,
         }
+    }
+
+    #[test]
+    fn tc_0263_set_presets_and_mesh_edits_undo_redo_and_merge_slider_drags() {
+        let mut project = MaterialProject::empty();
+        project.texture_sets.push(texture_set(1));
+        let mut history = EditHistory::default();
+
+        // Texture-set properties.
+        let before = project.texture_sets[0].properties();
+        let after = TextureSetProperties {
+            resolution: TextureResolution::new(4096, 4096).unwrap(),
+            ..before.clone()
+        };
+        assert!(history.apply(
+            &mut project,
+            EditCommand::TextureSetProperties {
+                texture_set_id: TextureSetId(1),
+                before: Box::new(before.clone()),
+                after: Box::new(after.clone()),
+            },
+        ));
+        assert_eq!(project.texture_sets[0].resolution.width, 4096);
+        // A command whose "before" no longer matches is refused.
+        assert!(!history.apply(
+            &mut project,
+            EditCommand::TextureSetProperties {
+                texture_set_id: TextureSetId(1),
+                before: Box::new(before.clone()),
+                after: Box::new(after.clone()),
+            },
+        ));
+        assert!(history.undo(&mut project));
+        assert_eq!(project.texture_sets[0].properties(), before);
+        assert!(history.redo(&mut project));
+        assert_eq!(project.texture_sets[0].properties(), after);
+
+        // Slider drags merge into one step.
+        let mut current = after.clone();
+        for strength in [1.5, 2.0, 2.5] {
+            let next = TextureSetProperties {
+                height_strength: strength,
+                ..current.clone()
+            };
+            assert!(history.apply_merging(
+                &mut project,
+                EditCommand::TextureSetProperties {
+                    texture_set_id: TextureSetId(1),
+                    before: Box::new(current.clone()),
+                    after: Box::new(next.clone()),
+                },
+            ));
+            current = next;
+        }
+        assert_eq!(project.texture_sets[0].height_strength, 2.5);
+        assert!(history.undo(&mut project));
+        assert_eq!(project.texture_sets[0].properties(), after, "one step");
+
+        // Inserting and removing whole sets.
+        let mut second = texture_set(2);
+        second
+            .layers
+            .push(MaterialLayer::new_paint(LayerId(9), "Paint"));
+        assert!(history.apply(
+            &mut project,
+            EditCommand::InsertTextureSet {
+                index: 1,
+                set: Box::new(second.clone()),
+            },
+        ));
+        assert!(
+            !history.apply(
+                &mut project,
+                EditCommand::InsertTextureSet {
+                    index: 0,
+                    set: Box::new(second.clone()),
+                },
+            ),
+            "ids stay unique"
+        );
+        project.active_texture_set = Some(TextureSetId(2));
+        assert!(history.apply(
+            &mut project,
+            EditCommand::RemoveTextureSet {
+                index: 1,
+                set: Box::new(second.clone()),
+            },
+        ));
+        assert_eq!(project.texture_sets.len(), 1);
+        assert_eq!(project.active_texture_set, Some(TextureSetId(1)));
+        assert!(history.undo(&mut project));
+        assert_eq!(project.texture_sets[1], second);
+        assert!(history.undo(&mut project));
+        assert_eq!(project.texture_sets.len(), 1);
+
+        // Presets and the mesh reference.
+        let presets = vec![ExportPreset::built_in().remove(0)];
+        assert!(history.apply(
+            &mut project,
+            EditCommand::ExportPresets {
+                before: Vec::new(),
+                after: presets.clone(),
+            },
+        ));
+        let mesh = MeshAsset {
+            id: MeshId(3),
+            source: "scan.fbx".to_owned(),
+            scale: 2.0,
+            smoothing: MeshSmoothing::default(),
+            high_poly_source: None,
+        };
+        let old_mesh = project.mesh.clone();
+        assert!(history.apply(
+            &mut project,
+            EditCommand::Mesh {
+                before: old_mesh.clone(),
+                after: Some(mesh.clone()),
+            },
+        ));
+        assert_eq!(project.mesh, Some(mesh));
+        assert!(history.undo(&mut project));
+        assert_eq!(project.mesh, old_mesh);
+        assert!(history.undo(&mut project));
+        assert!(project.export_presets.is_empty());
+
+        // Commands serialize, so history can be saved.
+        let command = EditCommand::Batch(vec![EditCommand::ExportPresets {
+            before: Vec::new(),
+            after: presets,
+        }]);
+        let json = serde_json::to_string(&command).unwrap();
+        assert_eq!(serde_json::from_str::<EditCommand>(&json).unwrap(), command);
     }
 
     #[test]

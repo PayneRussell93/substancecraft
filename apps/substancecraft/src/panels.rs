@@ -11,12 +11,13 @@ use eframe::egui::{
 use substancecraft_api::TextureFormat;
 use substancecraft_core::MIN_TILE_SIZE;
 use substancecraft_core::{
-    Axis, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction, ExportOutput,
-    ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS, MAX_BRUSH_SPACING,
-    MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS, MIN_BRUSH_SPACING,
-    MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer, MeshAsset, MeshId,
-    MeshMapKind, MeshSmoothing, OutputLayout, PreflightSeverity, PrimitivePreset, ProjectionMode,
-    ResourceId, SelectionMode, SourceComponent, TextureProjection, TextureSetId, ViewportCamera,
+    Axis, BitDepth, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction,
+    ExportOutput, ExportSource, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS,
+    MAX_BRUSH_SPACING, MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS,
+    MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialLayer,
+    MeshAsset, MeshId, MeshMapKind, MeshSmoothing, OutputLayout, PreflightSeverity,
+    PrimitivePreset, ProjectionMode, ResourceId, SelectionMode, SourceComponent, TextureProjection,
+    TextureSetId, ViewportCamera,
 };
 
 use super::resource_watch::ReloadMode;
@@ -238,7 +239,8 @@ impl SubstanceCraftApp {
         }
     }
 
-    fn select_primitive(&mut self, preset: PrimitivePreset) {
+    pub(super) fn select_primitive(&mut self, preset: PrimitivePreset) {
+        let before = self.project.mesh.clone();
         self.selected_primitive = Some(preset);
         self.selected_imported_mesh = None;
         self.project.mesh = Some(MeshAsset {
@@ -251,6 +253,9 @@ impl SubstanceCraftApp {
         self.set_base_geometry(Some(preset.build_mesh()));
         self.high_poly = None;
         self.high_poly_changed();
+        self.history.end_merge();
+        self.record_mesh_edit(before, Vec::new());
+        self.history.end_merge();
     }
 
     pub(super) fn select_texture_set(&mut self, set_id: TextureSetId) {
@@ -534,6 +539,14 @@ impl SubstanceCraftApp {
             .clicked()
         {
             self.import_mesh();
+        }
+        if widgets::pill_button(ui, Some(Icon::Import), "Replace mesh…", false, true)
+            .on_hover_text(
+                "Swap in another version of the mesh and keep every texture set and layer \n                 (undoable)",
+            )
+            .clicked()
+        {
+            self.replace_mesh();
         }
 
         let mut import_scale = self.import_scale;
@@ -1791,24 +1804,18 @@ impl SubstanceCraftApp {
                 });
                 let strength_changed =
                     slider_row(ui, "Height force", &mut strength, 0.0..=8.0, false, 2);
-                if let Some(set) = self
-                    .project
-                    .texture_sets
-                    .iter_mut()
-                    .find(|set| Some(set.id) == self.selected_texture_set)
-                {
-                    let mut changed = false;
+                if let Some(id) = self.selected_texture_set {
                     if strength_changed {
-                        set.height_strength = strength;
-                        changed = true;
+                        // A drag is one undo step.
+                        self.edit_set_properties_merging(id, |properties| {
+                            properties.height_strength = strength;
+                        });
                     }
                     if let Some(size) = chosen_resolution {
-                        set.resolution.width = size;
-                        set.resolution.height = size;
-                        changed = true;
-                    }
-                    if changed {
-                        self.invalidate_preview();
+                        self.edit_set_properties(id, |properties| {
+                            properties.resolution.width = size;
+                            properties.resolution.height = size;
+                        });
                     }
                 }
 
@@ -2856,12 +2863,22 @@ impl SubstanceCraftApp {
         if remember != remembered {
             self.remember_export_for_selected(remember);
         }
-        if let Some(export) = self.selected_export_settings_mut() {
-            let mut udim = export.udim;
+        let saved_udim = self
+            .selected_texture_set_ref()
+            .and_then(|set| set.export.as_ref())
+            .map(|export| export.udim);
+        if let (Some(saved), Some(id)) = (saved_udim, self.selected_texture_set) {
+            let mut udim = saved;
             widgets::property_row(ui, "UDIM tiles", |ui| {
                 widgets::toggle(ui, &mut udim).on_hover_text("Export one file set per UV tile");
             });
-            export.udim = udim;
+            if udim != saved {
+                self.edit_set_properties(id, |properties| {
+                    if let Some(export) = &mut properties.export {
+                        export.udim = udim;
+                    }
+                });
+            }
         }
         let presets = self.export_presets();
         let selected = self.selected_export_preset();
@@ -2888,7 +2905,8 @@ impl SubstanceCraftApp {
         let set_name = self
             .selected_texture_set_ref()
             .map_or_else(|| "Material".to_owned(), |set| set.name.clone());
-        for output in &selected.outputs {
+        let format = self.selected_format();
+        for output in &selected.resolved(format.extension()).outputs {
             let routing = output
                 .used_slots()
                 .iter()
@@ -2901,11 +2919,16 @@ impl SubstanceCraftApp {
             } else {
                 ""
             };
+            let extension = output.format.as_deref().unwrap_or(format.extension());
+            let depth = if output.bit_depth == BitDepth::Sixteen && extension == "png" {
+                " 16-bit"
+            } else {
+                ""
+            };
             ui.label(
                 RichText::new(format!(
-                    "{}.{}{optional}",
+                    "{}.{extension}{depth}{optional}",
                     output.resolved_file_name(&set_name),
-                    self.selected_format().extension()
                 ))
                 .size(12.0)
                 .color(theme::TEXT),
@@ -3001,6 +3024,12 @@ impl SubstanceCraftApp {
             {
                 self.export_engine_preset("Unity (URP Lit)");
             }
+            if widgets::chip(ui, "Godot…", false)
+                .on_hover_text("Select the Godot 4 preset and export")
+                .clicked()
+            {
+                self.export_engine_preset("Godot 4 (StandardMaterial3D)");
+            }
             if widgets::chip(ui, "All sets…", false)
                 .on_hover_text("Export every texture set with its own preset and format")
                 .clicked()
@@ -3032,6 +3061,24 @@ impl SubstanceCraftApp {
                         .margin(vec2(8.0, 4.0))
                         .hint_text("Preset name"),
                 );
+                widgets::property_row(ui, "Max size", |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if widgets::chip(ui, "Any", draft.preset.max_resolution.is_none())
+                        .on_hover_text("Accept texture sets of any size")
+                        .clicked()
+                    {
+                        draft.preset.max_resolution = None;
+                    }
+                    for edge in [1024, 2048, 4096, 8192] {
+                        let label = format!("{}k", edge / 1024);
+                        if widgets::chip(ui, &label, draft.preset.max_resolution == Some(edge))
+                            .on_hover_text("Block exports of texture sets larger than this")
+                            .clicked()
+                        {
+                            draft.preset.max_resolution = Some(edge);
+                        }
+                    }
+                });
                 let mut remove = None;
                 let removable = draft.preset.outputs.len() > 1;
                 for (index, output) in draft.preset.outputs.iter_mut().enumerate() {
@@ -3069,6 +3116,41 @@ impl SubstanceCraftApp {
                                     .size(11.5)
                                     .color(theme::TEXT_WEAK),
                             );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            // "Export" follows the format chosen when exporting.
+                            if widgets::chip(ui, "Export", output.format.is_none())
+                                .on_hover_text("Use the format chosen for the export")
+                                .clicked()
+                            {
+                                output.format = None;
+                            }
+                            for format in TextureFormat::ALL {
+                                let selected = output.format.as_deref() == Some(format.extension());
+                                if widgets::chip(ui, format.name(), selected)
+                                    .on_hover_text("Always write this file in this format")
+                                    .clicked()
+                                {
+                                    output.format = Some(format.extension().to_owned());
+                                }
+                            }
+                        });
+                        // Depth matters for PNG; TGA holds 8 bits and EXR
+                        // half floats.
+                        let fixed = matches!(output.format.as_deref(), Some("tga" | "exr"));
+                        ui.add_enabled_ui(!fixed, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for depth in BitDepth::ALL {
+                                    if widgets::chip(ui, depth.name(), output.bit_depth == depth)
+                                        .on_hover_text("Bits per channel when written as PNG")
+                                        .clicked()
+                                    {
+                                        output.bit_depth = depth;
+                                    }
+                                }
+                            });
                         });
                         let count = output.layout.channel_count();
                         for (slot, channel) in output.slots[..count]
@@ -3141,6 +3223,7 @@ fn source_label(source: ExportSource) -> String {
         ExportSource::Channel(MaterialChannel::AmbientOcclusion) => "Occlusion".to_owned(),
         ExportSource::Channel(channel) => channel_label(channel).to_owned(),
         ExportSource::MeshMap(kind) => format!("{} map", kind.name()),
+        ExportSource::SpecGloss(map) => format!("{} (spec/gloss)", map.name()),
     }
 }
 

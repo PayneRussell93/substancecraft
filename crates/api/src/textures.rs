@@ -226,7 +226,11 @@ pub fn encode_exported_texture(
     let words = || -> Result<Vec<u16>, TextureIoError> {
         let words = match &file.rgba16 {
             Some(words) => words.clone(),
-            None => texture.rgba8.iter().map(|byte| u16::from(*byte) * 257).collect(),
+            None => texture
+                .rgba8
+                .iter()
+                .map(|byte| u16::from(*byte) * 257)
+                .collect(),
         };
         if words.len() == pixel_count * 4 {
             Ok(words)
@@ -417,8 +421,12 @@ mod tests {
             rgba16: Some(precise.clone()),
             ..exported("Body_ORM", OutputLayout::Rgb)
         };
-        let written = write_exported_textures(folder.path(), &[deep.clone()], TextureFormat::Png)
-            .unwrap();
+        let written = write_exported_textures(
+            folder.path(),
+            std::slice::from_ref(&deep),
+            TextureFormat::Png,
+        )
+        .unwrap();
         let decoded = image::open(&written[0]).unwrap();
         assert_eq!(decoded.color(), image::ColorType::Rgb16);
         assert_eq!(
@@ -447,7 +455,11 @@ mod tests {
         };
         let written =
             write_exported_textures(folder.path(), &[gray, color], TextureFormat::Png).unwrap();
-        assert!(written.iter().all(|path| path.extension().unwrap() == "exr"));
+        assert!(
+            written
+                .iter()
+                .all(|path| path.extension().unwrap() == "exr")
+        );
         let read = |path: &std::path::Path| {
             let image = exr::prelude::read_first_flat_layer_from_file(path).unwrap();
             image
@@ -494,7 +506,10 @@ mod tests {
         let png = folder.path().join("Body_BaseColor.PNG");
         write_texture(&png, &texture()).unwrap();
         assert_eq!(load_texture_image(&png).unwrap().rgba8, texture().rgba8);
-        assert_eq!(write_texture(folder.path().join("map.exr"), &texture()), Ok(()));
+        assert_eq!(
+            write_texture(folder.path().join("map.exr"), &texture()),
+            Ok(())
+        );
         assert_eq!(
             write_texture(folder.path().join("map.bmp"), &texture()),
             Err(TextureIoError::UnsupportedFormat("bmp".to_owned()))

@@ -3,6 +3,7 @@
 
 mod fbx;
 mod gltf_import;
+mod history_file;
 mod interchange;
 mod jobs;
 mod project_format;
@@ -15,6 +16,9 @@ pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
 };
 pub use gltf_import::{GltfImportError, MAX_GLTF_BYTES, import_gltf, import_gltf_file};
+pub use history_file::{
+    HISTORY_EXTENSION, MAX_HISTORY_BYTES, history_path, load_project_history, save_project_history,
+};
 pub use interchange::{
     GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, openpbr_preset,
     read_openpbr_materialx, write_gltf, write_openpbr_materialx,
