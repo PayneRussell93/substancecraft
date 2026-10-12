@@ -833,6 +833,74 @@ impl SubstanceCraftApp {
         {
             self.import_resources();
         }
+        if !self.pending_import_assignments.is_empty() {
+            widgets::caption(ui, "Assign imported bitmaps");
+            hint(
+                ui,
+                "Review each channel suggestion before fill layers are created. Unassigned files stay in Assets.",
+            );
+            let resources = self
+                .project
+                .resources
+                .iter()
+                .map(|resource| (resource.id, resource.name.clone()))
+                .collect::<Vec<_>>();
+            let mut remove = Vec::new();
+            for assignment in &mut self.pending_import_assignments {
+                let name = resources
+                    .iter()
+                    .find(|(id, _)| *id == assignment.resource)
+                    .map_or_else(
+                        || format!("Resource {}", assignment.resource.0),
+                        |(_, name)| name.clone(),
+                    );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).size(11.5).color(theme::TEXT));
+                    egui::ComboBox::from_id_salt(("import_channel", assignment.resource.0))
+                        .width(ui.available_width().min(132.0))
+                        .selected_text(assignment.channel.map_or("Skip", channel_label))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut assignment.channel, None, "Skip");
+                            for channel in [
+                                MaterialChannel::BaseColor,
+                                MaterialChannel::Normal,
+                                MaterialChannel::Roughness,
+                                MaterialChannel::Metallic,
+                                MaterialChannel::Height,
+                                MaterialChannel::Emissive,
+                                MaterialChannel::Opacity,
+                            ] {
+                                ui.selectable_value(
+                                    &mut assignment.channel,
+                                    Some(channel),
+                                    channel_label(channel),
+                                );
+                            }
+                        });
+                    if widgets::icon_button(ui, Icon::Close, true, "Remove from assignment")
+                        .clicked()
+                    {
+                        remove.push(assignment.resource);
+                    }
+                });
+                ui.label(
+                    RichText::new(&assignment.reason)
+                        .size(10.5)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+            self.pending_import_assignments
+                .retain(|assignment| !remove.contains(&assignment.resource));
+            ui.horizontal(|ui| {
+                if widgets::pill_button(ui, None, "Create fill layers", true, false).clicked() {
+                    self.confirm_import_assignments();
+                }
+                if widgets::pill_button(ui, None, "Dismiss", false, false).clicked() {
+                    self.pending_import_assignments.clear();
+                }
+            });
+            ui.add_space(4.0);
+        }
         if widgets::pill_button(ui, None, "New text resource…", false, true)
             .on_hover_text(
                 "Write a .sctext file (text and size) and use the rendered text like a bitmap",

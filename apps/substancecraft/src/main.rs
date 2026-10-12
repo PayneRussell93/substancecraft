@@ -25,7 +25,7 @@ use substancecraft_core::{
     MaterialTextures, MeshAsset, MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings,
     MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PreflightIssue,
     PreflightSeverity, PrimitivePreset, ProjectResource, ResourceId, ResourceImages, SelectionMode,
-    TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
+    TextureImage, TextureResolution, TextureSet, TextureSetId, ViewportCamera, ViewportLighting,
     remap_subdivided_triangles,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
@@ -200,6 +200,8 @@ struct SubstanceCraftApp {
     asset_query: String,
     /// Search text for filtering the layer stack.
     layer_query: String,
+    /// Imported bitmaps waiting for channel confirmation before fill creation.
+    pending_import_assignments: Vec<ImportAssignment>,
     history: EditHistory,
     /// Last committed settings of the selected layer; edits made through the
     /// inspector are recorded as one history step once the pointer is up.
@@ -462,6 +464,13 @@ struct MeshMapJob {
     key: BakeKey,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImportAssignment {
+    resource: ResourceId,
+    channel: Option<MaterialChannel>,
+    reason: String,
+}
+
 struct PoseTransition {
     from: NamedPose,
     to: NamedPose,
@@ -571,6 +580,7 @@ impl Default for SubstanceCraftApp {
             skew_map_revision: 0,
             asset_query: String::new(),
             layer_query: String::new(),
+            pending_import_assignments: Vec::new(),
             history: EditHistory::default(),
             layer_settled: None,
             baked_preview: None,
@@ -3427,10 +3437,124 @@ impl SubstanceCraftApp {
         else {
             return;
         };
+        let mut pending = Vec::new();
+        let mut failures = Vec::new();
         for path in paths {
-            if let Err(error) = self.add_resource(&path) {
-                self.import_error = Some(error);
+            match self.add_resource(&path) {
+                Ok(resource) => {
+                    let name = self
+                        .project
+                        .resources
+                        .iter()
+                        .find(|candidate| candidate.id == resource)
+                        .map_or("", |candidate| candidate.name.as_str());
+                    let image = self.resource_images.get(&resource);
+                    let (channel, reason) = suggest_import_channel(name, image.map(Arc::as_ref));
+                    pending.push(ImportAssignment {
+                        resource,
+                        channel,
+                        reason,
+                    });
+                }
+                Err(error) => failures.push(error),
             }
+        }
+        if !failures.is_empty() {
+            self.import_error = Some(failures.join("\n"));
+        }
+        if !pending.is_empty() {
+            self.pending_import_assignments.extend(pending);
+        }
+    }
+
+    fn confirm_import_assignments(&mut self) {
+        let assignments: Vec<_> = self
+            .pending_import_assignments
+            .iter()
+            .filter_map(|assignment| {
+                assignment
+                    .channel
+                    .map(|channel| (assignment.resource, channel))
+            })
+            .collect();
+        if assignments.is_empty() {
+            self.pending_import_assignments.clear();
+            return;
+        }
+        if self.selected_texture_set.is_none() {
+            self.add_texture_set();
+        }
+        let Some(texture_set_id) = self.selected_texture_set else {
+            self.import_error = Some("Could not create a texture set for imported bitmaps.".into());
+            return;
+        };
+        let Some(set) = self
+            .project
+            .texture_sets
+            .iter()
+            .find(|set| set.id == texture_set_id)
+        else {
+            self.import_error = Some("The selected texture set no longer exists.".into());
+            return;
+        };
+        let insertion = self.insertion_slot(set);
+        let mut commands = Vec::with_capacity(assignments.len());
+        let mut inserted = Vec::with_capacity(assignments.len());
+        for (offset, (resource, channel)) in assignments.into_iter().enumerate() {
+            let Some(resource_name) = self
+                .project
+                .resources
+                .iter()
+                .find(|candidate| candidate.id == resource)
+                .map(|resource| resource.name.clone())
+            else {
+                self.import_error = Some(format!(
+                    "Imported bitmap resource {} no longer exists.",
+                    resource.0
+                ));
+                return;
+            };
+            let Some(layer_id) = self.allocate_layer_id() else {
+                self.import_error = Some("Out of layer ids.".to_owned());
+                return;
+            };
+            let mut fill = LayerFill::default();
+            let Some(slot) = fill.textures.slot_mut(channel) else {
+                self.import_error = Some(format!(
+                    "{} cannot be assigned to a fill layer.",
+                    channel_label(channel)
+                ));
+                return;
+            };
+            *slot = Some(resource);
+            let mut layer = MaterialLayer::new_fill(
+                layer_id,
+                format!("{} ({})", resource_name, channel_label(channel)),
+                fill,
+            );
+            layer.channels = BTreeSet::from([channel]);
+            commands.push(EditCommand::InsertLayer {
+                texture_set_id,
+                slot: LayerSlot {
+                    parent: insertion.parent,
+                    index: insertion.index + offset,
+                },
+                layer: Box::new(layer),
+            });
+            inserted.push(layer_id);
+        }
+        if self
+            .history
+            .apply(&mut self.project, EditCommand::Batch(commands))
+        {
+            self.selected_layer = inserted.last().copied();
+            self.layer_settled = None;
+            self.pending_import_assignments.clear();
+            self.import_error = None;
+            self.invalidate_preview();
+        } else {
+            self.import_error =
+                Some("Could not assign the imported bitmaps to fill layers.".to_owned());
         }
     }
 
@@ -4361,11 +4485,186 @@ fn channel_label(channel: MaterialChannel) -> &'static str {
     }
 }
 
+fn suggest_import_channel(
+    name: &str,
+    image: Option<&TextureImage>,
+) -> (Option<MaterialChannel>, String) {
+    let lower = name.to_lowercase();
+    let tokens = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<BTreeSet<_>>();
+    let has = |aliases: &[&str]| aliases.iter().any(|alias| tokens.contains(alias));
+    let pair = |first: &str, second: &str| tokens.contains(first) && tokens.contains(second);
+    let named = if lower.contains("metallicroughness")
+        || lower.contains("metalrough")
+        || pair("metallic", "roughness")
+        || pair("metal", "roughness")
+    {
+        return (
+            None,
+            "Packed metallic-roughness needs channel extraction".to_owned(),
+        );
+    } else if lower.contains("basecolor")
+        || lower.contains("base_color")
+        || has(&["albedo", "diffuse", "diff"])
+        || pair("base", "color")
+    {
+        Some(MaterialChannel::BaseColor)
+    } else if has(&["normal", "nrm", "normals"]) {
+        Some(MaterialChannel::Normal)
+    } else if has(&["rough", "roughness"]) {
+        Some(MaterialChannel::Roughness)
+    } else if has(&["metal", "metallic"]) {
+        Some(MaterialChannel::Metallic)
+    } else if has(&["ao", "occlusion"])
+        || lower.contains("ambientocclusion")
+        || pair("ambient", "occlusion")
+    {
+        return (
+            None,
+            "Ambient occlusion detected; this map is baked from mesh data".to_owned(),
+        );
+    } else if has(&["height", "displacement", "bump"]) {
+        Some(MaterialChannel::Height)
+    } else if has(&["emissive", "emission", "glow"]) {
+        Some(MaterialChannel::Emissive)
+    } else if has(&["opacity", "alpha", "transparency", "trans"]) {
+        Some(MaterialChannel::Opacity)
+    } else {
+        None
+    };
+    if let Some(channel) = named {
+        return (
+            Some(channel),
+            format!("Filename suggests {}", channel_label(channel)),
+        );
+    }
+
+    let Some(image) = image else {
+        return (None, "No channel name or image data detected".to_owned());
+    };
+    let pixel_count = image.rgba8.len() / 4;
+    if pixel_count == 0 {
+        return (None, "Image has no pixels to inspect".to_owned());
+    }
+    let stride = (pixel_count / 4096).max(1);
+    let mut sampled = 0;
+    let grayscale = image
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .step_by(stride)
+        .take(4096)
+        .all(|pixel| {
+            sampled += 1;
+            pixel[0].abs_diff(pixel[1]) <= 2 && pixel[1].abs_diff(pixel[2]) <= 2
+        });
+    if grayscale && sampled > 0 {
+        (
+            Some(MaterialChannel::Roughness),
+            "Grayscale image; roughness is a candidate".to_owned(),
+        )
+    } else {
+        (
+            Some(MaterialChannel::BaseColor),
+            "Color image; base color is a candidate".to_owned(),
+        )
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use substancecraft_api::write_texture;
+
+    #[test]
+    fn tc_0220_bitmap_import_suggestions_use_names_and_image_traits() {
+        let gray = TextureImage::new(2, 1, vec![64, 64, 64, 255, 192, 192, 192, 255]).unwrap();
+        let color = TextureImage::new(1, 1, vec![255, 40, 10, 255]).unwrap();
+        assert_eq!(
+            suggest_import_channel("Hull_BaseColor_4k", Some(&gray)).0,
+            Some(MaterialChannel::BaseColor)
+        );
+        assert_eq!(
+            suggest_import_channel("mask_roughness", Some(&color)).0,
+            Some(MaterialChannel::Roughness),
+            "name tokens take precedence over image traits"
+        );
+        assert_eq!(
+            suggest_import_channel("unknown", Some(&gray)).0,
+            Some(MaterialChannel::Roughness)
+        );
+        assert_eq!(
+            suggest_import_channel("unknown", Some(&color)).0,
+            Some(MaterialChannel::BaseColor)
+        );
+        assert_eq!(
+            suggest_import_channel("packed_metallic_roughness", Some(&color)).0,
+            None,
+            "packed data is not silently assigned to one channel"
+        );
+        let (channel, reason) = suggest_import_channel("chair_ao", Some(&gray));
+        assert_eq!(channel, None, "AO comes from mesh-map baking");
+        assert!(reason.contains("Ambient occlusion"));
+    }
+
+    #[test]
+    fn tc_0221_confirmed_bitmap_assignments_create_undoable_channel_fills() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_texture_set();
+        let base = folder.path().join("BaseColor.png");
+        let rough = folder.path().join("Roughness.png");
+        for path in [&base, &rough] {
+            write_texture(
+                path,
+                &BakedTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![128, 128, 128, 255],
+                },
+            )
+            .unwrap();
+        }
+        let base_id = app.add_resource(&base).unwrap();
+        let rough_id = app.add_resource(&rough).unwrap();
+        app.pending_import_assignments = vec![
+            ImportAssignment {
+                resource: base_id,
+                channel: Some(MaterialChannel::BaseColor),
+                reason: "Filename suggests Base Color".to_owned(),
+            },
+            ImportAssignment {
+                resource: rough_id,
+                channel: Some(MaterialChannel::Roughness),
+                reason: "Filename suggests Roughness".to_owned(),
+            },
+        ];
+
+        app.confirm_import_assignments();
+        let set = app.selected_texture_set_ref().unwrap();
+        assert_eq!(set.layers.len(), 2);
+        assert_eq!(
+            set.layers[0].fill.unwrap().textures.base_color,
+            Some(base_id)
+        );
+        assert_eq!(
+            set.layers[0].channels,
+            BTreeSet::from([MaterialChannel::BaseColor])
+        );
+        assert_eq!(
+            set.layers[1].fill.unwrap().textures.roughness,
+            Some(rough_id)
+        );
+        assert!(app.pending_import_assignments.is_empty());
+        app.undo();
+        assert!(app.selected_texture_set_ref().unwrap().layers.is_empty());
+        app.redo();
+        assert_eq!(app.selected_texture_set_ref().unwrap().layers.len(), 2);
+    }
 
     #[test]
     fn screen_point_maps_to_triangle_uv_and_rejects_outside_points() {
