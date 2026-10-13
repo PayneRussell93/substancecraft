@@ -3,7 +3,7 @@
 //! tolerance-driven curve sampling. Parametrisations follow the standard, so
 //! a surface's normal is `S_u x S_v` as STEP defines it.
 
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{DVec2, DVec3, DVec4};
 
@@ -47,7 +47,7 @@ impl Frame {
         }
     }
 
-    pub(crate) fn to_local(&self, point: DVec3) -> DVec3 {
+    pub(crate) fn to_local(self, point: DVec3) -> DVec3 {
         let offset = point - self.origin;
         DVec3::new(offset.dot(self.x), offset.dot(self.y), offset.dot(self.z))
     }
@@ -101,7 +101,7 @@ impl Knots {
     /// Piecewise Bézier knots: `degree`-fold interior breaks every `degree`
     /// control points; other counts fall back to quasi-uniform knots.
     pub(crate) fn bezier(degree: usize, count: usize) -> Option<Self> {
-        if degree == 0 || count <= degree || (count - 1) % degree != 0 {
+        if degree == 0 || count <= degree || !(count - 1).is_multiple_of(degree) {
             return Self::quasi_uniform(degree, count);
         }
         let segments = (count - 1) / degree;
@@ -241,7 +241,10 @@ impl BSplineCurve {
             Some(_) => return None,
             None => vec![1.0; points.len()],
         };
-        if weights.iter().any(|weight| !(weight.is_finite() && *weight > 0.0)) {
+        if weights
+            .iter()
+            .any(|weight| !(weight.is_finite() && *weight > 0.0))
+        {
             return None;
         }
         Some(Self {
@@ -425,12 +428,18 @@ impl Curve {
         };
         match self {
             Self::Line { .. } => vec![start, end],
-            Self::Circle { radius, .. } => {
-                uniform(arc_segments(*radius, (end - start).abs(), tolerance, max_angle))
-            }
-            Self::Ellipse { a, b, .. } => {
-                uniform(arc_segments(a.max(*b), (end - start).abs(), tolerance, max_angle))
-            }
+            Self::Circle { radius, .. } => uniform(arc_segments(
+                *radius,
+                (end - start).abs(),
+                tolerance,
+                max_angle,
+            )),
+            Self::Ellipse { a, b, .. } => uniform(arc_segments(
+                a.max(*b),
+                (end - start).abs(),
+                tolerance,
+                max_angle,
+            )),
             Self::Polyline(_) => {
                 let mut params = vec![start];
                 let (low, high) = (start.min(end), start.max(end));
@@ -547,32 +556,45 @@ impl BSplineSurface {
                 control.push(homogeneous(*point, weight));
             }
         }
-        let extent = points
-            .iter()
-            .flatten()
-            .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(min, max), point| {
-                (min.min(*point), max.max(*point))
-            });
+        let extent = points.iter().flatten().fold(
+            (DVec3::INFINITY, DVec3::NEG_INFINITY),
+            |(min, max), point| (min.min(*point), max.max(*point)),
+        );
         let size = (extent.1 - extent.0).length().max(1e-12);
-        let same = |a: &DVec3, b: &DVec3| a.distance(*b) <= size * 1e-7;
-        let closed_u = points[0]
-            .iter()
-            .zip(&points[u.count - 1])
-            .all(|(a, b)| same(a, b));
-        let closed_v = points.iter().all(|row| same(&row[0], &row[v.count - 1]));
         let mut surface = Self {
             u,
             v,
             control,
-            closed: [closed_u, closed_v],
+            closed: [false, false],
             samples: Vec::new(),
         };
+        // Closed where opposite domain edges evaluate to the same curve;
+        // periodic splines close smoothly without their first and last
+        // control points meeting.
+        let (u0, u1) = surface.u.domain();
+        let (v0, v1) = surface.v.domain();
+        let meets = |a: &dyn Fn(f64) -> DVec2, b: &dyn Fn(f64) -> DVec2| {
+            (0..=8).all(|step| {
+                let t = step as f64 / 8.0;
+                let (pa, pb) = (a(t), b(t));
+                surface
+                    .evaluate(pa.x, pa.y)
+                    .0
+                    .distance(surface.evaluate(pb.x, pb.y).0)
+                    <= size * 1e-7
+            })
+        };
+        let closed_u = meets(&|t| DVec2::new(u0, v0 + (v1 - v0) * t), &|t| {
+            DVec2::new(u1, v0 + (v1 - v0) * t)
+        });
+        let closed_v = meets(&|t| DVec2::new(u0 + (u1 - u0) * t, v0), &|t| {
+            DVec2::new(u0 + (u1 - u0) * t, v1)
+        });
+        surface.closed = [closed_u, closed_v];
         let (su, sv) = (
             (surface.u.count * 3).clamp(8, 48),
             (surface.v.count * 3).clamp(8, 48),
         );
-        let (u0, u1) = surface.u.domain();
-        let (v0, v1) = surface.v.domain();
         for i in 0..=su {
             for j in 0..=sv {
                 let uv = DVec2::new(
@@ -615,15 +637,39 @@ impl BSplineSurface {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Surface {
     Plane(Frame),
-    Cylinder { frame: Frame, radius: f64 },
+    Cylinder {
+        frame: Frame,
+        radius: f64,
+    },
     /// `tan` is the tangent of the semi-angle.
-    Cone { frame: Frame, radius: f64, tan: f64 },
-    Sphere { frame: Frame, radius: f64 },
-    Torus { frame: Frame, major: f64, minor: f64 },
+    Cone {
+        frame: Frame,
+        radius: f64,
+        tan: f64,
+    },
+    Sphere {
+        frame: Frame,
+        radius: f64,
+    },
+    Torus {
+        frame: Frame,
+        major: f64,
+        minor: f64,
+    },
     BSpline(Box<BSplineSurface>),
-    Extrusion { curve: Curve, direction: DVec3 },
-    Revolution { curve: Curve, origin: DVec3, axis: DVec3 },
-    Offset { basis: Box<Surface>, distance: f64 },
+    Extrusion {
+        curve: Curve,
+        direction: DVec3,
+    },
+    Revolution {
+        curve: Curve,
+        origin: DVec3,
+        axis: DVec3,
+    },
+    Offset {
+        basis: Box<Surface>,
+        distance: f64,
+    },
 }
 
 fn rotate(vector: DVec3, axis: DVec3, angle: f64) -> DVec3 {
@@ -801,8 +847,17 @@ impl Surface {
             Self::Cone { frame, radius, tan } => {
                 let local = frame.to_local(point);
                 let rho = local.x.hypot(local.y);
-                let v = ((rho - radius) * tan + local.z) / (1.0 + tan * tan);
-                DVec2::new(local.y.atan2(local.x), v)
+                let u = local.y.atan2(local.x);
+                let along = |rho: f64| ((rho - radius) * tan + local.z) / (1.0 + tan * tan);
+                let near = DVec2::new(u, along(rho));
+                // Past the apex the cone continues as a second nappe, seen
+                // from the far side of the axis.
+                let far = DVec2::new(u + PI, along(-rho));
+                if self.point(far).distance(point) < self.point(near).distance(point) {
+                    far
+                } else {
+                    near
+                }
             }
             Self::Sphere { frame, .. } => {
                 let local = frame.to_local(point);
@@ -813,16 +868,22 @@ impl Surface {
             }
             Self::Torus { frame, major, .. } => {
                 let local = frame.to_local(point);
-                DVec2::new(
-                    local.y.atan2(local.x),
-                    local.z.atan2(local.x.hypot(local.y) - major),
-                )
+                let rho = local.x.hypot(local.y);
+                let u = local.y.atan2(local.x);
+                let outer = DVec2::new(u, local.z.atan2(rho - major));
+                // A spindle torus (major < minor) also passes through the
+                // point from the far side of the axis, on its inner sheet.
+                let inner = DVec2::new(u + PI, local.z.atan2(-rho - major));
+                if self.point(inner).distance(point) < self.point(outer).distance(point) {
+                    inner
+                } else {
+                    outer
+                }
             }
             Self::Offset { basis, .. } => basis.project(point, seed, tolerance),
             Self::BSpline(surface) => {
                 let mut best = seed.map(|seed| self.newton(point, seed));
-                let good = best
-                    .is_some_and(|uv| self.point(uv).distance(point) <= tolerance * 4.0);
+                let good = best.is_some_and(|uv| self.point(uv).distance(point) <= tolerance * 4.0);
                 if !good {
                     let nearest = surface
                         .samples
@@ -847,16 +908,45 @@ impl Surface {
                 best.unwrap_or_default()
             }
             Self::Extrusion { curve, direction } => {
+                if let Some(seed) = seed {
+                    let uv = self.newton(point, seed);
+                    if self.point(uv).distance(point) <= tolerance * 1e-3 {
+                        return uv;
+                    }
+                }
+                // The curve point whose extrusion line passes nearest: the
+                // closest one seen along the extrusion, which need not be
+                // normal to the curve's plane.
                 let axis = direction.normalize_or_zero();
-                let reference = curve.point(curve.domain().map_or(0.0, |d| d.0));
-                let level = point - axis * (point - reference).dot(axis);
-                let u = curve.parameter_of(level);
+                let across = |offset: DVec3| offset - axis * offset.dot(axis);
+                let u = match (curve, curve.domain()) {
+                    (
+                        Curve::Line {
+                            origin,
+                            direction: along,
+                        },
+                        _,
+                    ) => {
+                        let flat = across(*along);
+                        across(point - *origin).dot(flat) / flat.length_squared().max(1e-300)
+                    }
+                    (_, Some((start, end))) => {
+                        let samples = 128;
+                        let mut best = (f64::INFINITY, start);
+                        for sample in 0..=samples {
+                            let t = start + (end - start) * sample as f64 / samples as f64;
+                            let distance = across(curve.point(t) - point).length_squared();
+                            if distance < best.0 {
+                                best = (distance, t);
+                            }
+                        }
+                        best.1
+                    }
+                    (_, None) => curve.parameter_of(point),
+                };
                 let length = direction.length_squared().max(1e-300);
                 let v = (point - curve.point(u)).dot(*direction) / length;
-                let start = seed
-                    .filter(|seed| (seed.x - u).abs() < 1e-3)
-                    .unwrap_or(DVec2::new(u, v));
-                self.newton(point, start)
+                self.newton(point, DVec2::new(u, v))
             }
             Self::Revolution {
                 curve,
@@ -907,8 +997,11 @@ impl Surface {
             let (a, b, c) = (du.dot(du), du.dot(dv), dv.dot(dv));
             let (g1, g2) = (residual.dot(du), residual.dot(dv));
             let determinant = a * c - b * b;
-            let step = if determinant.abs() > 1e-300 {
-                DVec2::new(-(c * g1 - b * g2) / determinant, -(a * g2 - b * g1) / determinant)
+            let mut step = if determinant.abs() > 1e-300 {
+                DVec2::new(
+                    -(c * g1 - b * g2) / determinant,
+                    -(a * g2 - b * g1) / determinant,
+                )
             } else if a > 1e-300 {
                 DVec2::new(-g1 / a, 0.0)
             } else if c > 1e-300 {
@@ -916,6 +1009,21 @@ impl Surface {
             } else {
                 break;
             };
+            // At a domain bound with the step pointing out, hold that
+            // parameter and solve for the other alone (the closest point
+            // lies on the boundary curve).
+            let pinned = |axis: usize, step: f64| {
+                periods[axis].is_none()
+                    && domain[axis].is_some_and(|(low, high)| {
+                        (uv[axis] <= low && step < 0.0) || (uv[axis] >= high && step > 0.0)
+                    })
+            };
+            match (pinned(0, step.x), pinned(1, step.y)) {
+                (true, true) => break,
+                (true, false) if c > 1e-300 => step = DVec2::new(0.0, -g2 / c),
+                (false, true) if a > 1e-300 => step = DVec2::new(-g1 / a, 0.0),
+                _ => {}
+            }
             let step = DVec2::new(
                 step.x.clamp(-limit(0), limit(0)),
                 step.y.clamp(-limit(1), limit(1)),
@@ -995,7 +1103,9 @@ mod tests {
         let params = curve.sample(0.0, 1.0, 1e-3, 1.0);
         for pair in params.windows(2) {
             let middle = curve.point((pair[0] + pair[1]) / 2.0);
-            assert!(distance_to_segment(middle, curve.point(pair[0]), curve.point(pair[1])) <= 1e-3);
+            assert!(
+                distance_to_segment(middle, curve.point(pair[0]), curve.point(pair[1])) <= 1e-3
+            );
         }
         let circle = Curve::Circle {
             frame: Frame::IDENTITY,
@@ -1052,6 +1162,71 @@ mod tests {
     }
 
     #[test]
+    fn projection_finds_inner_sheets_far_nappes_and_oblique_extrusions() {
+        let frame = Frame::new(
+            DVec3::new(1.0, -2.0, 0.5),
+            Some(DVec3::new(0.0, 0.3, -1.0)),
+            None,
+        );
+        // A spindle torus (major < minor): its inner sheet is reached from
+        // the far side of the axis. A double cone continues past its apex.
+        let spindle = Surface::Torus {
+            frame,
+            major: 8.25,
+            minor: 54.87,
+        };
+        let cone = Surface::Cone {
+            frame,
+            radius: 7.5,
+            tan: 1.0,
+        };
+        let oblique = Surface::Extrusion {
+            curve: Curve::Ellipse {
+                frame: Frame::IDENTITY,
+                a: 17.0,
+                b: 13.0,
+            },
+            direction: DVec3::new(0.0, 0.64, 0.77),
+        };
+        for (surface, uv) in [
+            (&spindle, DVec2::new(0.7, 2.0)),
+            (&spindle, DVec2::new(-2.5, -1.9)),
+            (&cone, DVec2::new(1.0, -15.0)),
+            (&oblique, DVec2::new(PI, 20.0)),
+            (&oblique, DVec2::new(2.0, -8.0)),
+        ] {
+            let point = surface.point(uv);
+            let back = surface.project(point, None, 1e-6);
+            assert!(
+                surface.point(back).distance(point) < 1e-7,
+                "{surface:?} {uv} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_b_spline_surfaces_close_without_meeting_control_points() {
+        // Uniform cubic knots over six control points wrapped by three: the
+        // curve closes smoothly though its first and last points differ.
+        let ring: Vec<DVec3> = (0..9)
+            .map(|i| {
+                let angle = (i % 6) as f64 / 6.0 * TAU;
+                DVec3::new(angle.cos(), angle.sin(), 0.0)
+            })
+            .collect();
+        let raised: Vec<DVec3> = ring.iter().map(|p| *p + DVec3::Z).collect();
+        let surface = BSplineSurface::new(
+            Knots::new(1, vec![0.0, 0.0, 1.0, 1.0], 2).unwrap(),
+            Knots::uniform(3, 9).unwrap(),
+            vec![ring, raised],
+            None,
+        )
+        .unwrap();
+        assert_eq!(surface.closed, [false, true]);
+        assert_eq!(Surface::BSpline(Box::new(surface)).periods()[1], Some(6.0));
+    }
+
+    #[test]
     fn b_spline_surfaces_project_and_detect_closure() {
         let knots = Knots::new(1, vec![0.0, 0.0, 1.0, 1.0], 2).unwrap();
         let surface = Surface::BSpline(Box::new(
@@ -1070,6 +1245,9 @@ mod tests {
         let uv = surface.project(point, None, 1e-9);
         assert!((uv - DVec2::new(0.25, 0.75)).length() < 1e-9);
         assert_eq!(surface.periods(), [None, None]);
-        assert_eq!(Knots::quasi_uniform(2, 4).unwrap().values, vec![0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0]);
+        assert_eq!(
+            Knots::quasi_uniform(2, 4).unwrap().values,
+            vec![0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0]
+        );
     }
 }

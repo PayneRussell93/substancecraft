@@ -17,6 +17,10 @@ pub const MAX_PROJECTION_SCALE: f32 = 256.0;
 /// Physical tile sizes, in object units (metres after import scale).
 pub const MIN_TILE_SIZE: f32 = 0.001;
 pub const MAX_TILE_SIZE: f32 = 1000.0;
+/// Smallest and largest decal width or height a drag scales to, in object
+/// units (the slider range in layer properties).
+pub const MIN_DECAL_SIZE: f32 = 0.01;
+pub const MAX_DECAL_SIZE: f32 = 4.0;
 
 /// A bitmap referenced by the project. The pixels live in the external
 /// `source` file and are loaded into [`ResourceImages`] at runtime, like the
@@ -289,6 +293,50 @@ impl DecalPlacement {
     pub fn face(&mut self, normal: Vec3) {
         self.normal = normal.normalize_or(Vec3::Z);
         self.up = Self::default_up(self.normal);
+    }
+
+    /// Moves the decal to `center` on a surface facing `normal`, keeping
+    /// its spin, size, and depth, as dragging it across the model does.
+    /// Non-finite or zero inputs change nothing.
+    pub fn move_to(&mut self, center: Vec3, normal: Vec3) {
+        if !center.is_finite() || !normal.is_finite() || normal.length_squared() < 1e-12 {
+            return;
+        }
+        let spin = self.spin_degrees();
+        self.face(normal);
+        self.set_spin_degrees(spin);
+        self.center = center;
+    }
+
+    /// Scales width and height by `factor`, keeping their ratio, within
+    /// [`MIN_DECAL_SIZE`]..=[`MAX_DECAL_SIZE`].
+    pub fn scale_by(&mut self, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let longest = self.size.max_element().max(f32::MIN_POSITIVE);
+        let shortest = self.size.min_element().max(f32::MIN_POSITIVE);
+        // max then min, not clamp: a very elongated decal can make the
+        // bounds cross, and the upper one wins.
+        let factor = factor
+            .max(MIN_DECAL_SIZE / shortest)
+            .min(MAX_DECAL_SIZE / longest);
+        self.size *= factor;
+    }
+
+    /// Corners of the image rectangle on the placement plane, counter-
+    /// clockwise from the image's bottom-left (UV 0, 0) as it faces you.
+    pub fn corners(self) -> [Vec3; 4] {
+        let normal = self.normal.normalize_or(Vec3::Z);
+        let right = self.up.cross(normal).normalize_or(Vec3::X);
+        let up = normal.cross(right);
+        let (half_x, half_y) = (right * self.size.x * 0.5, up * self.size.y * 0.5);
+        [
+            self.center - half_x - half_y,
+            self.center + half_x - half_y,
+            self.center + half_x + half_y,
+            self.center - half_x + half_y,
+        ]
     }
 
     /// How far the image is turned about its normal from its default up,
@@ -588,6 +636,71 @@ mod decal_keyboard_tests {
         assert!((decal.up - Vec3::NEG_X).length() < 1e-5);
         decal.set_spin_degrees(f32::NAN);
         assert!(decal.is_valid());
+    }
+
+    #[test]
+    fn tc_0333_decals_slide_across_surfaces_keeping_spin_and_scale_within_limits() {
+        let mut decal = DecalPlacement {
+            size: Vec2::new(0.4, 0.2),
+            ..DecalPlacement::default()
+        };
+        decal.set_spin_degrees(30.0);
+
+        // Moving onto a face turned another way keeps spin, size, and depth.
+        decal.move_to(Vec3::new(0.5, 0.1, 0.0), Vec3::new(2.0, 0.0, 0.0));
+        assert_eq!(decal.center, Vec3::new(0.5, 0.1, 0.0));
+        assert_eq!(decal.normal, Vec3::X);
+        assert!((decal.spin_degrees() - 30.0).abs() < 1e-3);
+        assert_eq!(decal.size, Vec2::new(0.4, 0.2));
+        assert!(decal.is_valid());
+        let moved = decal;
+        decal.move_to(Vec3::NAN, Vec3::Y);
+        decal.move_to(Vec3::ONE, Vec3::ZERO);
+        assert_eq!(decal, moved, "bad inputs change nothing");
+
+        // Corners: centred on the decal, on its plane, width along the
+        // image's right and height along its up.
+        let mut flat = DecalPlacement {
+            size: Vec2::new(0.4, 0.2),
+            ..DecalPlacement::default()
+        };
+        flat.center = Vec3::new(1.0, 2.0, 3.0);
+        let [bottom_left, bottom_right, top_right, top_left] = flat.corners();
+        assert!((bottom_left - Vec3::new(0.8, 1.9, 3.0)).length() < 1e-6);
+        assert!((top_right - Vec3::new(1.2, 2.1, 3.0)).length() < 1e-6);
+        assert!((bottom_right - bottom_left - Vec3::new(0.4, 0.0, 0.0)).length() < 1e-6);
+        assert!((top_left - bottom_left - Vec3::new(0.0, 0.2, 0.0)).length() < 1e-6);
+        // The corners are where the image's corners land.
+        for (corner, uv) in
+            flat.corners()
+                .into_iter()
+                .zip([Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y])
+        {
+            let (located, _) = flat.locate(corner, Vec3::Z);
+            assert!((located - uv).length() < 1e-5, "{located} {uv}");
+            let (_, coverage) = flat.locate(corner.lerp(flat.center, 1e-3), Vec3::Z);
+            assert!(coverage > 0.0, "just inside the corner is covered");
+        }
+
+        // Scaling keeps the aspect ratio and stops at the size limits.
+        flat.scale_by(2.0);
+        assert!((flat.size - Vec2::new(0.8, 0.4)).length() < 1e-6);
+        flat.scale_by(100.0);
+        assert!((flat.size - Vec2::new(MAX_DECAL_SIZE, MAX_DECAL_SIZE / 2.0)).length() < 1e-5);
+        flat.scale_by(1e-6);
+        assert!((flat.size - Vec2::new(MIN_DECAL_SIZE * 2.0, MIN_DECAL_SIZE)).length() < 1e-6);
+        let sized = flat;
+        flat.scale_by(f32::NAN);
+        flat.scale_by(-1.0);
+        assert_eq!(flat, sized);
+        // A decal too elongated for both limits never panics and keeps its
+        // longer edge within the maximum.
+        let mut sliver = DecalPlacement {
+            size: Vec2::new(4.0, 0.001),
+            ..DecalPlacement::default()
+        };
+        sliver.scale_by(10.0);
+        assert!(sliver.size.x <= MAX_DECAL_SIZE + 1e-5);
     }
 }
 

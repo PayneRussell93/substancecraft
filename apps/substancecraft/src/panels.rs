@@ -731,6 +731,7 @@ impl SubstanceCraftApp {
                 widgets::property_row(ui, "Color", |ui| {
                     ui.color_edit_button_srgba(&mut self.brush_color);
                 });
+                self.color_space_picker(ui);
                 slider_row(
                     ui,
                     "Roughness",
@@ -779,6 +780,74 @@ impl SubstanceCraftApp {
             }
         }
         self.brush_tip_controls(ui);
+    }
+
+    /// The brush colour as numbers in a chosen colour space: sRGB-encoded,
+    /// linear Rec.709 light, or ACEScg. Entries outside sRGB clip to the
+    /// colour brushes can store, and the panel says so.
+    fn color_space_picker(&mut self, ui: &mut Ui) {
+        use substancecraft_core::ColorSpace;
+
+        let space = self.preferences.values.picker_color_space;
+        let mut chosen = None;
+        widgets::property_row(ui, "Space", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (option, label, tooltip) in [
+                (
+                    ColorSpace::Srgb,
+                    "sRGB",
+                    "Encoded sRGB values, as image editors show them",
+                ),
+                (
+                    ColorSpace::LinearSrgb,
+                    "Linear",
+                    "Linear Rec.709 light, as renderers and MaterialX use",
+                ),
+                (
+                    ColorSpace::AcesCg,
+                    "ACEScg",
+                    "Linear light with ACES AP1 primaries (VFX)",
+                ),
+            ] {
+                if widgets::chip(ui, label, option == space)
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    chosen = Some(option);
+                }
+            }
+        });
+        if let Some(option) = chosen {
+            self.set_picker_color_space(option);
+        }
+        let space = self.preferences.values.picker_color_space;
+        let [r, g, b, _] = self.brush_color.to_array();
+        let mut value = space.from_srgb8([r, g, b]);
+        let changed = widgets::property_row(ui, "Values", |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            let mut changed = false;
+            for (label, component) in ["R", "G", "B"].into_iter().zip(value.as_mut()) {
+                let response = ui.add(
+                    egui::DragValue::new(component)
+                        .speed(0.002)
+                        .range(0.0..=2.0)
+                        .fixed_decimals(3)
+                        .prefix(format!("{label} ")),
+                );
+                response.widget_info(|| egui::WidgetInfo::drag_value(true, f64::from(*component)));
+                changed |= response.changed();
+            }
+            changed
+        });
+        if changed {
+            self.set_brush_color_in(space, value);
+        }
+        if self.picker_clipped == Some(self.brush_color) {
+            hint(
+                ui,
+                "Outside the sRGB gamut: clipped to the nearest colour a brush can store.",
+            );
+        }
     }
 
     /// Live preview of the brush tip, drawn with the real rasteriser.
@@ -1621,6 +1690,15 @@ impl SubstanceCraftApp {
                     {
                         self.add_group_layer();
                     }
+                    if widgets::chip(ui, "OpenPBR…", false)
+                        .on_hover_text(
+                            "Fill layer from a MaterialX document's OpenPBR surface: its \
+                             textures become bitmaps, its constant inputs fill values",
+                        )
+                        .clicked()
+                    {
+                        self.import_openpbr();
+                    }
                     if widgets::chip(ui, "Edge Wear", false)
                         .on_hover_text("Bare metal on convex edges, driven by curvature")
                         .clicked()
@@ -1980,6 +2058,7 @@ impl SubstanceCraftApp {
         });
         let overrides = instance.as_ref().map(|(link, ..)| link.overrides.clone());
         let mut instance_action = None;
+        let mut decal_gizmo = self.decal_gizmo;
         let Some(layer) = self.selected_layer_mut() else {
             return;
         };
@@ -2092,6 +2171,7 @@ impl SubstanceCraftApp {
             });
         });
         let evolution_action = evolution_controls(ui, layer, recording, &mut evolution_name);
+        let exposed_action = exposed_controls(ui, layer);
         if layer.is_group() {
             hint(
                 ui,
@@ -2109,7 +2189,7 @@ impl SubstanceCraftApp {
                 &resources,
                 overrides.as_ref(),
             );
-            projection_controls(ui, &mut fill.projection, 0);
+            projection_controls(ui, &mut fill.projection, 0, &mut decal_gizmo);
         } else {
             ui.add_space(2.0);
             if widgets::pill_button(ui, Some(Icon::Plus), "Add fill", false, true)
@@ -2252,7 +2332,7 @@ impl SubstanceCraftApp {
         }
         if let Some(mask) = layer.mask_bitmap.as_mut() {
             widgets::property_row(ui, "Invert", |ui| widgets::toggle(ui, &mut mask.invert));
-            projection_controls(ui, &mut mask.projection, 1);
+            projection_controls(ui, &mut mask.projection, 1, &mut decal_gizmo);
         }
 
         anchor_controls(ui, layer.id, &mut layer.mask_anchor, &anchor_candidates);
@@ -2345,6 +2425,10 @@ impl SubstanceCraftApp {
 
         if pick_id_color {
             self.picking_id_color = true;
+        }
+        self.decal_gizmo = decal_gizmo;
+        if let Some((index, value)) = exposed_action {
+            self.set_exposed_parameter(index, value);
         }
         self.evolution_name = evolution_name;
         match evolution_action {
@@ -2940,6 +3024,42 @@ enum EvolutionAction {
     Cancel,
 }
 
+/// A control per exposed parameter of an inserted smart material: a
+/// slider for amounts and values, a colour button for colours. Returns the
+/// parameter changed this frame.
+fn exposed_controls(
+    ui: &mut Ui,
+    layer: &MaterialLayer,
+) -> Option<(usize, substancecraft_core::ParameterValue)> {
+    use substancecraft_core::ParameterValue;
+
+    let values = layer.exposed_values();
+    if values.is_empty() {
+        return None;
+    }
+    widgets::caption(ui, "Parameters");
+    let mut action = None;
+    for (index, parameter, value) in values {
+        match value {
+            ParameterValue::Scalar(mut amount) => {
+                if slider_row(ui, &parameter.name, &mut amount, 0.0..=1.0, false, 2) {
+                    action = Some((index, ParameterValue::Scalar(amount)));
+                }
+            }
+            ParameterValue::Color([r, g, b]) => {
+                let mut color = Color32::from_rgb(r, g, b);
+                if widgets::property_row(ui, &parameter.name, |ui| {
+                    widgets::labeled_color_button(ui, &mut color).changed()
+                }) {
+                    let [r, g, b, _] = color.to_array();
+                    action = Some((index, ParameterValue::Color([r, g, b])));
+                }
+            }
+        }
+    }
+    action
+}
+
 /// A slider per evolution control of `layer`; on groups, recording a new
 /// control from a start and an end look.
 fn evolution_controls(
@@ -3193,7 +3313,12 @@ fn resource_picker(
 /// next viewport click places.
 pub(super) const PLACE_DECAL_KEY: &str = "place_decal_target";
 
-fn projection_controls(ui: &mut Ui, projection: &mut TextureProjection, decal_target: u8) {
+fn projection_controls(
+    ui: &mut Ui,
+    projection: &mut TextureProjection,
+    decal_target: u8,
+    gizmo: &mut Option<u8>,
+) {
     widgets::property_row(ui, "Projection", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -3226,6 +3351,18 @@ fn projection_controls(ui: &mut Ui, projection: &mut TextureProjection, decal_ta
             ui.ctx()
                 .data_mut(|data| data.insert_temp(Id::new(PLACE_DECAL_KEY), decal_target));
         }
+        let moving = *gizmo == Some(decal_target);
+        widgets::property_row(ui, "Gizmo", |ui| {
+            if widgets::chip(ui, "Move in viewport", moving)
+                .on_hover_text(
+                    "Drag on the model to slide the decal along the surface; Shift-drag \
+                     spins it, Ctrl-drag resizes it. Esc or a second click stops",
+                )
+                .clicked()
+            {
+                *gizmo = if moving { None } else { Some(decal_target) };
+            }
+        });
         // Keyboard placement: centre, facing, and spin without the mouse.
         widgets::property_row(ui, "Centre", |ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
@@ -4231,23 +4368,57 @@ impl SubstanceCraftApp {
 
         let smart = self.smart_material_library();
         let mut insert = None;
-        widgets::property_row(ui, "Smart", |ui| {
-            let combo = egui::ComboBox::from_id_salt("insert_smart_material")
-                .width(ui.available_width() - 8.0)
-                .selected_text("Insert…")
-                .show_ui(ui, |ui| {
-                    for material in &smart {
-                        if ui
-                            .selectable_label(false, &material.name)
-                            .on_hover_text(&material.description)
-                            .clicked()
-                        {
-                            insert = Some(material.clone());
-                        }
+        widgets::caption(ui, "Smart materials");
+        // Thumbnails render one per frame; the rest show a placeholder
+        // until their turn.
+        let mut budget = true;
+        let mut pending = false;
+        let context = ui.ctx().clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            let edge = 72.0;
+            for material in &smart {
+                let texture = self.smart_thumbnail_texture(&context, material, &mut budget);
+                pending |= texture.is_none();
+                ui.vertical(|ui| {
+                    ui.set_width(edge + 8.0);
+                    let button = match &texture {
+                        Some(texture) => egui::Button::image(
+                            egui::Image::new(egui::load::SizedTexture::from_handle(texture))
+                                .fit_to_exact_size(vec2(edge, edge)),
+                        ),
+                        None => egui::Button::new("…").min_size(vec2(edge, edge)),
+                    };
+                    let hover = if material.description.is_empty() {
+                        format!("Insert {}", material.name)
+                    } else {
+                        format!("Insert {}: {}", material.name, material.description)
+                    };
+                    let response = ui.add(button).on_hover_text(hover);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            format!("Insert smart material {}", material.name),
+                        )
+                    });
+                    if response.clicked() {
+                        insert = Some(material.clone());
                     }
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&material.name)
+                                .size(11.0)
+                                .color(theme::TEXT_WEAK),
+                        )
+                        .truncate(),
+                    );
                 });
-            widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
+            }
         });
+        if pending {
+            context.request_repaint();
+        }
         if let Some(material) = insert {
             self.insert_smart_material(&material);
         }

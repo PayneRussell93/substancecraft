@@ -97,6 +97,41 @@ impl ColorSpace {
             other => Self::Srgb.from_linear_srgb(other.to_linear_srgb(rgb)),
         }
     }
+
+    /// An sRGB-encoded colour, as brushes and fills store it, expressed in
+    /// this space (raw data reads it unconverted).
+    pub fn from_srgb8(self, rgb: [u8; 3]) -> Vec3 {
+        let srgb = Vec3::from(rgb.map(|component| f32::from(component) / 255.0));
+        match self {
+            Self::Srgb | Self::Raw => srgb,
+            other => other.from_linear_srgb(Self::Srgb.to_linear_srgb(srgb)),
+        }
+    }
+
+    /// A colour given in this space as the sRGB bytes brushes store, and
+    /// whether it lay outside the sRGB gamut or range (negative or above
+    /// white in linear Rec.709 light) and was clipped. Non-finite colours
+    /// clip to black.
+    pub fn to_srgb8(self, rgb: Vec3) -> ([u8; 3], bool) {
+        if !rgb.is_finite() {
+            return ([0, 0, 0], true);
+        }
+        let encode = |srgb: Vec3| {
+            srgb.to_array()
+                .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+        };
+        if matches!(self, Self::Srgb | Self::Raw) {
+            let clipped = rgb.cmplt(Vec3::ZERO).any() || rgb.cmpgt(Vec3::ONE).any();
+            return (encode(rgb), clipped);
+        }
+        // Half a byte of slack keeps colours read back from bytes unclipped.
+        const SLACK: f32 = 0.5 / 255.0;
+        let linear = self.to_linear_srgb(rgb);
+        let clipped =
+            linear.cmplt(Vec3::splat(-SLACK)).any() || linear.cmpgt(Vec3::splat(1.0 + SLACK)).any();
+        let srgb = Self::Srgb.from_linear_srgb(linear.clamp(Vec3::ZERO, Vec3::ONE));
+        (encode(srgb), clipped)
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +171,41 @@ mod tests {
         ));
         assert_eq!(ColorSpace::Srgb.to_srgb(colour), colour);
         assert_eq!(ColorSpace::Raw.to_srgb(colour), colour);
+    }
+
+    #[test]
+    fn tc_0335_picked_colours_convert_between_spaces_and_report_clipping() {
+        // sRGB bytes read back in each space and return unchanged.
+        for rgb in [[0_u8, 0, 0], [255, 255, 255], [200, 30, 30], [12, 128, 250]] {
+            for space in [ColorSpace::Srgb, ColorSpace::LinearSrgb, ColorSpace::AcesCg] {
+                let value = space.from_srgb8(rgb);
+                assert_eq!(space.to_srgb8(value), (rgb, false), "{rgb:?} via {space:?}");
+            }
+        }
+        // Byte 128 (0.502 encoded) is about 0.216 in linear light.
+        let grey = ColorSpace::LinearSrgb.from_srgb8([128, 128, 128]);
+        assert!((grey.x - 0.2158).abs() < 1e-3);
+        assert_eq!(
+            ColorSpace::LinearSrgb.to_srgb8(Vec3::splat(0.215_860_5)),
+            ([128, 128, 128], false)
+        );
+        // ACEScg white is white; its saturated primaries lie outside sRGB.
+        assert_eq!(
+            ColorSpace::AcesCg.to_srgb8(Vec3::ONE),
+            ([255, 255, 255], false)
+        );
+        let (green, clipped) = ColorSpace::AcesCg.to_srgb8(Vec3::new(0.0, 1.0, 0.0));
+        assert!(clipped, "ACEScg green is wider than sRGB");
+        assert_eq!(green[0], 0, "negative red clips to zero");
+        // Over-range and non-finite values clip.
+        assert_eq!(
+            ColorSpace::LinearSrgb.to_srgb8(Vec3::splat(2.0)),
+            ([255, 255, 255], true)
+        );
+        assert!(ColorSpace::Srgb.to_srgb8(Vec3::new(-0.1, 0.5, 0.5)).1);
+        assert_eq!(
+            ColorSpace::AcesCg.to_srgb8(Vec3::new(f32::NAN, 0.0, 0.0)),
+            ([0, 0, 0], true)
+        );
     }
 }

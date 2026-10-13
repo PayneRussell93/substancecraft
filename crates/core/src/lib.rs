@@ -28,6 +28,7 @@ mod resources;
 pub mod rig;
 mod smoothing;
 mod templates;
+mod thumbnails;
 mod topology;
 pub mod udim;
 
@@ -67,9 +68,10 @@ pub use painting::{
 };
 pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{
-    BitmapMask, ContentHash, ContentHasher, DecalPlacement, MAX_PROJECTION_SCALE,
-    MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource,
-    ProjectionMode, ResourceImages, ResourceProvenance, TextureImage, TextureProjection,
+    BitmapMask, ContentHash, ContentHasher, DecalPlacement, MAX_DECAL_SIZE, MAX_PROJECTION_SCALE,
+    MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_DECAL_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE,
+    ProjectResource, ProjectionMode, ResourceImages, ResourceProvenance, TextureImage,
+    TextureProjection,
 };
 pub use rig::{
     AnimationClip, ClipSample, Influence, Joint, JointAnimation, MAX_INFLUENCES, Rig, RigError,
@@ -81,6 +83,7 @@ pub use smoothing::{
     vertex_tangents,
 };
 pub use templates::ProjectTemplate;
+pub use thumbnails::{MAX_THUMBNAIL_SIZE, THUMBNAIL_BAKE_RESOLUTION, ThumbnailStage};
 pub use topology::{DiagnosticEdge, EdgeFlags, MeshTopology, SelectionMode, diagnostic_edges};
 pub use udim::{UDIM_TOKEN, UdimTile};
 
@@ -913,6 +916,10 @@ pub struct MaterialLayer {
     /// layer and the layers inside it through recorded ranges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evolutions: Vec<Evolution>,
+    /// Named parameters of a smart material inserted as this layer, each
+    /// a property of this layer or one inside it, offered as one panel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed: Vec<ExposedParameter>,
     /// UDIM tiles the layer (with its children) paints in; empty means
     /// every tile. A bake of the unit square is tile 1001.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -950,6 +957,7 @@ impl MaterialLayer {
             children: None,
             material_link: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             uv_tiles: BTreeSet::new(),
         }
     }
@@ -2934,6 +2942,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             children: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             channel_blend_modes: BTreeMap::new(),
             uv_tiles: BTreeSet::new(),
             filter_channels: BTreeSet::new(),
@@ -2982,6 +2991,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             children: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             channel_blend_modes: BTreeMap::new(),
             uv_tiles: BTreeSet::new(),
             filter_channels: BTreeSet::new(),
@@ -3039,6 +3049,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             children: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             channel_blend_modes: BTreeMap::new(),
             uv_tiles: BTreeSet::new(),
             filter_channels: BTreeSet::new(),
@@ -3102,6 +3113,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             children: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             channel_blend_modes: BTreeMap::new(),
             uv_tiles: BTreeSet::new(),
             filter_channels: BTreeSet::new(),
@@ -3223,6 +3235,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             children: None,
             evolutions: Vec::new(),
+            exposed: Vec::new(),
             channel_blend_modes: BTreeMap::new(),
             uv_tiles: BTreeSet::new(),
             filter_channels: BTreeSet::new(),
@@ -3266,6 +3279,7 @@ mod tests {
                 blend_mode: BlendMode::Normal,
                 children: None,
                 evolutions: Vec::new(),
+                exposed: Vec::new(),
                 channel_blend_modes: BTreeMap::new(),
                 uv_tiles: BTreeSet::new(),
                 filter_channels: BTreeSet::new(),
@@ -3292,6 +3306,7 @@ mod tests {
                 blend_mode: BlendMode::Normal,
                 children: None,
                 evolutions: Vec::new(),
+                exposed: Vec::new(),
                 channel_blend_modes: BTreeMap::new(),
                 uv_tiles: BTreeSet::new(),
                 filter_channels: BTreeSet::new(),

@@ -80,6 +80,8 @@ const MESH_EXTENSIONS: [&str; 5] = ["fbx", "gltf", "glb", "step", "stp"];
 const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "tga", "svg", "sctext"];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
 const MAX_SAVED_POSES: usize = 256;
+/// Edge of smart-material thumbnails in the browser, in pixels.
+const SMART_THUMBNAIL_SIZE: u32 = 72;
 /// Selection overlays stop drawing beyond this many triangles to keep the
 /// viewport responsive on dense meshes.
 const MAX_OVERLAY_TRIANGLES: usize = 200_000;
@@ -130,6 +132,20 @@ struct SubstanceCraftApp {
     /// Layers Ctrl-clicked alongside `selected_layer`, which "Flatten to
     /// bitmaps" merges with it. Never holds `selected_layer` itself.
     extra_selected_layers: BTreeSet<LayerId>,
+    /// Which decal (0 = fill, 1 = bitmap mask) of the selected layer the
+    /// viewport gizmo drags, while it is on.
+    decal_gizmo: Option<u8>,
+    /// The brush colour a clipped colour-space entry produced, while it is
+    /// still the brush colour.
+    picker_clipped: Option<egui::Color32>,
+    /// Sphere and mesh maps smart-material thumbnails are shaded on, built
+    /// the first time the browser shows.
+    thumbnail_stage: Option<Arc<substancecraft_core::ThumbnailStage>>,
+    /// Smart-material thumbnails by name, with a hash of the layer tree
+    /// they show.
+    smart_thumbnails: BTreeMap<String, (u64, Arc<TextureImage>)>,
+    /// Uploaded thumbnails, by name and hash.
+    smart_thumbnail_textures: BTreeMap<String, (u64, egui::TextureHandle)>,
     selected_primitive: Option<PrimitivePreset>,
     /// Imported or primitive geometry after scaling, before smoothing.
     base_geometry: Option<MeshGeometry>,
@@ -730,6 +746,11 @@ impl Default for SubstanceCraftApp {
             selected_texture_set: None,
             selected_layer: None,
             extra_selected_layers: BTreeSet::new(),
+            decal_gizmo: None,
+            picker_clipped: None,
+            thumbnail_stage: None,
+            smart_thumbnails: BTreeMap::new(),
+            smart_thumbnail_textures: BTreeMap::new(),
             selected_primitive: Some(PrimitivePreset::Cube),
             base_geometry: None,
             mesh_geometry: None,
@@ -2016,6 +2037,84 @@ impl SubstanceCraftApp {
 
     /// Moves evolution control `index` of the selected layer to `amount`;
     /// the frames of a slider drag are one undo step.
+    /// The thumbnail of `material` and the hash of the layer tree it
+    /// shows: from the cache while that tree is unchanged, else rendered
+    /// now if `budget` allows, which spends it (the browser renders at most
+    /// one new thumbnail per frame so it never stalls).
+    fn smart_thumbnail_image(
+        &mut self,
+        material: &substancecraft_core::SmartMaterial,
+        budget: &mut bool,
+    ) -> Option<(u64, Arc<TextureImage>)> {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&material.root)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((cached, image)) = self.smart_thumbnails.get(&material.name)
+            && *cached == key
+        {
+            return Some((key, Arc::clone(image)));
+        }
+        if !*budget {
+            return None;
+        }
+        *budget = false;
+        if self.thumbnail_stage.is_none() {
+            self.thumbnail_stage = substancecraft_core::ThumbnailStage::new(SMART_THUMBNAIL_SIZE)
+                .ok()
+                .map(Arc::new);
+        }
+        let stage = self.thumbnail_stage.clone()?;
+        let image = Arc::new(
+            stage
+                .render(&material.root, Some(&self.resource_images))
+                .ok()?,
+        );
+        self.smart_thumbnails
+            .insert(material.name.clone(), (key, Arc::clone(&image)));
+        Some((key, image))
+    }
+
+    /// [`Self::smart_thumbnail_image`] uploaded as an egui texture, kept
+    /// until the thumbnail changes.
+    fn smart_thumbnail_texture(
+        &mut self,
+        context: &egui::Context,
+        material: &substancecraft_core::SmartMaterial,
+        budget: &mut bool,
+    ) -> Option<egui::TextureHandle> {
+        let (key, image) = self.smart_thumbnail_image(material, budget)?;
+        if let Some((uploaded, texture)) = self.smart_thumbnail_textures.get(&material.name)
+            && *uploaded == key
+        {
+            return Some(texture.clone());
+        }
+        let texture = context.load_texture(
+            format!("smart-thumbnail-{}", material.name),
+            egui::ColorImage::from_rgba_unmultiplied(
+                [image.width as usize, image.height as usize],
+                &image.rgba8,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        self.smart_thumbnail_textures
+            .insert(material.name.clone(), (key, texture.clone()));
+        Some(texture)
+    }
+
+    /// Sets exposed parameter `index` of the selected (inserted smart
+    /// material) layer; slider drags merge into one undo step.
+    fn set_exposed_parameter(&mut self, index: usize, value: substancecraft_core::ParameterValue) {
+        if let (Some(set_id), Some(layer_id)) = (self.selected_texture_set, self.selected_layer)
+            && let Some(command) = self.project.exposed_command(set_id, layer_id, index, value)
+        {
+            self.apply_material_command(command, true);
+        }
+    }
+
     fn evolve_selected_layer(&mut self, index: usize, amount: f32) {
         if let (Some(set_id), Some(layer_id)) = (self.selected_texture_set, self.selected_layer)
             && let Some(command) = self.project.evolve_command(set_id, layer_id, index, amount)
@@ -2972,6 +3071,14 @@ impl SubstanceCraftApp {
             }
             return;
         }
+        if self.active_decal().is_some() {
+            if response.dragged() || response.clicked() {
+                let command = response.ctx.input(|input| input.modifiers.command);
+                let hit = pick(self, pointer);
+                self.drag_decal(mesh, hit, response.drag_delta(), shift, command);
+            }
+            return;
+        }
         if self.inspect.armed {
             if response.clicked()
                 && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
@@ -3066,6 +3173,83 @@ impl SubstanceCraftApp {
         self.stroke_stabilizer
             .update(glam::Vec2::new(pointer.x, pointer.y))
             .map(|point| egui::pos2(point.x, point.y))
+    }
+
+    /// The decal the viewport gizmo moves (0 = fill, 1 = bitmap mask) and
+    /// its placement, while the gizmo is on and the selected layer still
+    /// projects that target as a decal.
+    fn active_decal(&self) -> Option<(u8, substancecraft_core::DecalPlacement)> {
+        let target = self.decal_gizmo?;
+        let layer = self.selected_layer()?;
+        let projection = match target {
+            0 => layer.fill.map(|fill| fill.projection),
+            _ => layer.mask_bitmap.map(|mask| mask.projection),
+        }?;
+        (projection.mode == substancecraft_core::ProjectionMode::Decal)
+            .then_some((target, projection.decal))
+    }
+
+    /// Applies one gizmo drag step to the active decal: by default it
+    /// slides to the surface point under the pointer, facing out of that
+    /// face and keeping its spin; Shift spins it by the horizontal motion
+    /// (half a degree per point) and Ctrl resizes it by the vertical motion
+    /// (dragging up grows it). Edits merge into one undo step per drag.
+    fn drag_decal(
+        &mut self,
+        mesh: &MeshGeometry,
+        hit: Option<TriangleHit>,
+        delta: egui::Vec2,
+        shift: bool,
+        command: bool,
+    ) {
+        let Some((target, _)) = self.active_decal() else {
+            return;
+        };
+        let surface = hit.and_then(|hit| {
+            let corners = mesh.triangles.get(hit.triangle as usize)?;
+            let [a, b, c] = corners.map(|corner| mesh.vertices[corner as usize].position);
+            Some((hit.position, (b - a).cross(c - a)))
+        });
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+        let projection = match target {
+            0 => layer.fill.as_mut().map(|fill| &mut fill.projection),
+            _ => layer.mask_bitmap.as_mut().map(|mask| &mut mask.projection),
+        };
+        let Some(decal) = projection.map(|projection| &mut projection.decal) else {
+            return;
+        };
+        let before = *decal;
+        if shift {
+            decal.set_spin_degrees(decal.spin_degrees() + delta.x * 0.5);
+        } else if command {
+            decal.scale_by((-delta.y * 0.01).exp());
+        } else if let Some((position, normal)) = surface {
+            decal.move_to(position, normal);
+        }
+        if *decal != before {
+            self.invalidate_preview();
+        }
+    }
+
+    /// Outlines the active decal's image rectangle on the model, with a
+    /// tick from its centre towards the image's top edge.
+    fn draw_decal_gizmo(&self, painter: &egui::Painter, projection: &ViewProjection) {
+        let Some((_, decal)) = self.active_decal() else {
+            return;
+        };
+        let corners: Vec<egui::Pos2> = decal
+            .corners()
+            .into_iter()
+            .map(|corner| projection.project(corner).screen)
+            .collect();
+        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
+        painter.add(egui::Shape::closed_line(corners.clone(), stroke));
+        let top = corners[2].lerp(corners[3], 0.5);
+        let centre = projection.project(decal.center).screen;
+        painter.line_segment([centre, top], stroke);
+        painter.circle_filled(centre, 3.0, theme::ACCENT);
     }
 
     /// Centres the selected layer's decal (0 = fill, 1 = bitmap mask) on a
@@ -4552,6 +4736,74 @@ impl SubstanceCraftApp {
         Ok(written)
     }
 
+    /// Adds a fill layer from the OpenPBR material in MaterialX document
+    /// `document`: each texture it reads becomes a bitmap resource tagged
+    /// with its colour space, and constant inputs become fill values.
+    /// Returns the new layer.
+    fn import_openpbr_from(&mut self, document: &std::path::Path) -> Result<LayerId, String> {
+        let material = substancecraft_api::read_openpbr_materialx(document)
+            .map_err(|error| format!("{}: {error}", document.display()))?;
+        let folder = document.parent().unwrap_or(std::path::Path::new(""));
+        let mut resources = BTreeMap::new();
+        let resources_before = self.project.resources.len();
+        for (input, _, _, _) in substancecraft_api::OPENPBR_INPUTS {
+            let Some(file) = material.textures.get(input) else {
+                continue;
+            };
+            let path = folder.join(file);
+            let id = match self
+                .project
+                .resources
+                .iter()
+                .find(|resource| std::path::Path::new(&resource.source) == path)
+            {
+                Some(existing) => existing.id,
+                None => match self.add_resource(&path) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        // Leave no bitmaps behind from a failed import.
+                        for added in self.project.resources.split_off(resources_before) {
+                            self.resource_images.remove(&added.id);
+                            self.resource_watcher.forget(added.id);
+                        }
+                        return Err(error);
+                    }
+                },
+            };
+            let space = substancecraft_api::openpbr_texture_color_space(&material, input);
+            if let Some(resource) = self
+                .project
+                .resources
+                .iter_mut()
+                .find(|resource| resource.id == id)
+            {
+                resource.color_space = space;
+            }
+            resources.insert(input.to_owned(), id);
+        }
+        let (fill, channels) = substancecraft_api::openpbr_fill(&material, &resources);
+        let id = self.allocate_layer_id().ok_or("Out of layer ids.")?;
+        let mut layer = MaterialLayer::new_fill(id, material.name.replace('_', " "), fill);
+        layer.channels = channels;
+        self.insert_layer(layer);
+        if self.selected_layer != Some(id) {
+            return Err("The OpenPBR layer could not be inserted.".to_owned());
+        }
+        Ok(id)
+    }
+
+    fn import_openpbr(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MaterialX document", &["mtlx"])
+            .pick_file()
+        else {
+            return;
+        };
+        if let Err(error) = self.import_openpbr_from(&path) {
+            self.import_error = Some(error);
+        }
+    }
+
     fn export_openpbr(&mut self) {
         let Some(texture_set) = self.exportable_texture_set(false) else {
             return;
@@ -5296,7 +5548,11 @@ impl SubstanceCraftApp {
             });
             ui.input(|input| keyboard_camera(&mut self.viewport_camera, input));
         }
-        if response.dragged() && !painting {
+        let gizmo = self.active_decal().is_some();
+        if gizmo && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.decal_gizmo = None;
+        }
+        if response.dragged() && !painting && !gizmo {
             let delta = ui.input(|input| input.pointer.delta());
             let delta = glam::Vec2::new(delta.x, delta.y);
             if shift {
@@ -5359,7 +5615,8 @@ impl SubstanceCraftApp {
         let needs_projection = software
             || (painting && response.hovered())
             || response.clicked()
-            || (selecting && response.hovered());
+            || (selecting && response.hovered())
+            || (gizmo && response.dragged());
         // Points come from the shown (possibly posed) mesh; picks read UVs
         // and positions from the bind mesh, which shares its topology.
         let shown = self.display_mesh();
@@ -5422,6 +5679,7 @@ impl SubstanceCraftApp {
             self.paint_software_mesh(&painter, mesh, points);
         }
         self.draw_edge_overlay(&painter, &projection);
+        self.draw_decal_gizmo(&painter, &projection);
 
         if selecting {
             let overlay_points = projected
@@ -8372,5 +8630,287 @@ Connections:  {
             app.brush_footprints(&cube, &projection, Some(&points), egui::pos2(400.0, 400.0))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tc_0332_openpbr_documents_import_as_fill_layers_through_the_app() {
+        let folder = tempfile::tempdir().unwrap();
+        let solid = |rgba: [u8; 4]| BakedTexture {
+            width: 4,
+            height: 4,
+            rgba8: rgba.repeat(16),
+        };
+        write_texture(
+            folder.path().join("crate_color.png"),
+            &solid([200, 30, 30, 255]),
+        )
+        .unwrap();
+        write_texture(
+            folder.path().join("crate_rough.png"),
+            &solid([64, 64, 64, 255]),
+        )
+        .unwrap();
+        let files: BTreeMap<String, String> = [
+            ("base_color", "crate_color.png"),
+            ("specular_roughness", "crate_rough.png"),
+        ]
+        .into_iter()
+        .map(|(input, file)| (input.to_owned(), file.to_owned()))
+        .collect();
+        let document = folder.path().join("crate.mtlx");
+        substancecraft_api::write_openpbr_materialx(&document, "Painted crate", &files).unwrap();
+
+        let mut app = SubstanceCraftApp::default();
+        app.add_paint_layer();
+        small_sets(&mut app, 4);
+        let before = app.selected_texture_set_ref().unwrap().layers.clone();
+        let id = app.import_openpbr_from(&document).unwrap();
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let layer = set.layer(id).unwrap();
+        assert_eq!(layer.name, "Painted crate");
+        let fill = layer.fill.unwrap();
+        let color = fill.textures.base_color.unwrap();
+        let rough = fill.textures.roughness.unwrap();
+        let space = |id: ResourceId| {
+            app.project
+                .resources
+                .iter()
+                .find(|resource| resource.id == id)
+                .unwrap()
+                .color_space
+        };
+        assert_eq!(space(color), substancecraft_core::ColorSpace::Srgb);
+        assert_eq!(space(rough), substancecraft_core::ColorSpace::Raw);
+        let set_id = app.selected_texture_set.unwrap();
+        let base = app
+            .bake_inputs(set_id)
+            .bake_channel(&set, MaterialChannel::BaseColor)
+            .unwrap();
+        assert_eq!(&base.rgba8[..3], &[200, 30, 30]);
+        let roughness = app
+            .bake_inputs(set_id)
+            .bake_channel(&set, MaterialChannel::Roughness)
+            .unwrap();
+        assert_eq!(roughness.rgba8[0], 64);
+
+        // Importing again reuses the bitmaps; one undo removes each layer.
+        let resources = app.project.resources.len();
+        app.import_openpbr_from(&document).unwrap();
+        assert_eq!(app.project.resources.len(), resources);
+        app.undo();
+        app.undo();
+        assert_eq!(app.selected_texture_set_ref().unwrap().layers, before);
+
+        // A missing texture is reported, and adds no layer and no bitmaps
+        // even when an earlier texture loaded.
+        let fresh = folder.path().join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        std::fs::copy(&document, fresh.join("crate.mtlx")).unwrap();
+        std::fs::copy(
+            folder.path().join("crate_color.png"),
+            fresh.join("crate_color.png"),
+        )
+        .unwrap();
+        let error = app
+            .import_openpbr_from(&fresh.join("crate.mtlx"))
+            .unwrap_err();
+        assert!(error.contains("crate_rough.png"), "{error}");
+        assert_eq!(app.selected_texture_set_ref().unwrap().layers, before);
+        assert_eq!(app.project.resources.len(), resources);
+    }
+
+    #[test]
+    fn tc_0334_the_decal_gizmo_drags_spins_and_resizes_decals_in_one_undo_step() {
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.add_fill_layer();
+        small_sets(&mut app, 16);
+        let cube = app.mesh_geometry.clone().unwrap();
+        if let Some(fill) = app
+            .selected_layer_mut()
+            .and_then(|layer| layer.fill.as_mut())
+        {
+            fill.projection.mode = substancecraft_core::ProjectionMode::Decal;
+            fill.projection.decal.set_spin_degrees(30.0);
+        }
+        app.sync_layer_history(&egui::Context::default());
+        let original = app.selected_layer().unwrap().settings();
+        let decal = |app: &SubstanceCraftApp| app.active_decal().unwrap().1;
+        let hit_at = |point: glam::Vec3| {
+            let hit = cube.closest_surface_point(point).unwrap();
+            TriangleHit {
+                triangle: hit.triangle,
+                uv: Some(hit.uv),
+                position: hit.position,
+            }
+        };
+
+        // Off until switched on; then it follows the selected decal.
+        assert!(app.active_decal().is_none());
+        app.decal_gizmo = Some(1);
+        assert!(app.active_decal().is_none(), "no bitmap-mask decal");
+        app.decal_gizmo = Some(0);
+        assert!(app.active_decal().is_some());
+
+        // A plain drag slides it onto the +X face, keeping its spin.
+        let none = egui::Vec2::ZERO;
+        app.drag_decal(
+            &cube,
+            Some(hit_at(glam::Vec3::new(0.9, 0.1, 0.0))),
+            none,
+            false,
+            false,
+        );
+        let moved = decal(&app);
+        assert!((moved.center - glam::Vec3::new(0.5, 0.1, 0.0)).length() < 1e-4);
+        assert!((moved.normal - glam::Vec3::X).length() < 1e-5);
+        assert!((moved.spin_degrees() - 30.0).abs() < 1e-3);
+        // Off the mesh a plain drag leaves it where it is.
+        app.drag_decal(&cube, None, egui::vec2(5.0, 5.0), false, false);
+        assert_eq!(decal(&app), moved);
+
+        // Shift spins by half a degree per point; Ctrl resizes, up grows.
+        app.drag_decal(&cube, None, egui::vec2(20.0, 0.0), true, false);
+        assert!((decal(&app).spin_degrees() - 40.0).abs() < 1e-3);
+        let size = decal(&app).size;
+        app.drag_decal(&cube, None, egui::vec2(0.0, -100.0), false, true);
+        let grown = decal(&app).size;
+        assert!((grown.x / size.x - std::f32::consts::E).abs() < 1e-3);
+        assert_eq!(
+            decal(&app).center,
+            moved.center,
+            "spin and size keep the centre"
+        );
+
+        // The whole drag is one undo step.
+        app.sync_layer_history(&egui::Context::default());
+        app.undo();
+        assert_eq!(app.selected_layer().unwrap().settings(), original);
+
+        // Turning the projection away from Decal switches the gizmo off.
+        if let Some(fill) = app
+            .selected_layer_mut()
+            .and_then(|layer| layer.fill.as_mut())
+        {
+            fill.projection.mode = substancecraft_core::ProjectionMode::Uv;
+        }
+        assert!(app.active_decal().is_none());
+        app.drag_decal(&cube, Some(hit_at(glam::Vec3::X)), none, false, false);
+        assert_eq!(
+            app.selected_layer().unwrap().fill.unwrap().projection.decal,
+            original.fill.unwrap().projection.decal
+        );
+    }
+
+    #[test]
+    fn tc_0336_brush_colours_are_picked_in_a_remembered_colour_space() {
+        use substancecraft_core::ColorSpace;
+
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("preferences.json");
+        let mut app = SubstanceCraftApp::default();
+        app.load_preferences(path.clone());
+        assert_eq!(app.preferences.values.picker_color_space, ColorSpace::Srgb);
+
+        // The space is a preference; raw data is not offered.
+        app.set_picker_color_space(ColorSpace::AcesCg);
+        app.set_picker_color_space(ColorSpace::Raw);
+        assert_eq!(
+            app.preferences.values.picker_color_space,
+            ColorSpace::AcesCg
+        );
+        let mut later = SubstanceCraftApp::default();
+        later.load_preferences(path.clone());
+        assert_eq!(
+            later.preferences.values.picker_color_space,
+            ColorSpace::AcesCg
+        );
+        let mut raw = preferences::Preferences::load(&path);
+        raw.picker_color_space = ColorSpace::Raw;
+        raw.save(&path).unwrap();
+        assert_eq!(
+            preferences::Preferences::load(&path).picker_color_space,
+            ColorSpace::Srgb
+        );
+
+        // Linear values set the sRGB brush colour, keeping its alpha.
+        app.brush_color = egui::Color32::from_rgba_premultiplied(10, 10, 10, 200);
+        let clipped =
+            app.set_brush_color_in(ColorSpace::LinearSrgb, glam::Vec3::splat(0.215_860_5));
+        assert!(!clipped);
+        assert_eq!(app.brush_color.to_array(), [128, 128, 128, 200]);
+        assert_eq!(app.picker_clipped, None);
+        let shown = ColorSpace::LinearSrgb.from_srgb8([128, 128, 128]);
+        assert!(
+            (shown.x - 0.215_860_5).abs() < 1e-4,
+            "fields read the brush back"
+        );
+
+        // An ACEScg primary outside sRGB clips, and is flagged only while it
+        // stays the brush colour.
+        assert!(app.set_brush_color_in(ColorSpace::AcesCg, glam::Vec3::new(0.0, 1.0, 0.0)));
+        assert_eq!(app.picker_clipped, Some(app.brush_color));
+        assert_eq!(app.brush_color.r(), 0);
+        app.brush_color = egui::Color32::from_rgb(1, 2, 3);
+        assert_ne!(app.picker_clipped, Some(app.brush_color));
+    }
+
+    #[test]
+    fn tc_0338_the_smart_material_browser_shows_thumbnails_and_instances_offer_parameters() {
+        use substancecraft_core::ParameterValue;
+
+        let mut app = SubstanceCraftApp::default();
+        app.add_paint_layer();
+        small_sets(&mut app, 8);
+        let library = app.smart_material_library();
+        let (worn, rusty) = (&library[0], &library[1]);
+
+        // One new thumbnail per frame; cached ones cost nothing.
+        let mut budget = true;
+        let (_, first) = app.smart_thumbnail_image(worn, &mut budget).unwrap();
+        assert!(!budget);
+        assert_eq!(first.width, SMART_THUMBNAIL_SIZE);
+        assert!(app.smart_thumbnail_image(rusty, &mut budget).is_none());
+        let (_, again) = app.smart_thumbnail_image(worn, &mut budget).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "served from the cache");
+        let mut budget = true;
+        assert!(app.smart_thumbnail_image(rusty, &mut budget).is_some());
+        // A changed layer tree renders afresh.
+        let mut changed = worn.clone();
+        changed.root.opacity = 0.3;
+        let mut budget = true;
+        let (_, redrawn) = app.smart_thumbnail_image(&changed, &mut budget).unwrap();
+        assert!(!budget && redrawn != first);
+
+        // An inserted instance offers its parameters; setting one edits the
+        // layer it drives, and a drag is one undo step.
+        app.insert_smart_material(worn);
+        let root = app.selected_layer().unwrap().clone();
+        let values = root.exposed_values();
+        assert_eq!(values.len(), worn.parameters.len());
+        let index = values
+            .iter()
+            .find(|(_, parameter, _)| parameter.name == "Paint roughness")
+            .map(|(index, _, _)| *index)
+            .unwrap();
+        app.set_exposed_parameter(index, ParameterValue::Scalar(0.2));
+        app.set_exposed_parameter(index, ParameterValue::Scalar(0.9));
+        let edited = app.selected_layer().unwrap().clone();
+        assert!(
+            edited
+                .exposed_values()
+                .iter()
+                .any(|(i, _, value)| *i == index && *value == ParameterValue::Scalar(0.9))
+        );
+        assert_eq!(edited.id, root.id, "the instance stays selected");
+        app.history.end_merge();
+        app.undo();
+        assert_eq!(app.selected_layer().unwrap(), &root);
+
+        // Saving the instance keeps its parameters.
+        app.save_layer_as_smart_material();
+        let saved = app.project.smart_materials.last().unwrap();
+        assert_eq!(saved.parameters.len(), worn.parameters.len());
+        assert!(saved.root.exposed.is_empty());
     }
 }

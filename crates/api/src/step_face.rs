@@ -66,6 +66,32 @@ fn ring_area(ring: &[UvPoint]) -> f64 {
     area / 2.0
 }
 
+/// Even-odd point-in-polygon test.
+fn contains(ring: &[UvPoint], point: DVec2) -> bool {
+    let mut inside = false;
+    for (index, a) in ring.iter().enumerate() {
+        let b = ring[(index + 1) % ring.len()];
+        let (a, b) = (a.uv, b.uv);
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y)
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Whether a ring's area is negligible next to its extent.
+fn encloses_nothing(ring: &[UvPoint]) -> bool {
+    let low = ring
+        .iter()
+        .fold(DVec2::INFINITY, |low, point| low.min(point.uv));
+    let high = ring
+        .iter()
+        .fold(DVec2::NEG_INFINITY, |high, point| high.max(point.uv));
+    ring_area(ring).abs() <= 1e-9 * (high - low).max_element().powi(2).max(1e-300)
+}
+
 fn mean(ring: &[UvPoint], axis: usize) -> f64 {
     ring.iter().map(|point| point.uv[axis]).sum::<f64>() / ring.len().max(1) as f64
 }
@@ -89,12 +115,11 @@ fn singular_axes(surface: &Surface, uv: DVec2, tolerance: f64) -> [bool; 2] {
     let (_, du, dv) = surface.evaluate(uv.x, uv.y);
     let periods = surface.periods();
     let domain = surface.domain();
-    let span = |axis: usize| {
-        periods[axis].or_else(|| domain[axis].map(|(low, high)| (high - low).abs()))
-    };
+    let span =
+        |axis: usize| periods[axis].or_else(|| domain[axis].map(|(low, high)| (high - low).abs()));
     [
-        span(0).is_some_and(|span| du.length() * span <= tolerance),
-        span(1).is_some_and(|span| dv.length() * span <= tolerance),
+        span(0).is_some_and(|span| du.length() * span <= tolerance * 1e-3),
+        span(1).is_some_and(|span| dv.length() * span <= tolerance * 1e-3),
     ]
 }
 
@@ -105,7 +130,10 @@ struct MappedLoop {
     winding: [i64; 2],
 }
 
-fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64) -> MappedLoop {
+/// Maps a boundary into the parameter plane. Where it crosses a pole more
+/// than once, the parameter jumps there are ambiguous (a lune or its
+/// complement); `sense` picks the reading whose winding agrees with it.
+fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64, sense: bool) -> MappedLoop {
     let periods = surface.periods();
     let count = points.len();
     let mut uv = Vec::with_capacity(count);
@@ -117,6 +145,15 @@ fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64) -> MappedLoop {
         uv.push(parameters);
         singular.push(singular_axes(surface, parameters, tolerance));
     }
+    // Start at a regular point, so every pole crossing lies inside the
+    // sequence.
+    let mut points = points.to_vec();
+    if let Some(start) = singular.iter().position(|flags| !flags[0] && !flags[1]) {
+        uv.rotate_left(start);
+        singular.rotate_left(start);
+        points.rotate_left(start);
+    }
+    let points = points.as_slice();
     let mut winding = [0_i64; 2];
     for axis in 0..2 {
         let Some(period) = periods[axis] else {
@@ -136,10 +173,14 @@ fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64) -> MappedLoop {
         let closing = closing - (closing / period).round() * period;
         let turns = ((uv[last][axis] + closing - uv[first][axis]) / period).round() as i64;
         winding[axis] = turns;
+        // Pole crossings: the first singular point of each run.
+        let crossings: Vec<usize> = (first + 1..count)
+            .filter(|index| singular[*index][axis] && !singular[*index - 1][axis])
+            .collect();
         // Across a pole the parameter jumps freely; let that jump undo the
         // winding, so a loop through a pole stays closed.
         if turns != 0
-            && let Some(pole) = (first..count).find(|index| singular[*index][axis])
+            && let Some(&pole) = crossings.first()
         {
             for index in pole..count {
                 if !singular[index][axis] {
@@ -148,13 +189,43 @@ fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64) -> MappedLoop {
             }
             winding[axis] = 0;
         }
+        if winding[axis] == 0 && crossings.len() >= 2 {
+            let area = ring_area(&open_poles(&uv, &singular, points));
+            if (area > 0.0) != sense {
+                let (from, to) = (crossings[0], crossings[1]);
+                for shift in [period, -period] {
+                    let mut shifted = uv.clone();
+                    for index in from..to {
+                        if !singular[index][axis] {
+                            shifted[index][axis] += shift;
+                        }
+                    }
+                    let shifted_area = ring_area(&open_poles(&shifted, &singular, points));
+                    if (shifted_area > 0.0) == sense {
+                        uv = shifted;
+                        break;
+                    }
+                }
+            }
+        }
     }
+    let mut mapped = open_poles(&uv, &singular, points);
+    dedup(&mut mapped, true);
+    MappedLoop {
+        points: mapped,
+        winding,
+    }
+}
 
-    // Open each pole into a segment between its neighbours' parameters.
+/// Opens each pole into a segment between its neighbours' parameters. A run
+/// of points along a collapsed boundary shares one segment, spread across
+/// the run. The loop must start at a regular point.
+fn open_poles(uv: &[DVec2], singular: &[[bool; 2]], points: &[DVec3]) -> Vec<UvPoint> {
+    let count = uv.len();
     let mut mapped = Vec::with_capacity(count + 4);
-    for index in 0..count {
-        let flags = singular[index];
-        let axis = match flags {
+    let mut index = 0;
+    while index < count {
+        let axis = match singular[index] {
             [true, false] => 0,
             [false, true] => 1,
             _ => {
@@ -162,43 +233,54 @@ fn map_loop(surface: &Surface, points: &[DVec3], tolerance: f64) -> MappedLoop {
                     uv: uv[index],
                     position: points[index],
                 });
+                index += 1;
                 continue;
             }
         };
-        let neighbour = |step: isize| {
-            (1..count).find_map(|offset| {
-                let other =
-                    (index as isize + step * offset as isize).rem_euclid(count as isize) as usize;
-                (!singular[other][axis]).then_some(uv[other][axis])
-            })
-        };
-        let (Some(before), Some(after)) = (neighbour(-1), neighbour(1)) else {
-            mapped.push(UvPoint {
-                uv: uv[index],
-                position: points[index],
-            });
+        let mut end = index + 1;
+        while end < count && singular[end] == singular[index] {
+            end += 1;
+        }
+        let regular = |at: usize| (!singular[at][axis]).then_some(uv[at][axis]);
+        let before = (0..index).rev().find_map(regular);
+        let after = (end..count)
+            .find_map(regular)
+            .or_else(|| (0..index).find_map(regular));
+        let (Some(before), Some(after)) = (before, after) else {
+            for at in index..end {
+                mapped.push(UvPoint {
+                    uv: uv[at],
+                    position: points[at],
+                });
+            }
+            index = end;
             continue;
         };
-        let mut start = uv[index];
-        start[axis] = before;
-        let mut end = uv[index];
-        end[axis] = after;
-        mapped.push(UvPoint {
-            uv: start,
-            position: points[index],
-        });
-        if (after - before).abs() > 1e-12 {
+        let run = end - index;
+        let mut place = |at: usize, value: f64| {
+            let mut point = uv[at];
+            point[axis] = value;
             mapped.push(UvPoint {
-                uv: end,
-                position: points[index],
+                uv: point,
+                position: points[at],
             });
+        };
+        if run == 1 {
+            place(index, before);
+            if (after - before).abs() > 1e-12 {
+                place(index, after);
+            }
+        } else {
+            for (offset, at) in (index..end).enumerate() {
+                place(
+                    at,
+                    before + (after - before) * offset as f64 / (run - 1) as f64,
+                );
+            }
         }
+        index = end;
     }
-    dedup(&mut mapped, true);
-    MappedLoop {
-        points: mapped,
-        winding,
-    }
+    mapped
 }
 
 /// Re-cuts a loop that winds `winding` times around `axis` (period
@@ -319,7 +401,10 @@ fn close_ring(
 fn seam_avoiding(holes: &[Vec<UvPoint>], axis: usize, period: f64, start: f64) -> f64 {
     let crosses = |seam: f64| {
         holes.iter().any(|hole| {
-            let low = hole.iter().map(|p| p.uv[axis]).fold(f64::INFINITY, f64::min);
+            let low = hole
+                .iter()
+                .map(|p| p.uv[axis])
+                .fold(f64::INFINITY, f64::min);
             let high = hole
                 .iter()
                 .map(|p| p.uv[axis])
@@ -367,8 +452,13 @@ fn rectangle(surface: &Surface, low: DVec2, high: DVec2, tolerance: f64) -> Vec<
     close_ring(surface, parts, tolerance, DOMAIN_EDGE_SEGMENTS)
 }
 
-/// Closes the mapped loops into rings: the outer boundary first, then
-/// holes.
+/// Closes the mapped loops into rings (the outer boundary first, then
+/// holes), and says whether the face normal follows `S_u x S_v`.
+///
+/// Loop directions are tied together by the edges faces share, so they
+/// orient the face; the `same_sense` flag (`sense`) is only consulted where
+/// the loops leave the face's side open: a cap or the complement of a loop
+/// on a closed surface, and lunes through poles.
 fn assemble(
     surface: &Surface,
     sense: bool,
@@ -376,7 +466,7 @@ fn assemble(
     wrapping: Vec<(Vec<UvPoint>, usize, i64)>,
     vertices: &[DVec2],
     tolerance: f64,
-) -> Result<Vec<Vec<UvPoint>>, &'static str> {
+) -> Result<(Vec<Vec<UvPoint>>, bool), &'static str> {
     let periods = surface.periods();
     let mut holes = closed;
     if wrapping.is_empty() {
@@ -386,54 +476,65 @@ fn assemble(
             let (Some(u), Some(v)) = (domain[0], domain[1]) else {
                 return Err("face has no boundary");
             };
-            let outer = rectangle(surface, DVec2::new(u.0, v.0), DVec2::new(u.1, v.1), tolerance);
-            return Ok(vec![outer]);
+            let outer = rectangle(
+                surface,
+                DVec2::new(u.0, v.0),
+                DVec2::new(u.1, v.1),
+                tolerance,
+            );
+            return Ok((vec![outer], sense));
         }
         let outer_index = (0..holes.len())
-            .max_by(|a, b| ring_area(&holes[*a]).abs().total_cmp(&ring_area(&holes[*b]).abs()))
+            .max_by(|a, b| {
+                ring_area(&holes[*a])
+                    .abs()
+                    .total_cmp(&ring_area(&holes[*b]).abs())
+            })
             .unwrap_or(0);
-        // On a closed surface (sphere, torus) a loop bounds either side; the
-        // face lies to its left, so a clockwise largest loop is a hole in
-        // the whole surface.
+        // On a closed surface a loop bounds either side. With several loops
+        // the face is inside the largest only if it holds the others; loops
+        // side by side are holes in the whole surface. A single loop on a
+        // sphere goes by the face's sense (the face lies to its left); torus
+        // faces are fillet and revolve patches, never whole tori with a
+        // hole, so a single loop there keeps its inside.
+        let outer_area = ring_area(&holes[outer_index]);
         let domain = surface.domain();
         if let ([Some(u), Some(v)], Some(period)) = (domain, periods[0]) {
-            let oriented = ring_area(&holes[outer_index]) * if sense { 1.0 } else { -1.0 };
-            if oriented < 0.0 {
+            let complement = if holes.len() > 1 {
+                let outer = &holes[outer_index];
+                let centre = outer.iter().map(|p| p.uv).sum::<DVec2>() / outer.len() as f64;
+                let mut others: Vec<Vec<UvPoint>> = holes
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != outer_index)
+                    .map(|(_, ring)| ring.clone())
+                    .collect();
+                place_holes(&mut others, periods, centre);
+                !others
+                    .iter()
+                    .all(|ring| ring.first().is_some_and(|point| contains(outer, point.uv)))
+            } else if matches!(surface, Surface::Torus { .. }) {
+                false
+            } else {
+                (outer_area > 0.0) != sense
+            };
+            if complement {
                 let seam = seam_avoiding(&holes, 0, period, u.0);
                 let low = DVec2::new(seam, v.0);
                 let high = DVec2::new(seam + period, v.1);
                 place_holes(&mut holes, periods, (low + high) / 2.0);
                 let mut rings = vec![rectangle(surface, low, high, tolerance)];
                 rings.extend(holes);
-                return Ok(rings);
+                return Ok((rings, outer_area < 0.0));
             }
         }
         let outer = holes.swap_remove(outer_index);
-        let low = outer
-            .iter()
-            .fold(DVec2::INFINITY, |low, point| low.min(point.uv));
-        let high = outer
-            .iter()
-            .fold(DVec2::NEG_INFINITY, |high, point| high.max(point.uv));
-        let extent = high - low;
-        // A loop with no area that only runs up and back down a seam bounds
-        // the whole period (a sphere cut along one meridian).
-        let degenerate = ring_area(&outer).abs() <= 1e-9 * extent.max_element().powi(2).max(1e-300);
-        let outer = match (degenerate, periods) {
-            (true, [Some(period), _]) => {
-                rectangle(surface, low, DVec2::new(low.x + period, high.y), tolerance)
-            }
-            (true, [None, Some(period)]) => {
-                rectangle(surface, low, DVec2::new(high.x, low.y + period), tolerance)
-            }
-            (true, _) => return Err("face boundary encloses no area"),
-            (false, _) => outer,
-        };
+        let along = outer_area > 0.0;
         let centre = outer.iter().map(|p| p.uv).sum::<DVec2>() / outer.len() as f64;
         place_holes(&mut holes, periods, centre);
         let mut rings = vec![outer];
         rings.extend(holes);
-        return Ok(rings);
+        return Ok((rings, along));
     }
 
     let axis = wrapping[0].1;
@@ -457,14 +558,21 @@ fn assemble(
         }
         Some(cut)
     };
-    let outer = if wrapping.len() == 2 {
+    let (outer, along) = if wrapping.len() == 2 {
         let mut bands = wrapping;
         bands.sort_by(|a, b| mean(&a.0, across).total_cmp(&mean(&b.0, across)));
         let (Some(low), Some(mut high)) = (cut(&bands[0]), cut(&bands[1])) else {
             return Err("could not cut a face boundary at its seam");
         };
         high.reverse();
-        close_ring(surface, vec![low, high], tolerance, 1)
+        // The lower loop runs forward when the band is counter-clockwise
+        // (mirrored when the band wraps in v).
+        let along = if bands[0].2 == -bands[1].2 {
+            (bands[0].2 > 0) != (axis == 1)
+        } else {
+            sense
+        };
+        (close_ring(surface, vec![low, high], tolerance, 1), along)
     } else {
         let ring = &wrapping[0];
         let cap = cut(ring).ok_or("could not cut a face boundary at its seam")?;
@@ -504,7 +612,8 @@ fn assemble(
             tolerance,
             DOMAIN_EDGE_SEGMENTS,
         );
-        close_ring(surface, vec![cap, edge], tolerance, 1)
+        let along = ((ring.2 > 0) == high) != (axis == 1);
+        (close_ring(surface, vec![cap, edge], tolerance, 1), along)
     };
     let centre = DVec2::from_array({
         let mut centre = [0.0; 2];
@@ -515,11 +624,13 @@ fn assemble(
     place_holes(&mut holes, periods, centre);
     let mut rings = vec![outer];
     rings.extend(holes);
-    Ok(rings)
+    Ok((rings, along))
 }
 
 /// Tessellates a face on `surface` bounded by `loops`. `sense` is true when
-/// the face normal agrees with the surface normal (`S_u x S_v`).
+/// the file says the face normal agrees with the surface normal
+/// (`S_u x S_v`); the triangles are wound by the loops wherever they decide
+/// it (see [`assemble`]).
 pub(crate) fn tessellate_face(
     surface: &Surface,
     sense: bool,
@@ -543,31 +654,23 @@ pub(crate) fn tessellate_face(
             }
             Loop3::Points(points) => points,
         };
-        let mapped = map_loop(surface, points, tolerance);
+        let mapped = map_loop(surface, points, tolerance, sense);
         if mapped.points.len() < 2 {
             continue;
         }
         match mapped.winding {
-            [0, 0] if mapped.points.len() >= 3 => closed.push(mapped.points),
+            // A loop enclosing no area is a slit (an edge out and back) or a
+            // seam traversed both ways: it bounds nothing.
+            [0, 0] if mapped.points.len() >= 3 && !encloses_nothing(&mapped.points) => {
+                closed.push(mapped.points)
+            }
             [0, 0] => {}
             [turns, 0] => wrapping.push((mapped.points, 0, turns.signum())),
             [0, turns] => wrapping.push((mapped.points, 1, turns.signum())),
             _ => return Err("face boundary winds around the surface in both directions"),
         }
     }
-    if std::env::var_os("STEP_DEBUG_SENSE").is_some() && wrapping.is_empty() && !closed.is_empty() {
-        let largest = closed
-            .iter()
-            .map(|ring| ring_area(ring))
-            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-            .unwrap_or(0.0);
-        let kind = format!("{surface:?}").split(['(', ' ', '{']).next().unwrap_or("").to_owned();
-        eprintln!(
-            "SENSE {kind} {}",
-            if (largest > 0.0) == sense { "agree" } else { "disagree" }
-        );
-    }
-    let mut rings = assemble(surface, sense, closed, wrapping, &vertices, tolerance)?;
+    let (mut rings, along) = assemble(surface, sense, closed, wrapping, &vertices, tolerance)?;
     for ring in &mut rings {
         dedup(ring, true);
     }
@@ -603,12 +706,6 @@ pub(crate) fn tessellate_face(
         }
     }
     let scaled: Vec<DVec2> = parameters.iter().map(|uv| *uv * scale).collect();
-    if std::env::var_os("STEP_DEBUG_UV").is_some() {
-        eprintln!("scale {scale} rings {}", rings.len());
-        for (i, p) in parameters.iter().enumerate() {
-            eprintln!("  {i} uv {:.5} {:.5}  pos {:.4}", p.x, p.y, positions[i]);
-        }
-    }
     let triangles = earcut(&scaled, &starts);
     if triangles.is_empty() {
         return Err("face boundary could not be triangulated");
@@ -619,7 +716,14 @@ pub(crate) fn tessellate_face(
         .collect();
     mesh.restore_boundary_points(&ranges);
     mesh.make_delaunay();
-    refine(&mut mesh, surface, scale, &mut parameters, &mut positions, tolerance);
+    refine(
+        &mut mesh,
+        surface,
+        scale,
+        &mut parameters,
+        &mut positions,
+        tolerance,
+    );
 
     let mut patch = FacePatch {
         positions: Vec::new(),
@@ -641,7 +745,7 @@ pub(crate) fn tessellate_face(
             }
             *slot
         });
-        if !sense {
+        if !along {
             indices.swap(1, 2);
         }
         patch.triangles.push(indices);
@@ -649,7 +753,7 @@ pub(crate) fn tessellate_face(
     if patch.triangles.is_empty() {
         return Err("face tessellates to no triangles");
     }
-    if !sense {
+    if !along {
         // Mirror the chart too, so it keeps the triangles' winding.
         for point in &mut patch.chart {
             point.x = -point.x;
@@ -680,7 +784,11 @@ fn refine(
             continue;
         }
         let [qa, qb, qc] = corners.map(|corner| mesh.points[corner as usize]);
-        if orient(qa, qb, qc) <= 1e-18 * longest * longest {
+        // Parameters are scaled to model lengths: a triangle already below
+        // the tolerance there cannot get closer by splitting (its corners
+        // are boundary points off the surface).
+        let span = qa.distance(qb).max(qb.distance(qc)).max(qc.distance(qa));
+        if span <= tolerance || orient(qa, qb, qc) <= 1e-18 * span * span {
             continue;
         }
         let centroid = (qa + qb + qc) / 3.0;
@@ -810,12 +918,20 @@ pub(crate) fn pack_charts(charts: &[&[DVec2]]) -> Vec<Vec<Vec2>> {
         .map(|(index, chart)| {
             let min = chart.iter().fold(DVec2::INFINITY, |a, b| a.min(*b));
             let max = chart.iter().fold(DVec2::NEG_INFINITY, |a, b| a.max(*b));
-            let size = if chart.is_empty() { DVec2::ZERO } else { max - min };
+            let size = if chart.is_empty() {
+                DVec2::ZERO
+            } else {
+                max - min
+            };
             let rotated = size.y > size.x;
             Item {
                 index,
                 min: if chart.is_empty() { DVec2::ZERO } else { min },
-                size: if rotated { DVec2::new(size.y, size.x) } else { size },
+                size: if rotated {
+                    DVec2::new(size.y, size.x)
+                } else {
+                    size
+                },
                 rotated,
             }
         })
@@ -928,7 +1044,12 @@ mod tests {
         let patch = tessellate_face(&surface, true, &loops, 1e-3).unwrap();
         assert!((area(&patch) - TAU).abs() < 0.03, "{}", area(&patch));
         assert!(patch.positions.iter().all(|p| p.z >= -1e-9));
-        assert!(patch.positions.iter().all(|p| (p.length() - 1.0).abs() < 1e-9));
+        assert!(
+            patch
+                .positions
+                .iter()
+                .all(|p| (p.length() - 1.0).abs() < 1e-9)
+        );
         // Reversed sense: the south cap.
         let south = tessellate_face(&surface, false, &loops, 1e-3).unwrap();
         assert!(south.positions.iter().all(|p| p.z <= 1e-9));
@@ -940,10 +1061,18 @@ mod tests {
             frame: Frame::IDENTITY,
             radius: 2.0,
         };
-        let patch =
-            tessellate_face(&sphere, true, &[Loop3::Vertex(DVec3::new(0.0, 0.0, 2.0))], 1e-3)
-                .unwrap();
-        assert!((area(&patch) - 4.0 * PI * 4.0).abs() < 0.2, "{}", area(&patch));
+        let patch = tessellate_face(
+            &sphere,
+            true,
+            &[Loop3::Vertex(DVec3::new(0.0, 0.0, 2.0))],
+            1e-3,
+        )
+        .unwrap();
+        assert!(
+            (area(&patch) - 4.0 * PI * 4.0).abs() < 0.2,
+            "{}",
+            area(&patch)
+        );
         assert!((patch.signed_volume() / 6.0 - 4.0 / 3.0 * PI * 8.0).abs() < 0.2);
 
         // Cone of base radius 1 at z = 0 narrowing to an apex at z = 1.
@@ -992,18 +1121,52 @@ mod tests {
     }
 
     #[test]
+    fn spheres_with_slits_are_whole_and_side_by_side_loops_are_holes() {
+        let surface = Surface::Sphere {
+            frame: Frame::IDENTITY,
+            radius: 1.0,
+        };
+        // An arc out and back along the equator: a slit bounding nothing.
+        let mut slit = circle(1.0, 0.0, 64, false)[..17].to_vec();
+        slit.extend(slit.clone().into_iter().rev().skip(1).take(15));
+        let patch = tessellate_face(&surface, true, &[Loop3::Points(slit)], 1e-3).unwrap();
+        assert!((area(&patch) - 4.0 * PI).abs() < 0.05, "{}", area(&patch));
+
+        // Two small loops wound the same way, side by side: whatever the
+        // sense says, the face is the sphere with two holes.
+        let small = |centre: f64| -> Vec<DVec3> {
+            (0..48)
+                .map(|index| {
+                    let angle = index as f64 / 48.0 * TAU;
+                    let (u, v) = (centre + 0.2 * angle.cos(), 0.2 * angle.sin());
+                    DVec3::new(v.cos() * u.cos(), v.cos() * u.sin(), v.sin())
+                })
+                .collect()
+        };
+        let loops = [Loop3::Points(small(0.0)), Loop3::Points(small(PI))];
+        for sense in [true, false] {
+            let patch = tessellate_face(&surface, sense, &loops, 1e-3).unwrap();
+            let caps = 2.0 * TAU * (1.0 - 0.2_f64.cos());
+            assert!(
+                (area(&patch) - (4.0 * PI - caps)).abs() < 0.05,
+                "{}",
+                area(&patch)
+            );
+        }
+    }
+
+    #[test]
     fn soups_split_by_facing_and_charts_pack_inside_the_unit_square() {
-        let positions = vec![
-            DVec3::ZERO,
-            DVec3::X,
-            DVec3::Y,
-            DVec3::Z,
-        ];
+        let positions = vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z];
         let triangles = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
         let patches = soup_patches(&positions, &triangles);
         assert_eq!(patches.iter().map(|p| p.triangles.len()).sum::<usize>(), 4);
         let charts: Vec<&[DVec2]> = patches.iter().map(|p| p.chart.as_slice()).collect();
         let uvs = pack_charts(&charts);
-        assert!(uvs.iter().flatten().all(|uv| uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0));
+        assert!(
+            uvs.iter()
+                .flatten()
+                .all(|uv| uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0)
+        );
     }
 }

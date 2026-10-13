@@ -205,7 +205,10 @@ struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     fn error(&self, message: impl Into<String>) -> StepSyntaxError {
         let end = self.position.min(self.bytes.len());
-        let line = 1 + self.bytes[..end].iter().filter(|byte| **byte == b'\n').count();
+        let line = 1 + self.bytes[..end]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
         StepSyntaxError::At {
             line,
             message: message.into(),
@@ -305,8 +308,8 @@ impl<'a> Lexer<'a> {
                 {
                     self.position += 1;
                 }
-                let text = String::from_utf8_lossy(&self.bytes[start..self.position])
-                    .to_ascii_uppercase();
+                let text =
+                    String::from_utf8_lossy(&self.bytes[start..self.position]).to_ascii_uppercase();
                 if self.bytes.get(self.position) != Some(&b'.') {
                     return Err(self.error("unterminated enumeration"));
                 }
@@ -323,8 +326,7 @@ impl<'a> Lexer<'a> {
                     self.position += 1;
                 }
                 Ok(Token::Keyword(
-                    String::from_utf8_lossy(&self.bytes[start..self.position])
-                        .to_ascii_uppercase(),
+                    String::from_utf8_lossy(&self.bytes[start..self.position]).to_ascii_uppercase(),
                 ))
             }
             other => Err(self.error(format!("unexpected character `{}`", other as char))),
@@ -442,7 +444,11 @@ fn decode_string(raw: &[u8]) -> String {
                 let units: Vec<u16> = units.iter().map(|unit| *unit as u16).collect();
                 out.extend(char::decode_utf16(units).map(|c| c.unwrap_or('\u{fffd}')));
             } else {
-                out.extend(units.iter().map(|unit| char::from_u32(*unit).unwrap_or('\u{fffd}')));
+                out.extend(
+                    units
+                        .iter()
+                        .map(|unit| char::from_u32(*unit).unwrap_or('\u{fffd}')),
+                );
             }
             index = body_start + end + 4;
         } else if rest.starts_with(b"\\X\\") && rest.len() >= 5 {

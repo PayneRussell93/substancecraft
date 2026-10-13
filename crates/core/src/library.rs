@@ -305,6 +305,61 @@ impl ExposedProperty {
     }
 }
 
+impl MaterialLayer {
+    /// The current value of each exposed parameter whose layer is still
+    /// this one or inside it, with its index.
+    pub fn exposed_values(&self) -> Vec<(usize, &ExposedParameter, ParameterValue)> {
+        let layers = self.walk();
+        self.exposed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parameter)| {
+                let layer = layers.iter().find(|layer| layer.id == parameter.layer)?;
+                Some((index, parameter, parameter.property.read(layer)?))
+            })
+            .collect()
+    }
+}
+
+impl MaterialProject {
+    /// The undoable edit setting exposed parameter `index` of layer
+    /// `layer_id` to `value`: a batch holding the settings change of the
+    /// layer it drives
+    /// (an override when that layer is a material instance). `None` when
+    /// nothing changes or the index, layer, or value does not fit.
+    pub fn exposed_command(
+        &self,
+        set_id: crate::TextureSetId,
+        layer_id: LayerId,
+        index: usize,
+        value: ParameterValue,
+    ) -> Option<crate::EditCommand> {
+        let root = self
+            .texture_sets
+            .iter()
+            .find(|set| set.id == set_id)?
+            .layer(layer_id)?;
+        let parameter = root.exposed.get(index)?;
+        let target = root
+            .walk()
+            .into_iter()
+            .find(|layer| layer.id == parameter.layer)?;
+        let mut changed = target.clone();
+        parameter.property.access(&mut changed, Some(value))?;
+        let before = target.settings();
+        let after = self.track_instance_edit(changed.settings());
+        // A batch, as evolution moves are, so slider drags merge.
+        (before != after).then(|| {
+            crate::EditCommand::Batch(vec![crate::EditCommand::LayerSettings {
+                texture_set_id: set_id,
+                layer_id: target.id,
+                before: Box::new(before),
+                after: Box::new(after),
+            }])
+        })
+    }
+}
+
 /// What a smart material needs from the project to bake.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MapRequirements {
@@ -351,11 +406,26 @@ impl SmartMaterial {
             {
                 layer.mask_anchor = None;
             }
+            layer
+                .exposed
+                .retain(|parameter| inside.contains(&parameter.layer));
             for child in layer.children.iter_mut().flatten() {
                 strip(child, inside);
             }
         }
         strip(&mut root, &inside);
+        // An inserted instance keeps the parameters it was given.
+        let kept = std::mem::take(&mut root.exposed);
+        if !kept.is_empty() {
+            return Self {
+                name: name.into(),
+                description: String::new(),
+                root,
+                parameters: kept,
+                provenance: ResourceProvenance::default(),
+                tags: Vec::new(),
+            };
+        }
         let mut parameters = Vec::new();
         for layer in root.walk() {
             let mut candidates = Vec::new();
@@ -459,11 +529,24 @@ impl SmartMaterial {
                     drive.layer = *id;
                 }
             }
+            for parameter in &mut layer.exposed {
+                if let Some(id) = mapping.get(&parameter.layer) {
+                    parameter.layer = *id;
+                }
+            }
             for child in layer.children.iter_mut().flatten() {
                 remap(child, mapping);
             }
         }
         let mut root = self.root.clone();
+        // The instance keeps the material's parameters, so they stay
+        // adjustable after insertion.
+        root.exposed = self
+            .parameters
+            .iter()
+            .filter(|parameter| mapping.contains_key(&parameter.layer))
+            .cloned()
+            .collect();
         remap(&mut root, &mapping);
         root
     }

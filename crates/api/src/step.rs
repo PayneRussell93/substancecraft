@@ -18,7 +18,9 @@ use substancecraft_core::{MeshGeometry, MeshVertex};
 use thiserror::Error;
 
 use crate::fbx::ImportedMesh;
-use crate::step_face::{FacePatch, Loop3, newell_normal, pack_charts, soup_patches, tessellate_face};
+use crate::step_face::{
+    FacePatch, Loop3, newell_normal, pack_charts, soup_patches, tessellate_face,
+};
 use crate::step_geom::{BSplineCurve, BSplineSurface, Curve, Frame, Knots, Surface};
 use crate::step_parse::{Instance, Param, Record, StepFile, parse_step};
 
@@ -139,10 +141,9 @@ pub fn import_step_with_report(
     let mut slot_patches: Vec<Vec<FacePatch>> = Vec::new();
     let mut vertex_count = 0_usize;
     for placement in &placements {
-        if !cache.contains_key(&placement.item) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(placement.item) {
             reader.tolerance = tolerance / placement.unit;
-            let patches = reader.item_patches(placement.item);
-            cache.insert(placement.item, patches);
+            slot.insert(reader.item_patches(placement.item));
         }
         let Some(patches) = cache.get(&placement.item) else {
             continue;
@@ -192,7 +193,9 @@ pub fn import_step_with_report(
         }
     }
     if slot_patches.iter().all(Vec::is_empty) {
-        return Err(StepImportError::NoTriangles(skipped_summary(&reader.report)));
+        return Err(StepImportError::NoTriangles(skipped_summary(
+            &reader.report,
+        )));
     }
 
     let mut geometry = MeshGeometry::default();
@@ -204,10 +207,20 @@ pub fn import_step_with_report(
             let offset = geometry.vertices.len() as u32;
             geometry
                 .vertices
-                .extend(patch.positions.iter().zip(uvs).map(|(position, uv)| MeshVertex {
-                    position: Vec3::new(position.x as f32, position.y as f32, position.z as f32),
-                    uv,
-                }));
+                .extend(
+                    patch
+                        .positions
+                        .iter()
+                        .zip(uvs)
+                        .map(|(position, uv)| MeshVertex {
+                            position: Vec3::new(
+                                position.x as f32,
+                                position.y as f32,
+                                position.z as f32,
+                            ),
+                            uv,
+                        }),
+                );
             for triangle in &patch.triangles {
                 geometry
                     .triangles
@@ -255,6 +268,14 @@ fn skipped_summary(report: &StepImportReport) -> String {
     }
     summary
 }
+
+/// A placing relationship: (child representation, parent representation,
+/// child frame item, parent frame item, item whose style the child takes).
+type Link = (u64, u64, Option<u64>, Option<u64>, Option<u64>);
+
+/// Assembly edges: parent group -> (child group, child-to-parent transform
+/// in metres, colour).
+type Children = BTreeMap<usize, Vec<(usize, DAffine3, Option<[u8; 3]>)>>;
 
 struct ColouredPatch {
     patch: FacePatch,
@@ -475,7 +496,13 @@ impl<'a> Reader<'a> {
         None
     }
 
-    fn knots(&self, degree: usize, count: usize, multiplicities: &Param, values: &Param) -> Option<Knots> {
+    fn knots(
+        &self,
+        degree: usize,
+        count: usize,
+        multiplicities: &Param,
+        values: &Param,
+    ) -> Option<Knots> {
         let multiplicities = multiplicities.numbers()?;
         let values = values.numbers()?;
         if multiplicities.len() != values.len() {
@@ -725,7 +752,7 @@ impl<'a> Reader<'a> {
         let start = self.vertex(start_id)?;
         let end = self.vertex(end_id)?;
         let same_sense = record.logical(4).unwrap_or(true);
-        let closed = start_id == end_id || start.distance(end) <= self.tolerance * 1e-3;
+        let closed = start_id == end_id || start.distance(end) <= self.tolerance * 1e-6;
         let points = match record.reference(3).and_then(|curve| self.curve(curve, 0)) {
             Some(curve) => self.sample_edge(&curve, start, end, same_sense, closed),
             None => vec![start, end],
@@ -796,16 +823,17 @@ impl<'a> Reader<'a> {
                     if !forward {
                         edge_points.reverse();
                     }
-                    let join = points.last().zip(edge_points.first()).is_some_and(|(a, b)| {
-                        a.distance(*b) <= self.tolerance * 1e-2
-                    });
+                    let join = points
+                        .last()
+                        .zip(edge_points.first())
+                        .is_some_and(|(a, b)| a.distance(*b) <= self.tolerance * 1e-6);
                     points.extend(edge_points.into_iter().skip(usize::from(join)));
                 }
                 if points.len() > 1
                     && points
                         .first()
                         .zip(points.last())
-                        .is_some_and(|(a, b)| a.distance(*b) <= self.tolerance * 1e-2)
+                        .is_some_and(|(a, b)| a.distance(*b) <= self.tolerance * 1e-6)
                 {
                     points.pop();
                 }
@@ -846,7 +874,8 @@ impl<'a> Reader<'a> {
         let (name, record) = self.simple(id)?;
         if name == "ORIENTED_FACE" {
             let inner = record.reference(3)?;
-            let mut patch = self.face(inner, flip != !record.logical(4).unwrap_or(true), depth + 1)?;
+            let mut patch =
+                self.face(inner, flip != !record.logical(4).unwrap_or(true), depth + 1)?;
             patch.colour = self.colours.get(&id).copied().or(patch.colour);
             return Some(patch);
         }
@@ -864,7 +893,9 @@ impl<'a> Reader<'a> {
             (None, true)
         } else {
             (
-                record.reference(2).and_then(|surface| self.surface(surface, 0)),
+                record
+                    .reference(2)
+                    .and_then(|surface| self.surface(surface, 0)),
                 record.logical(3).unwrap_or(true),
             )
         };
@@ -886,22 +917,7 @@ impl<'a> Reader<'a> {
                 return None;
             }
         };
-        let result = tessellate_face(&surface, same_sense != flip, &bounds, self.tolerance);
-        if std::env::var_os("STEP_DEBUG").is_some() {
-            let kind = format!("{surface:?}").split(['(', ' ', '{']).next().unwrap_or("").to_owned();
-            let loops: Vec<String> = bounds
-                .iter()
-                .map(|b| match b {
-                    Loop3::Points(p) => format!("{}", p.len()),
-                    Loop3::Vertex(_) => "v".to_owned(),
-                })
-                .collect();
-            match &result {
-                Ok(patch) => eprintln!("#{id} {kind} loops {loops:?} tris {}", patch.triangles.len()),
-                Err(reason) => eprintln!("#{id} {kind} loops {loops:?} ERR {reason}"),
-            }
-        }
-        match result {
+        match tessellate_face(&surface, same_sense != flip, &bounds, self.tolerance) {
             Ok(patch) => Some(ColouredPatch {
                 patch,
                 colour: self.colours.get(&id).copied(),
@@ -1025,10 +1041,7 @@ impl<'a> Reader<'a> {
             "COMPLEX_TRIANGULATED_SURFACE_SET" => (4, 5, Some(6)),
             _ => return Vec::new(),
         };
-        let Some(coordinates) = record
-            .reference(1)
-            .and_then(|list| self.coordinates(list))
-        else {
+        let Some(coordinates) = record.reference(1).and_then(|list| self.coordinates(list)) else {
             return Vec::new();
         };
         let indices: Vec<usize> = record
@@ -1077,7 +1090,12 @@ impl<'a> Reader<'a> {
                 }
             }
         } else {
-            faces.extend(first.iter().filter(|t| t.len() == 3).map(|t| [t[0], t[1], t[2]]));
+            faces.extend(
+                first
+                    .iter()
+                    .filter(|t| t.len() == 3)
+                    .map(|t| [t[0], t[1], t[2]]),
+            );
         }
         faces.retain(|[a, b, c]| a != b && b != c && a != c);
         let colour = self.colours.get(&id).copied();
@@ -1243,10 +1261,9 @@ impl<'a> Reader<'a> {
         }
         let conversion = instance.record("CONVERSION_BASED_UNIT")?;
         let measure = self.get(conversion.reference(1)?)?;
-        let record = measure
-            .records
-            .iter()
-            .find(|record| record.name.ends_with("MEASURE_WITH_UNIT") && record.params.len() >= 2)?;
+        let record = measure.records.iter().find(|record| {
+            record.name.ends_with("MEASURE_WITH_UNIT") && record.params.len() >= 2
+        })?;
         let value = record.number(0)?;
         let factor = value * self.unit_factor(record.reference(1)?, depth + 1)?;
         (factor.is_finite() && factor > 0.0).then_some(factor)
@@ -1296,7 +1313,7 @@ impl<'a> Reader<'a> {
         let mut groups = UnionFind((0..representations.len()).collect());
         // (child representation, parent representation, child frame item,
         // parent frame item, colour item)
-        let mut links: Vec<(u64, u64, Option<u64>, Option<u64>, Option<u64>)> = Vec::new();
+        let mut links: Vec<Link> = Vec::new();
         for id in &self.ids {
             let Some(instance) = self.get(*id) else {
                 continue;
@@ -1342,7 +1359,13 @@ impl<'a> Reader<'a> {
                         record.reference(1).and_then(|map| self.simple(map))
                     && let Some(child) = map.reference(1)
                 {
-                    mapped.push((child, *parent, map.reference(0), record.reference(2), Some(*item)));
+                    mapped.push((
+                        child,
+                        *parent,
+                        map.reference(0),
+                        record.reference(2),
+                        Some(*item),
+                    ));
                 }
             }
         }
@@ -1367,10 +1390,7 @@ impl<'a> Reader<'a> {
         let default_unit = group_unit.iter().flatten().next().copied().unwrap_or(1e-3);
         let unit_of = |group: usize| group_unit[group].unwrap_or(default_unit);
 
-        // Edges parent -> (child, child-to-parent transform in metres,
-        // colour).
-        let mut children: BTreeMap<usize, Vec<(usize, DAffine3, Option<[u8; 3]>)>> =
-            BTreeMap::new();
+        let mut children: Children = BTreeMap::new();
         let mut has_parent = vec![false; group_count];
         for (child, parent, from, to, colour_item) in links {
             let (Some(&child_index), Some(&parent_index)) =
@@ -1378,8 +1398,7 @@ impl<'a> Reader<'a> {
             else {
                 continue;
             };
-            let (child_group, parent_group) =
-                (groups.find(child_index), groups.find(parent_index));
+            let (child_group, parent_group) = (groups.find(child_index), groups.find(parent_index));
             let (mut from, mut to) = (from, to);
             // Writers disagree on which item belongs to which side; the
             // items say.
@@ -1415,8 +1434,9 @@ impl<'a> Reader<'a> {
         }
 
         let tessellated_only = !group_items.iter().flatten().any(|item| {
-            self.simple(*item)
-                .is_some_and(|(name, _)| BODY_TYPES.contains(&name) && !TESSELLATED_TYPES.contains(&name))
+            self.simple(*item).is_some_and(|(name, _)| {
+                BODY_TYPES.contains(&name) && !TESSELLATED_TYPES.contains(&name)
+            })
         });
         let mut placements = Vec::new();
         let roots: BTreeSet<usize> = (0..group_count)
@@ -1474,7 +1494,7 @@ impl<'a> Reader<'a> {
         stack: &mut Vec<usize>,
         group_items: &[Vec<u64>],
         unit_of: &dyn Fn(usize) -> f64,
-        children: &BTreeMap<usize, Vec<(usize, DAffine3, Option<[u8; 3]>)>>,
+        children: &Children,
         tessellated_only: bool,
         placements: &mut Vec<Placement>,
     ) {
@@ -1543,7 +1563,12 @@ mod tests {
     }
 
     fn triple(values: [f64; 3]) -> String {
-        format!("({},{},{})", real(values[0]), real(values[1]), real(values[2]))
+        format!(
+            "({},{},{})",
+            real(values[0]),
+            real(values[1]),
+            real(values[2])
+        )
     }
 
     impl Writer {
@@ -1585,7 +1610,10 @@ mod tests {
             let direction = self.direction(delta.normalize().to_array());
             let vector = self.add(format!("VECTOR('',#{direction},{})", real(delta.length())));
             let line = self.add(format!("LINE('',#{origin},#{vector})"));
-            self.add(format!("EDGE_CURVE('',#{},#{},#{line},.T.)", start.0, end.0))
+            self.add(format!(
+                "EDGE_CURVE('',#{},#{},#{line},.T.)",
+                start.0, end.0
+            ))
         }
 
         /// A face from bounds of (edge, forward) lists.
@@ -1720,8 +1748,7 @@ mod tests {
         let top_plane = writer.add(format!("PLANE('',#{top_axis})"));
         let top = writer.face(&[vec![(top_edge, true)]], top_plane, true);
         let side_axis = writer.axis([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
-        let side_surface =
-            writer.add(format!("CYLINDRICAL_SURFACE('',#{side_axis},{})", real(r)));
+        let side_surface = writer.add(format!("CYLINDRICAL_SURFACE('',#{side_axis},{})", real(r)));
         let side = if seam {
             let seam_edge = writer.line_edge((v1, p1), (v2, p2));
             let bound = vec![
@@ -1805,13 +1832,20 @@ mod tests {
         assert_eq!(geometry.triangles.len(), 12);
         assert_eq!(geometry.vertices.len(), 24);
         assert!(geometry.material_slots.is_empty() && mesh.generated_uvs);
-        assert!((volume(geometry) - 1e-6).abs() < 1e-12, "{}", volume(geometry));
+        assert!(
+            (volume(geometry) - 1e-6).abs() < 1e-12,
+            "{}",
+            volume(geometry)
+        );
         assert_watertight(geometry);
         let (min, max) = bounds(geometry);
         assert!(min.abs().max_element() < 1e-7);
         assert!((max - Vec3::splat(0.01)).abs().max_element() < 1e-7);
         assert!(uvs_in_unit_square(geometry));
-        assert_eq!((report.bodies, report.faces, report.skipped_faces), (1, 6, 0));
+        assert_eq!(
+            (report.bodies, report.faces, report.skipped_faces),
+            (1, 6, 0)
+        );
         assert!((report.length_unit - 1e-3).abs() < 1e-15);
     }
 
@@ -1897,7 +1931,9 @@ mod tests {
         for k in 0..4 {
             let ((i0, j0), (i1, j1)) = (corners[k], corners[(k + 1) % 4]);
             let path: Vec<u64> = (0..3)
-                .map(|step| ids[(i0 * (2 - step) + i1 * step) / 2][(j0 * (2 - step) + j1 * step) / 2])
+                .map(|step| {
+                    ids[(i0 * (2 - step) + i1 * step) / 2][(j0 * (2 - step) + j1 * step) / 2]
+                })
                 .collect();
             let points = format!("(#{},#{},#{})", path[0], path[1], path[2]);
             let curve = if k == 0 {
@@ -1981,15 +2017,26 @@ mod tests {
         assert_eq!(report.bodies, 3);
         assert_eq!(geometry.triangles.len(), 36);
         assert_eq!(geometry.material_slots, vec!["Colour FF0000", "Default"]);
-        let red = geometry.triangle_materials.iter().filter(|s| **s == 0).count();
+        let red = geometry
+            .triangle_materials
+            .iter()
+            .filter(|s| **s == 0)
+            .count();
         assert_eq!(red, 24);
-        assert!((volume(geometry) - 3e-6).abs() < 1e-11, "{}", volume(geometry));
+        assert!(
+            (volume(geometry) - 3e-6).abs() < 1e-11,
+            "{}",
+            volume(geometry)
+        );
         // The turned instance spans x from 2 in - 10 mm to 2 in; the mapped
         // one sits 3 in up.
         let (min, max) = bounds(geometry);
         assert!(min.abs().max_element() < 1e-6, "{min}");
         assert!(
-            (max - Vec3::new(0.0508, 0.01, 0.0762 + 0.01)).abs().max_element() < 1e-6,
+            (max - Vec3::new(0.0508, 0.01, 0.0762 + 0.01))
+                .abs()
+                .max_element()
+                < 1e-6,
             "{max}"
         );
         assert!(uvs_in_unit_square(geometry));
@@ -2027,9 +2074,8 @@ mod tests {
         // The same tetrahedron as an AP242 tessellated shell.
         let mut writer = Writer::new();
         let (context, _) = writer.millimetre_context();
-        let coordinates = writer.add(
-            "COORDINATES_LIST('',4,((0.,0.,0.),(10.,0.,0.),(0.,10.,0.),(0.,0.,10.)))",
-        );
+        let coordinates =
+            writer.add("COORDINATES_LIST('',4,((0.,0.,0.),(10.,0.,0.),(0.,10.,0.),(0.,0.,10.)))");
         let face = writer.add(format!(
             "TRIANGULATED_FACE('',#{coordinates},0,(),$,(),((1,3,2),(1,2,4),(1,4,3),(2,3,4)))"
         ));

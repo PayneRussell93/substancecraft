@@ -35,8 +35,9 @@ pub use history_file::{
     HISTORY_EXTENSION, MAX_HISTORY_BYTES, history_path, load_project_history, save_project_history,
 };
 pub use interchange::{
-    GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, openpbr_preset,
-    read_openpbr_materialx, write_gltf, write_openpbr_materialx,
+    GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, materialx_color_space,
+    openpbr_fill, openpbr_preset, openpbr_texture_color_space, read_openpbr_materialx, write_gltf,
+    write_openpbr_materialx,
 };
 pub use jobs::{
     DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, load_mesh_file, load_project_mesh,
@@ -739,6 +740,7 @@ mod tests {
                         blend_mode: substancecraft_core::BlendMode::Multiply,
                         children: None,
                         evolutions: Vec::new(),
+                        exposed: Vec::new(),
                         channel_blend_modes: BTreeMap::new(),
                         uv_tiles: BTreeSet::new(),
                         filter_channels: BTreeSet::new(),

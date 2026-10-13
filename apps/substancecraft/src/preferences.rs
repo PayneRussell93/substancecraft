@@ -252,6 +252,8 @@ pub struct Preferences {
     pub cache_budget_mb: u32,
     /// Lighting-check environment of the viewport.
     pub lighting_preset: substancecraft_core::LightingPreset,
+    /// Colour space the brush colour's numeric fields are shown in.
+    pub picker_color_space: substancecraft_core::ColorSpace,
 }
 
 impl Default for Preferences {
@@ -265,6 +267,7 @@ impl Default for Preferences {
             overlay_pattern: false,
             cache_budget_mb: crate::cache::DEFAULT_CACHE_BUDGET_MB,
             lighting_preset: substancecraft_core::LightingPreset::default(),
+            picker_color_space: substancecraft_core::ColorSpace::Srgb,
         }
     }
 }
@@ -315,6 +318,10 @@ impl Preferences {
         };
         self.bindings.retain(|binding| binding.key().is_some());
         self.favorites.truncate(MAX_FAVORITES);
+        // Raw data is not a colour space to pick colours in.
+        if self.picker_color_space == substancecraft_core::ColorSpace::Raw {
+            self.picker_color_space = substancecraft_core::ColorSpace::Srgb;
+        }
         self.cache_budget_mb = self.cache_budget_mb.clamp(
             crate::cache::MIN_CACHE_BUDGET_MB,
             crate::cache::MAX_CACHE_BUDGET_MB,
@@ -382,6 +389,33 @@ impl SubstanceCraftApp {
             self.preferences.values.lighting_preset = preset;
             self.save_preferences();
         }
+    }
+
+    /// Shows the brush colour's numeric fields in `space` from now on.
+    pub(super) fn set_picker_color_space(&mut self, space: substancecraft_core::ColorSpace) {
+        if space != substancecraft_core::ColorSpace::Raw
+            && self.preferences.values.picker_color_space != space
+        {
+            self.preferences.values.picker_color_space = space;
+            self.save_preferences();
+        }
+    }
+
+    /// Sets the brush colour from `rgb` given in `space`, keeping its
+    /// alpha. Returns whether the colour lay outside sRGB and was clipped;
+    /// the clipped result is remembered so the panel can say so while it
+    /// stays the brush colour.
+    pub(super) fn set_brush_color_in(
+        &mut self,
+        space: substancecraft_core::ColorSpace,
+        rgb: glam::Vec3,
+    ) -> bool {
+        let ([r, g, b], clipped) = space.to_srgb8(rgb);
+        let alpha = self.brush_color.a();
+        // The bytes are the stroke colour as stored, so they are set as is.
+        self.brush_color = egui::Color32::from_rgba_premultiplied(r, g, b, alpha);
+        self.picker_clipped = clipped.then_some(self.brush_color);
+        clipped
     }
 
     pub(super) fn save_preferences(&mut self) {

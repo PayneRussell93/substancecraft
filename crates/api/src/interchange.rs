@@ -1,14 +1,14 @@
 //! Material interchange through documented open formats: OpenPBR surfaces in
 //! MaterialX documents, and glTF 2.0 metallic-roughness materials.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 use serde_json::json;
 use substancecraft_core::{
-    ChannelSlot, ExportOutput, ExportPreset, MaterialChannel, MeshGeometry, OutputLayout,
-    SourceComponent, vertex_normals,
+    ChannelSlot, ColorSpace, ExportOutput, ExportPreset, LayerFill, MaterialChannel, MeshGeometry,
+    OutputLayout, ResourceId, SourceComponent, vertex_normals,
 };
 use thiserror::Error;
 
@@ -151,28 +151,50 @@ pub fn write_openpbr_materialx(
 }
 
 /// An OpenPBR material read back from MaterialX: its name and, per OpenPBR
-/// input, the texture file feeding it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// input, the texture file feeding it or its constant value.
+#[derive(Clone, Debug, PartialEq)]
 pub struct OpenPbrMaterial {
     pub name: String,
+    /// Texture file (relative to the document) per input.
     pub textures: BTreeMap<String, String>,
+    /// Constant value per unconnected input: three components for colours,
+    /// one for floats, in the document's colour space.
+    pub values: BTreeMap<String, Vec<f32>>,
+    /// The `colorspace` of each texture input's file, where the document
+    /// gives one.
+    pub texture_color_spaces: BTreeMap<String, String>,
+    /// The document's working colour space (`lin_rec709` when unstated).
+    pub color_space: String,
+}
+
+/// Where a shader input reads from.
+enum Binding {
+    /// A nodegraph output.
+    Output(String),
+    /// A node in the document.
+    Node(String),
 }
 
 /// Reads the first `surfacematerial` with an `open_pbr_surface` shader,
-/// following each shader input through its nodegraph output (and an
-/// optional `normalmap`) to the image file.
+/// following each shader input through its nodegraph output or node (and an
+/// optional `normalmap`) to the image file, and keeping the constant value
+/// of inputs that have one.
 pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, InterchangeError> {
     let xml = std::fs::read_to_string(path).map_err(io)?;
     let mut reader = quick_xml::Reader::from_str(&xml);
     let invalid = |error: &dyn std::fmt::Display| InterchangeError::Invalid(error.to_string());
 
-    // node name -> file (images) or upstream node (normal maps); output name
-    // -> node; shader input -> output; material -> shader.
+    // node name -> file and colour space (images) or upstream node (normal
+    // maps); output name -> node; shader input -> binding; material ->
+    // shader.
     let mut image_files = BTreeMap::new();
+    let mut image_spaces = BTreeMap::new();
     let mut upstream = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     let mut shader_inputs = BTreeMap::new();
+    let mut values = BTreeMap::new();
     let mut material = None;
+    let mut color_space = "lin_rec709".to_owned();
     let mut stack: Vec<(String, String)> = Vec::new();
     loop {
         let event = reader.read_event().map_err(|error| invalid(&error))?;
@@ -202,6 +224,11 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
         let name = attributes.get("name").cloned().unwrap_or_default();
         let parent = stack.last().cloned();
         match (tag.as_str(), parent) {
+            ("materialx", _) => {
+                if let Some(space) = attributes.get("colorspace") {
+                    color_space.clone_from(space);
+                }
+            }
             ("output", _) => {
                 if let Some(node) = attributes.get("nodename") {
                     outputs.insert(name.clone(), node.clone());
@@ -210,7 +237,10 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
             ("input", Some((parent_tag, parent_name))) => match parent_tag.as_str() {
                 "image" if name == "file" => {
                     if let Some(value) = attributes.get("value") {
-                        image_files.insert(parent_name, value.clone());
+                        image_files.insert(parent_name.clone(), value.clone());
+                    }
+                    if let Some(space) = attributes.get("colorspace") {
+                        image_spaces.insert(parent_name, space.clone());
                     }
                 }
                 "normalmap" if name == "in" => {
@@ -220,7 +250,20 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
                 }
                 "open_pbr_surface" => {
                     if let Some(output) = attributes.get("output") {
-                        shader_inputs.insert(name.clone(), output.clone());
+                        shader_inputs.insert(name.clone(), Binding::Output(output.clone()));
+                    } else if let Some(node) = attributes.get("nodename") {
+                        shader_inputs.insert(name.clone(), Binding::Node(node.clone()));
+                    } else if let Some(value) = attributes.get("value") {
+                        let components: Vec<f32> = value
+                            .split(',')
+                            .map(|part| part.trim().parse::<f32>())
+                            .collect::<Result<_, _>>()
+                            .map_err(|_| {
+                                InterchangeError::Invalid(format!(
+                                    "input `{name}` has a malformed value `{value}`"
+                                ))
+                            })?;
+                        values.insert(name.clone(), components);
                     }
                 }
                 "surfacematerial" if name == "surfaceshader" && material.is_none() => {
@@ -237,18 +280,120 @@ pub fn read_openpbr_materialx(path: &Path) -> Result<OpenPbrMaterial, Interchang
     let name =
         material.ok_or_else(|| InterchangeError::Invalid("no surfacematerial".to_owned()))?;
     let mut textures = BTreeMap::new();
-    for (input, output) in shader_inputs {
-        let Some(mut node) = outputs.get(&output).cloned() else {
-            continue;
+    let mut texture_color_spaces = BTreeMap::new();
+    for (input, binding) in shader_inputs {
+        let node = match binding {
+            Binding::Output(output) => match outputs.get(&output) {
+                Some(node) => node.clone(),
+                None => continue,
+            },
+            Binding::Node(node) => node,
         };
-        if let Some(image) = upstream.get(&node) {
-            node = image.clone();
-        }
+        let node = upstream.get(&node).cloned().unwrap_or(node);
         if let Some(file) = image_files.get(&node) {
-            textures.insert(input, file.clone());
+            textures.insert(input.clone(), file.clone());
+            if let Some(space) = image_spaces.get(&node) {
+                texture_color_spaces.insert(input, space.clone());
+            }
         }
     }
-    Ok(OpenPbrMaterial { name, textures })
+    Ok(OpenPbrMaterial {
+        name,
+        textures,
+        values,
+        texture_color_spaces,
+        color_space,
+    })
+}
+
+/// The colour space a MaterialX `colorspace` name stands for, or `None`
+/// for names SubstanceCraft cannot convert.
+pub fn materialx_color_space(name: &str) -> Option<ColorSpace> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "srgb_texture" | "srgb" | "srgb_rec709" => Some(ColorSpace::Srgb),
+        "lin_rec709" | "lin_srgb" | "linear" => Some(ColorSpace::LinearSrgb),
+        "acescg" | "lin_ap1" => Some(ColorSpace::AcesCg),
+        "raw" | "none" | "data" => Some(ColorSpace::Raw),
+        _ => None,
+    }
+}
+
+/// The colour space the texture feeding OpenPBR `input` is read in: the
+/// one the document names, else sRGB for colours and raw data otherwise.
+pub fn openpbr_texture_color_space(material: &OpenPbrMaterial, input: &str) -> ColorSpace {
+    material
+        .texture_color_spaces
+        .get(input)
+        .and_then(|name| materialx_color_space(name))
+        .unwrap_or(match input {
+            "base_color" | "emission_color" => ColorSpace::Srgb,
+            _ => ColorSpace::Raw,
+        })
+}
+
+/// The fill layer settings an OpenPBR material describes, and the channels
+/// it writes. Texture inputs bind the resource `resources` maps them to;
+/// constant colours convert from the document's colour space to sRGB;
+/// unset inputs take OpenPBR's defaults (base colour 0.8, roughness 0.3,
+/// metalness 0). Emission is written only when given a texture or a colour
+/// other than black; normals and opacity only when given.
+pub fn openpbr_fill(
+    material: &OpenPbrMaterial,
+    resources: &BTreeMap<String, ResourceId>,
+) -> (LayerFill, BTreeSet<MaterialChannel>) {
+    let space = materialx_color_space(&material.color_space).unwrap_or(ColorSpace::LinearSrgb);
+    let scalar = |input: &str, default: f32| {
+        material
+            .values
+            .get(input)
+            .and_then(|value| value.first().copied())
+            .filter(|value| value.is_finite())
+            .map_or(default, |value| value.clamp(0.0, 1.0))
+    };
+    let color = |input: &str, default: [f32; 3]| {
+        let rgb = material
+            .values
+            .get(input)
+            .filter(|value| value.len() == 3 && value.iter().all(|c| c.is_finite()))
+            .map_or(glam::Vec3::from(default), |value| {
+                glam::Vec3::new(value[0], value[1], value[2])
+            });
+        space
+            .to_srgb(rgb.max(glam::Vec3::ZERO))
+            .to_array()
+            .map(|component| (component.clamp(0.0, 1.0) * 255.0).round() as u8)
+    };
+    let mut fill = LayerFill::default();
+    let [r, g, b] = color("base_color", [0.8, 0.8, 0.8]);
+    fill.color = [r, g, b, 255];
+    fill.roughness = scalar("specular_roughness", 0.3);
+    fill.metallic = scalar("base_metalness", 0.0);
+    fill.emissive = color("emission_color", [0.0, 0.0, 0.0]);
+    fill.material_opacity = scalar("geometry_opacity", 1.0);
+    let mut channels = BTreeSet::from([
+        MaterialChannel::BaseColor,
+        MaterialChannel::Roughness,
+        MaterialChannel::Metallic,
+    ]);
+    if resources.contains_key("emission_color") || fill.emissive != [0, 0, 0] {
+        channels.insert(MaterialChannel::Emissive);
+    }
+    if resources.contains_key("geometry_normal") {
+        channels.insert(MaterialChannel::Normal);
+    }
+    if resources.contains_key("geometry_opacity")
+        || material.values.contains_key("geometry_opacity")
+    {
+        channels.insert(MaterialChannel::Opacity);
+    }
+    for (input, channel, _, _) in OPENPBR_INPUTS {
+        if let (Some(resource), Some(slot)) =
+            (resources.get(input), fill.textures.slot_mut(channel))
+        {
+            *slot = Some(*resource);
+        }
+    }
+    (fill, channels)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,5 +663,116 @@ mod tests {
         );
         assert_eq!(document["images"].as_array().unwrap().len(), 5);
         assert!(write_gltf(&path, &MeshGeometry::default(), 60.0, &[]).is_err());
+    }
+
+    #[test]
+    fn tc_0331_openpbr_materials_read_constants_and_map_onto_fill_layers() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("gilded.mtlx");
+        let document = |space: &str, base: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<materialx version="1.39" colorspace="{space}">
+  <image name="rough_img" type="float">
+    <input name="file" type="filename" value="rough.png" colorspace="raw" />
+  </image>
+  <open_pbr_surface name="SR" type="surfaceshader">
+    <input name="base_color" type="color3" value="{base}" />
+    <input name="base_metalness" type="float" value="1" />
+    <input name="specular_roughness" type="float" nodename="rough_img" />
+    <input name="emission_color" type="color3" value="0, 0, 0" />
+    <input name="geometry_opacity" type="float" value="0.5" />
+  </open_pbr_surface>
+  <surfacematerial name="Gilded" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="SR" />
+  </surfacematerial>
+</materialx>
+"#
+            )
+        };
+
+        // Constants are kept, and inputs bound straight to a node resolve.
+        std::fs::write(&path, document("lin_rec709", "0.2158605, 0.0, 1.0")).unwrap();
+        let material = read_openpbr_materialx(&path).unwrap();
+        assert_eq!(material.name, "Gilded");
+        assert_eq!(material.color_space, "lin_rec709");
+        assert_eq!(
+            material.textures,
+            [("specular_roughness".to_owned(), "rough.png".to_owned())].into()
+        );
+        assert_eq!(material.values["base_metalness"], [1.0]);
+        assert_eq!(material.values["base_color"], [0.215_860_5, 0.0, 1.0]);
+        assert_eq!(
+            openpbr_texture_color_space(&material, "specular_roughness"),
+            ColorSpace::Raw
+        );
+        assert_eq!(
+            openpbr_texture_color_space(&material, "base_color"),
+            ColorSpace::Srgb,
+            "colour textures default to sRGB"
+        );
+
+        // The fill: linear colour encoded as sRGB, the texture bound, black
+        // emission left out, the given opacity written.
+        let resources = [("specular_roughness".to_owned(), ResourceId(7))].into();
+        let (fill, channels) = openpbr_fill(&material, &resources);
+        assert_eq!(fill.color, [128, 0, 255, 255]);
+        assert_eq!(fill.metallic, 1.0);
+        assert_eq!(fill.material_opacity, 0.5);
+        assert_eq!(fill.textures.roughness, Some(ResourceId(7)));
+        assert_eq!(fill.textures.base_color, None);
+        assert_eq!(
+            channels,
+            [
+                MaterialChannel::BaseColor,
+                MaterialChannel::Roughness,
+                MaterialChannel::Metallic,
+                MaterialChannel::Opacity,
+            ]
+            .into()
+        );
+
+        // ACEScg documents convert their colours; unknown spaces read as
+        // linear Rec.709.
+        std::fs::write(&path, document("acescg", "1, 1, 1")).unwrap();
+        let (fill, _) = openpbr_fill(&read_openpbr_materialx(&path).unwrap(), &BTreeMap::new());
+        assert!(
+            fill.color[..3].iter().all(|c| *c >= 254),
+            "{:?}",
+            fill.color
+        );
+        assert_eq!(materialx_color_space("lin_ap1"), Some(ColorSpace::AcesCg));
+        assert_eq!(materialx_color_space("g22_ap1"), None);
+
+        // Defaults for a bare surface, and every round-tripped texture binds.
+        let written: BTreeMap<String, String> = OPENPBR_INPUTS
+            .iter()
+            .map(|(input, _, _, _)| ((*input).to_owned(), format!("{input}.png")))
+            .collect();
+        write_openpbr_materialx(&path, "Hull", &written).unwrap();
+        let material = read_openpbr_materialx(&path).unwrap();
+        assert_eq!(material.textures, written);
+        assert!(material.values.is_empty());
+        let resources: BTreeMap<String, ResourceId> = OPENPBR_INPUTS
+            .iter()
+            .enumerate()
+            .map(|(index, (input, _, _, _))| ((*input).to_owned(), ResourceId(index as u64 + 1)))
+            .collect();
+        let (fill, channels) = openpbr_fill(&material, &resources);
+        assert_eq!(fill.color, [231, 231, 231, 255], "OpenPBR's 0.8 grey");
+        assert_eq!(fill.roughness, 0.3);
+        for (index, (_, channel, _, _)) in OPENPBR_INPUTS.iter().enumerate() {
+            assert_eq!(
+                fill.textures.for_channel(*channel),
+                Some(ResourceId(index as u64 + 1))
+            );
+            assert!(channels.contains(channel), "{channel:?}");
+        }
+
+        std::fs::write(&path, document("lin_rec709", "red, 0, 0")).unwrap();
+        assert!(matches!(
+            read_openpbr_materialx(&path),
+            Err(InterchangeError::Invalid(reason)) if reason.contains("base_color")
+        ));
     }
 }

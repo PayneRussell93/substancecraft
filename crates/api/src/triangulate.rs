@@ -194,7 +194,8 @@ impl Earcut {
         let mut signed = 0.0;
         let mut previous = range.end.checked_sub(1)?;
         for index in range.clone() {
-            signed += (points[previous].x - points[index].x) * (points[index].y + points[previous].y);
+            signed +=
+                (points[previous].x - points[index].x) * (points[index].y + points[previous].y);
             previous = index;
         }
         let mut last = None;
@@ -506,12 +507,7 @@ impl Earcut {
             if h.x >= point.x
                 && point.x >= mp.x
                 && h.x != point.x
-                && point_in_triangle(
-                    DVec2::new(first, h.y),
-                    mp,
-                    DVec2::new(last, h.y),
-                    point,
-                )
+                && point_in_triangle(DVec2::new(first, h.y), mp, DVec2::new(last, h.y), point)
             {
                 let tan = (h.y - point.y).abs() / (h.x - point.x);
                 let current = self.p(m);
@@ -688,7 +684,8 @@ impl Earcut {
             let next = self.p(self.next(p));
             if (point.y > middle.y) != (next.y > middle.y)
                 && next.y != point.y
-                && middle.x < (next.x - point.x) * (middle.y - point.y) / (next.y - point.y) + point.x
+                && middle.x
+                    < (next.x - point.x) * (middle.y - point.y) / (next.y - point.y) + point.x
             {
                 inside = !inside;
             }
@@ -735,9 +732,12 @@ pub(crate) fn orient(a: DVec2, b: DVec2, c: DVec2) -> f64 {
 
 fn in_circle(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> (f64, f64) {
     let (ad, bd, cd) = (a - d, b - d, c - d);
-    let (al, bl, cl) = (ad.length_squared(), bd.length_squared(), cd.length_squared());
-    let determinant =
-        al * bd.perp_dot(cd) + bl * cd.perp_dot(ad) + cl * ad.perp_dot(bd);
+    let (al, bl, cl) = (
+        ad.length_squared(),
+        bd.length_squared(),
+        cd.length_squared(),
+    );
+    let determinant = al * bd.perp_dot(cd) + bl * cd.perp_dot(ad) + cl * ad.perp_dot(bd);
     let scale = al + bl + cl;
     (determinant, scale * scale)
 }
@@ -758,7 +758,9 @@ impl TriangleMesh {
         let triangles: Vec<[u32; 3]> = triangles
             .into_iter()
             .filter(|triangle| {
-                triangle.iter().all(|corner| (*corner as usize) < points.len())
+                triangle
+                    .iter()
+                    .all(|corner| (*corner as usize) < points.len())
                     && orient(
                         points[triangle[0] as usize],
                         points[triangle[1] as usize],
@@ -873,9 +875,10 @@ impl TriangleMesh {
         }
     }
 
-    /// Splits boundary edges at the ring points the ear clipper dropped as
-    /// collinear, so every boundary point of `rings` is a mesh vertex.
-    /// Points off their edge (cut away as self-intersections) stay out.
+    /// Splits boundary edges at the ring points the ear clipper dropped (as
+    /// collinear, or in slivers too thin to keep), so every boundary point
+    /// of `rings` is a mesh vertex. Points well off their edge (cut away as
+    /// self-intersections) stay out.
     pub(crate) fn restore_boundary_points(&mut self, rings: &[std::ops::Range<usize>]) {
         let mut used = vec![false; self.points.len()];
         for triangle in &self.triangles {
@@ -923,10 +926,17 @@ impl TriangleMesh {
                 let (mut triangle, mut k) = entry;
                 for point in gap {
                     let (a, b, p) = (self.point(start), self.point(end), self.point(point));
+                    let c = self.point(self.triangles[triangle as usize][(k + 2) % 3]);
                     let segment = b - a;
                     let along = (p - a).dot(segment) / segment.length_squared().max(1e-300);
                     let off = (p - a).perp_dot(segment).abs() / segment.length().max(1e-300);
-                    if !(along > 0.0 && along < 1.0) || off > 1e-7 * segment.length() {
+                    // Nearly on the edge, and splitting there leaves both
+                    // halves counter-clockwise.
+                    if !(along > 0.0 && along < 1.0)
+                        || off > 0.1 * segment.length()
+                        || orient(a, p, c) <= 0.0
+                        || orient(p, b, c) <= 0.0
+                    {
                         continue;
                     }
                     boundary.remove(&(start, end));
