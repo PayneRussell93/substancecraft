@@ -56,3 +56,5 @@ REQ-0054,Collect project diagnostics in one panel with a copyable report,docs/fe
 REQ-0055,Start new projects from built-in or saved templates,docs/feature-map.md,docs/architecture.md,,TC-0303;TC-0304,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0056,Import ASCII FBX meshes like binary ones,docs/feature-map.md,docs/api-and-mcp.md,,TC-0305;TC-0306,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0057,Edit layer structure masks strokes texture sets and meshes through automation and MCP,docs/feature-map.md,docs/api-and-mcp.md,,TC-0307;TC-0308;TC-0309;TC-0310,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0058,Check materials under one-click lighting environments,docs/feature-map.md,docs/architecture.md,,TC-0311;TC-0312;TC-0313;TC-0314;TC-0315,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0059,Import skeletons skin weights and animation clips and pose meshes in the viewport,docs/feature-map.md,docs/architecture.md,,TC-0316;TC-0317;TC-0318;TC-0319;TC-0320;TC-0321;TC-0322,Documentation/Quality/TestPlan-short.md,Project owner,Verified

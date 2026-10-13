@@ -34,6 +34,7 @@ use substancecraft_core::{
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
+mod animation;
 mod autosave;
 mod bake_log;
 mod cache;
@@ -156,6 +157,12 @@ struct SubstanceCraftApp {
     loaded_mesh: Option<MeshAsset>,
     imported_meshes: Vec<ImportedMesh>,
     selected_imported_mesh: Option<usize>,
+    /// How the viewport mesh is posed by its imported rig.
+    animation: animation::AnimationState,
+    /// The posed viewport mesh, kept until the pose or mesh changes.
+    posed_mesh: Option<animation::PosedMesh>,
+    /// Pose of the vertices Filament has: `Some(None)` is the bind pose.
+    filament_pose: Option<Option<animation::PoseKey>>,
     import_error: Option<String>,
     import_scale: f32,
     project_path: Option<std::path::PathBuf>,
@@ -741,6 +748,9 @@ impl Default for SubstanceCraftApp {
             loaded_mesh: None,
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
+            animation: animation::AnimationState::default(),
+            posed_mesh: None,
+            filament_pose: None,
             import_error: None,
             import_scale: 1.0,
             project_path: None,
@@ -751,6 +761,7 @@ impl Default for SubstanceCraftApp {
             current_pose: NamedPose {
                 id: PoseId(0),
                 name: "Current Pose".to_owned(),
+                animation: None,
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             },
             viewport_camera: ViewportCamera::default(),
@@ -935,6 +946,9 @@ impl SubstanceCraftApp {
 
     fn set_base_geometry(&mut self, geometry: Option<MeshGeometry>) {
         self.base_geometry = geometry;
+        // A new mesh starts in its bind pose.
+        self.animation = animation::AnimationState::default();
+        self.posed_mesh = None;
         self.rebuild_mesh();
     }
 
@@ -1110,6 +1124,9 @@ impl SubstanceCraftApp {
             return;
         }
         let plan = self.slot_upload_plan(target);
+        // The posed mesh, when the viewport shows a pose; bound otherwise.
+        let pose = self.pose_key();
+        let shown = self.display_mesh();
         let Some(mesh) = self.mesh_geometry.as_deref() else {
             return;
         };
@@ -1118,16 +1135,32 @@ impl SubstanceCraftApp {
         };
         if self.filament_mesh_revision != Some(self.mesh_revision) {
             match renderer.set_mesh(mesh, self.mesh_smoothing.angle_degrees) {
-                Ok(()) => self.filament_mesh_revision = Some(self.mesh_revision),
+                Ok(()) => {
+                    self.filament_mesh_revision = Some(self.mesh_revision);
+                    self.filament_pose = Some(None);
+                }
                 Err(error) => {
                     self.filament_error = Some(error.to_string());
                     return;
                 }
             }
         }
-        if let Err(error) =
-            apply_environment(renderer, self.viewport_lighting, &mut self.filament_environment)
+        if self.filament_pose.as_ref() != Some(&pose)
+            && let Some(shown) = &shown
         {
+            match renderer.update_vertices(shown, self.mesh_smoothing.angle_degrees) {
+                Ok(()) => self.filament_pose = Some(pose),
+                Err(error) => {
+                    self.filament_error = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+        if let Err(error) = apply_environment(
+            renderer,
+            self.viewport_lighting,
+            &mut self.filament_environment,
+        ) {
             self.filament_error = Some(error.to_string());
             return;
         }
@@ -1471,6 +1504,7 @@ impl SubstanceCraftApp {
             .unwrap_or_else(|| NamedPose {
                 id: PoseId(0),
                 name: "Current Pose".to_owned(),
+                animation: None,
                 bones: BTreeMap::from([(BoneId(0), BoneTransform::IDENTITY)]),
             });
         self.viewport_camera = ViewportCamera::default();
@@ -2515,7 +2549,9 @@ impl SubstanceCraftApp {
     /// projection is on and the mode paints, erases, or masks (ID strokes
     /// stay in UV space).
     fn projects_strokes(&self) -> bool {
+        // Projected strokes rasterise the bind mesh, so they wait for it.
         self.projection_painting
+            && !self.is_posed()
             && matches!(
                 self.paint_mode,
                 PaintMode::Paint | PaintMode::Erase | PaintMode::Mask
@@ -4993,7 +5029,12 @@ impl SubstanceCraftApp {
         let amount =
             ((now - transition.started_at) / POSE_TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
         match transition.from.interpolate(&transition.to, amount) {
-            Ok(pose) => self.current_pose = pose,
+            Ok(pose) => {
+                // A saved animation frame shows (blending its time within
+                // one clip) as the pose transitions.
+                self.show_animation_frame(pose.animation.as_ref());
+                self.current_pose = pose;
+            }
             Err(_) => {
                 self.pose_transition = None;
                 return;
@@ -5018,7 +5059,10 @@ impl SubstanceCraftApp {
         };
         self.selected_pose = Some(pose_id);
         self.pose_transition = Some(PoseTransition {
-            from: self.current_pose.clone(),
+            from: NamedPose {
+                animation: self.animation_frame(),
+                ..self.current_pose.clone()
+            },
             to: target,
             started_at: context.input(|input| input.time),
         });
@@ -5061,6 +5105,7 @@ impl SubstanceCraftApp {
         }
         let mut pose = self.current_pose.clone();
         pose.id = PoseId(next_id);
+        pose.animation = self.animation_frame();
         pose.name.clone_from(&name);
         self.project.saved_poses.push(pose);
         self.selected_pose = Some(PoseId(next_id));
@@ -5248,12 +5293,11 @@ impl SubstanceCraftApp {
             || (painting && response.hovered())
             || response.clicked()
             || (selecting && response.hovered());
+        // Points come from the shown (possibly posed) mesh; picks read UVs
+        // and positions from the bind mesh, which shares its topology.
+        let shown = self.display_mesh();
         let projected = needs_projection
-            .then(|| {
-                self.mesh_geometry
-                    .as_ref()
-                    .map(|mesh| projection.project_mesh(mesh))
-            })
+            .then(|| shown.as_ref().map(|mesh| projection.project_mesh(mesh)))
             .flatten();
 
         if let (Some(points), Some(mesh)) = (&projected, self.mesh_geometry.clone()) {
@@ -5315,7 +5359,7 @@ impl SubstanceCraftApp {
         if selecting {
             let overlay_points = projected
                 .clone()
-                .unwrap_or_else(|| projection.project_mesh(mesh));
+                .unwrap_or_else(|| projection.project_mesh(shown.as_deref().unwrap_or(mesh)));
             if let Some(mask) = self
                 .selected_layer()
                 .and_then(|layer| layer.polygon_mask.as_ref())
@@ -5406,9 +5450,15 @@ impl SubstanceCraftApp {
             self.brush_radius / set.resolution.height.max(1) as f32,
         );
         let outline = mesh.uv_brush_outline(hit.triangle, hit.position, uv_radius, 40)?;
+        // The outline is found on the bind mesh; a pose carries it along.
+        let posed = self.is_posed().then(|| self.shown_mesh()).flatten();
         Some(
             outline
                 .into_iter()
+                .map(|point| match &posed {
+                    Some(posed) => animation::carry_point(mesh, posed, hit.triangle, point),
+                    None => point,
+                })
                 .map(|point| projection.project(point).screen)
                 .collect(),
         )
@@ -5799,6 +5849,7 @@ impl eframe::App for SubstanceCraftApp {
         self.refresh_set_caches();
         self.enforce_cache_budget();
         self.update_pose_transition(ui.ctx());
+        self.advance_animation(ui.ctx());
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
         self.sync_layer_history(ui.ctx());
@@ -7791,7 +7842,7 @@ mod tests {
         app.add_fill_layer();
         small_sets(&mut app, 16);
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 150.0));
-        let mut render = |app: &mut SubstanceCraftApp, name: &str| {
+        let render = |app: &mut SubstanceCraftApp, name: &str| {
             let path = folder.path().join(name);
             app.queue_render(path.clone(), 128, None);
             for _ in 0..600 {
@@ -7828,5 +7879,247 @@ mod tests {
         let (preset, _, rotation) = app.filament_environment.unwrap();
         assert_eq!(preset, LightingPreset::Night);
         assert_eq!(rotation, app.viewport_lighting.rotation);
+    }
+
+    /// A triangle skinned to a two-bone arm whose elbow turns 90° about Z
+    /// over one second (the same rig as the API's FBX rig test).
+    const RIGGED_ARM_FBX: &str = r#"; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXVersion: 7400
+}
+Documents:  {
+	Document: 900, "Scene", "Scene" {
+		RootNode: 0
+	}
+}
+Objects:  {
+	Geometry: 1, "Geometry::Arm", "Mesh" {
+		Vertices: *9 {
+			a: 0.5,0,0,2,0,0,2,0.1,0
+		}
+		PolygonVertexIndex: *3 {
+			a: 0,1,-3
+		}
+	}
+	Model: 10, "Model::Arm", "Mesh" {
+	}
+	Model: 20, "Model::Shoulder", "LimbNode" {
+	}
+	Model: 21, "Model::Elbow", "LimbNode" {
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",1,0,0
+		}
+	}
+	Deformer: 30, "Deformer::Skin", "Skin" {
+	}
+	Deformer: 31, "SubDeformer::Shoulder", "Cluster" {
+		Indexes: *1 {
+			a: 0
+		}
+		Weights: *1 {
+			a: 1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+	}
+	Deformer: 32, "SubDeformer::Elbow", "Cluster" {
+		Indexes: *2 {
+			a: 1,2
+		}
+		Weights: *2 {
+			a: 1,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,1,0,0,1
+		}
+	}
+	AnimationStack: 40, "AnimStack::Bend", "" {
+	}
+	AnimationLayer: 41, "AnimLayer::BaseLayer", "" {
+	}
+	AnimationCurveNode: 42, "AnimCurveNode::R", "" {
+	}
+	AnimationCurve: 43, "AnimCurve::", "" {
+		KeyTime: *2 {
+			a: 0,46186158000
+		}
+		KeyValueFloat: *2 {
+			a: 0,90
+		}
+	}
+}
+Connections:  {
+	C: "OO",1,10
+	C: "OO",10,0
+	C: "OO",20,0
+	C: "OO",21,20
+	C: "OO",30,1
+	C: "OO",31,30
+	C: "OO",32,30
+	C: "OO",20,31
+	C: "OO",21,32
+	C: "OO",41,40
+	C: "OO",42,41
+	C: "OP",42,21, "Lcl Rotation"
+	C: "OP",43,42, "d|Z"
+}
+"#;
+
+    #[test]
+    fn tc_0320_rigged_meshes_pose_in_the_viewport_and_saved_poses_keep_their_frame() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("arm.fbx");
+        std::fs::write(&path, RIGGED_ARM_FBX).unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.set_mesh_smoothing(MeshSmoothing {
+            angle_degrees: 0.0,
+            subdivision_levels: 0,
+        });
+        app.load_imported_mesh(&path);
+        assert!(app.import_error.is_none(), "{:?}", app.import_error);
+        let rig = app.current_rig().unwrap();
+        assert_eq!(rig.clips[0].name, "Bend");
+
+        // Bind pose: the viewport shows the mesh as imported.
+        assert!(!app.is_posed());
+        let bind = app.display_mesh().unwrap();
+        assert_eq!(bind.vertices[1].position, glam::Vec3::new(2.0, 0.0, 0.0));
+
+        // At the end of the clip the elbow vertices have swung up, while the
+        // painted (bind) mesh is untouched.
+        app.animation.source = animation::PoseSource::Clip("Bend".to_owned());
+        app.animation.time = 1.0;
+        assert!(app.is_posed());
+        let posed = app.display_mesh().unwrap();
+        assert!((posed.vertices[1].position - glam::Vec3::new(1.0, 1.0, 0.0)).length() < 1e-4);
+        assert_eq!(
+            app.mesh_geometry.as_ref().unwrap().vertices[1].position,
+            glam::Vec3::new(2.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            posed.triangles,
+            app.mesh_geometry.as_ref().unwrap().triangles
+        );
+
+        // Picking the posed triangle returns bind-space UVs and positions.
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
+        app.viewport_camera = ViewportCamera {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..ViewportCamera::default()
+        };
+        let projection = app.view_projection(viewport);
+        let points = projection.project_mesh(&posed);
+        let centroid =
+            (points[0].screen.to_vec2() + points[1].screen.to_vec2() + points[2].screen.to_vec2())
+                / 3.0;
+        let bind_mesh = app.mesh_geometry.clone().unwrap();
+        let hit = pick_triangle(&bind_mesh, &points, centroid.to_pos2()).unwrap();
+        let expected = (bind_mesh.vertices[0].position
+            + bind_mesh.vertices[1].position
+            + bind_mesh.vertices[2].position)
+            / 3.0;
+        assert!(
+            (hit.position - expected).length() < 1e-3,
+            "{}",
+            hit.position
+        );
+        // A point on the bind triangle lands on the posed one.
+        let carried = animation::carry_point(&bind_mesh, &posed, 0, bind_mesh.vertices[1].position);
+        assert!((carried - posed.vertices[1].position).length() < 1e-4);
+
+        // Projection painting waits for the bind pose.
+        app.projection_painting = true;
+        app.paint_mode = PaintMode::Paint;
+        assert!(!app.projects_strokes());
+
+        // A saved pose keeps its frame; selecting it later restores it.
+        app.pose_name = "Bent".to_owned();
+        app.save_pose();
+        let saved = app.project.saved_poses.last().unwrap().clone();
+        assert_eq!(
+            saved.animation,
+            Some(substancecraft_core::AnimationFrame {
+                clip: Some("Bend".to_owned()),
+                time: 1.0
+            })
+        );
+        app.project.validate().unwrap();
+        app.show_animation_frame(None);
+        assert!(!app.is_posed());
+        assert!(app.projects_strokes());
+        let context = egui::Context::default();
+        app.select_pose(saved.id, &context);
+        // A headless context's clock stands still; start the transition
+        // long ago so it completes.
+        if let Some(transition) = app.pose_transition.as_mut() {
+            transition.started_at = -10.0;
+        }
+        app.update_pose_transition(&context);
+        assert!(app.pose_transition.is_none());
+        assert_eq!(
+            app.animation.source,
+            animation::PoseSource::Clip("Bend".to_owned())
+        );
+        assert_eq!(app.animation.time, 1.0);
+
+        // Playing moves time on and loops within the clip.
+        app.animation.time = 0.9;
+        app.animation.playing = true;
+        app.advance_animation(&context);
+        std::thread::sleep(Duration::from_millis(250));
+        app.advance_animation(&context);
+        assert!(app.animation.time < 0.9, "looped: {}", app.animation.time);
+
+        // A primitive has no rig and no animation controls.
+        app.select_primitive(PrimitivePreset::Cube);
+        assert!(app.current_rig().is_none());
+        assert!(!app.is_posed());
+    }
+
+    #[test]
+    #[ignore]
+    fn tc_0321_filament_shows_the_posed_mesh() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("arm.fbx");
+        std::fs::write(&path, RIGGED_ARM_FBX).unwrap();
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp {
+            filament_renderer: Some(FilamentRuntime::new(64, 64).unwrap()),
+            ..SubstanceCraftApp::default()
+        };
+        app.load_imported_mesh(&path);
+        app.viewport_camera = ViewportCamera {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..ViewportCamera::default()
+        };
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let render = |app: &mut SubstanceCraftApp, name: &str| {
+            let path = folder.path().join(name);
+            for _ in 0..2 {
+                app.queue_render(path.clone(), 128, None);
+                for _ in 0..600 {
+                    app.update_filament_frame(&context, viewport);
+                    if app.render_request.is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            load_texture_image(&path).unwrap().rgba8
+        };
+        let bound = render(&mut app, "bind.png");
+        app.animation.source = animation::PoseSource::Clip("Bend".to_owned());
+        app.animation.time = 1.0;
+        let posed = render(&mut app, "posed.png");
+        assert!(app.filament_pose.as_ref().is_some_and(Option::is_some));
+        let changed = bound
+            .chunks(4)
+            .zip(posed.chunks(4))
+            .filter(|(a, b)| a[..3] != b[..3])
+            .count();
+        assert!(changed > 50, "posing changes the render ({changed} texels)");
     }
 }

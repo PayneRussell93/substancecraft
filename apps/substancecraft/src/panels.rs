@@ -1336,6 +1336,7 @@ impl SubstanceCraftApp {
     }
 
     fn poses_drawer(&mut self, ui: &mut Ui) {
+        self.animation_section(ui);
         widgets::caption(ui, "Root translation");
         let transform = self
             .current_pose

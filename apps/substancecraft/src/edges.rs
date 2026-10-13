@@ -108,8 +108,18 @@ impl SubstanceCraftApp {
         if !self.edge_overlay.any() {
             return;
         }
-        let (Some(edges), Some(mesh)) = (self.overlay_edges(), self.mesh_geometry.clone()) else {
+        let (Some(edges), Some(bind)) = (self.overlay_edges(), self.mesh_geometry.clone()) else {
             return;
+        };
+        // Edges are found on the bind mesh; a pose carries them along.
+        let mesh = self.shown_mesh().unwrap_or_else(|| bind.clone());
+        let posed = self.is_posed();
+        let place = |triangle: u32, point: glam::Vec3| {
+            if posed {
+                super::animation::carry_point(&bind, &mesh, triangle, point)
+            } else {
+                point
+            }
         };
         let facing = |triangle: u32| {
             mesh.triangles
@@ -136,8 +146,8 @@ impl SubstanceCraftApp {
             let (width, dashed) = edge_style(kind, pattern);
             let stroke = egui::Stroke::new(width, colors[kind as usize]);
             let points = [
-                projection.project(edge.a).screen,
-                projection.project(edge.b).screen,
+                projection.project(place(edge.faces[0], edge.a)).screen,
+                projection.project(place(edge.faces[0], edge.b)).screen,
             ];
             if dashed {
                 painter.extend(egui::Shape::dashed_line(&points, stroke, 6.0, 4.0));

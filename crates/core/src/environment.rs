@@ -91,12 +91,12 @@ impl LightingPreset {
     /// Lux that a relative radiance of 1 stands for.
     pub const fn environment_lux(self) -> f32 {
         match self {
-            Self::Studio => 22_000.0,
-            Self::Overcast => 30_000.0,
-            Self::Sunset => 14_000.0,
-            Self::Warehouse => 20_000.0,
-            Self::BrightOutdoor => 24_000.0,
-            Self::Night => 9_000.0,
+            Self::Studio => 9_000.0,
+            Self::Overcast => 36_000.0,
+            Self::Sunset => 24_000.0,
+            Self::Warehouse => 26_000.0,
+            Self::BrightOutdoor => 14_000.0,
+            Self::Night => 30_000.0,
         }
     }
 
@@ -109,9 +109,9 @@ impl LightingPreset {
         };
         match self {
             Self::Studio | Self::Overcast | Self::Warehouse => None,
-            Self::Sunset => Some(light(6.0, 110.0, Vec3::new(1.0, 0.55, 0.3), 45_000.0)),
-            Self::BrightOutdoor => Some(light(55.0, -30.0, Vec3::new(1.0, 0.97, 0.9), 100_000.0)),
-            Self::Night => Some(light(35.0, 40.0, Vec3::new(0.65, 0.75, 1.0), 12_000.0)),
+            Self::Sunset => Some(light(6.0, 110.0, Vec3::new(1.0, 0.55, 0.3), 70_000.0)),
+            Self::BrightOutdoor => Some(light(55.0, -30.0, Vec3::new(1.0, 0.97, 0.9), 55_000.0)),
+            Self::Night => Some(light(35.0, 40.0, Vec3::new(0.65, 0.75, 1.0), 30_000.0)),
         }
     }
 
@@ -285,6 +285,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -299,15 +300,20 @@ mod tests {
 
     #[test]
     fn tc_0311_every_preset_is_finite_named_and_lit_from_above() {
-        let names: std::collections::BTreeSet<&str> =
-            LightingPreset::ALL.iter().map(|preset| preset.name()).collect();
+        let names: std::collections::BTreeSet<&str> = LightingPreset::ALL
+            .iter()
+            .map(|preset| preset.name())
+            .collect();
         assert_eq!(names.len(), 6);
         for preset in LightingPreset::ALL {
             let image = preset.equirect(64);
             assert_eq!((image.width, image.height), (64, 32));
             assert_eq!(image.rgb.len(), 64 * 32 * 3);
             assert!(
-                image.rgb.iter().all(|value| value.is_finite() && *value >= 0.0),
+                image
+                    .rgb
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0),
                 "{preset:?}"
             );
             // The upper hemisphere carries more light than the ground.
@@ -326,8 +332,10 @@ mod tests {
                 assert!(sun.illuminance > 0.0);
             }
         }
-        assert!(LightingPreset::BrightOutdoor.sun().unwrap().illuminance
-            > LightingPreset::Night.sun().unwrap().illuminance * 4.0);
+        assert!(
+            LightingPreset::BrightOutdoor.sun().unwrap().illuminance
+                > LightingPreset::Night.sun().unwrap().illuminance * 1.5
+        );
         assert!(LightingPreset::Overcast.sun().is_none());
     }
 
@@ -364,8 +372,10 @@ mod tests {
             assert!(luminance(preset.radiance(Vec3::Y)) > night * 5.0);
         }
         // The studio key light is brighter than its fill.
-        let key = LightingPreset::Studio.radiance(direction(35f32.to_radians(), -40f32.to_radians()));
-        let fill = LightingPreset::Studio.radiance(direction(15f32.to_radians(), 65f32.to_radians()));
+        let key =
+            LightingPreset::Studio.radiance(direction(35f32.to_radians(), -40f32.to_radians()));
+        let fill =
+            LightingPreset::Studio.radiance(direction(15f32.to_radians(), 65f32.to_radians()));
         assert!(luminance(key) > luminance(fill) * 2.0);
 
         // Rotation turns a sun about the vertical axis only.

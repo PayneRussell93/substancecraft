@@ -4,6 +4,7 @@
 mod automation;
 mod fbx;
 mod fbx_ascii;
+mod fbx_rig;
 mod gltf_import;
 mod history_file;
 mod interchange;
@@ -748,6 +749,7 @@ mod tests {
             saved_poses: vec![NamedPose {
                 id: PoseId(4),
                 name: "Turned".to_owned(),
+                animation: None,
                 bones: BTreeMap::from([(
                     BoneId(5),
                     BoneTransform {

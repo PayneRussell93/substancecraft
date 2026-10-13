@@ -9,7 +9,7 @@ use fbxcel_dom::{
 };
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
-use substancecraft_core::{MeshGeometry, MeshVertex};
+use substancecraft_core::{MeshGeometry, MeshVertex, Rig};
 use thiserror::Error;
 
 pub const MAX_FBX_BYTES: usize = 64 * 1024 * 1024;
@@ -293,6 +293,10 @@ pub struct ImportedMesh {
     pub name: String,
     pub geometry: MeshGeometry,
     pub generated_uvs: bool,
+    /// Skeleton, skin weights (one entry per vertex of `geometry`), and
+    /// animation clips, when the file animates this mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig: Option<Rig>,
 }
 
 /// Former name of [`ImportedMesh`].
@@ -421,6 +425,7 @@ fn import_mesh(
     let generated_uvs = uv_data.is_none();
     let mut vertices = Vec::with_capacity(triangulated.len());
     let mut triangles = Vec::with_capacity(triangulated.len() / 3);
+    let mut control_points = Vec::with_capacity(triangulated.len());
     for (vertex_index, triangle_vertex) in triangulated.triangle_vertex_indices().enumerate() {
         if vertex_index % 3 == 0
             && let Some(materials) = &material_data
@@ -430,6 +435,12 @@ fn import_mesh(
                 .map_err(|error| FbxImportError::InvalidMesh(error.to_string()))?;
             triangle_materials.push(slot.to_u32());
         }
+        control_points.push(
+            triangulated
+                .control_point_index(triangle_vertex)
+                .ok_or(FbxImportError::InvalidControlPoint)?
+                .to_u32(),
+        );
         let point = triangulated
             .control_point(triangle_vertex)
             .ok_or(FbxImportError::InvalidControlPoint)?;
@@ -485,10 +496,12 @@ fn import_mesh(
         .validate()
         .map_err(|error| FbxImportError::InvalidMesh(error.to_string()))?;
 
+    let rig = crate::fbx_rig::read_rig(&mesh, &control_points)?;
     Ok(ImportedMesh {
         name: mesh.name().unwrap_or("Mesh").to_owned(),
         geometry,
         generated_uvs,
+        rig,
     })
 }
 
@@ -984,5 +997,169 @@ Connections:  {
         assert_eq!(meshes[0].geometry.vertices[0].uv, Vec2::new(0.25, 0.5));
         assert_eq!(meshes[0].geometry.vertices[1].uv, Vec2::new(0.75, 0.5));
         assert_eq!(meshes[0].geometry.vertices[2].uv, Vec2::new(0.25, 1.0));
+    }
+
+    /// A triangle skinned to a two-bone arm (shoulder at the origin, elbow
+    /// at +X) with a one-second stack turning the elbow 90° about Z.
+    const ASCII_ARM: &str = r#"; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXVersion: 7400
+}
+Documents:  {
+	Document: 900, "Scene", "Scene" {
+		RootNode: 0
+	}
+}
+Objects:  {
+	Geometry: 1, "Geometry::Arm", "Mesh" {
+		Vertices: *9 {
+			a: 0.5,0,0,2,0,0,2,0.1,0
+		}
+		PolygonVertexIndex: *3 {
+			a: 0,1,-3
+		}
+	}
+	Model: 10, "Model::Arm", "Mesh" {
+		Version: 232
+	}
+	Model: 20, "Model::Shoulder", "LimbNode" {
+		Version: 232
+	}
+	Model: 21, "Model::Elbow", "LimbNode" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",1,0,0
+		}
+	}
+	Deformer: 30, "Deformer::Skin", "Skin" {
+		Version: 101
+	}
+	Deformer: 31, "SubDeformer::Shoulder", "Cluster" {
+		Version: 100
+		Indexes: *1 {
+			a: 0
+		}
+		Weights: *1 {
+			a: 1
+		}
+		Transform: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+	}
+	Deformer: 32, "SubDeformer::Elbow", "Cluster" {
+		Version: 100
+		Indexes: *2 {
+			a: 1,2
+		}
+		Weights: *2 {
+			a: 1,1
+		}
+		Transform: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,1,0,0,1
+		}
+	}
+	AnimationStack: 40, "AnimStack::Bend", "" {
+		Properties70:  {
+			P: "LocalStart", "KTime", "Time", "",0
+			P: "LocalStop", "KTime", "Time", "",46186158000
+		}
+	}
+	AnimationLayer: 41, "AnimLayer::BaseLayer", "" {
+	}
+	AnimationCurveNode: 42, "AnimCurveNode::R", "" {
+		Properties70:  {
+			P: "d|X", "Number", "", "A",0
+			P: "d|Y", "Number", "", "A",0
+			P: "d|Z", "Number", "", "A",0
+		}
+	}
+	AnimationCurve: 43, "AnimCurve::", "" {
+		Default: 0
+		KeyVer: 4009
+		KeyTime: *2 {
+			a: 0,46186158000
+		}
+		KeyValueFloat: *2 {
+			a: 0,90
+		}
+	}
+}
+Connections:  {
+	C: "OO",1,10
+	C: "OO",10,0
+	C: "OO",20,0
+	C: "OO",21,20
+	C: "OO",30,1
+	C: "OO",31,30
+	C: "OO",32,30
+	C: "OO",20,31
+	C: "OO",21,32
+	C: "OO",41,40
+	C: "OO",42,41
+	C: "OP",42,21, "Lcl Rotation"
+	C: "OP",43,42, "d|Z"
+}
+"#;
+
+    #[test]
+    fn tc_0319_fbx_skins_bones_and_animation_stacks_become_a_rig() {
+        use substancecraft_core::ClipSample;
+        let meshes = import_fbx_meshes(ASCII_ARM.as_bytes()).unwrap();
+        let mesh = &meshes[0];
+        let rig = mesh.rig.as_ref().unwrap();
+        let names: Vec<&str> = rig.joints.iter().map(|joint| joint.name.as_str()).collect();
+        assert_eq!(names, ["Arm", "Shoulder", "Elbow"]);
+        assert_eq!(rig.joints[2].parent, Some(1));
+        assert_eq!(rig.bindings.len(), 2);
+        assert_eq!(rig.clips.len(), 1);
+        assert_eq!(rig.clips[0].name, "Bend");
+        assert!((rig.clips[0].duration - 1.0).abs() < 1e-6);
+
+        let positions: Vec<Vec3> = mesh.geometry.vertices.iter().map(|v| v.position).collect();
+        let close = |a: Vec3, b: Vec3| (a - b).length() < 1e-4;
+        let rest = rig.pose_positions(&positions, 1.0, None).unwrap();
+        assert!(rest.iter().zip(&positions).all(|(a, b)| close(*a, *b)));
+        let clip = &rig.clips[0];
+        let end = rig
+            .pose_positions(
+                &positions,
+                1.0,
+                Some(ClipSample {
+                    clip,
+                    time: 1.0,
+                    in_place: false,
+                }),
+            )
+            .unwrap();
+        // Vertex order follows the triangle: 0.5 X on the shoulder, then
+        // the two elbow vertices.
+        assert!(close(end[0], positions[0]));
+        assert!(close(end[1], Vec3::new(1.0, 1.0, 0.0)), "{}", end[1]);
+        let half = rig
+            .pose_positions(
+                &positions,
+                1.0,
+                Some(ClipSample {
+                    clip,
+                    time: 0.5,
+                    in_place: false,
+                }),
+            )
+            .unwrap();
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(close(half[1], Vec3::new(1.0 + diagonal, diagonal, 0.0)));
+
+        // A static file has no rig.
+        assert!(
+            import_fbx_meshes(ASCII_CRATE.as_bytes()).unwrap()[0]
+                .rig
+                .is_none()
+        );
     }
 }

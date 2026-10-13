@@ -573,6 +573,27 @@ bool sc_renderer_set_mesh(ScRenderer* r, float const* vertices, uint32_t vertex_
     }
 }
 
+// Replaces the vertex data of the current mesh (same layout as sc_renderer_set_mesh) without
+// touching its indices, primitives, or material instances: a posed copy of the same topology.
+bool sc_renderer_set_vertices(ScRenderer* r, float const* vertices, uint32_t vertex_count) {
+    try {
+        if (!r->vertexBuffer || vertex_count != r->vertexBuffer->getVertexCount()) {
+            return false;
+        }
+        size_t const bytes = size_t(vertex_count) * 9 * sizeof(float);
+        void* copy = copyBytes(vertices, bytes);
+        if (!copy) {
+            return false;
+        }
+        // Filament takes ownership of `copy` and frees it once uploaded.
+        r->vertexBuffer->setBufferAt(*r->engine, 0,
+                VertexBuffer::BufferDescriptor(copy, bytes, freeCallback));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void sc_renderer_clear_mesh(ScRenderer* r) {
     try {
         destroyMesh(r);

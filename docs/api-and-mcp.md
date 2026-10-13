@@ -6,7 +6,7 @@
 
 - `list_primitive_presets()` for the supported starter-mesh names.
 - `inspect_primitive_preset(name)` for indexed topology counts, local-space bounds, and UV bounds.
-- `import_fbx_meshes(bytes)` for static mesh geometry from binary or ASCII FBX 7.4+ files (`import_binary_fbx_meshes(bytes)` accepts binary only).
+- `import_fbx_meshes(bytes)` for mesh geometry from binary or ASCII FBX 7.4+ files (`import_binary_fbx_meshes(bytes)` accepts binary only), and `import_gltf_file(path)` for glTF 2.0. When a file skins or animates a mesh, its `ImportedMesh::rig` holds the skeleton, up to four skin weights per vertex, and the animation clips; `Rig::pose_positions(positions, scale, sample)` poses the mesh at rest or at a time in a clip (optionally in place).
 - `bake_texture_set_base_color(texture_set)` for a bounded RGBA8 composite respecting layer opacity, grayscale masks, and optional ID-color clipping.
 - `bake_texture_set_id_mask(texture_set)` for the discrete color-coded ID map painted into UV layers.
 - `bake_texture_set_channel(texture_set, channel, mesh, mesh_maps)` for Base Color, Roughness, Metallic, or ID. Fill layers, mask generators (which need `mesh_maps`), polygon masks (which need `mesh`), painted masks, and ID clipping all compose here.
@@ -51,7 +51,7 @@ Project tools only reach paths inside the server's root directory: `SUBSTANCECRA
 
 The command line takes the same edits: `substancecraft-cli inspect <project>` prints the summary, and `substancecraft-cli edit <project> '<edit as JSON>'` applies one edit and prints its outcome (exit status 1 when refused, 2 when the JSON is invalid).
 
-The desktop uses the Rust API for local file import after checking the file-size limit. FBX import preserves supported FBX UV mappings, maps per-polygon materials to named material slots, creates a planar UV fallback when a mesh has no UV layer, and preflights declared decoded data against a memory budget. ASCII FBX is parsed, typed as binary FBX stores each value, and re-encoded as binary, so both forms share one importer. Model transforms, skins, and animation curves are not imported yet. Future MCP tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
+The desktop uses the Rust API for local file import after checking the file-size limit. FBX import preserves supported FBX UV mappings, maps per-polygon materials to named material slots, creates a planar UV fallback when a mesh has no UV layer, and preflights declared decoded data against a memory budget. ASCII FBX is parsed, typed as binary FBX stores each value, and re-encoded as binary, so both forms share one importer. Skins, bone hierarchies, and animation stacks become a rig (curve tangents are not read; keys interpolate linearly); static meshes are imported in geometry space without their model transform. Future MCP tools should call the same versioned command API as the desktop and CLI, validate all input, and return actionable tool errors rather than panicking.
 
 ## Verification
 

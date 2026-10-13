@@ -25,6 +25,7 @@ pub mod painting;
 mod raster;
 mod region;
 mod resources;
+pub mod rig;
 mod smoothing;
 mod templates;
 mod topology;
@@ -69,6 +70,10 @@ pub use resources::{
     BitmapMask, ContentHash, ContentHasher, DecalPlacement, MAX_PROJECTION_SCALE,
     MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE, ProjectResource,
     ProjectionMode, ResourceImages, ResourceProvenance, TextureImage, TextureProjection,
+};
+pub use rig::{
+    AnimationClip, ClipSample, Influence, Joint, JointAnimation, MAX_INFLUENCES, Rig, RigError,
+    SkinBinding, Track, strongest_influences,
 };
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
@@ -376,7 +381,6 @@ impl ViewportLighting {
         }
     }
 
-
     pub fn face_intensity(self, normal: Vec3) -> f32 {
         let rotation = if self.rotation.is_finite() {
             self.rotation
@@ -661,11 +665,27 @@ impl BoneTransform {
     }
 }
 
+/// A moment of the mesh's imported animation, which a saved pose can show.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnimationFrame {
+    /// Clip name; `None` is the rig's rest pose.
+    pub clip: Option<String>,
+    /// Seconds into the clip.
+    pub time: f32,
+}
+
+/// Longest clip name a saved pose keeps.
+pub const MAX_CLIP_NAME_CHARS: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedPose {
     pub id: PoseId,
     pub name: String,
     pub bones: BTreeMap<BoneId, BoneTransform>,
+    /// The animation frame the mesh shows in this pose; `None` is the mesh
+    /// as imported (its bind pose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation: Option<AnimationFrame>,
 }
 
 impl NamedPose {
@@ -677,6 +697,16 @@ impl NamedPose {
             if !transform.is_valid() {
                 return Err(PoseError::InvalidTransform(*bone_id));
             }
+        }
+        if let Some(frame) = &self.animation
+            && (!frame.time.is_finite()
+                || frame.time < 0.0
+                || frame
+                    .clip
+                    .as_ref()
+                    .is_some_and(|clip| clip.chars().count() > MAX_CLIP_NAME_CHARS))
+        {
+            return Err(PoseError::InvalidAnimationFrame);
         }
         Ok(())
     }
@@ -711,6 +741,15 @@ impl NamedPose {
                 target.name.clone()
             },
             bones,
+            // The same clip blends its time; anything else switches halfway.
+            animation: match (&self.animation, &target.animation) {
+                (Some(from), Some(to)) if from.clip == to.clip => Some(AnimationFrame {
+                    clip: to.clip.clone(),
+                    time: from.time + (to.time - from.time) * amount,
+                }),
+                _ if amount < 0.5 => self.animation.clone(),
+                _ => target.animation.clone(),
+            },
         })
     }
 }
@@ -723,6 +762,8 @@ pub enum PoseError {
     InvalidInterpolationAmount(f32),
     #[error("pose contains an invalid transform for bone {0:?}")]
     InvalidTransform(BoneId),
+    #[error("pose has an invalid animation frame")]
+    InvalidAnimationFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -3321,6 +3362,7 @@ mod tests {
         let from = NamedPose {
             id: PoseId(1),
             name: "Rest".to_owned(),
+            animation: None,
             bones: BTreeMap::from([(
                 BoneId(1),
                 BoneTransform {
@@ -3333,6 +3375,7 @@ mod tests {
         let target = NamedPose {
             id: PoseId(2),
             name: "Turn".to_owned(),
+            animation: None,
             bones: BTreeMap::from([(
                 BoneId(1),
                 BoneTransform {
@@ -3359,6 +3402,7 @@ mod tests {
         let pose = NamedPose {
             id: PoseId(1),
             name: "Pose".to_owned(),
+            animation: None,
             bones: BTreeMap::new(),
         };
 
@@ -3373,6 +3417,7 @@ mod tests {
         let from = NamedPose {
             id: PoseId(1),
             name: "Rest".to_owned(),
+            animation: None,
             bones: BTreeMap::from([(
                 BoneId(2),
                 BoneTransform {
@@ -3384,6 +3429,7 @@ mod tests {
         let target = NamedPose {
             id: PoseId(2),
             name: "Empty".to_owned(),
+            animation: None,
             bones: BTreeMap::new(),
         };
 

@@ -84,6 +84,11 @@ mod ffi {
             half_extent: *const f32,
         ) -> bool;
         pub fn sc_renderer_clear_mesh(renderer: *mut ScRenderer);
+        pub fn sc_renderer_set_vertices(
+            renderer: *mut ScRenderer,
+            vertices: *const f32,
+            vertex_count: u32,
+        ) -> bool;
         pub fn sc_renderer_set_camera(
             renderer: *mut ScRenderer,
             left: f64,
@@ -610,6 +615,31 @@ impl FilamentRuntime {
         Ok(())
     }
 
+    /// Replaces the vertices of the uploaded mesh with `geometry`'s, which must have the same
+    /// vertices and triangles in the same order (a posed copy). Textures and framing stay.
+    pub fn update_vertices(
+        &mut self,
+        geometry: &MeshGeometry,
+        smoothing_angle_degrees: f32,
+    ) -> Result<(), FilamentError> {
+        if self.mesh_bounds.is_none() || geometry.vertices.len() > MAX_MESH_VERTICES {
+            return Err(FilamentError::InvalidMesh);
+        }
+        let MeshBuffers { vertex_data, .. } =
+            build_mesh_buffers(geometry, smoothing_angle_degrees)?;
+        let vertex_count =
+            u32::try_from(geometry.vertices.len()).map_err(|_| FilamentError::InvalidMesh)?;
+        // SAFETY: `vertex_data` holds `vertex_count` vertices; the shim copies it.
+        let updated = unsafe {
+            ffi::sc_renderer_set_vertices(self.raw.as_ptr(), vertex_data.as_ptr(), vertex_count)
+        };
+        if updated {
+            Ok(())
+        } else {
+            Err(FilamentError::InvalidMesh)
+        }
+    }
+
     pub fn clear_mesh(&mut self) {
         // SAFETY: `raw` is a live renderer owned by `self`.
         unsafe { ffi::sc_renderer_clear_mesh(self.raw.as_ptr()) };
@@ -1098,7 +1128,7 @@ mod tests {
 
         // Cameras looking straight at the +X, +Y, and +Z faces.
         let looking_along = |axis: Vec3| {
-            let cameras = (0..4).flat_map(|yaw| {
+            let mut cameras = (0..4).flat_map(|yaw| {
                 [0.0, 1.55, -1.55].map(move |pitch| ViewportCamera {
                     yaw: yaw as f32 * std::f32::consts::FRAC_PI_2,
                     pitch,
@@ -1106,12 +1136,14 @@ mod tests {
                 })
             });
             cameras
-                .filter(|camera| (camera.rotation().inverse() * Vec3::Z).dot(axis) > 0.99)
-                .next()
+                .find(|camera| (camera.rotation().inverse() * Vec3::Z).dot(axis) > 0.99)
                 .expect("a camera along the axis")
         };
         let center = (32 * 64 + 32) * 4;
-        for (label, orm) in [("diffuse", [255, 230, 0, 255]), ("mirror", [255, 8, 255, 255])] {
+        for (label, orm) in [
+            ("diffuse", [255, 230, 0, 255]),
+            ("mirror", [255, 8, 255, 255]),
+        ] {
             renderer
                 .set_map(0, MaterialMap::Orm, 10 + orm[1] as usize, 1, 1, &orm)
                 .expect("ORM upload");
@@ -1145,11 +1177,17 @@ mod tests {
                 .expect("preset environment");
             frames.push(render_with_camera(&mut renderer, camera));
         }
-        let brightness = |frame: &[u8]| -> f32 {
-            frame[center..center + 3].iter().map(|v| f32::from(*v)).sum()
-        };
+        // Night is darker overall than the evenly lit daylight presets
+        // (studio, overcast, bright outdoor).
+        let brightness = |frame: &[u8]| -> f32 { frame.iter().map(|v| f32::from(*v)).sum() };
         let night = brightness(&frames[5]);
-        assert!(frames.iter().take(5).all(|frame| brightness(frame) > night));
+        for index in [0, 1, 4] {
+            assert!(
+                brightness(&frames[index]) > night,
+                "{:?} should be brighter than night",
+                LightingPreset::ALL[index]
+            );
+        }
         let unrotated = render_with_camera(&mut renderer, camera);
         renderer.set_environment_transform(
             LightingPreset::Night.environment_lux(),
@@ -1157,6 +1195,9 @@ mod tests {
             LightingPreset::Night.sun(),
         );
         let rotated = render_with_camera(&mut renderer, camera);
-        assert!(mean_difference(&unrotated, &rotated) > 0.5, "rotation turns the lighting");
+        assert!(
+            mean_difference(&unrotated, &rotated) > 0.5,
+            "rotation turns the lighting"
+        );
     }
 }

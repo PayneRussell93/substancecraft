@@ -15,7 +15,7 @@
 ## Milestones
 
 1. **Project foundation:** Rust workspace, versioned material project model, model validation. Complete.
-2. **Mesh inspection:** starter presets, binary and ASCII FBX 7.4+ and glTF 2.0 static mesh import with material slots, UV preservation/fallback, selectable meshes, and the Filament 3D viewport are implemented; skeletal animation remains open.
+2. **Mesh inspection:** starter presets, binary and ASCII FBX 7.4+ and glTF 2.0 mesh import with material slots, UV preservation/fallback, selectable meshes, the Filament 3D viewport, and skeletal animation (skins and clips posed and played in the viewport) are implemented. Complete.
 3. **First paint loop:** create a texture set, paint Base Color/ID in UV space, apply grayscale masks, and preview the result on the mesh. Implemented; broader channel painting remains open.
 4. **History and export:** undo/redo for strokes, layer settings, and layer insert/remove/move; TGA export of Base Color, Roughness, Metallic, ID, and mesh maps. Implemented; PNG export and texture-set/mesh history remain open.
 5. **Multi-channel materials:** Base Color, Roughness, Metallic, Height, and Normal compositing with fill layers, generator/painted/polygon/ID masks, height-to-normal detail, and a PBR Filament viewport (ORM + normal maps) are implemented; opacity and emissive channels remain open.
