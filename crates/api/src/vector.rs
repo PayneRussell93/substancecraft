@@ -4,6 +4,7 @@
 //! alphas, and decals, and reload when their source file changes.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use resvg::{tiny_skia, usvg};
@@ -18,11 +19,45 @@ pub const DEFAULT_SVG_EDGE: u32 = 1_024;
 pub const TEXT_RESOURCE_EXTENSION: &str = "sctext";
 const MAX_TEXT_CHARS: usize = 1_024;
 
+/// The fonts SVG `<text>` is set in: the bundled Ubuntu Light (Ubuntu Font
+/// Licence) for every family, and Hack for `monospace`. System fonts are
+/// never read, so an SVG rasterises the same on every machine.
+fn svg_fonts() -> &'static (Arc<usvg::fontdb::Database>, String) {
+    static FONTS: OnceLock<(Arc<usvg::fontdb::Database>, String)> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut fonts = usvg::fontdb::Database::new();
+        fonts.load_font_data(epaint_default_fonts::UBUNTU_LIGHT.to_vec());
+        let family = fonts
+            .faces()
+            .next()
+            .and_then(|face| face.families.first())
+            .map_or_else(|| "Ubuntu".to_owned(), |(name, _)| name.clone());
+        fonts.load_font_data(epaint_default_fonts::HACK_REGULAR.to_vec());
+        let monospace = fonts
+            .faces()
+            .nth(1)
+            .and_then(|face| face.families.first())
+            .map_or_else(|| "Hack".to_owned(), |(name, _)| name.clone());
+        fonts.set_serif_family(family.clone());
+        fonts.set_sans_serif_family(family.clone());
+        fonts.set_cursive_family(family.clone());
+        fonts.set_fantasy_family(family.clone());
+        fonts.set_monospace_family(monospace);
+        (Arc::new(fonts), family)
+    })
+}
+
 /// Rasterises SVG data so its longest edge is `edge` pixels. Shapes keep
-/// their fill colours and alpha; `<text>` elements are not supported (use a
-/// text resource instead).
+/// their fill colours and alpha; `<text>` is set in the bundled fonts (see
+/// [`svg_fonts`]), whatever family it names.
 pub fn rasterize_svg(data: &[u8], edge: u32) -> Result<TextureImage, TextureIoError> {
-    let tree = usvg::Tree::from_data(data, &usvg::Options::default())
+    let (fonts, family) = svg_fonts();
+    let options = usvg::Options {
+        font_family: family.clone(),
+        fontdb: Arc::clone(fonts),
+        ..usvg::Options::default()
+    };
+    let tree = usvg::Tree::from_data(data, &options)
         .map_err(|error| TextureIoError::Decode(format!("SVG: {error}")))?;
     let size = tree.size();
     let longest = size.width().max(size.height());
@@ -285,5 +320,98 @@ mod tests {
             load_texture_image(&path),
             Err(TextureIoError::Io(_))
         ));
+    }
+
+    /// Columns and rows of `image` holding any ink (alpha above 64), as
+    /// `(min_x, max_x, min_y, max_y)`.
+    fn ink_bounds(image: &TextureImage) -> Option<(u32, u32, u32, u32)> {
+        let mut bounds: Option<(u32, u32, u32, u32)> = None;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let alpha = image.rgba8[(y as usize * image.width as usize + x as usize) * 4 + 3];
+                if alpha > 64 {
+                    bounds = Some(match bounds {
+                        None => (x, x, y, y),
+                        Some((x0, x1, y0, y1)) => (x0.min(x), x1.max(x), y0.min(y), y1.max(y)),
+                    });
+                }
+            }
+        }
+        bounds
+    }
+
+    fn text_svg(attributes: &str, content: &str) -> String {
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="50">
+                <text x="10" y="35" font-size="30" fill="#ff0000" {attributes}>{content}</text>
+            </svg>"##
+        )
+    }
+
+    #[test]
+    fn tc_0327_svg_text_is_set_in_the_bundled_fonts() {
+        let sans = rasterize_svg(
+            text_svg(r#"font-family="sans-serif""#, "Wear").as_bytes(),
+            200,
+        )
+        .unwrap();
+        let (x0, x1, y0, y1) = ink_bounds(&sans).unwrap();
+        assert!(x0 >= 9 && x1 < 120, "starts at x = 10: {x0}..{x1}");
+        assert!(
+            y0 > 5 && y1 <= 36,
+            "sits on the baseline at y = 35: {y0}..{y1}"
+        );
+        assert!(
+            sans.rgba8
+                .chunks(4)
+                .filter(|texel| texel[3] == 255)
+                .all(|texel| texel[..3] == [255, 0, 0]),
+            "glyphs take the fill colour"
+        );
+
+        // Families the bundle lacks fall back to it, so output never
+        // depends on the machine's fonts; rendering is repeatable.
+        let arial =
+            rasterize_svg(text_svg(r#"font-family="Arial""#, "Wear").as_bytes(), 200).unwrap();
+        assert_eq!(arial, sans);
+        let unnamed = rasterize_svg(text_svg("", "Wear").as_bytes(), 200).unwrap();
+        assert_eq!(unnamed, sans);
+        let mono = rasterize_svg(
+            text_svg(r#"font-family="monospace""#, "Wear").as_bytes(),
+            200,
+        )
+        .unwrap();
+        assert_ne!(mono, sans, "monospace uses its own face");
+
+        // Anchoring, spans, and longer runs lay out as SVG specifies.
+        let end = rasterize_svg(
+            text_svg(r#"text-anchor="end" x="190""#, "Wear")
+                .replace(r#"x="10" "#, "")
+                .as_bytes(),
+            200,
+        )
+        .unwrap();
+        let (end_x0, end_x1, _, _) = ink_bounds(&end).unwrap();
+        assert!(end_x1 <= 190 && end_x1 > 180, "ends at x = 190: {end_x1}");
+        assert!(
+            ((end_x1 - end_x0) as i64 - (x1 - x0) as i64).abs() <= 1,
+            "same width when anchored at its end"
+        );
+        let spans = rasterize_svg(
+            text_svg("", r##"We<tspan fill="#0000ff">ar</tspan>"##).as_bytes(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(
+            ink_bounds(&spans),
+            ink_bounds(&sans),
+            "spans keep the layout"
+        );
+        assert!(
+            spans.rgba8.chunks(4).any(|texel| texel == [0, 0, 255, 255]),
+            "a span takes its own fill"
+        );
+        let longer = rasterize_svg(text_svg("", "Wear and tear").as_bytes(), 200).unwrap();
+        assert!(ink_bounds(&longer).unwrap().1 > x1 + 40);
     }
 }

@@ -12,13 +12,19 @@ mod jobs;
 mod project_format;
 mod recovery;
 mod relink;
+mod step;
+mod step_face;
+mod step_geom;
+mod step_parse;
 mod textures;
+mod triangulate;
 mod vector;
 
 pub use automation::{
     AUTOMATION_API_VERSION, AutomationEdit, AutomationError, EditOutcome, LayerSummary,
-    MaterialSummary, NewLayerKind, ProjectSummary, ResourceSummary, TextureSetSummary,
-    apply_automation_edit, edit_project_file, project_summary, texture_set_ids,
+    LibraryEntrySummary, LibrarySummary, MaterialSummary, NewLayerKind, ProjectSummary,
+    ResourceSummary, SmartMaterialSummary, TextureSetSummary, apply_automation_edit,
+    edit_project_file, library_summary, project_summary, texture_set_ids,
 };
 pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,
@@ -41,6 +47,10 @@ pub use recovery::{RecoveryCandidate, RecoveryStore};
 pub use relink::{
     MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, file_content_hash, find_relink_candidates,
     find_relink_candidates_by_content, missing_project_files,
+};
+pub use step::{
+    MAX_STEP_BYTES, STEP_EXTENSIONS, StepImportError, StepImportReport, StepTessellation,
+    import_step, import_step_file, import_step_with_report,
 };
 pub use textures::{
     MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,

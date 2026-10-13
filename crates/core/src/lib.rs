@@ -4755,4 +4755,138 @@ mod tests {
         let settings = set.layers[1].settings();
         assert_eq!(settings.channel_blend_modes.len(), 2);
     }
+
+    #[test]
+    fn tc_0328_several_layers_flatten_into_one_fill() {
+        use std::sync::Arc;
+
+        // Blue base; two strokes; a 60% group holding a third; a fill on top.
+        let base = MaterialLayer::new_fill(
+            LayerId(1),
+            "Base",
+            LayerFill {
+                color: [20, 40, 200, 255],
+                roughness: 0.8,
+                ..LayerFill::default()
+            },
+        );
+        let stroke = |id: u64, from: (f32, f32), to: (f32, f32), color: [u8; 4]| {
+            let mut layer = MaterialLayer::new_paint(LayerId(id), format!("Stroke {id}"));
+            layer.paint_strokes.push(PaintStroke::new(
+                vec![glam::Vec2::new(from.0, from.1), glam::Vec2::new(to.0, to.1)],
+                2.5,
+                color,
+            ));
+            layer
+        };
+        let mut scratches = stroke(2, (0.1, 0.3), (0.9, 0.6), [250, 250, 250, 255]);
+        scratches.opacity = 0.7;
+        let rust = stroke(3, (0.2, 0.8), (0.8, 0.2), [150, 60, 20, 255]);
+        let mut group = MaterialLayer::new_group(LayerId(4), "Decals");
+        group.opacity = 0.6;
+        group.children = Some(vec![stroke(5, (0.5, 0.1), (0.5, 0.9), [10, 200, 10, 255])]);
+        let top = MaterialLayer::new_fill(
+            LayerId(6),
+            "Varnish",
+            LayerFill {
+                roughness: 0.1,
+                ..LayerFill::default()
+            },
+        );
+        let mut set = small_set(24, base);
+        set.layers.extend([scratches, rust, group]);
+        let mut with_top = set.clone();
+        with_top.layers.push(top);
+
+        // Each layer once, without those inside a listed group, bottom
+        // first; missing ids are refused.
+        assert_eq!(
+            with_top.flatten_order(&[LayerId(5), LayerId(6), LayerId(2), LayerId(4), LayerId(2)]),
+            Some(vec![LayerId(2), LayerId(4), LayerId(6)])
+        );
+        assert_eq!(with_top.flatten_order(&[LayerId(2), LayerId(99)]), None);
+        assert_eq!(
+            set.flatten_layers(&[LayerId(99)], BakeContext::default()),
+            Err(BakeError::InvalidLayerSettings)
+        );
+        assert_eq!(
+            set.flatten_layers(&[], BakeContext::default()),
+            Err(BakeError::InvalidLayerSettings)
+        );
+        assert_eq!(
+            set.flatten_layers(&[LayerId(3)], BakeContext::default()),
+            set.flatten_layer(LayerId(3), BakeContext::default()),
+            "one layer flattens on its own"
+        );
+
+        // Adjacent Normal layers: a fill of the result in their place
+        // composites like the originals.
+        let flattened = set
+            .flatten_layers(&[LayerId(3), LayerId(2)], BakeContext::default())
+            .unwrap();
+        assert_eq!(flattened.blend_mode, BlendMode::Normal);
+        let ids: Vec<ResourceId> = (0..flattened.channels.len() as u64)
+            .map(|i| ResourceId(100 + i))
+            .collect();
+        let images: ResourceImages = ids
+            .iter()
+            .zip(&flattened.channels)
+            .map(|(id, (_, image))| (*id, Arc::new(image.clone())))
+            .collect();
+        let mut replaced = set.clone();
+        replaced
+            .layers
+            .splice(1..3, [flattened.to_fill_layer(LayerId(9), "Merged", &ids)]);
+        let context = BakeContext {
+            resources: Some(&images),
+            ..BakeContext::default()
+        };
+        for channel in [MaterialChannel::BaseColor, MaterialChannel::Roughness] {
+            let original = set.bake_channel(channel, BakeContext::default()).unwrap();
+            let rebuilt = replaced.bake_channel(channel, context).unwrap();
+            let worst = original
+                .rgba8
+                .iter()
+                .zip(&rebuilt.rgba8)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(worst <= 2, "{channel:?} differs by {worst}");
+        }
+
+        // Unrelated layers: each keeps its own opacity but not its group's.
+        let merged = set
+            .flatten_layers(&[LayerId(2), LayerId(5)], BakeContext::default())
+            .unwrap();
+        let alpha = |flattened: &FlattenedLayer, u: f32, v: f32| {
+            let x = (u * 23.0).round() as usize;
+            let y = ((1.0 - v) * 23.0).round() as usize;
+            flattened.channels[0].1.rgba8[(y * 24 + x) * 4 + 3]
+        };
+        let green = set.layer(LayerId(5)).unwrap().clone();
+        let green_alone = small_set(24, green)
+            .flatten_layer(LayerId(5), BakeContext::default())
+            .unwrap();
+        let scratches_alone = set
+            .flatten_layer(LayerId(2), BakeContext::default())
+            .unwrap();
+        assert!(alpha(&green_alone, 0.5, 0.85) > 200);
+        assert_eq!(
+            alpha(&merged, 0.5, 0.85),
+            alpha(&green_alone, 0.5, 0.85),
+            "the green stroke is not faded by its group"
+        );
+        assert_eq!(
+            alpha(&merged, 0.15, 0.32),
+            alpha(&scratches_alone, 0.15, 0.32),
+            "the scratches keep their own opacity"
+        );
+        assert!(alpha(&scratches_alone, 0.15, 0.32) > 100);
+        assert_eq!(alpha(&merged, 0.9, 0.1), 0, "nothing else is baked in");
+        assert_eq!(
+            merged.channels.len(),
+            3,
+            "colour, roughness, and metallic from the paint"
+        );
+    }
 }

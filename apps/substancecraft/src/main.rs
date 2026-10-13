@@ -75,7 +75,7 @@ const BAKEABLE_CHANNELS: [MaterialChannel; 8] = [
     MaterialChannel::Id,
 ];
 /// Mesh formats the importer reads.
-const MESH_EXTENSIONS: [&str; 3] = ["fbx", "gltf", "glb"];
+const MESH_EXTENSIONS: [&str; 5] = ["fbx", "gltf", "glb", "step", "stp"];
 /// Bitmap formats the resource importer reads.
 const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "tga", "svg", "sctext"];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
@@ -127,6 +127,9 @@ struct SubstanceCraftApp {
     project: MaterialProject,
     selected_texture_set: Option<TextureSetId>,
     selected_layer: Option<LayerId>,
+    /// Layers Ctrl-clicked alongside `selected_layer`, which "Flatten to
+    /// bitmaps" merges with it. Never holds `selected_layer` itself.
+    extra_selected_layers: BTreeSet<LayerId>,
     selected_primitive: Option<PrimitivePreset>,
     /// Imported or primitive geometry after scaling, before smoothing.
     base_geometry: Option<MeshGeometry>,
@@ -726,6 +729,7 @@ impl Default for SubstanceCraftApp {
             },
             selected_texture_set: None,
             selected_layer: None,
+            extra_selected_layers: BTreeSet::new(),
             selected_primitive: Some(PrimitivePreset::Cube),
             base_geometry: None,
             mesh_geometry: None,
@@ -1088,7 +1092,7 @@ impl SubstanceCraftApp {
 
     fn replace_mesh(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
+            .add_filter("3D mesh (FBX, glTF, STEP)", &MESH_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -1647,7 +1651,7 @@ impl SubstanceCraftApp {
 
     fn import_mesh(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
+            .add_filter("3D mesh (FBX, glTF, STEP)", &MESH_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -1749,6 +1753,7 @@ impl SubstanceCraftApp {
         self.project.active_texture_set = Some(id);
         self.selected_texture_set = Some(id);
         self.selected_layer = None;
+        self.extra_selected_layers.clear();
         self.invalidate_preview();
     }
 
@@ -1817,29 +1822,61 @@ impl SubstanceCraftApp {
         }
     }
 
-    /// Flattens the selected layer or group into per-channel PNGs in
-    /// `folder`, inserts a fill layer using them just above it, and hides
-    /// the source, as one undoable edit. Returns the new layer.
+    /// The selected layer and those Ctrl-clicked with it that still exist
+    /// in the selected texture set.
+    fn flatten_selection(&self) -> Vec<LayerId> {
+        let Some(set) = self.selected_texture_set_ref() else {
+            return Vec::new();
+        };
+        self.selected_layer
+            .into_iter()
+            .chain(self.extra_selected_layers.iter().copied())
+            .filter(|id| set.layer(*id).is_some())
+            .collect()
+    }
+
+    /// Ctrl-click: adds `id` to the layers flattened together, or takes it
+    /// out again. Plain clicks select one layer.
+    fn toggle_extra_selection(&mut self, id: LayerId) {
+        match self.selected_layer {
+            None => self.selected_layer = Some(id),
+            Some(selected) if selected == id => {
+                // Hand the main selection to another chosen layer.
+                self.selected_layer = self.extra_selected_layers.pop_last().or(Some(id));
+            }
+            Some(_) => {
+                if !self.extra_selected_layers.remove(&id) {
+                    self.extra_selected_layers.insert(id);
+                }
+            }
+        }
+    }
+
+    /// Flattens the selected layer or group, merged with any Ctrl-clicked
+    /// with it, into per-channel PNGs in `folder`, inserts a fill layer
+    /// using them just above the topmost, and hides the sources, as one
+    /// undoable edit. Returns the new layer.
     fn flatten_selected_into(&mut self, folder: &std::path::Path) -> Result<LayerId, String> {
-        let (Some(set_id), Some(source_id)) = (self.selected_texture_set, self.selected_layer)
-        else {
+        let (Some(set_id), Some(_)) = (self.selected_texture_set, self.selected_layer) else {
             return Err("Select a layer to flatten.".to_owned());
         };
         let set = self
             .selected_texture_set_ref()
             .cloned()
             .ok_or("No texture set is selected.")?;
-        let source = set
-            .layer(source_id)
+        let order = set
+            .flatten_order(&self.flatten_selection())
+            .ok_or("The layer no longer exists.")?;
+        let top_id = *order.last().ok_or("The layer no longer exists.")?;
+        let top = set
+            .layer(top_id)
             .cloned()
             .ok_or("The layer no longer exists.")?;
-        let slot = set
-            .slot_of(source_id)
-            .ok_or("The layer no longer exists.")?;
+        let slot = set.slot_of(top_id).ok_or("The layer no longer exists.")?;
         let flattened = {
             let inputs = self.bake_inputs(set_id);
-            set.flatten_layer(
-                source_id,
+            set.flatten_layers(
+                &order,
                 substancecraft_core::BakeContext {
                     mesh: inputs.mesh.as_deref(),
                     mesh_maps: inputs.maps(),
@@ -1852,7 +1889,15 @@ impl SubstanceCraftApp {
             return Err("The layer writes no channels to flatten.".to_owned());
         }
         std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
-        let stem = format!("{}_{}", set.name, source.name).replace([' ', '/', '\\', ':'], "_");
+        let (name, stem) = if order.len() == 1 {
+            (format!("{} (flattened)", top.name), top.name.clone())
+        } else {
+            (
+                format!("{} + {} (flattened)", top.name, order.len() - 1),
+                format!("{}_merged", top.name),
+            )
+        };
+        let stem = format!("{}_{stem}", set.name).replace([' ', '/', '\\', ':'], "_");
         let mut resources = Vec::new();
         for (channel, image) in &flattened.channels {
             let path = folder.join(format!(
@@ -1871,35 +1916,40 @@ impl SubstanceCraftApp {
             resources.push(self.add_resource(&path)?);
         }
         let id = self.allocate_layer_id().ok_or("Out of layer ids.")?;
-        let layer = flattened.to_fill_layer(id, format!("{} (flattened)", source.name), &resources);
-        let before = source.settings();
-        let after = substancecraft_core::LayerSettings {
-            visible: false,
-            ..before.clone()
-        };
-        let applied = self.history.apply(
-            &mut self.project,
-            EditCommand::Batch(vec![
+        let layer = flattened.to_fill_layer(id, name, &resources);
+        let mut commands: Vec<EditCommand> = order
+            .iter()
+            .filter_map(|source| set.layer(*source))
+            .map(|source| {
+                let before = source.settings();
+                let after = substancecraft_core::LayerSettings {
+                    visible: false,
+                    ..before.clone()
+                };
                 EditCommand::LayerSettings {
                     texture_set_id: set_id,
-                    layer_id: source_id,
+                    layer_id: source.id,
                     before: Box::new(before),
                     after: Box::new(after),
-                },
-                EditCommand::InsertLayer {
-                    texture_set_id: set_id,
-                    slot: LayerSlot {
-                        parent: slot.parent,
-                        index: slot.index + 1,
-                    },
-                    layer: Box::new(layer),
-                },
-            ]),
-        );
-        if !applied {
+                }
+            })
+            .collect();
+        commands.push(EditCommand::InsertLayer {
+            texture_set_id: set_id,
+            slot: LayerSlot {
+                parent: slot.parent,
+                index: slot.index + 1,
+            },
+            layer: Box::new(layer),
+        });
+        if !self
+            .history
+            .apply(&mut self.project, EditCommand::Batch(commands))
+        {
             return Err("The flattened layer could not be inserted.".to_owned());
         }
         self.selected_layer = Some(id);
+        self.extra_selected_layers.clear();
         self.layer_settled = None;
         self.invalidate_preview();
         Ok(id)
@@ -3156,6 +3206,38 @@ impl SubstanceCraftApp {
         self.brush_emissive = egui::Color32::from_rgb(r, g, b);
     }
 
+    /// The symmetric copies of a brush hit that paint: with symmetry on,
+    /// those landing on the selected texture set inside the unit UV square,
+    /// each with its stroke path number (1 onwards, in copy order).
+    fn symmetry_copies(
+        &self,
+        hit: &TriangleHit,
+        uv: glam::Vec2,
+    ) -> Vec<(usize, substancecraft_core::SurfaceHit)> {
+        let (Some(symmetry), Some(mesh)) = (self.symmetry, self.mesh_geometry.as_deref()) else {
+            return Vec::new();
+        };
+        symmetry
+            .symmetric_hits(
+                mesh,
+                &substancecraft_core::SurfaceHit {
+                    triangle: hit.triangle,
+                    position: hit.position,
+                    normal: glam::Vec3::Z,
+                    uv,
+                },
+            )
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, copy)| Some((index + 1, copy?)))
+            .filter(|(_, copy)| {
+                self.triangle_in_selected_set(copy.triangle)
+                    && copy.uv.cmpge(glam::Vec2::ZERO).all()
+                    && copy.uv.cmple(glam::Vec2::ONE).all()
+            })
+            .collect()
+    }
+
     /// Paints at a picked surface point: continues the brush stroke
     /// (restarting it when the pointer crosses into another UV island) and,
     /// with symmetry on, the mirrored stroke on the other side.
@@ -3170,28 +3252,13 @@ impl SubstanceCraftApp {
             self.stroke_last_triangles.clear();
         }
         let mut targets = vec![(0, hit.triangle, uv)];
-        if let (Some(symmetry), Some(mesh)) = (self.symmetry, self.mesh_geometry.as_deref()) {
-            let copies = symmetry.symmetric_hits(
-                mesh,
-                &substancecraft_core::SurfaceHit {
-                    triangle: hit.triangle,
-                    position: hit.position,
-                    normal: glam::Vec3::Z,
-                    uv,
-                },
-            );
-            // Path numbers follow the copy order, so each copy keeps its own
-            // stroke through the drag.
-            for (index, copy) in copies.into_iter().enumerate() {
-                if let Some(copy) = copy
-                    && self.triangle_in_selected_set(copy.triangle)
-                    && copy.uv.cmpge(glam::Vec2::ZERO).all()
-                    && copy.uv.cmple(glam::Vec2::ONE).all()
-                {
-                    targets.push((index + 1, copy.triangle, copy.uv));
-                }
-            }
-        }
+        // Path numbers follow the copy order, so each copy keeps its own
+        // stroke through the drag.
+        targets.extend(
+            self.symmetry_copies(&hit, uv)
+                .into_iter()
+                .map(|(path, copy)| (path, copy.triangle, copy.uv)),
+        );
         for (path, triangle, uv) in targets {
             let previous = self.stroke_last_triangles.get(path).copied().flatten();
             let restart = match (previous, &self.mesh_topology) {
@@ -3454,7 +3521,7 @@ impl SubstanceCraftApp {
 
     fn pick_high_poly(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("3D mesh (FBX, glTF)", &MESH_EXTENSIONS)
+            .add_filter("3D mesh (FBX, glTF, STEP)", &MESH_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -5404,15 +5471,25 @@ impl SubstanceCraftApp {
             // The footprint the brush paints: screen pixels when projecting,
             // else the texel radius carried onto the surface under the
             // cursor through its UVs.
-            let footprint = (!self.projects_strokes())
-                .then(|| self.brush_footprint(mesh, &projection, projected.as_deref(), pointer))
-                .flatten();
-            match footprint {
-                Some(outline) => {
+            // Symmetric copies follow, drawn fainter so the brush under the
+            // cursor stays clear.
+            let footprints = if self.projects_strokes() {
+                Vec::new()
+            } else {
+                self.brush_footprints(mesh, &projection, projected.as_deref(), pointer)
+            };
+            match footprints.split_first() {
+                Some((outline, copies)) => {
                     painter.add(egui::Shape::closed_line(
-                        outline,
+                        outline.clone(),
                         egui::Stroke::new(1.5, cursor_color),
                     ));
+                    for copy in copies {
+                        painter.add(egui::Shape::closed_line(
+                            copy.clone(),
+                            egui::Stroke::new(1.0, cursor_color.gamma_multiply(0.6)),
+                        ));
+                    }
                 }
                 None => {
                     let radius = if self.projects_strokes() {
@@ -5433,35 +5510,54 @@ impl SubstanceCraftApp {
         }
     }
 
-    /// The screen outline of the brush footprint on the surface under
+    /// The screen outlines of the brush footprint on the surface under
     /// `pointer`: the brush's texel radius in the selected set, carried
-    /// through the hovered triangle's UVs. `None` off the mesh.
-    fn brush_footprint(
+    /// through the hovered triangle's UVs, then the footprint of each
+    /// symmetric copy the stroke would paint. Empty off the mesh.
+    fn brush_footprints(
         &self,
         mesh: &MeshGeometry,
         projection: &ViewProjection,
         points: Option<&[ProjectedVertex]>,
         pointer: egui::Pos2,
-    ) -> Option<Vec<egui::Pos2>> {
-        let hit = pick_triangle(mesh, points?, pointer)?;
-        let set = self.selected_texture_set_ref()?;
+    ) -> Vec<Vec<egui::Pos2>> {
+        let (Some(points), Some(set)) = (points, self.selected_texture_set_ref()) else {
+            return Vec::new();
+        };
+        let Some(hit) = pick_triangle(mesh, points, pointer) else {
+            return Vec::new();
+        };
         let uv_radius = glam::Vec2::new(
             self.brush_radius / set.resolution.width.max(1) as f32,
             self.brush_radius / set.resolution.height.max(1) as f32,
         );
-        let outline = mesh.uv_brush_outline(hit.triangle, hit.position, uv_radius, 40)?;
-        // The outline is found on the bind mesh; a pose carries it along.
+        // Outlines are found on the bind mesh; a pose carries them along.
         let posed = self.is_posed().then(|| self.shown_mesh()).flatten();
-        Some(
-            outline
-                .into_iter()
-                .map(|point| match &posed {
-                    Some(posed) => animation::carry_point(mesh, posed, hit.triangle, point),
-                    None => point,
-                })
-                .map(|point| projection.project(point).screen)
-                .collect(),
-        )
+        let outline = |triangle: u32, position: glam::Vec3| -> Option<Vec<egui::Pos2>> {
+            let outline = mesh.uv_brush_outline(triangle, position, uv_radius, 40)?;
+            Some(
+                outline
+                    .into_iter()
+                    .map(|point| match &posed {
+                        Some(posed) => animation::carry_point(mesh, posed, triangle, point),
+                        None => point,
+                    })
+                    .map(|point| projection.project(point).screen)
+                    .collect(),
+            )
+        };
+        let Some(main) = outline(hit.triangle, hit.position) else {
+            return Vec::new();
+        };
+        let mut outlines = vec![main];
+        if let Some(uv) = hit.uv {
+            outlines.extend(
+                self.symmetry_copies(&hit, uv)
+                    .into_iter()
+                    .filter_map(|(_, copy)| outline(copy.triangle, copy.position)),
+            );
+        }
+        outlines
     }
 
     /// Flat-shaded painter's-algorithm fallback when Filament is unavailable.
@@ -5749,8 +5845,9 @@ fn apply_environment(
     Ok(())
 }
 
-/// Reads an FBX (every mesh it holds) or a glTF/GLB (the flattened scene),
-/// choosing the importer by extension.
+/// Reads an FBX (every mesh it holds), a glTF/GLB (the flattened scene), or
+/// a STEP file (the tessellated, flattened assembly), choosing the importer
+/// by extension.
 fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
     let extension = path
         .extension()
@@ -5758,6 +5855,11 @@ fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
         .unwrap_or_default();
     if extension == "gltf" || extension == "glb" {
         return import_gltf_file(path)
+            .map(|mesh| vec![mesh])
+            .map_err(|error| error.to_string());
+    }
+    if substancecraft_api::STEP_EXTENSIONS.contains(&extension.as_str()) {
+        return substancecraft_api::import_step_file(path)
             .map(|mesh| vec![mesh])
             .map_err(|error| error.to_string());
     }
@@ -8121,5 +8223,154 @@ Connections:  {
             .filter(|(a, b)| a[..3] != b[..3])
             .count();
         assert!(changed > 50, "posing changes the render ({changed} texels)");
+    }
+
+    #[test]
+    fn tc_0329_ctrl_clicked_layers_flatten_together_through_the_app() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        let bottom = app.selected_layer.unwrap();
+        app.add_paint_layer();
+        let middle = app.selected_layer.unwrap();
+        app.add_fill_layer();
+        let top = app.selected_layer.unwrap();
+        small_sets(&mut app, 8);
+        if let Some(layer) = app.selected_layer_mut() {
+            layer.opacity = 0.5;
+            if let Some(fill) = &mut layer.fill {
+                fill.color = [200, 20, 20, 255];
+            }
+        }
+        app.sync_layer_history(&egui::Context::default());
+        let set_id = app.selected_texture_set.unwrap();
+        let before = app.selected_texture_set_ref().unwrap().clone();
+        let ids: Vec<LayerId> = before.layers.iter().map(|layer| layer.id).collect();
+        assert_eq!(ids, [bottom, middle, top]);
+        let original = app
+            .bake_inputs(set_id)
+            .bake_channel(&before, MaterialChannel::BaseColor)
+            .unwrap();
+
+        // Ctrl-clicks add and remove layers; Ctrl-clicking the main one
+        // hands the selection on.
+        app.selected_layer = Some(bottom);
+        app.toggle_extra_selection(top);
+        assert_eq!(app.flatten_selection(), [bottom, top]);
+        app.toggle_extra_selection(middle);
+        app.toggle_extra_selection(middle);
+        assert_eq!(app.flatten_selection(), [bottom, top]);
+        app.toggle_extra_selection(bottom);
+        assert_eq!(app.selected_layer, Some(top));
+        assert_eq!(app.flatten_selection(), [top]);
+        app.toggle_extra_selection(bottom);
+        assert_eq!(app.flatten_selection(), [top, bottom]);
+
+        // One fill above the topmost, both sources hidden, the layer
+        // between them untouched; the stack composites as before.
+        let merged = app.flatten_selected_into(folder.path()).unwrap();
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let ids: Vec<LayerId> = set.layers.iter().map(|layer| layer.id).collect();
+        assert_eq!(ids, [bottom, middle, top, merged]);
+        assert!(
+            set.layers[3].name.ends_with(" + 1 (flattened)"),
+            "{}",
+            set.layers[3].name
+        );
+        assert!(!set.layer(bottom).unwrap().visible);
+        assert!(set.layer(middle).unwrap().visible);
+        assert!(!set.layer(top).unwrap().visible);
+        assert!(app.extra_selected_layers.is_empty());
+        assert_eq!(app.selected_layer, Some(merged));
+        let rebuilt = app
+            .bake_inputs(set_id)
+            .bake_channel(&set, MaterialChannel::BaseColor)
+            .unwrap();
+        let worst = original
+            .rgba8
+            .iter()
+            .zip(&rebuilt.rgba8)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 2, "differs by {worst}");
+
+        // One undo step restores the stack.
+        app.undo();
+        assert_eq!(
+            app.selected_texture_set_ref().unwrap().layers,
+            before.layers
+        );
+    }
+
+    #[test]
+    fn tc_0330_the_brush_cursor_previews_every_symmetric_copy() {
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.add_paint_layer();
+        small_sets(&mut app, 64);
+        app.set_paint_mode(PaintMode::Paint);
+        app.brush_radius = 2.0;
+        let cube = app.mesh_geometry.clone().unwrap();
+        // Looking down -Z at the +Z face: screen (130, 90) is (0.3, 0.1).
+        let projection = ViewProjection {
+            pose: BoneTransform::IDENTITY,
+            camera_rotation: glam::Quat::IDENTITY,
+            posed_center: glam::Vec3::ZERO,
+            center: egui::pos2(100.0, 100.0),
+            scale: 100.0,
+            pan: glam::Vec2::ZERO,
+        };
+        let points = projection.project_mesh(&cube);
+        let pointer = egui::pos2(130.0, 90.0);
+        let footprints = |app: &SubstanceCraftApp| {
+            app.brush_footprints(&cube, &projection, Some(&points), pointer)
+        };
+        let centre = |outline: &[egui::Pos2]| {
+            let sum = outline
+                .iter()
+                .fold(egui::Vec2::ZERO, |sum, point| sum + point.to_vec2());
+            (sum / outline.len() as f32).to_pos2()
+        };
+        let near = |a: egui::Pos2, b: egui::Pos2| (a - b).length() < 1.5;
+
+        // Without symmetry, one outline round the cursor.
+        let single = footprints(&app);
+        assert_eq!(single.len(), 1);
+        assert!(
+            near(centre(&single[0]), pointer),
+            "{:?}",
+            centre(&single[0])
+        );
+
+        // Mirrored across X, a second outline on the other side.
+        app.symmetry = Some(substancecraft_core::Symmetry::new(
+            substancecraft_core::Axis::X,
+        ));
+        let mirrored = footprints(&app);
+        assert_eq!(mirrored.len(), 2);
+        assert_eq!(mirrored[0], single[0], "the cursor outline is unchanged");
+        assert!(
+            near(centre(&mirrored[1]), egui::pos2(70.0, 90.0)),
+            "{:?}",
+            centre(&mirrored[1])
+        );
+
+        // Radial copies: one outline per copy the stroke paints, matching
+        // the copies a stroke would paint.
+        app.symmetry = Some(substancecraft_core::Symmetry::radial(
+            substancecraft_core::Axis::Y,
+            4,
+        ));
+        let radial = footprints(&app);
+        assert_eq!(radial.len(), 4);
+        let hit = pick_triangle(&cube, &points, pointer).unwrap();
+        assert_eq!(app.symmetry_copies(&hit, hit.uv.unwrap()).len(), 3);
+
+        // Off the mesh there is no footprint.
+        assert!(
+            app.brush_footprints(&cube, &projection, Some(&points), egui::pos2(400.0, 400.0))
+                .is_empty()
+        );
     }
 }

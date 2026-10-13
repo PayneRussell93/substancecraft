@@ -58,3 +58,7 @@ REQ-0056,Import ASCII FBX meshes like binary ones,docs/feature-map.md,docs/api-a
 REQ-0057,Edit layer structure masks strokes texture sets and meshes through automation and MCP,docs/feature-map.md,docs/api-and-mcp.md,,TC-0307;TC-0308;TC-0309;TC-0310,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0058,Check materials under one-click lighting environments,docs/feature-map.md,docs/architecture.md,,TC-0311;TC-0312;TC-0313;TC-0314;TC-0315,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0059,Import skeletons skin weights and animation clips and pose meshes in the viewport,docs/feature-map.md,docs/architecture.md,,TC-0316;TC-0317;TC-0318;TC-0319;TC-0320;TC-0321;TC-0322,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0060,Set filters bitmap polygon and anchor masks insert smart materials and apply smart masks through automation and MCP,docs/feature-map.md,docs/api-and-mcp.md,,TC-0323;TC-0324;TC-0325;TC-0326,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0061,Set SVG text in the bundled fonts,docs/feature-map.md,docs/architecture.md,,TC-0327,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0062,Flatten several layers together into one fill,docs/feature-map.md,docs/architecture.md,,TC-0328;TC-0329,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0063,Preview symmetric brush copies at the cursor,docs/feature-map.md,docs/architecture.md,,TC-0330,Documentation/Quality/TestPlan-short.md,Project owner,Verified

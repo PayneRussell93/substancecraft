@@ -156,7 +156,7 @@ impl SubstanceCraftApp {
             .unwrap_or_default();
         if let Some(path) = rfd::FileDialog::new()
             .set_title(format!("Locate {name}"))
-            .add_filter("3D mesh (FBX, glTF)", &super::MESH_EXTENSIONS)
+            .add_filter("3D mesh (FBX, glTF, STEP)", &super::MESH_EXTENSIONS)
             .pick_file()
         {
             self.locate_project_mesh(&path);

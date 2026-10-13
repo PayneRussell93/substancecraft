@@ -287,7 +287,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, FbxImportError> {
     Ok(u64::from_le_bytes(array))
 }
 
-/// A mesh read from FBX or glTF.
+/// A mesh read from FBX, glTF, or STEP.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImportedMesh {
     pub name: String,

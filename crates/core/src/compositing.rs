@@ -1545,6 +1545,89 @@ impl TextureSet {
         })
     }
 
+    /// The layers `ids` would flatten together: each once, without those
+    /// inside another listed group (the group already holds them), in
+    /// compositing order. `None` when an id is missing.
+    pub fn flatten_order(&self, ids: &[LayerId]) -> Option<Vec<LayerId>> {
+        if ids.iter().any(|id| self.layer(*id).is_none()) {
+            return None;
+        }
+        let listed = |id: LayerId| ids.contains(&id);
+        let inside_listed = |id: LayerId| {
+            let mut parent = self.slot_of(id).and_then(|slot| slot.parent);
+            while let Some(group) = parent {
+                if listed(group) {
+                    return true;
+                }
+                parent = self.slot_of(group).and_then(|slot| slot.parent);
+            }
+            false
+        };
+        Some(
+            self.walk_layers()
+                .into_iter()
+                .map(|layer| layer.id)
+                .filter(|id| listed(*id) && !inside_listed(*id))
+                .collect(),
+        )
+    }
+
+    /// Flattens several layers or groups, anywhere in the stack, into one
+    /// set of per-channel bitmaps: they composite together, each with its
+    /// own opacity, mask, filters, and blend mode (but not those of groups
+    /// enclosing it), as a Normal group in place of the topmost. For
+    /// adjacent Normal layers, a fill layer textured with the result in
+    /// that place composites like the originals; layers that sat between
+    /// them end up beneath it. A single layer flattens as
+    /// [`TextureSet::flatten_layer`] does.
+    pub fn flatten_layers(
+        &self,
+        ids: &[LayerId],
+        context: BakeContext<'_>,
+    ) -> Result<FlattenedLayer, BakeError> {
+        let order = self
+            .flatten_order(ids)
+            .ok_or(BakeError::InvalidLayerSettings)?;
+        let top = match order.as_slice() {
+            [] => return Err(BakeError::InvalidLayerSettings),
+            [only] => return self.flatten_layer(*only, context),
+            [.., top] => *top,
+        };
+        let group_id = LayerId(
+            self.walk_layers()
+                .iter()
+                .map(|layer| layer.id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        let mut merged = MaterialLayer::new_group(group_id, "Flattened");
+        merged.children = Some(
+            order
+                .iter()
+                .filter_map(|id| self.layer(*id).cloned())
+                .collect(),
+        );
+        // The group takes the topmost layer's place; the rest leave theirs.
+        let mut staged = self.clone();
+        let slot = staged
+            .layer_mut(top)
+            .ok_or(BakeError::InvalidLayerSettings)?;
+        *slot = merged;
+        fn remove(layers: &mut Vec<MaterialLayer>, ids: &[LayerId], keep: LayerId) {
+            layers.retain(|layer| layer.id == keep || !ids.contains(&layer.id));
+            for layer in layers.iter_mut() {
+                if layer.id != keep
+                    && let Some(children) = &mut layer.children
+                {
+                    remove(children, ids, keep);
+                }
+            }
+        }
+        remove(&mut staged.layers, &order, group_id);
+        staged.flatten_layer(group_id, context)
+    }
+
     pub fn bake_id_mask(&self) -> Result<BakedTexture, BakeError> {
         if self
             .walk_layers()

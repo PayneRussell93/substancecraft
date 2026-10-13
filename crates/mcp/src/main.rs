@@ -14,8 +14,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use substancecraft_api::{
     AutomationEdit, ExportJob, TextureFormat, edit_project_file, inspect_primitive_preset,
-    list_export_presets, list_primitive_presets, load_project_file_with_report, project_summary,
-    run_export_job,
+    library_summary, list_export_presets, list_primitive_presets, load_project_file_with_report,
+    project_summary, run_export_job,
 };
 
 /// Environment variable naming the directory project tools may read and
@@ -236,6 +236,118 @@ struct SetMeshRequest {
     smoothing_angle: Option<f32>,
     #[schemars(description = "Optional subdivision levels, 0-3; polygon masks follow")]
     subdivision_levels: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetFiltersRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional content filter stack, replacing the current one ([] clears it). Each filter is a name (Blur, Sharpen, Levels, Invert, Hue / Saturation, Brightness / Contrast, Posterize, Threshold, Gradient map) or an object such as {\"kind\": \"Blur\", \"radius\": 8} whose fields replace the defaults"
+    )]
+    filters: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Optional mask filter stack, in the same form")]
+    mask_filters: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Optional channels the content filters apply to, such as [\"Roughness\"]; [] means every channel"
+    )]
+    channels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetBitmapMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional project bitmap resource id or exact name; `none` removes the bitmap mask"
+    )]
+    resource: Option<String>,
+    #[schemars(description = "Optional: invert the bitmap")]
+    invert: Option<bool>,
+    #[schemars(
+        description = "Optional projection settings to change, such as {\"mode\": \"Triplanar\", \"scale\": 2, \"rotation_degrees\": 45}; modes are Uv, Triplanar, Planar, Cylindrical, Spherical, Decal"
+    )]
+    projection: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetPolygonMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional mesh triangle indices the layer is limited to; [] removes the polygon mask"
+    )]
+    triangles: Option<Vec<u32>>,
+    #[schemars(description = "Optional: limit the layer to every other triangle instead")]
+    inverted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetAnchorMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Optional earlier layer (id or exact name) whose composited result the mask reads; `none` removes the anchor"
+    )]
+    anchor: Option<String>,
+    #[schemars(
+        description = "Optional channel read: Base Color (as luminance), Roughness, Metallic, Height, Emissive, or Opacity"
+    )]
+    channel: Option<String>,
+    #[schemars(description = "Optional value mapped to 0, 0-1")]
+    low: Option<f32>,
+    #[schemars(description = "Optional value mapped to 1, 0-1, above low")]
+    high: Option<f32>,
+    #[schemars(description = "Optional: invert the mask")]
+    invert: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct InsertSmartMaterialRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(
+        description = "Smart material name, from the project or the built-ins (see list_library)"
+    )]
+    smart_material: String,
+    #[schemars(description = "Optional group (id or exact name) to insert into")]
+    parent: Option<String>,
+    #[schemars(description = "Optional position counted from the bottom; default on top")]
+    index: Option<usize>,
+    #[schemars(
+        description = "Optional exposed parameters by name: a number 0-1 or an sRGB colour [r, g, b]"
+    )]
+    parameters: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ApplySmartMaskRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Layer id or exact name")]
+    layer: String,
+    #[schemars(description = "Smart mask name, from the project or the built-ins")]
+    smart_mask: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -594,6 +706,132 @@ impl SubstanceCraftMcp {
                 scale: request.scale,
                 smoothing_angle: request.smoothing_angle,
                 subdivision_levels: request.subdivision_levels,
+            },
+        )
+    }
+
+    #[tool(
+        description = "List the smart materials (with their exposed parameters, current values, and evolution controls), smart masks, and materials a project can use: its own first, then the built-ins."
+    )]
+    fn list_library(
+        &self,
+        Parameters(request): Parameters<ProjectRequest>,
+    ) -> Result<String, String> {
+        let path = self.project_path(&request.project)?;
+        let (project, _) =
+            load_project_file_with_report(&path).map_err(|error| error.to_string())?;
+        serde_json::to_string_pretty(&library_summary(&project)).map_err(|error| error.to_string())
+    }
+
+    #[tool(
+        description = "Replace a layer's content filter stack, mask filter stack, or the channels its content filters apply to, and save the project."
+    )]
+    fn set_filters(
+        &self,
+        Parameters(request): Parameters<SetFiltersRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetFilters {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                filters: request.filters,
+                mask_filters: request.mask_filters,
+                channels: request.channels,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Set or remove a layer's bitmap mask (a project bitmap through a projection, optionally inverted) and save the project."
+    )]
+    fn set_bitmap_mask(
+        &self,
+        Parameters(request): Parameters<SetBitmapMaskRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetBitmapMask {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                resource: request.resource,
+                invert: request.invert,
+                projection: request.projection,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Limit a layer to chosen mesh triangles (or every other triangle), or remove its polygon mask, and save the project."
+    )]
+    fn set_polygon_mask(
+        &self,
+        Parameters(request): Parameters<SetPolygonMaskRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetPolygonMask {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                triangles: request.triangles,
+                inverted: request.inverted,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Mask a layer by a channel of the stack as composited through an earlier layer (an anchor point), with a low/high remap and inversion, or remove the anchor; save the project."
+    )]
+    fn set_anchor_mask(
+        &self,
+        Parameters(request): Parameters<SetAnchorMaskRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::SetAnchorMask {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                anchor: request.anchor,
+                channel: request.channel,
+                low: request.low,
+                high: request.high,
+                invert: request.invert,
+            },
+        )
+    }
+
+    #[tool(
+        description = "Insert a fresh copy of a smart material (a layer tree with fresh ids, keeping its evolution controls) into a texture set, optionally setting its exposed parameters, and save the project."
+    )]
+    fn insert_smart_material(
+        &self,
+        Parameters(request): Parameters<InsertSmartMaterialRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::InsertSmartMaterial {
+                texture_set: request.texture_set,
+                smart_material: request.smart_material,
+                parent: request.parent,
+                index: request.index,
+                parameters: request.parameters.unwrap_or_default(),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Apply a smart mask to a layer: replace its generator, bitmap mask, mask filters, and final inversion, keeping painted mask strokes, polygon selections, and ID clipping; save the project."
+    )]
+    fn apply_smart_mask(
+        &self,
+        Parameters(request): Parameters<ApplySmartMaskRequest>,
+    ) -> Result<String, String> {
+        self.edit(
+            &request.project,
+            AutomationEdit::ApplySmartMask {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                smart_mask: request.smart_mask,
             },
         )
     }
@@ -1025,6 +1263,182 @@ mod tests {
             }))
             .unwrap_err();
         assert!(error.contains("unknown variant `folder`"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn tc_0326_filter_mask_and_library_tools_edit_project_files() {
+        let (folder, server) = server();
+        let project = MaterialProject {
+            texture_sets: vec![TextureSet {
+                id: TextureSetId(1),
+                name: "Body".to_owned(),
+                material_slot: "Body".to_owned(),
+                resolution: TextureResolution::new(16, 16).unwrap(),
+                channels: [MaterialChannel::BaseColor, MaterialChannel::Roughness].into(),
+                layers: vec![
+                    MaterialLayer::new_paint(LayerId(1), "Base"),
+                    MaterialLayer::new_paint(LayerId(2), "Grime"),
+                ],
+                height_strength: 1.0,
+                export: None,
+            }],
+            resources: vec![substancecraft_core::ProjectResource::new(
+                substancecraft_core::ResourceId(1),
+                "Stencil",
+                "stencil.png",
+            )],
+            active_texture_set: Some(TextureSetId(1)),
+            ..MaterialProject::empty()
+        };
+        let path = folder.path().join("library.sproject");
+        substancecraft_api::save_project_file(&path, &project).unwrap();
+        let file = || "library.sproject".to_owned();
+
+        let library: serde_json::Value = serde_json::from_str(
+            &server
+                .list_library(Parameters(ProjectRequest { project: file() }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            library["smart_materials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|material| material["name"] == "Rusty iron"
+                    && material["parameters"]["Rust amount"].is_number())
+        );
+
+        server
+            .set_filters(Parameters(SetFiltersRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Grime".to_owned(),
+                filters: Some(vec![serde_json::json!({"kind": "Blur", "radius": 2.0})]),
+                mask_filters: Some(vec![serde_json::json!("Invert")]),
+                channels: Some(vec!["Roughness".to_owned()]),
+            }))
+            .unwrap();
+        server
+            .set_bitmap_mask(Parameters(SetBitmapMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                resource: Some("Stencil".to_owned()),
+                invert: None,
+                projection: Some(serde_json::json!({"mode": "Planar"})),
+            }))
+            .unwrap();
+        server
+            .set_polygon_mask(Parameters(SetPolygonMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                triangles: Some(vec![0, 5]),
+                inverted: None,
+            }))
+            .unwrap();
+        server
+            .set_anchor_mask(Parameters(SetAnchorMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Grime".to_owned(),
+                anchor: Some("Base".to_owned()),
+                channel: Some("Base Color".to_owned()),
+                low: None,
+                high: Some(0.5),
+                invert: None,
+            }))
+            .unwrap();
+        let inserted = server
+            .insert_smart_material(Parameters(InsertSmartMaterialRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                smart_material: "Rusty iron".to_owned(),
+                parent: None,
+                index: Some(0),
+                parameters: Some([("Rust amount".to_owned(), serde_json::json!(0.9))].into()),
+            }))
+            .unwrap();
+        assert!(inserted.contains("as layer 3"), "{inserted}");
+        server
+            .apply_smart_mask(Parameters(ApplySmartMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                smart_mask: "Cavity dirt".to_owned(),
+            }))
+            .unwrap();
+
+        let saved = substancecraft_api::load_project_file(&path).unwrap();
+        let set = &saved.texture_sets[0];
+        let grime = set.layer(LayerId(2)).unwrap();
+        assert_eq!(
+            grime.filters,
+            [substancecraft_core::LayerFilter::Blur { radius: 2.0 }]
+        );
+        assert_eq!(
+            grime.mask_filters,
+            [substancecraft_core::LayerFilter::Invert]
+        );
+        assert_eq!(grime.filter_channels, [MaterialChannel::Roughness].into());
+        let anchor = grime.mask_anchor.unwrap();
+        assert_eq!(
+            (anchor.layer, anchor.channel, anchor.high),
+            (LayerId(1), MaterialChannel::BaseColor, 0.5)
+        );
+        let base = set.layer(LayerId(1)).unwrap();
+        assert_eq!(base.polygon_mask.as_ref().unwrap().triangles, [0, 5].into());
+        assert!(matches!(
+            base.mask_generator,
+            Some(substancecraft_core::MaskGenerator::Dirt(_))
+        ));
+        assert_eq!(
+            base.mask_bitmap, None,
+            "a smart mask without a bitmap clears the layer's"
+        );
+        let rusty = &set.layers[0];
+        assert_eq!(rusty.name, "Rusty iron");
+        let rust = set
+            .walk_layers()
+            .into_iter()
+            .find(|layer| layer.name == "Rust")
+            .unwrap();
+        assert!(matches!(
+            rust.mask_generator,
+            Some(substancecraft_core::MaskGenerator::Noise(noise)) if noise.amount == 0.9
+        ));
+
+        // Refusals are actionable and leave the file alone.
+        let bytes = std::fs::read(&path).unwrap();
+        let error = server
+            .set_anchor_mask(Parameters(SetAnchorMaskRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                layer: "Base".to_owned(),
+                anchor: Some("Grime".to_owned()),
+                channel: None,
+                low: None,
+                high: None,
+                invert: None,
+            }))
+            .unwrap_err();
+        assert!(error.contains("can only anchor"), "{error}");
+        let error = server
+            .insert_smart_material(Parameters(InsertSmartMaterialRequest {
+                project: file(),
+                texture_set: "Body".to_owned(),
+                smart_material: "Gold leaf".to_owned(),
+                parent: None,
+                index: None,
+                parameters: None,
+            }))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "no smart material `Gold leaf` in the project or the built-in library"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

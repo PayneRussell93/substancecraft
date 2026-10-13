@@ -10,10 +10,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{
-    BlendMode, EditCommand, EditHistory, LayerFill, LayerId, LayerSlot, MaskGenerator, MaskStroke,
-    MaterialChannel, MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource,
-    PaintStroke, TextureResolution, TextureSet, TextureSetId, mask_drivers,
-    remap_subdivided_triangles,
+    AnchorMask, BitmapMask, BlendMode, EditCommand, EditHistory, LayerFill, LayerFilter, LayerId,
+    LayerSettings, LayerSlot, MapRequirements, MaskGenerator, MaskStroke, MaterialChannel,
+    MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource, PaintStroke,
+    ParameterValue, PolygonMask, SmartMask, SmartMaterial, TextureProjection, TextureResolution,
+    TextureSet, TextureSetId, mask_drivers, remap_subdivided_triangles,
 };
 use thiserror::Error;
 
@@ -70,6 +71,9 @@ pub struct LayerSummary {
     /// What the mask reads (generator, painted mask, polygon selection, ...).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask: Vec<String>,
+    /// Content filters, in the order they apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<String>,
     pub strokes: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<LayerSummary>,
@@ -119,6 +123,11 @@ fn layer_summary(layer: &MaterialLayer, set: &TextureSet) -> LayerSummary {
         channels: channel_names(&layer.channels),
         material: layer.material_link.as_ref().map(|link| link.material.0),
         mask: mask_drivers(layer, set),
+        filters: layer
+            .filters
+            .iter()
+            .map(|filter| filter.name().to_owned())
+            .collect(),
         strokes: layer.paint_strokes.len() + layer.mask_strokes.len() + layer.id_strokes.len(),
         children: layer
             .children
@@ -184,6 +193,110 @@ pub fn project_summary(project: &MaterialProject) -> ProjectSummary {
                 source: resource.source.clone(),
             })
             .collect(),
+    }
+}
+
+/// Smart materials, smart masks, and materials automation can insert or
+/// apply: the project's first, then the built-ins.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibrarySummary {
+    pub api_version: u32,
+    pub smart_materials: Vec<SmartMaterialSummary>,
+    pub smart_masks: Vec<LibraryEntrySummary>,
+    pub materials: Vec<LibraryEntrySummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibraryEntrySummary {
+    pub name: String,
+    /// `project` or `built-in`.
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmartMaterialSummary {
+    pub name: String,
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Exposed parameters by name, with their current values (a number or
+    /// an sRGB colour).
+    pub parameters: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Evolution controls (for example `Wear`) carried by its layers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<String>,
+    /// Whether it needs baked mesh maps.
+    pub needs_mesh_maps: bool,
+}
+
+fn origin(project: bool) -> String {
+    if project { "project" } else { "built-in" }.to_owned()
+}
+
+/// The library entries automation can use with `project`.
+pub fn library_summary(project: &MaterialProject) -> LibrarySummary {
+    let smart_materials = project
+        .smart_materials
+        .iter()
+        .cloned()
+        .chain(SmartMaterial::built_in())
+        .enumerate()
+        .map(|(index, material)| SmartMaterialSummary {
+            origin: origin(index < project.smart_materials.len()),
+            parameters: material
+                .parameters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, parameter)| {
+                    let value = match material.parameter_value(index)? {
+                        ParameterValue::Scalar(value) => serde_json::json!(value),
+                        ParameterValue::Color(color) => serde_json::json!(color),
+                    };
+                    Some((parameter.name.clone(), value))
+                })
+                .collect(),
+            controls: material
+                .root
+                .walk()
+                .iter()
+                .flat_map(|layer| layer.evolutions.iter().map(|control| control.name.clone()))
+                .collect(),
+            needs_mesh_maps: material.requirements().mesh_maps,
+            name: material.name,
+            description: material.description,
+        })
+        .collect();
+    let smart_masks = project
+        .smart_masks
+        .iter()
+        .cloned()
+        .chain(SmartMask::built_in())
+        .enumerate()
+        .map(|(index, mask)| LibraryEntrySummary {
+            name: mask.name,
+            origin: origin(index < project.smart_masks.len()),
+            description: mask.description,
+        })
+        .collect();
+    let materials = project
+        .materials
+        .iter()
+        .cloned()
+        .chain(MaterialResource::built_in())
+        .enumerate()
+        .map(|(index, material)| LibraryEntrySummary {
+            name: material.name,
+            origin: origin(index < project.materials.len()),
+            description: String::new(),
+        })
+        .collect();
+    LibrarySummary {
+        api_version: AUTOMATION_API_VERSION,
+        smart_materials,
+        smart_masks,
+        materials,
     }
 }
 
@@ -315,6 +428,86 @@ pub enum AutomationEdit {
         #[serde(default)]
         subdivision_levels: Option<u32>,
     },
+    /// Replaces a layer's content filter stack, its mask filter stack, or
+    /// the channels its content filters apply to (an empty list: every
+    /// channel). Each filter is a name (`Blur`, `Levels`, `Hue / Saturation`,
+    /// ...: its defaults) or an object such as `{"kind": "Blur", "radius": 8}`
+    /// whose fields replace those defaults. Filters apply in list order.
+    SetFilters {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        filters: Option<Vec<serde_json::Value>>,
+        #[serde(default)]
+        mask_filters: Option<Vec<serde_json::Value>>,
+        #[serde(default)]
+        channels: Option<Vec<String>>,
+    },
+    /// Sets a layer's bitmap mask to a project bitmap (`resource`, by id or
+    /// name; `none` removes the mask), with its inversion and projection.
+    /// `projection` is an object whose fields (`mode`, `scale`, `offset`,
+    /// `rotation_degrees`, `axis`, `tile_size`, ...) replace those of the
+    /// current projection.
+    SetBitmapMask {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        resource: Option<String>,
+        #[serde(default)]
+        invert: Option<bool>,
+        #[serde(default)]
+        projection: Option<serde_json::Value>,
+    },
+    /// Limits a layer to the given mesh triangles (`triangles`; an empty
+    /// list removes the polygon mask), or to every other triangle
+    /// (`inverted`).
+    SetPolygonMask {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        triangles: Option<Vec<u32>>,
+        #[serde(default)]
+        inverted: Option<bool>,
+    },
+    /// Masks a layer by a channel of the stack as composited through an
+    /// earlier layer (`anchor`, by id or name; `none` removes the anchor),
+    /// remapping `low..high` to `0..1`, optionally inverted.
+    SetAnchorMask {
+        texture_set: String,
+        layer: String,
+        #[serde(default)]
+        anchor: Option<String>,
+        #[serde(default)]
+        channel: Option<String>,
+        #[serde(default)]
+        low: Option<f32>,
+        #[serde(default)]
+        high: Option<f32>,
+        #[serde(default)]
+        invert: Option<bool>,
+    },
+    /// Inserts a fresh copy of a smart material (project first, then the
+    /// built-ins) inside `parent` or at the top level, at `index` from the
+    /// bottom (default: on top). `parameters` sets exposed parameters by
+    /// name: a number from 0 to 1, or an sRGB colour `[r, g, b]`.
+    InsertSmartMaterial {
+        texture_set: String,
+        smart_material: String,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        parameters: std::collections::BTreeMap<String, serde_json::Value>,
+    },
+    /// Replaces a layer's generator, bitmap mask, mask filters, and final
+    /// inversion with a smart mask's (project first, then the built-ins).
+    /// Painted mask strokes, polygon selections, and ID clipping stay.
+    ApplySmartMask {
+        texture_set: String,
+        layer: String,
+        smart_mask: String,
+    },
 }
 
 /// The kind of layer [`AutomationEdit::AddLayer`] creates.
@@ -359,6 +552,12 @@ pub enum AutomationError {
     UnknownLayer(String),
     #[error("no material `{0}` in the project or the built-in library")]
     UnknownMaterial(String),
+    #[error("no bitmap resource `{0}` in the project")]
+    UnknownResource(String),
+    #[error("no smart material `{0}` in the project or the built-in library")]
+    UnknownSmartMaterial(String),
+    #[error("no smart mask `{0}` in the project or the built-in library")]
+    UnknownSmartMask(String),
     #[error("`{0}` names several entries; use the numeric id")]
     Ambiguous(String),
     #[error("{0}")]
@@ -1085,7 +1284,499 @@ fn automation_command(
                 },
             ))
         }
+        AutomationEdit::SetFilters {
+            texture_set,
+            layer,
+            filters,
+            mask_filters,
+            channels,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let before = target.settings();
+            let mut after = before.clone();
+            if let Some(filters) = filters {
+                after.filters = parse_filters(filters)?;
+            }
+            if let Some(filters) = mask_filters {
+                after.mask_filters = parse_filters(filters)?;
+            }
+            if let Some(channels) = channels {
+                after.filter_channels = channels
+                    .iter()
+                    .map(|name| parse_channel(name))
+                    .collect::<Result<_, _>>()?;
+            }
+            let summary = format!(
+                "set the filters of layer {} `{}` ({} on content, {} on mask)",
+                target.id.0,
+                target.name,
+                after.filters.len(),
+                after.mask_filters.len()
+            );
+            Ok(settings_edit(set, target, before, after, summary))
+        }
+        AutomationEdit::SetBitmapMask {
+            texture_set,
+            layer,
+            resource,
+            invert,
+            projection,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let before = target.settings();
+            let mut after = before.clone();
+            let removing = resource
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty() || name.trim() == "none");
+            if removing {
+                after.mask_bitmap = None;
+            } else {
+                let mut mask = match (resource, before.mask_bitmap) {
+                    (Some(reference), current) => {
+                        let resource = find_unique(
+                            project.resources.iter(),
+                            reference,
+                            |resource| resource.id.0,
+                            |resource| resource.name.as_str(),
+                            AutomationError::UnknownResource,
+                        )?;
+                        BitmapMask {
+                            resource: resource.id,
+                            ..current.unwrap_or(BitmapMask {
+                                resource: resource.id,
+                                projection: TextureProjection::default(),
+                                invert: false,
+                            })
+                        }
+                    }
+                    (None, Some(current)) => current,
+                    (None, None) => {
+                        return Err(AutomationError::InvalidValue(
+                            "the layer has no bitmap mask; name a `resource`".to_owned(),
+                        ));
+                    }
+                };
+                if let Some(invert) = invert {
+                    mask.invert = *invert;
+                }
+                if let Some(fields) = projection {
+                    mask.projection = merge_fields("projection", &mask.projection, fields)?;
+                }
+                after.mask_bitmap = Some(mask);
+            }
+            let summary = format!(
+                "{} the bitmap mask of layer {} `{}`",
+                if removing { "removed" } else { "set" },
+                target.id.0,
+                target.name
+            );
+            Ok(settings_edit(set, target, before, after, summary))
+        }
+        AutomationEdit::SetPolygonMask {
+            texture_set,
+            layer,
+            triangles,
+            inverted,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let before = target.settings();
+            let mut after = before.clone();
+            match triangles {
+                Some(triangles) if triangles.is_empty() => after.polygon_mask = None,
+                Some(triangles) => {
+                    after.polygon_mask = Some(PolygonMask {
+                        triangles: triangles.iter().copied().collect(),
+                        inverted: before
+                            .polygon_mask
+                            .as_ref()
+                            .is_some_and(|mask| mask.inverted),
+                    });
+                }
+                None => {}
+            }
+            if let Some(inverted) = inverted {
+                match after.polygon_mask.as_mut() {
+                    Some(mask) => mask.inverted = *inverted,
+                    None if triangles.is_some() => {}
+                    None => {
+                        return Err(AutomationError::InvalidValue(
+                            "the layer has no polygon mask; give its `triangles`".to_owned(),
+                        ));
+                    }
+                }
+            }
+            let summary = match &after.polygon_mask {
+                Some(mask) => format!(
+                    "limited layer {} `{}` to {}{} triangle(s)",
+                    target.id.0,
+                    target.name,
+                    if mask.inverted { "all but " } else { "" },
+                    mask.triangles.len()
+                ),
+                None => format!(
+                    "removed the polygon mask of layer {} `{}`",
+                    target.id.0, target.name
+                ),
+            };
+            Ok(settings_edit(set, target, before, after, summary))
+        }
+        AutomationEdit::SetAnchorMask {
+            texture_set,
+            layer,
+            anchor,
+            channel,
+            low,
+            high,
+            invert,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let before = target.settings();
+            let mut after = before.clone();
+            let removing = anchor
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty() || name.trim() == "none");
+            if removing {
+                after.mask_anchor = None;
+            } else {
+                let mut mask = match (anchor, before.mask_anchor) {
+                    (Some(reference), current) => {
+                        let source = find_layer(set, reference)?;
+                        if !set.anchor_is_valid(target.id, source.id) {
+                            return Err(AutomationError::InvalidValue(format!(
+                                "layer `{}` can only anchor to a layer composited before it, \
+                                 outside it, and not to a group holding it",
+                                target.name
+                            )));
+                        }
+                        AnchorMask {
+                            layer: source.id,
+                            ..current
+                                .unwrap_or(AnchorMask::new(source.id, MaterialChannel::BaseColor))
+                        }
+                    }
+                    (None, Some(current)) => current,
+                    (None, None) => {
+                        return Err(AutomationError::InvalidValue(
+                            "the layer has no anchor mask; name an `anchor` layer".to_owned(),
+                        ));
+                    }
+                };
+                if let Some(channel) = channel {
+                    mask.channel = parse_channel(channel)?;
+                    if !AnchorMask::CHANNELS.contains(&mask.channel) {
+                        return Err(AutomationError::InvalidValue(format!(
+                            "anchors cannot read the {:?} channel",
+                            mask.channel
+                        )));
+                    }
+                }
+                if let Some(low) = unit("low", *low)? {
+                    mask.low = low;
+                }
+                if let Some(high) = unit("high", *high)? {
+                    mask.high = high;
+                }
+                if mask.low >= mask.high {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "low ({}) must be below high ({})",
+                        mask.low, mask.high
+                    )));
+                }
+                if let Some(invert) = invert {
+                    mask.invert = *invert;
+                }
+                after.mask_anchor = Some(mask);
+            }
+            let summary = match after.mask_anchor {
+                Some(mask) => format!(
+                    "anchored layer {} `{}` to layer {} ({:?})",
+                    target.id.0, target.name, mask.layer.0, mask.channel
+                ),
+                None => format!(
+                    "removed the anchor mask of layer {} `{}`",
+                    target.id.0, target.name
+                ),
+            };
+            Ok(settings_edit(set, target, before, after, summary))
+        }
+        AutomationEdit::InsertSmartMaterial {
+            texture_set,
+            smart_material,
+            parent,
+            index,
+            parameters,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let wanted = smart_material.trim();
+            let mut material = project
+                .smart_materials
+                .iter()
+                .cloned()
+                .chain(SmartMaterial::built_in())
+                .find(|candidate| candidate.name == wanted)
+                .ok_or_else(|| AutomationError::UnknownSmartMaterial(wanted.to_owned()))?;
+            require_resources(project, &material.name, &material.requirements())?;
+            for (name, value) in parameters {
+                let index = material
+                    .parameters
+                    .iter()
+                    .position(|parameter| parameter.name.eq_ignore_ascii_case(name.trim()))
+                    .ok_or_else(|| {
+                        AutomationError::InvalidValue(format!(
+                            "`{}` has no parameter `{name}`; it has {}",
+                            material.name,
+                            material
+                                .parameters
+                                .iter()
+                                .map(|parameter| format!("`{}`", parameter.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+                let value = parse_parameter_value(value)?;
+                if !material.set_parameter(index, value) {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "parameter `{name}` does not take {value:?}"
+                    )));
+                }
+            }
+            let parent = parent
+                .as_deref()
+                .map(|parent| find_group(set, parent))
+                .transpose()?;
+            let index = slot_index(*index, siblings(set, parent).len())?;
+            let mut next = next_layer_id(project).0;
+            let root = material.instantiate(|| {
+                let id = LayerId(next);
+                next += 1;
+                id
+            });
+            let id = root.id;
+            Ok((
+                Some(EditCommand::InsertLayer {
+                    texture_set_id: set.id,
+                    slot: LayerSlot {
+                        parent: parent.map(|group| group.id),
+                        index,
+                    },
+                    layer: Box::new(root),
+                }),
+                EditOutcome {
+                    summary: format!(
+                        "inserted smart material `{}` as layer {} in `{}`{}",
+                        material.name,
+                        id.0,
+                        set.name,
+                        in_group(parent)
+                    ),
+                    layer: Some(id.0),
+                    changed: true,
+                },
+            ))
+        }
+        AutomationEdit::ApplySmartMask {
+            texture_set,
+            layer,
+            smart_mask,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            let wanted = smart_mask.trim();
+            let mask = project
+                .smart_masks
+                .iter()
+                .cloned()
+                .chain(SmartMask::built_in())
+                .find(|candidate| candidate.name == wanted)
+                .ok_or_else(|| AutomationError::UnknownSmartMask(wanted.to_owned()))?;
+            require_resources(project, &mask.name, &mask.requirements())?;
+            let mut masked = target.clone();
+            mask.apply_to(&mut masked);
+            let summary = format!(
+                "applied smart mask `{}` to layer {} `{}`",
+                mask.name, target.id.0, target.name
+            );
+            Ok(settings_edit(
+                set,
+                target,
+                target.settings(),
+                masked.settings(),
+                summary,
+            ))
+        }
     }
+}
+
+/// A layer-settings command from `before` to `after`, or no command when
+/// they match.
+fn settings_edit(
+    set: &TextureSet,
+    target: &MaterialLayer,
+    before: LayerSettings,
+    after: LayerSettings,
+    summary: String,
+) -> (Option<EditCommand>, EditOutcome) {
+    if after == before {
+        return (None, unchanged(Some(target.id)));
+    }
+    (
+        Some(EditCommand::LayerSettings {
+            texture_set_id: set.id,
+            layer_id: target.id,
+            before: Box::new(before),
+            after: Box::new(after),
+        }),
+        EditOutcome {
+            summary,
+            layer: Some(target.id.0),
+            changed: true,
+        },
+    )
+}
+
+/// Refuses a library entry whose bitmaps the project does not have.
+fn require_resources(
+    project: &MaterialProject,
+    name: &str,
+    requirements: &MapRequirements,
+) -> Result<(), AutomationError> {
+    match requirements
+        .resources
+        .iter()
+        .find(|id| !project.resources.iter().any(|resource| resource.id == **id))
+    {
+        Some(missing) => Err(AutomationError::InvalidValue(format!(
+            "`{name}` uses bitmap resource {}, which this project does not have",
+            missing.0
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `current` with the fields of the object `fields` replaced; unknown
+/// fields are refused.
+fn merge_fields<T: Serialize + serde::de::DeserializeOwned>(
+    what: &str,
+    current: &T,
+    fields: &serde_json::Value,
+) -> Result<T, AutomationError> {
+    let invalid = |error: serde_json::Error| AutomationError::InvalidValue(error.to_string());
+    let serde_json::Value::Object(fields) = fields else {
+        return Err(AutomationError::InvalidValue(format!(
+            "a {what} is an object of the settings to change"
+        )));
+    };
+    let mut merged = serde_json::to_value(current).map_err(invalid)?;
+    if let serde_json::Value::Object(settings) = &mut merged {
+        for (key, value) in fields {
+            if !settings.contains_key(key) {
+                return Err(AutomationError::InvalidValue(format!(
+                    "a {what} has no `{key}` setting"
+                )));
+            }
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::from_value(merged).map_err(invalid)
+}
+
+/// A smart-material parameter value: a number or an sRGB `[r, g, b]`.
+fn parse_parameter_value(value: &serde_json::Value) -> Result<ParameterValue, AutomationError> {
+    if let Some(number) = value.as_f64() {
+        return Ok(ParameterValue::Scalar(number as f32));
+    }
+    serde_json::from_value::<[u8; 3]>(value.clone())
+        .map(ParameterValue::Color)
+        .map_err(|_| {
+            AutomationError::InvalidValue(format!(
+                "a parameter is a number from 0 to 1 or a colour [r, g, b], not {value}"
+            ))
+        })
+}
+
+/// The serialized variant name of a filter (`Blur`, `HueSaturation`).
+fn filter_kind(filter: LayerFilter) -> Option<String> {
+    match serde_json::to_value(filter).ok()? {
+        serde_json::Value::String(kind) => Some(kind),
+        serde_json::Value::Object(map) => map.keys().next().cloned(),
+        _ => None,
+    }
+}
+
+/// The default filter named `name`: its display name (`Hue / Saturation`)
+/// or its variant name (`HueSaturation`), ignoring case.
+fn filter_preset(name: &str) -> Result<LayerFilter, AutomationError> {
+    let name = name.trim();
+    LayerFilter::PRESETS
+        .into_iter()
+        .find(|preset| {
+            preset.name().eq_ignore_ascii_case(name)
+                || filter_kind(*preset).is_some_and(|kind| kind.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| AutomationError::InvalidValue(format!("unknown filter `{name}`")))
+}
+
+/// A filter stack: each entry a filter name or an object with a `kind` and
+/// the settings that replace its defaults.
+fn parse_filters(values: &[serde_json::Value]) -> Result<Vec<LayerFilter>, AutomationError> {
+    values
+        .iter()
+        .map(|value| {
+            let fields = match value {
+                serde_json::Value::String(name) => return filter_preset(name),
+                serde_json::Value::Object(fields) => fields,
+                _ => {
+                    return Err(AutomationError::InvalidValue(
+                        "a filter is a name or an object with a `kind`".to_owned(),
+                    ));
+                }
+            };
+            let kind = fields
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AutomationError::InvalidValue("a filter object needs a `kind`".to_owned())
+                })?;
+            let preset = filter_preset(kind)?;
+            let settings: serde_json::Map<_, _> = fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "kind")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let variant = filter_kind(preset).unwrap_or_default();
+            let filter = match serde_json::to_value(preset) {
+                Ok(serde_json::Value::Object(mut wrapper)) => {
+                    let defaults = wrapper.remove(&variant).unwrap_or_default();
+                    let merged = merge_fields(
+                        &format!("{} filter", preset.name()),
+                        &defaults,
+                        &serde_json::Value::Object(settings),
+                    )?;
+                    serde_json::from_value(serde_json::json!({ variant: merged }))
+                        .map_err(|error| AutomationError::InvalidValue(error.to_string()))?
+                }
+                // Settings-free filters such as Invert.
+                _ if settings.is_empty() => preset,
+                _ => {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "the {} filter has no settings",
+                        preset.name()
+                    )));
+                }
+            };
+            if !filter.is_valid() {
+                return Err(AutomationError::InvalidValue(format!(
+                    "the {} filter settings are out of range",
+                    preset.name()
+                )));
+            }
+            Ok(filter)
+        })
+        .collect()
 }
 
 /// The group whose id or exact name is `reference`.
@@ -1869,6 +2560,455 @@ mod tests {
             Err(AutomationError::InvalidValue(
                 "at most 3 subdivision levels, not 4".to_owned()
             ))
+        );
+    }
+
+    /// Applies an edit that must be refused and checks the project did not
+    /// change.
+    fn refused(project: &mut MaterialProject, json: &str) -> AutomationError {
+        let before = project.clone();
+        let error = apply_automation_edit(project, &edit(json)).unwrap_err();
+        assert_eq!(*project, before, "{json} changed the project");
+        error
+    }
+
+    #[test]
+    fn tc_0323_automation_sets_content_and_mask_filter_stacks() {
+        let mut project = project();
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_filters","texture_set":"Body","layer":"Base",
+                    "filters":["Blur",{"kind":"Levels","gamma":2.0},"invert"],
+                    "mask_filters":[{"kind":"hue / saturation","saturation":0.5}],
+                    "channels":["roughness"]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "set the filters of layer 1 `Base` (3 on content, 1 on mask)"
+        );
+        let base = project.texture_sets[0].layer(LayerId(1)).unwrap().clone();
+        assert_eq!(
+            base.filters,
+            [
+                LayerFilter::Blur { radius: 4.0 },
+                LayerFilter::Levels {
+                    in_low: 0.0,
+                    in_high: 1.0,
+                    gamma: 2.0,
+                    out_low: 0.0,
+                    out_high: 1.0,
+                },
+                LayerFilter::Invert,
+            ]
+        );
+        assert_eq!(
+            base.mask_filters,
+            [LayerFilter::HueSaturation {
+                hue: 0.0,
+                saturation: 0.5,
+                lightness: 0.0,
+            }]
+        );
+        assert_eq!(base.filter_channels, [MaterialChannel::Roughness].into());
+        let summary = project_summary(&project);
+        assert_eq!(
+            summary.texture_sets[0].layers[0].filters,
+            ["Blur", "Levels", "Invert"]
+        );
+        assert!(
+            summary.texture_sets[0].layers[0]
+                .mask
+                .contains(&"1 mask filter(s)".to_owned())
+        );
+
+        // Asking for what the layer has changes nothing.
+        let again = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_filters","texture_set":"Body","layer":"Base","channels":["Roughness"]}"#,
+            ),
+        )
+        .unwrap();
+        assert!(!again.changed);
+
+        // Bad filters are refused with their reason and change nothing.
+        let base_edit = |filter: &str| {
+            format!(
+                r#"{{"edit":"set_filters","texture_set":"Body","layer":"Base","filters":[{filter}]}}"#
+            )
+        };
+        for (filter, reason) in [
+            (r#""Glow""#, "unknown filter `Glow`"),
+            (
+                r#"{"kind":"Blur","radius":500}"#,
+                "the Blur filter settings are out of range",
+            ),
+            (
+                r#"{"kind":"Blur","strength":1}"#,
+                "a Blur filter has no `strength` setting",
+            ),
+            (
+                r#"{"kind":"Invert","amount":1}"#,
+                "the Invert filter has no settings",
+            ),
+            (r#"{"radius":2}"#, "a filter object needs a `kind`"),
+            ("3", "a filter is a name or an object with a `kind`"),
+        ] {
+            assert_eq!(
+                refused(&mut project, &base_edit(filter)),
+                AutomationError::InvalidValue(reason.to_owned()),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_filters","texture_set":"Body","layer":"Base","channels":["Shine"]}"#
+            ),
+            AutomationError::InvalidValue("unknown channel `Shine`".to_owned())
+        );
+
+        // Empty lists clear the stacks and the channel scope.
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_filters","texture_set":"Body","layer":"Base","filters":[],"mask_filters":[],"channels":[]}"#,
+            ),
+        )
+        .unwrap();
+        let base = project.texture_sets[0].layer(LayerId(1)).unwrap();
+        assert!(base.filters.is_empty() && base.mask_filters.is_empty());
+        assert!(base.filter_channels.is_empty());
+    }
+
+    #[test]
+    fn tc_0324_automation_sets_bitmap_polygon_and_anchor_masks() {
+        let mut project = project();
+        project
+            .resources
+            .push(substancecraft_core::ProjectResource::new(
+                substancecraft_core::ResourceId(1),
+                "Stencil",
+                "stencil.png",
+            ));
+        let layer = |project: &MaterialProject, id: u64| {
+            project.texture_sets[0].layer(LayerId(id)).unwrap().clone()
+        };
+
+        // Bitmap masks: a resource by name, inverted, through a projection
+        // whose named fields change.
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","resource":"Stencil",
+                    "invert":true,"projection":{"mode":"Triplanar","scale":2.0}}"#,
+            ),
+        )
+        .unwrap();
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","projection":{"rotation_degrees":45.0}}"#,
+            ),
+        )
+        .unwrap();
+        let mask = layer(&project, 1).mask_bitmap.unwrap();
+        assert_eq!(mask.resource, substancecraft_core::ResourceId(1));
+        assert!(mask.invert);
+        assert_eq!(
+            mask.projection.mode,
+            substancecraft_core::ProjectionMode::Triplanar
+        );
+        assert_eq!(
+            (mask.projection.scale, mask.projection.rotation_degrees),
+            (2.0, 45.0)
+        );
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","resource":"Missing"}"#
+            ),
+            AutomationError::UnknownResource("Missing".to_owned())
+        );
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","projection":{"zoom":2}}"#
+            ),
+            AutomationError::InvalidValue("a projection has no `zoom` setting".to_owned())
+        );
+        assert!(matches!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","projection":{"scale":-1}}"#
+            ),
+            AutomationError::Rejected(_)
+        ));
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","resource":"none"}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(layer(&project, 1).mask_bitmap, None);
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_bitmap_mask","texture_set":"Body","layer":"Base","invert":true}"#
+            ),
+            AutomationError::InvalidValue(
+                "the layer has no bitmap mask; name a `resource`".to_owned()
+            )
+        );
+
+        // Polygon masks: triangles, then inverted, then removed.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_polygon_mask","texture_set":"Body","layer":"Base","triangles":[3,1,2,1]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(outcome.summary, "limited layer 1 `Base` to 3 triangle(s)");
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_polygon_mask","texture_set":"Body","layer":"Base","inverted":true}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "limited layer 1 `Base` to all but 3 triangle(s)"
+        );
+        let polygon = layer(&project, 1).polygon_mask.unwrap();
+        assert_eq!(polygon.triangles, [1, 2, 3].into());
+        assert!(polygon.inverted);
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_polygon_mask","texture_set":"Body","layer":"Base","triangles":[]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(layer(&project, 1).polygon_mask, None);
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_polygon_mask","texture_set":"Body","layer":"Base","inverted":true}"#
+            ),
+            AutomationError::InvalidValue(
+                "the layer has no polygon mask; give its `triangles`".to_owned()
+            )
+        );
+
+        // Anchor masks read an earlier layer outside the anchored one.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_anchor_mask","texture_set":"Body","layer":"Scratches","anchor":"Base",
+                    "channel":"Roughness","low":0.2,"high":0.8,"invert":true}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "anchored layer 4 `Scratches` to layer 1 (Roughness)"
+        );
+        assert_eq!(
+            layer(&project, 4).mask_anchor,
+            Some(AnchorMask {
+                layer: LayerId(1),
+                channel: MaterialChannel::Roughness,
+                low: 0.2,
+                high: 0.8,
+                invert: true,
+            })
+        );
+        assert!(
+            project_summary(&project).texture_sets[0].layers[1].children[0]
+                .mask
+                .contains(&"Anchor to Base (Roughness)".to_owned())
+        );
+        let anchor_edit = |layer: &str, anchor: &str| {
+            format!(
+                r#"{{"edit":"set_anchor_mask","texture_set":"Body","layer":"{layer}","anchor":"{anchor}"}}"#
+            )
+        };
+        for (layer, anchor) in [
+            ("Base", "Scratches"),
+            ("Scratches", "Details"),
+            ("Base", "Base"),
+        ] {
+            assert!(
+                matches!(
+                    refused(&mut project, &anchor_edit(layer, anchor)),
+                    AutomationError::InvalidValue(reason) if reason.contains("can only anchor")
+                ),
+                "{layer} to {anchor}"
+            );
+        }
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_anchor_mask","texture_set":"Body","layer":"Scratches","channel":"Normal"}"#
+            ),
+            AutomationError::InvalidValue("anchors cannot read the Normal channel".to_owned())
+        );
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_anchor_mask","texture_set":"Body","layer":"Scratches","low":0.9}"#
+            ),
+            AutomationError::InvalidValue("low (0.9) must be below high (0.8)".to_owned())
+        );
+        apply_automation_edit(&mut project, &edit(&anchor_edit("Scratches", "none"))).unwrap();
+        assert_eq!(layer(&project, 4).mask_anchor, None);
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"set_anchor_mask","texture_set":"Body","layer":"Scratches","invert":true}"#
+            ),
+            AutomationError::InvalidValue(
+                "the layer has no anchor mask; name an `anchor` layer".to_owned()
+            )
+        );
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn tc_0325_automation_lists_the_library_inserts_smart_materials_and_applies_smart_masks() {
+        let mut project = project();
+        let library = library_summary(&project);
+        let worn = library
+            .smart_materials
+            .iter()
+            .find(|material| material.name == "Worn painted steel")
+            .unwrap();
+        assert_eq!(worn.origin, "built-in");
+        assert_eq!(worn.controls, ["Wear"]);
+        assert!(worn.needs_mesh_maps);
+        assert_eq!(
+            worn.parameters["Paint color"],
+            serde_json::json!([40, 70, 120])
+        );
+        assert!(
+            library
+                .smart_masks
+                .iter()
+                .any(|mask| mask.name == "Worn edges")
+        );
+        assert!(
+            library
+                .materials
+                .iter()
+                .any(|material| material.name == "Gold")
+        );
+
+        // A smart material inserts as a fresh tree inside a group, with its
+        // parameters set and its control following the new ids.
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"insert_smart_material","texture_set":"Body","smart_material":"Worn painted steel",
+                    "parent":"Details","index":0,"parameters":{"paint color":[200,30,30],"Paint roughness":0.2}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "inserted smart material `Worn painted steel` as layer 5 in `Body` in group `Details`"
+        );
+        let details = project.texture_sets[0].layer(LayerId(3)).unwrap();
+        let root = &details.children.as_ref().unwrap()[0];
+        assert_eq!(root.id, LayerId(5));
+        let ids: Vec<u64> = root.walk().iter().map(|layer| layer.id.0).collect();
+        assert_eq!(ids, [5, 6, 7, 8]);
+        let paint = project.texture_sets[0].layer(LayerId(7)).unwrap();
+        assert_eq!(paint.name, "Paint");
+        let fill = paint.fill.unwrap();
+        assert_eq!(fill.color, [200, 30, 30, 255]);
+        assert_eq!(fill.roughness, 0.2);
+        let root = project.texture_sets[0].layer(LayerId(5)).unwrap();
+        assert!(
+            root.evolutions[0]
+                .drives
+                .iter()
+                .all(|drive| (6..=8).contains(&drive.layer.0))
+        );
+        project.validate().unwrap();
+
+        let insert = |material: &str, parameters: &str| {
+            format!(
+                r#"{{"edit":"insert_smart_material","texture_set":"Body","smart_material":"{material}","parameters":{parameters}}}"#
+            )
+        };
+        assert_eq!(
+            refused(&mut project, &insert("Chrome", "{}")),
+            AutomationError::UnknownSmartMaterial("Chrome".to_owned())
+        );
+        assert!(matches!(
+            refused(&mut project, &insert("Rusty iron", r#"{"Shine":1}"#)),
+            AutomationError::InvalidValue(reason)
+                if reason.starts_with("`Rusty iron` has no parameter `Shine`; it has `Iron color`")
+        ));
+        for value in ["2.0", r#""red""#, "[1,2,3]"] {
+            let parameters = format!(r#"{{"Iron roughness":{value}}}"#);
+            assert!(
+                matches!(
+                    refused(&mut project, &insert("Rusty iron", &parameters)),
+                    AutomationError::InvalidValue(_)
+                ),
+                "{value}"
+            );
+        }
+
+        // A project smart material wins over a built-in of the same name.
+        let mut custom =
+            SmartMaterial::from_layer(&MaterialLayer::new_paint(LayerId(1), "Mine"), "Rusty iron");
+        custom.parameters.clear();
+        project.smart_materials.push(custom);
+        apply_automation_edit(&mut project, &edit(&insert("Rusty iron", "{}"))).unwrap();
+        assert_eq!(project.texture_sets[0].layers.last().unwrap().name, "Mine");
+        assert_eq!(
+            library_summary(&project).smart_materials[0].origin,
+            "project"
+        );
+
+        // A smart mask replaces the generator and keeps painted strokes.
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"paint_mask","texture_set":"Body","layer":"Base",
+                    "stroke":{"points":[[0.5,0.5]],"radius_pixels":2,"value":0,"opacity":1}}"#,
+            ),
+        )
+        .unwrap();
+        let outcome = apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"apply_smart_mask","texture_set":"Body","layer":"Base","smart_mask":"Worn edges"}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "applied smart mask `Worn edges` to layer 1 `Base`"
+        );
+        let worn_edges = SmartMask::built_in().remove(0);
+        let base = project.texture_sets[0].layer(LayerId(1)).unwrap();
+        assert_eq!(base.mask_generator, worn_edges.generator);
+        assert_eq!(base.mask_strokes.len(), 1);
+        assert_eq!(
+            refused(
+                &mut project,
+                r#"{"edit":"apply_smart_mask","texture_set":"Body","layer":"Base","smart_mask":"Moss"}"#
+            ),
+            AutomationError::UnknownSmartMask("Moss".to_owned())
         );
     }
 }

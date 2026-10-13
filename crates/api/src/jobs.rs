@@ -12,9 +12,9 @@ use substancecraft_core::{
 use thiserror::Error;
 
 use crate::{
-    ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_mesh_maps, bake_mesh_maps_high_to_low,
-    import_fbx_meshes, import_gltf_file, load_project_file, load_project_resources,
-    write_exported_textures,
+    ImportedMesh, MAX_FBX_BYTES, STEP_EXTENSIONS, TextureFormat, bake_mesh_maps,
+    bake_mesh_maps_high_to_low, import_fbx_meshes, import_gltf_file, import_step_file,
+    load_project_file, load_project_resources, write_exported_textures,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -29,8 +29,9 @@ pub enum JobError {
     Export { set: String, message: String },
 }
 
-/// Reads an FBX (every mesh it holds) or a glTF/GLB (the flattened scene),
-/// choosing the importer by extension.
+/// Reads an FBX (every mesh it holds), a glTF/GLB (the flattened scene), or
+/// a STEP file (the tessellated, flattened assembly), choosing the importer
+/// by extension.
 pub fn load_mesh_file(path: &Path) -> Result<Vec<ImportedMesh>, String> {
     let extension = path
         .extension()
@@ -38,6 +39,11 @@ pub fn load_mesh_file(path: &Path) -> Result<Vec<ImportedMesh>, String> {
         .unwrap_or_default();
     if extension == "gltf" || extension == "glb" {
         return import_gltf_file(path)
+            .map(|mesh| vec![mesh])
+            .map_err(|error| error.to_string());
+    }
+    if STEP_EXTENSIONS.contains(&extension.as_str()) {
+        return import_step_file(path)
             .map(|mesh| vec![mesh])
             .map_err(|error| error.to_string());
     }

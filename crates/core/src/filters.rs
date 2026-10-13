@@ -111,7 +111,7 @@ impl LayerFilter {
         }
     }
 
-    pub(crate) fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         let finite_in =
             |value: f32, low: f32, high: f32| value.is_finite() && (low..=high).contains(&value);
         match self {

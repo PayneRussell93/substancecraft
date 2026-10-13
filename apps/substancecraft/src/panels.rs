@@ -268,6 +268,7 @@ impl SubstanceCraftApp {
     pub(super) fn select_texture_set(&mut self, set_id: TextureSetId) {
         self.finish_active_stroke();
         self.selected_texture_set = Some(set_id);
+        self.extra_selected_layers.clear();
         self.project.active_texture_set = Some(set_id);
         self.selected_layer = self
             .project
@@ -1670,7 +1671,8 @@ impl SubstanceCraftApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for row in rows {
-                            let selected = self.selected_layer == Some(row.id);
+                            let selected = self.selected_layer == Some(row.id)
+                                || self.extra_selected_layers.contains(&row.id);
                             let mut toggle_visibility = false;
                             let response = widgets::list_row(
                                 ui,
@@ -1716,7 +1718,12 @@ impl SubstanceCraftApp {
                                 self.toggle_layer_visibility(texture_set_id, row.id);
                             } else if response.clicked() {
                                 self.finish_active_stroke();
-                                self.selected_layer = Some(row.id);
+                                if ui.input(|input| input.modifiers.command) {
+                                    self.toggle_extra_selection(row.id);
+                                } else {
+                                    self.selected_layer = Some(row.id);
+                                    self.extra_selected_layers.clear();
+                                }
                             }
                         }
                     });
@@ -4128,11 +4135,22 @@ impl SubstanceCraftApp {
             return;
         };
         widgets::caption(ui, "Layer actions");
-        if widgets::pill_button(ui, None, "Flatten to bitmaps", false, true)
-            .on_hover_text(
-                "Bake this layer (with its mask, opacity, and filters) into one fill layer; \
-                 the original stays below, hidden",
+        let merging = self.flatten_selection().len();
+        let (label, tooltip) = if merging > 1 {
+            (
+                format!("Flatten {merging} layers to bitmaps"),
+                "Bake the Ctrl-clicked layers (each with its mask, opacity, and filters) \
+                 together into one fill layer above the topmost; the originals stay, hidden",
             )
+        } else {
+            (
+                "Flatten to bitmaps".to_owned(),
+                "Bake this layer (with its mask, opacity, and filters) into one fill layer; \
+                 the original stays below, hidden. Ctrl-click other layers to merge them too",
+            )
+        };
+        if widgets::pill_button(ui, None, &label, false, true)
+            .on_hover_text(tooltip)
             .clicked()
         {
             self.flatten_selected_layer();
