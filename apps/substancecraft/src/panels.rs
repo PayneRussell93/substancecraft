@@ -1515,8 +1515,9 @@ impl SubstanceCraftApp {
         let mut chosen = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            let custom = self.custom_environment.is_some();
             for preset in substancecraft_core::LightingPreset::ALL {
-                let selected = self.viewport_lighting.preset == preset;
+                let selected = !custom && self.viewport_lighting.preset == preset;
                 if widgets::chip(ui, preset.name(), selected)
                     .on_hover_text(preset.description())
                     .clicked()
@@ -1524,9 +1525,26 @@ impl SubstanceCraftApp {
                     chosen = Some(preset);
                 }
             }
+            if let Some(environment) = &self.custom_environment {
+                widgets::chip(ui, &environment.name(), true)
+                    .on_hover_text(environment.path.display().to_string());
+            }
         });
-        if let Some(preset) = chosen.filter(|preset| *preset != self.viewport_lighting.preset) {
+        if let Some(preset) = chosen.filter(|preset| {
+            self.custom_environment.is_some() || *preset != self.viewport_lighting.preset
+        }) {
             self.set_lighting_preset(preset);
+        }
+        if widgets::pill_button(ui, Some(Icon::Folder), "Load HDRI…", false, true)
+            .on_hover_text(
+                "Light the viewport and renders with an equirectangular .hdr or .exr panorama",
+            )
+            .clicked()
+        {
+            self.pick_custom_environment();
+        }
+        if let Some(status) = &self.environment_status {
+            hint(ui, status);
         }
         slider_row(
             ui,
@@ -1560,6 +1578,40 @@ impl SubstanceCraftApp {
         });
         if let Some(edge) = long_edge {
             self.request_render(edge, None);
+        }
+        widgets::property_row(ui, "Turntable", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for mode in crate::turntable::TurntableMode::ALL {
+                if widgets::chip(ui, mode.name(), self.turntable_mode == mode)
+                    .on_hover_text(mode.description())
+                    .clicked()
+                {
+                    self.turntable_mode = mode;
+                }
+            }
+        });
+        widgets::property_row(ui, "Frames", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for frames in crate::turntable::TURNTABLE_FRAME_COUNTS {
+                if widgets::chip(ui, &frames.to_string(), self.turntable_frames == frames)
+                    .on_hover_text(format!("One full turn in {frames} frames"))
+                    .clicked()
+                {
+                    self.turntable_frames = frames;
+                }
+            }
+        });
+        if self.turntable.is_some() {
+            if widgets::pill_button(ui, Some(Icon::Close), "Cancel turntable", false, true)
+                .clicked()
+            {
+                self.cancel_turntable();
+            }
+        } else if widgets::pill_button(ui, Some(Icon::Image), "Render turntable…", false, true)
+            .on_hover_text("Render a looping 1K PNG sequence of one full turn")
+            .clicked()
+        {
+            self.request_turntable(self.turntable_frames, self.turntable_mode, 1024);
         }
         if let Some(status) = &self.render_status {
             hint(ui, status);

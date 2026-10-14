@@ -39,7 +39,9 @@ pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
     MaterialSample, MaterialTextures,
 };
-pub use environment::{EnvironmentImage, LightingPreset, SunLight};
+pub use environment::{
+    CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightingPreset, PanoramaError, SunLight,
+};
 pub use evolution::{Evolution, EvolutionDrive, MAX_EVOLUTION_DRIVES, MAX_EVOLUTIONS};
 pub use export::{
     BitDepth, ChannelSlot, ExportOutput, ExportPreset, ExportPresetError, ExportSource,

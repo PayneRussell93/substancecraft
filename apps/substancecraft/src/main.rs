@@ -41,6 +41,7 @@ mod cache;
 mod cameras;
 mod diagnostics;
 mod edges;
+mod environments;
 mod icons;
 mod incremental;
 mod inspector;
@@ -49,6 +50,7 @@ mod preferences;
 mod relink;
 mod resource_watch;
 mod theme;
+mod turntable;
 mod uv_view;
 mod widgets;
 
@@ -157,9 +159,15 @@ struct SubstanceCraftApp {
     mesh_error: Option<String>,
     mesh_revision: u64,
     filament_mesh_revision: Option<u64>,
-    /// Lighting preset the renderer was last given, and the lux and rotation
-    /// it was applied at.
-    filament_environment: Option<(substancecraft_core::LightingPreset, f32, f32)>,
+    /// Environment the renderer was last given, and the lux and rotation it
+    /// was applied at.
+    filament_environment: Option<(environments::EnvironmentSource, f32, f32)>,
+    /// A loaded HDR panorama lighting the viewport instead of the preset.
+    custom_environment: Option<environments::CustomEnvironment>,
+    /// Loads of custom environments so far.
+    environment_revision: u64,
+    /// Result of the last custom environment load.
+    environment_status: Option<String>,
     filament_renderer: Option<FilamentRuntime>,
     filament_error: Option<String>,
     filament_frame_texture: Option<egui::TextureHandle>,
@@ -171,6 +179,10 @@ struct SubstanceCraftApp {
     render_result: Arc<std::sync::Mutex<Option<FilamentFrame>>>,
     /// Outcome of the last still render, for the Light drawer.
     render_status: Option<String>,
+    /// A turntable sequence being rendered, one still at a time.
+    turntable: Option<turntable::TurntableJob>,
+    turntable_mode: turntable::TurntableMode,
+    turntable_frames: u32,
     /// The project mesh reference the loaded geometry reflects; undo and redo
     /// reload the mesh when the project's stops matching it.
     loaded_mesh: Option<MeshAsset>,
@@ -322,6 +334,10 @@ struct RenderRequest {
     long_edge: u32,
     /// Camera to render from; `None` uses the viewport camera.
     camera: Option<ViewportCamera>,
+    /// Environment rotation to render with; `None` uses the viewport's.
+    lighting_rotation: Option<f32>,
+    /// The turntable frame this render is, if any.
+    turntable_frame: Option<u32>,
     issued: bool,
 }
 
@@ -761,6 +777,9 @@ impl Default for SubstanceCraftApp {
             mesh_revision: 1,
             filament_mesh_revision: None,
             filament_environment: None,
+            custom_environment: None,
+            environment_revision: 0,
+            environment_status: None,
             filament_renderer: None,
             filament_error: None,
             filament_frame_texture: None,
@@ -770,6 +789,9 @@ impl Default for SubstanceCraftApp {
             render_request: None,
             render_result: Arc::new(std::sync::Mutex::new(None)),
             render_status: None,
+            turntable: None,
+            turntable_mode: turntable::TurntableMode::default(),
+            turntable_frames: turntable::TURNTABLE_FRAME_COUNTS[1],
             loaded_mesh: None,
             imported_meshes: Vec::new(),
             selected_imported_mesh: None,
@@ -1126,6 +1148,7 @@ impl SubstanceCraftApp {
             renderer.poll();
         }
         self.save_finished_render();
+        self.advance_turntable();
         while let Ok(frame) = self.filament_frames_rx.try_recv() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
@@ -1181,9 +1204,20 @@ impl SubstanceCraftApp {
                 }
             }
         }
+        // A still render waiting to be drawn may turn the light (turntables).
+        let mut lighting = self.viewport_lighting;
+        if let Some(rotation) = self
+            .render_request
+            .as_ref()
+            .filter(|request| !request.issued)
+            .and_then(|request| request.lighting_rotation)
+        {
+            lighting.rotation = rotation;
+        }
         if let Err(error) = apply_environment(
             renderer,
-            self.viewport_lighting,
+            lighting,
+            self.custom_environment.as_ref(),
             &mut self.filament_environment,
         ) {
             self.filament_error = Some(error.to_string());
@@ -1317,6 +1351,7 @@ impl SubstanceCraftApp {
                     self.filament_render_pending.store(false, Ordering::Release);
                     self.render_status = Some(format!("Render failed: {error}"));
                     self.render_request = None;
+                    self.turntable = None;
                 }
             }
             context.request_repaint_after(Duration::from_millis(16));
@@ -1367,11 +1402,14 @@ impl SubstanceCraftApp {
         long_edge: u32,
         camera: Option<ViewportCamera>,
     ) {
+        self.turntable = None;
         self.render_status = Some("Rendering…".to_owned());
         self.render_request = Some(RenderRequest {
             path,
             long_edge,
             camera,
+            lighting_rotation: None,
+            turntable_frame: None,
             issued: false,
         });
     }
@@ -1399,7 +1437,11 @@ impl SubstanceCraftApp {
             height: frame.height,
             rgba8,
         };
-        self.render_status = Some(match write_texture(&request.path, &texture) {
+        let written = write_texture(&request.path, &texture);
+        if let Some(frame) = request.turntable_frame {
+            self.turntable_frame_done(frame, written.is_ok());
+        }
+        self.render_status = Some(match written {
             Ok(()) => format!(
                 "Saved {} × {} render to {}",
                 frame.width,
@@ -6073,31 +6115,53 @@ fn sanitize_mesh_scale(scale: f32) -> f32 {
     }
 }
 
-/// Brings the renderer's environment up to `lighting`: a new preset is
-/// rendered and prefiltered again; a new strength or rotation only turns and
-/// rescales the one already there. `applied` records what the renderer has.
+/// Brings the renderer's environment up to `lighting`, or to `custom` when
+/// a panorama is loaded: a new preset or panorama is prefiltered again; a
+/// new strength or rotation only turns and rescales the one already there.
+/// `applied` records what the renderer has.
 fn apply_environment(
     renderer: &mut FilamentRuntime,
     lighting: ViewportLighting,
-    applied: &mut Option<(substancecraft_core::LightingPreset, f32, f32)>,
+    custom: Option<&environments::CustomEnvironment>,
+    applied: &mut Option<(environments::EnvironmentSource, f32, f32)>,
 ) -> Result<(), substancecraft_filament::FilamentError> {
+    use environments::EnvironmentSource;
     let preset = lighting.preset;
-    let lux = preset.environment_lux() * lighting.environment_scale();
+    // A panorama's sun is part of its image, so it has no separate light.
+    let (source, lux, sun) = match custom {
+        Some(custom) => (
+            EnvironmentSource::Custom(custom.revision),
+            custom.image.normalized_lux(),
+            None,
+        ),
+        None => (
+            EnvironmentSource::Preset(preset),
+            preset.environment_lux(),
+            preset.sun(),
+        ),
+    };
+    let lux = lux * lighting.environment_scale();
     let rotation = if lighting.rotation.is_finite() {
         lighting.rotation
     } else {
         0.0
     };
     match *applied {
-        Some(current) if current == (preset, lux, rotation) => {}
-        Some((current, _, _)) if current == preset => {
-            renderer.set_environment_transform(lux, rotation, preset.sun());
-            *applied = Some((preset, lux, rotation));
+        Some(current) if current == (source, lux, rotation) => {}
+        Some((current, _, _)) if current == source => {
+            renderer.set_environment_transform(lux, rotation, sun);
+            *applied = Some((source, lux, rotation));
         }
         _ => {
-            let image = preset.equirect(substancecraft_core::environment::ENVIRONMENT_WIDTH);
-            renderer.set_environment(&image, lux, rotation, preset.sun())?;
-            *applied = Some((preset, lux, rotation));
+            match custom {
+                Some(custom) => renderer.set_environment(&custom.image, lux, rotation, sun)?,
+                None => {
+                    let image =
+                        preset.equirect(substancecraft_core::environment::ENVIRONMENT_WIDTH);
+                    renderer.set_environment(&image, lux, rotation, sun)?;
+                }
+            }
+            *applied = Some((source, lux, rotation));
         }
     }
     Ok(())
@@ -8221,7 +8285,7 @@ mod tests {
             render(&mut app, "warmup.png");
             assert_eq!(
                 app.filament_environment.map(|(applied, _, _)| applied),
-                Some(preset)
+                Some(environments::EnvironmentSource::Preset(preset))
             );
             frames.push(render(&mut app, &format!("{preset:?}.png")));
         }
@@ -8236,9 +8300,335 @@ mod tests {
         // A new rotation keeps the preset and only turns it.
         app.viewport_lighting.rotation += 1.0;
         app.update_filament_frame(&context, viewport);
-        let (preset, _, rotation) = app.filament_environment.unwrap();
-        assert_eq!(preset, LightingPreset::Night);
+        let (source, _, rotation) = app.filament_environment.unwrap();
+        assert_eq!(
+            source,
+            environments::EnvironmentSource::Preset(LightingPreset::Night)
+        );
         assert_eq!(rotation, app.viewport_lighting.rotation);
+    }
+
+    /// An uncompressed Radiance panorama, `width` x `width / 2`, of one
+    /// colour (each component below 1).
+    fn uniform_radiance_file(path: &std::path::Path, width: u32, rgb: [f32; 3]) {
+        let height = width / 2;
+        let mut bytes =
+            format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n").into_bytes();
+        // Mantissas over 2^0: value = byte / 256.
+        let texel = rgb.map(|value| (value * 256.0).clamp(0.0, 255.0) as u8);
+        for _ in 0..width * height {
+            bytes.extend(texel);
+            bytes.push(128);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn tc_0347_custom_hdr_environments_are_remembered_and_presets_replace_them() {
+        let folder = tempfile::tempdir().unwrap();
+        let preferences_path = folder.path().join("preferences.json");
+        let sky = folder.path().join("sky.hdr");
+        uniform_radiance_file(&sky, 32, [0.5, 0.5, 0.75]);
+        let broken = folder.path().join("broken.hdr");
+        std::fs::write(&broken, b"#?RADIANCE\nnot an image").unwrap();
+
+        let mut app = SubstanceCraftApp::default();
+        app.load_preferences(preferences_path.clone());
+        assert!(app.custom_environment.is_none());
+
+        // Loading lights the viewport with the file and remembers it.
+        app.load_custom_environment(sky.clone()).unwrap();
+        let custom = app.custom_environment.as_ref().unwrap();
+        assert_eq!(custom.name(), "sky.hdr");
+        assert_eq!(
+            (custom.image.width, custom.image.height),
+            (
+                substancecraft_core::environment::ENVIRONMENT_WIDTH,
+                substancecraft_core::environment::ENVIRONMENT_WIDTH / 2
+            )
+        );
+        let first = custom.revision;
+        assert_eq!(app.environment_status.as_deref(), Some("Lit by sky.hdr"));
+        assert_eq!(
+            preferences::Preferences::load(&preferences_path).environment_file,
+            Some(sky.clone())
+        );
+
+        // A broken file says why and keeps the current lighting.
+        let error = app.load_custom_environment(broken).unwrap_err();
+        assert!(error.starts_with("Could not load broken.hdr"), "{error}");
+        assert_eq!(app.environment_status.as_deref(), Some(error.as_str()));
+        assert_eq!(app.custom_environment.as_ref().unwrap().revision, first);
+        assert_eq!(
+            preferences::Preferences::load(&preferences_path).environment_file,
+            Some(sky.clone())
+        );
+
+        // Reloading the same file is a new environment for the renderer.
+        app.load_custom_environment(sky.clone()).unwrap();
+        assert!(app.custom_environment.as_ref().unwrap().revision > first);
+
+        // Opening a project keeps it; a later session restores it.
+        app.adopt_project(MaterialProject::empty(), None).unwrap();
+        assert!(app.custom_environment.is_some());
+        let mut later = SubstanceCraftApp::default();
+        later.load_preferences(preferences_path.clone());
+        assert_eq!(
+            later.custom_environment.as_ref().map(|custom| &custom.path),
+            Some(&sky)
+        );
+
+        // Picking a preset replaces it and forgets the file, even the
+        // preset that was selected underneath.
+        let underneath = later.viewport_lighting.preset;
+        later.set_lighting_preset(underneath);
+        assert!(later.custom_environment.is_none());
+        assert_eq!(later.environment_status, None);
+        assert_eq!(
+            preferences::Preferences::load(&preferences_path).environment_file,
+            None
+        );
+
+        // A remembered file gone missing falls back to the preset but stays
+        // remembered for when it returns.
+        let mut values = preferences::Preferences::load(&preferences_path);
+        let missing = folder.path().join("moved.exr");
+        values.environment_file = Some(missing.clone());
+        values.save(&preferences_path).unwrap();
+        let mut session = SubstanceCraftApp::default();
+        session.load_preferences(preferences_path.clone());
+        assert!(session.custom_environment.is_none());
+        assert!(
+            session
+                .environment_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Could not load moved.exr")),
+            "{:?}",
+            session.environment_status
+        );
+        assert_eq!(
+            preferences::Preferences::load(&preferences_path).environment_file,
+            Some(missing)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn tc_0348_still_renders_follow_a_custom_environment() {
+        use environments::EnvironmentSource;
+        let folder = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp {
+            filament_renderer: Some(FilamentRuntime::new(64, 64).unwrap()),
+            ..SubstanceCraftApp::default()
+        };
+        app.add_fill_layer();
+        small_sets(&mut app, 16);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 150.0));
+        let render = |app: &mut SubstanceCraftApp, name: &str| {
+            let path = folder.path().join(name);
+            app.queue_render(path.clone(), 128, None);
+            for _ in 0..600 {
+                app.update_filament_frame(&context, viewport);
+                if app.render_request.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            load_texture_image(&path).unwrap().rgba8
+        };
+        // Red and blue skies of the same brightness light the model red and
+        // blue.
+        let mut tints = Vec::new();
+        for (name, rgb) in [
+            ("red.hdr", [0.9, 0.05, 0.05]),
+            ("blue.hdr", [0.05, 0.05, 0.9]),
+        ] {
+            let path = folder.path().join(name);
+            uniform_radiance_file(&path, 64, rgb);
+            app.load_custom_environment(path).unwrap();
+            render(&mut app, "warmup.png");
+            let revision = app.custom_environment.as_ref().unwrap().revision;
+            assert_eq!(
+                app.filament_environment.map(|(applied, _, _)| applied),
+                Some(EnvironmentSource::Custom(revision))
+            );
+            let frame = render(&mut app, &format!("{name}.png"));
+            let sum = |channel: usize| -> f64 {
+                frame
+                    .chunks(4)
+                    .map(|texel| f64::from(texel[channel]))
+                    .sum::<f64>()
+            };
+            tints.push((sum(0), sum(2)));
+        }
+        assert!(tints[0].0 > tints[0].1, "the red sky lights red: {tints:?}");
+        assert!(
+            tints[1].1 > tints[1].0,
+            "the blue sky lights blue: {tints:?}"
+        );
+
+        // A new rotation keeps the panorama and only turns it; a preset
+        // replaces it.
+        let revision = app.custom_environment.as_ref().unwrap().revision;
+        app.viewport_lighting.rotation += 1.0;
+        app.update_filament_frame(&context, viewport);
+        let (source, _, rotation) = app.filament_environment.unwrap();
+        assert_eq!(source, EnvironmentSource::Custom(revision));
+        assert_eq!(rotation, app.viewport_lighting.rotation);
+        app.set_lighting_preset(LightingPreset::Overcast);
+        app.update_filament_frame(&context, viewport);
+        assert_eq!(
+            app.filament_environment.map(|(applied, _, _)| applied),
+            Some(EnvironmentSource::Preset(LightingPreset::Overcast))
+        );
+    }
+
+    /// Hands the app a finished 2x2 frame, as the renderer's callback does,
+    /// and lets it save and move on.
+    fn finish_render(app: &mut SubstanceCraftApp) {
+        let request = app.render_request.as_mut().unwrap();
+        request.issued = true;
+        *app.render_result.lock().unwrap() = Some(FilamentFrame {
+            width: 2,
+            height: 2,
+            rgba8: vec![90; 16],
+        });
+        app.save_finished_render();
+        app.advance_turntable();
+    }
+
+    #[test]
+    fn tc_0350_turntables_render_numbered_frames_one_after_another() {
+        use turntable::TurntableMode;
+        let folder = tempfile::tempdir().unwrap();
+        let base = folder.path().join("spin.png");
+        let mut app = SubstanceCraftApp::default();
+        app.viewport_camera.yaw = 1.0;
+        app.viewport_lighting.rotation = 0.5;
+
+        // A light turntable keeps the camera and turns the environment.
+        app.start_turntable(base.clone(), 4, TurntableMode::Lighting, 256);
+        let request = app.render_request.as_ref().unwrap();
+        assert_eq!(request.path, folder.path().join("spin_000.png"));
+        assert_eq!(request.camera.unwrap().yaw, 1.0);
+        assert_eq!(request.lighting_rotation, Some(0.5));
+        assert_eq!(request.long_edge, 256);
+        assert_eq!(
+            app.render_status.as_deref(),
+            Some("Rendering turntable frame 1 of 4…")
+        );
+
+        // Moving the viewport mid-sequence does not move the turntable.
+        app.viewport_camera.yaw = 3.0;
+        app.viewport_lighting.rotation = 2.0;
+        let mut rotations = Vec::new();
+        for frame in 0..4 {
+            let request = app.render_request.as_ref().unwrap();
+            assert_eq!(request.turntable_frame, Some(frame));
+            assert_eq!(request.camera.unwrap().yaw, 1.0);
+            rotations.push(request.lighting_rotation.unwrap());
+            finish_render(&mut app);
+        }
+        let step = std::f32::consts::FRAC_PI_2;
+        for (frame, rotation) in rotations.iter().enumerate() {
+            assert!((rotation - (0.5 + step * frame as f32)).abs() < 1e-5);
+        }
+        assert!(app.turntable.is_none() && app.render_request.is_none());
+        for frame in 0..4 {
+            assert!(folder.path().join(format!("spin_{frame:03}.png")).is_file());
+        }
+        let status = app.render_status.clone().unwrap();
+        assert!(status.starts_with("Saved 4-frame turntable to"), "{status}");
+
+        // A camera turntable orbits the camera from where it started.
+        app.start_turntable(base.clone(), 3, TurntableMode::Camera, 256);
+        finish_render(&mut app);
+        let request = app.render_request.as_ref().unwrap();
+        let expected = (3.0 + std::f32::consts::TAU / 3.0).rem_euclid(std::f32::consts::TAU);
+        assert!((request.camera.unwrap().yaw - expected).abs() < 1e-5);
+        assert_eq!(request.lighting_rotation, Some(2.0));
+
+        // Cancelling stops after the frames already saved.
+        app.cancel_turntable();
+        assert!(app.turntable.is_none() && app.render_request.is_none());
+        assert_eq!(
+            app.render_status.as_deref(),
+            Some("Turntable cancelled after 1 of 3 frames")
+        );
+
+        // A still render replaces a running turntable.
+        app.start_turntable(base, 3, TurntableMode::Camera, 256);
+        app.queue_render(folder.path().join("still.png"), 256, None);
+        assert!(app.turntable.is_none());
+        assert_eq!(app.render_request.as_ref().unwrap().turntable_frame, None);
+
+        // A frame that cannot be written ends the turntable with the error.
+        let blocked = folder.path().join("blocked");
+        std::fs::write(&blocked, b"a file, not a folder").unwrap();
+        app.render_request = None;
+        app.start_turntable(blocked.join("spin.png"), 3, TurntableMode::Camera, 256);
+        finish_render(&mut app);
+        assert!(app.turntable.is_none() && app.render_request.is_none());
+        let status = app.render_status.clone().unwrap();
+        assert!(status.starts_with("Render failed"), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn tc_0351_turntable_frames_render_on_the_gpu() {
+        use turntable::TurntableMode;
+        let folder = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp {
+            filament_renderer: Some(FilamentRuntime::new(64, 64).unwrap()),
+            ..SubstanceCraftApp::default()
+        };
+        app.add_fill_layer();
+        small_sets(&mut app, 16);
+        app.set_lighting_preset(LightingPreset::Sunset);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 150.0));
+        // Settle the environment before the sequence starts.
+        app.queue_render(folder.path().join("warmup.png"), 64, None);
+        let run = |app: &mut SubstanceCraftApp| {
+            for _ in 0..2000 {
+                app.update_filament_frame(&context, viewport);
+                if app.render_request.is_none() && app.turntable.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                app.render_request.is_none() && app.turntable.is_none(),
+                "the renders did not finish"
+            );
+        };
+        run(&mut app);
+        for (mode, name) in [
+            (TurntableMode::Camera, "camera.png"),
+            (TurntableMode::Lighting, "light.png"),
+        ] {
+            app.start_turntable(folder.path().join(name), 4, mode, 96);
+            run(&mut app);
+            let stem = name.trim_end_matches(".png");
+            let frames: Vec<Vec<u8>> = (0..4)
+                .map(|frame| {
+                    load_texture_image(folder.path().join(format!("{stem}_{frame:03}.png")))
+                        .unwrap()
+                        .rgba8
+                })
+                .collect();
+            // Every quarter turn looks different: the model (camera) or its
+            // shading (light) turns between frames.
+            for pair in frames.windows(2) {
+                let difference: u64 = pair[0]
+                    .iter()
+                    .zip(&pair[1])
+                    .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                    .sum();
+                assert!(difference > 1000, "{mode:?}: {difference}");
+            }
+        }
     }
 
     /// A triangle skinned to a two-bone arm whose elbow turns 90° about Z

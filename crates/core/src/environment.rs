@@ -225,6 +225,173 @@ impl EnvironmentImage {
     }
 }
 
+/// Lux that a custom environment's mean radiance stands for, so any HDRI
+/// lights the scene about as brightly as the built-in presets.
+pub const CUSTOM_ENVIRONMENT_LUX: f32 = 12_000.0;
+
+/// Widest aspect deviation from 2:1 accepted as an equirectangular image.
+const PANORAMA_ASPECT_TOLERANCE: f32 = 0.1;
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PanoramaError {
+    #[error("panorama has {actual} samples; {width}x{height} RGB needs {expected}")]
+    SizeMismatch {
+        width: u32,
+        height: u32,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "panorama is {width}x{height}; an equirectangular (latitude-longitude) image is twice as wide as it is tall"
+    )]
+    NotEquirectangular { width: u32, height: u32 },
+    #[error("panorama holds no light: every pixel is black")]
+    Black,
+}
+
+impl EnvironmentImage {
+    /// Converts an equirectangular panorama in the usual layout (rows top
+    /// to bottom, the image centre looking along −Z and its right quarter
+    /// along +X, as seen from inside) into the viewport's layout at
+    /// `width` × `width / 2`.
+    ///
+    /// Each output pixel is the area average of the source pixels it
+    /// covers, so a small, very bright sun is kept at any reduction rather
+    /// than skipped. Negative and non-finite samples count as black.
+    pub fn from_panorama(
+        width: u32,
+        height: u32,
+        rgb: &[f32],
+        target_width: u32,
+    ) -> Result<Self, PanoramaError> {
+        let expected = width as usize * height as usize * 3;
+        if width == 0 || height == 0 || rgb.len() != expected {
+            return Err(PanoramaError::SizeMismatch {
+                width,
+                height,
+                expected,
+                actual: rgb.len(),
+            });
+        }
+        let aspect = width as f32 / height as f32;
+        if (aspect - 2.0).abs() > PANORAMA_ASPECT_TOLERANCE * 2.0 {
+            return Err(PanoramaError::NotEquirectangular { width, height });
+        }
+        let target_width = target_width.max(2) & !1;
+        let target_height = target_width / 2;
+        let columns = box_weights(width, target_width);
+        let rows = box_weights(height, target_height);
+
+        // Columns first, keeping source rows, then rows.
+        let clean = |value: f32| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let mut narrowed = vec![0.0f32; height as usize * target_width as usize * 3];
+        for row in 0..height as usize {
+            let source = &rgb[row * width as usize * 3..(row + 1) * width as usize * 3];
+            for (column, weights) in columns.iter().enumerate() {
+                let out = (row * target_width as usize + column) * 3;
+                for &(index, weight) in weights {
+                    for channel in 0..3 {
+                        narrowed[out + channel] += clean(source[index * 3 + channel]) * weight;
+                    }
+                }
+            }
+        }
+        let mut resampled = vec![0.0f32; target_height as usize * target_width as usize * 3];
+        for (row, weights) in rows.iter().enumerate() {
+            for &(index, weight) in weights {
+                let source =
+                    &narrowed[index * target_width as usize * 3..][..target_width as usize * 3];
+                let out =
+                    &mut resampled[row * target_width as usize * 3..][..target_width as usize * 3];
+                for (out, source) in out.iter_mut().zip(source) {
+                    *out += source * weight;
+                }
+            }
+        }
+
+        // The viewport's column `c` looks along azimuth `π (1 − 2(c + ½)/w)`
+        // from +Z, which is the usual layout's column `c + w/2`: the same
+        // image turned half way round, not mirrored.
+        let half = target_width as usize / 2;
+        let mut image = Self {
+            width: target_width,
+            height: target_height,
+            rgb: Vec::with_capacity(resampled.len()),
+        };
+        for row in resampled.chunks_exact(target_width as usize * 3) {
+            image.rgb.extend_from_slice(&row[half * 3..]);
+            image.rgb.extend_from_slice(&row[..half * 3]);
+        }
+        if image.mean_luminance() <= 0.0 {
+            return Err(PanoramaError::Black);
+        }
+        Ok(image)
+    }
+
+    /// Average luminance over the sphere: each row weighted by the solid
+    /// angle its pixels cover.
+    pub fn mean_luminance(&self) -> f32 {
+        let (width, height) = (self.width as usize, self.height as usize);
+        if width == 0 || height == 0 || self.rgb.len() != width * height * 3 {
+            return 0.0;
+        }
+        let mut total = 0.0f64;
+        let mut weights = 0.0f64;
+        for (row, texels) in self.rgb.chunks_exact(width * 3).enumerate() {
+            let latitude =
+                std::f64::consts::FRAC_PI_2 * (1.0 - 2.0 * (row as f64 + 0.5) / height as f64);
+            let weight = latitude.cos();
+            let sum: f64 = texels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|[r, g, b]| f64::from(0.2126 * r + 0.7152 * g + 0.0722 * b))
+                .sum();
+            total += sum * weight;
+            weights += width as f64 * weight;
+        }
+        (total / weights) as f32
+    }
+
+    /// Lux per unit of radiance that lights this image at the strength of
+    /// [`CUSTOM_ENVIRONMENT_LUX`] on average.
+    pub fn normalized_lux(&self) -> f32 {
+        let mean = self.mean_luminance();
+        if mean.is_finite() && mean > 0.0 {
+            CUSTOM_ENVIRONMENT_LUX / mean
+        } else {
+            CUSTOM_ENVIRONMENT_LUX
+        }
+    }
+}
+
+/// For each of `target` cells spanning `source` cells, the source cells it
+/// overlaps and the share of the target cell each covers (summing to 1).
+/// Enlarging repeats source cells.
+fn box_weights(source: u32, target: u32) -> Vec<Vec<(usize, f32)>> {
+    let scale = f64::from(source) / f64::from(target);
+    (0..target)
+        .map(|cell| {
+            let start = f64::from(cell) * scale;
+            let end = start + scale;
+            let first = start.floor() as usize;
+            let last = (end.ceil() as usize).min(source as usize);
+            (first..last)
+                .filter_map(|index| {
+                    let overlap = (end.min(index as f64 + 1.0) - start.max(index as f64)) / scale;
+                    (overlap > 0.0).then_some((index, overlap as f32))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Unit direction at `elevation` above the horizon and `azimuth` measured
 /// from +Z towards +X (radians).
 pub fn direction(elevation: f32, azimuth: f32) -> Vec3 {
@@ -384,5 +551,125 @@ mod tests {
         assert!((turned.y - sun.y).abs() < 1e-6);
         assert!((turned.length() - 1.0).abs() < 1e-5);
         assert!((rotate_about_up(Vec3::Z, std::f32::consts::FRAC_PI_2) - Vec3::X).length() < 1e-6);
+    }
+
+    /// Direction a pixel of the viewport layout looks along.
+    fn pixel_direction(image: &EnvironmentImage, column: u32, row: u32) -> Vec3 {
+        let elevation =
+            std::f32::consts::FRAC_PI_2 * (1.0 - 2.0 * (row as f32 + 0.5) / image.height as f32);
+        let azimuth =
+            std::f32::consts::PI * (1.0 - 2.0 * (column as f32 + 0.5) / image.width as f32);
+        direction(elevation, azimuth)
+    }
+
+    fn brightest(image: &EnvironmentImage) -> (u32, u32, f32) {
+        let mut best = (0, 0, f32::MIN);
+        for row in 0..image.height {
+            for column in 0..image.width {
+                let value = luminance(pixel(image, column, row));
+                if value > best.2 {
+                    best = (column, row, value);
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn tc_0345_panoramas_convert_to_the_viewport_layout_keeping_their_light() {
+        // A 64x32 panorama in the usual layout: a dim sky over darker
+        // ground and one very bright pixel just above the horizon at
+        // u = 0.75, which looks along +X.
+        let (width, height) = (64u32, 32u32);
+        let mut rgb = Vec::new();
+        for row in 0..height {
+            for column in 0..width {
+                let value = if (column, row) == (48, 15) {
+                    5_000.0
+                } else if row < height / 2 {
+                    0.5
+                } else {
+                    0.1
+                };
+                rgb.extend([value, value, value]);
+            }
+        }
+        let image = EnvironmentImage::from_panorama(width, height, &rgb, 16).unwrap();
+        assert_eq!((image.width, image.height), (16, 8));
+        assert_eq!(image.rgb.len(), 16 * 8 * 3);
+
+        // The sun lands where it points, not mirrored, and a 4x reduction
+        // averages it in rather than skipping it.
+        let (column, row, value) = brightest(&image);
+        let toward = pixel_direction(&image, column, row);
+        assert!(toward.dot(Vec3::X) > 0.9, "{toward}");
+        assert!(value > 5_000.0 / 16.0 * 0.99, "{value}");
+        // The sky stays above the ground.
+        assert!(luminance(pixel(&image, 0, 0)) > luminance(pixel(&image, 0, 7)));
+
+        // The sphere's light is kept within the error of coarser rows.
+        let source = EnvironmentImage {
+            width,
+            height,
+            rgb: rgb.clone(),
+        };
+        let ratio = image.mean_luminance() / source.mean_luminance();
+        assert!((ratio - 1.0).abs() < 0.05, "{ratio}");
+
+        // Lux normalizes the mean: twice the radiance lights at half the lux.
+        let doubled: Vec<f32> = rgb.iter().map(|value| value * 2.0).collect();
+        let brighter = EnvironmentImage::from_panorama(width, height, &doubled, 16).unwrap();
+        assert!((image.normalized_lux() / brighter.normalized_lux() - 2.0).abs() < 1e-3);
+        assert!(
+            (image.mean_luminance() * image.normalized_lux() - CUSTOM_ENVIRONMENT_LUX).abs() < 1.0
+        );
+
+        // Enlarging a tiny panorama repeats its pixels.
+        let tiny = EnvironmentImage::from_panorama(4, 2, &[1.0; 24], 16).unwrap();
+        assert_eq!((tiny.width, tiny.height), (16, 8));
+        assert!(tiny.rgb.iter().all(|value| (value - 1.0).abs() < 1e-5));
+
+        // NaN, infinite, and negative samples count as black.
+        let mut broken = vec![1.0f32; 4 * 2 * 3];
+        broken[0] = f32::NAN;
+        broken[1] = f32::INFINITY;
+        broken[2] = -3.0;
+        let cleaned = EnvironmentImage::from_panorama(4, 2, &broken, 4).unwrap();
+        assert!(
+            cleaned
+                .rgb
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+
+        // Wrong sizes, shapes, and black images are refused.
+        assert!(matches!(
+            EnvironmentImage::from_panorama(4, 2, &[1.0; 5], 16),
+            Err(PanoramaError::SizeMismatch { .. })
+        ));
+        assert!(matches!(
+            EnvironmentImage::from_panorama(0, 0, &[], 16),
+            Err(PanoramaError::SizeMismatch { .. })
+        ));
+        assert_eq!(
+            EnvironmentImage::from_panorama(4, 4, &[1.0; 48], 16),
+            Err(PanoramaError::NotEquirectangular {
+                width: 4,
+                height: 4
+            })
+        );
+        assert_eq!(
+            EnvironmentImage::from_panorama(4, 2, &[0.0; 24], 16),
+            Err(PanoramaError::Black)
+        );
+        assert_eq!(
+            EnvironmentImage {
+                width: 2,
+                height: 1,
+                rgb: vec![1.0; 5]
+            }
+            .normalized_lux(),
+            CUSTOM_ENVIRONMENT_LUX
+        );
     }
 }

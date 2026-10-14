@@ -66,3 +66,6 @@ REQ-0064,Import OpenPBR MaterialX materials as fill layers,docs/feature-map.md,d
 REQ-0065,Drag spin and resize decals with a viewport gizmo,docs/feature-map.md,docs/architecture.md,,TC-0333;TC-0334,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0066,Pick brush colours in sRGB linear or ACEScg with gamut clipping,docs/feature-map.md,docs/architecture.md,,TC-0335;TC-0336,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0067,Browse smart materials as thumbnails and adjust inserted instances' parameters,docs/feature-map.md,docs/architecture.md,,TC-0337;TC-0338,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0068,Import STEP CAD solids surfaces tessellations and assemblies as meshes,docs/feature-map.md,docs/architecture.md,,TC-0339;TC-0340;TC-0341;TC-0342;TC-0343;TC-0344,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0069,Light the viewport and renders with custom HDR environment maps,docs/feature-map.md,docs/architecture.md,,TC-0345;TC-0346;TC-0347;TC-0348,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0070,Render camera and light turntables as PNG sequences,docs/feature-map.md,docs/architecture.md,,TC-0349;TC-0350;TC-0351,Documentation/Quality/TestPlan-short.md,Project owner,Verified

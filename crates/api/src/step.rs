@@ -1822,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0331_cube_imports_closed_outward_and_in_metres() {
+    fn tc_0339_cube_imports_closed_outward_and_in_metres() {
         let mut writer = Writer::new();
         let (context, _) = writer.millimetre_context();
         let body = cube(&mut writer, 10.0);
@@ -1850,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0332_cylinders_with_and_without_seams_are_round_and_watertight() {
+    fn tc_0340_cylinders_with_and_without_seams_are_round_and_watertight() {
         for seam in [true, false] {
             let mut writer = Writer::new();
             let (context, _) = writer.millimetre_context();
@@ -1874,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0333_sphere_and_nurbs_faces_follow_their_surfaces() {
+    fn tc_0341_sphere_and_nurbs_faces_follow_their_surfaces() {
         let mut writer = Writer::new();
         let (context, _) = writer.millimetre_context();
         let pole = writer.vertex([0.0, 0.0, 30.0]);
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0334_assemblies_place_instances_with_units_and_colours() {
+    fn tc_0342_assemblies_place_instances_with_units_and_colours() {
         let mut writer = Writer::new();
         let (part_context, mm) = writer.millimetre_context();
         let body = cube(&mut writer, 10.0);
@@ -2043,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0335_faceted_and_tessellated_bodies_import() {
+    fn tc_0343_faceted_and_tessellated_bodies_import() {
         // A faceted tetrahedron with polygon loops and no surfaces.
         let mut writer = Writer::new();
         let (context, _) = writer.millimetre_context();
@@ -2090,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_0336_rejects_files_without_geometry_and_broken_syntax() {
+    fn tc_0344_rejects_files_without_geometry_and_broken_syntax() {
         let mut writer = Writer::new();
         writer.point([0.0; 3]);
         assert_eq!(

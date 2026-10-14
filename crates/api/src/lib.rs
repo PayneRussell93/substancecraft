@@ -2,6 +2,7 @@
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
 mod automation;
+mod environment_file;
 mod fbx;
 mod fbx_ascii;
 mod fbx_rig;
@@ -25,6 +26,10 @@ pub use automation::{
     LibraryEntrySummary, LibrarySummary, MaterialSummary, NewLayerKind, ProjectSummary,
     ResourceSummary, SmartMaterialSummary, TextureSetSummary, apply_automation_edit,
     edit_project_file, library_summary, project_summary, texture_set_ids,
+};
+pub use environment_file::{
+    ENVIRONMENT_EXTENSIONS, EnvironmentIoError, MAX_ENVIRONMENT_EDGE, MAX_ENVIRONMENT_FILE_BYTES,
+    decode_environment, load_environment_file,
 };
 pub use fbx::{
     FbxImportError, ImportedFbxMesh, ImportedMesh, MAX_FBX_BYTES, import_binary_fbx_meshes,

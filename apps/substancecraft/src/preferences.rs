@@ -252,6 +252,8 @@ pub struct Preferences {
     pub cache_budget_mb: u32,
     /// Lighting-check environment of the viewport.
     pub lighting_preset: substancecraft_core::LightingPreset,
+    /// HDR panorama lighting the viewport in place of the preset.
+    pub environment_file: Option<PathBuf>,
     /// Colour space the brush colour's numeric fields are shown in.
     pub picker_color_space: substancecraft_core::ColorSpace,
 }
@@ -267,6 +269,7 @@ impl Default for Preferences {
             overlay_pattern: false,
             cache_budget_mb: crate::cache::DEFAULT_CACHE_BUDGET_MB,
             lighting_preset: substancecraft_core::LightingPreset::default(),
+            environment_file: None,
             picker_color_space: substancecraft_core::ColorSpace::Srgb,
         }
     }
@@ -379,11 +382,13 @@ impl SubstanceCraftApp {
         self.preferences.values = Preferences::load(&path);
         self.viewport_lighting.preset = self.preferences.values.lighting_preset;
         self.preferences.path = Some(path);
+        self.restore_custom_environment();
     }
 
-    /// Lights the viewport (and still renders) with `preset` and remembers it
-    /// for later sessions.
+    /// Lights the viewport (and still renders) with `preset`, in place of
+    /// any custom environment, and remembers it for later sessions.
     pub(super) fn set_lighting_preset(&mut self, preset: substancecraft_core::LightingPreset) {
+        self.clear_custom_environment();
         self.viewport_lighting.preset = preset;
         if self.preferences.values.lighting_preset != preset {
             self.preferences.values.lighting_preset = preset;
