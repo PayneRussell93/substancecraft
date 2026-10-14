@@ -701,6 +701,7 @@ mod tests {
                             path: Some(substancecraft_core::PathSpec {
                                 controls: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
                                 closed: false,
+                                surface: Vec::new(),
                             }),
                             camera: None,
                         }],

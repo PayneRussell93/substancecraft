@@ -245,6 +245,26 @@ impl MeshGeometry {
             .then_some(frame)
     }
 
+    /// UV at `point` projected onto `triangle`'s plane, extrapolated past
+    /// its edges. `None` for a degenerate triangle.
+    pub fn uv_on_plane(&self, triangle: u32, point: Vec3) -> Option<Vec2> {
+        let [a, b, c] = self.triangle_corners(triangle)?;
+        let (e1, e2, offset) = (
+            b.position - a.position,
+            c.position - a.position,
+            point - a.position,
+        );
+        let (d00, d01, d11) = (e1.dot(e1), e1.dot(e2), e2.dot(e2));
+        let (d20, d21) = (offset.dot(e1), offset.dot(e2));
+        let determinant = d00 * d11 - d01 * d01;
+        if !determinant.is_finite() || determinant.abs() < 1e-20 {
+            return None;
+        }
+        let v = (d11 * d20 - d01 * d21) / determinant;
+        let w = (d00 * d21 - d01 * d20) / determinant;
+        Some(a.uv * (1.0 - v - w) + b.uv * v + c.uv * w)
+    }
+
     fn triangle_corners(&self, triangle: u32) -> Option<[MeshVertex; 3]> {
         let corners = self.triangles.get(triangle as usize)?;
         let [a, b, c] = corners.map(|corner| self.vertices.get(corner as usize).copied());
@@ -327,58 +347,159 @@ pub fn crosses_uv_seam(topology: &MeshTopology, previous: u32, next: u32) -> boo
     }
 }
 
-/// Control points of an editable spline path (UV space).
+/// Control points of an editable spline path. `controls` are UV points; a
+/// path placed on the model also keeps the object-space surface point
+/// under each control in `surface`, and then follows the surface across
+/// UV seams instead of running straight through UV space.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathSpec {
     pub controls: Vec<Vec2>,
     #[serde(default)]
     pub closed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surface: Vec<Vec3>,
 }
+
+/// Bisection steps that locate where a surface path crosses a UV seam.
+const SEAM_BISECTIONS: usize = 12;
 
 impl PathSpec {
     /// Catmull-Rom curve through every control point, `samples` points per
     /// segment.
     pub fn sample(&self, samples: usize) -> Vec<Vec2> {
-        let controls = &self.controls;
-        let count = controls.len();
-        if count < 2 {
-            return controls.clone();
-        }
-        let samples = samples.clamp(1, 64);
-        let at = |index: isize| -> Vec2 {
-            if self.closed {
-                controls[index.rem_euclid(count as isize) as usize]
-            } else {
-                controls[index.clamp(0, count as isize - 1) as usize]
-            }
-        };
-        let segments = if self.closed { count } else { count - 1 };
-        let mut points = Vec::with_capacity(segments * samples + 1);
-        for segment in 0..segments as isize {
-            let (p0, p1, p2, p3) = (
-                at(segment - 1),
-                at(segment),
-                at(segment + 1),
-                at(segment + 2),
-            );
-            for step in 0..samples {
-                let t = step as f32 / samples as f32;
-                let (t2, t3) = (t * t, t * t * t);
-                points.push(
-                    0.5 * (2.0 * p1
-                        + (p2 - p0) * t
-                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3),
-                );
-            }
-        }
-        points.push(if self.closed {
-            controls[0]
-        } else {
-            controls[count - 1]
-        });
-        points
+        catmull_rom(&self.controls, self.closed, samples)
     }
+
+    /// True when the path keeps a surface point for every control.
+    pub fn on_surface(&self) -> bool {
+        self.surface.len() >= 2 && self.surface.len() == self.controls.len()
+    }
+
+    /// Catmull-Rom curve through the surface points (object space), not
+    /// yet snapped onto the mesh.
+    pub fn sample_surface(&self, samples: usize) -> Vec<Vec3> {
+        catmull_rom(&self.surface, self.closed, samples)
+    }
+
+    /// True when the path's numbers are all finite.
+    pub fn is_valid(&self) -> bool {
+        self.controls.iter().all(|point| point.is_finite())
+            && self.surface.iter().all(|point| point.is_finite())
+            && (self.surface.is_empty() || self.surface.len() == self.controls.len())
+    }
+
+    /// The path traced over `mesh`, as one UV polyline per stretch that
+    /// stays in a single UV island. The surface curve is snapped onto the
+    /// mesh and cut where it crosses a UV seam; each stretch runs up to the
+    /// crossing (its UV carried over the edge of its own last triangle), so
+    /// neighbouring stretches meet on the surface. A path without surface
+    /// points gives its UV curve as the only stretch.
+    pub fn surface_runs(
+        &self,
+        mesh: &MeshGeometry,
+        topology: &MeshTopology,
+        samples: usize,
+    ) -> Vec<Vec<Vec2>> {
+        if !self.on_surface() {
+            return vec![self.sample(samples)];
+        }
+        let mut runs = Vec::new();
+        let mut current = Vec::new();
+        let mut previous: Option<(Vec3, SurfaceHit)> = None;
+        for point in self.sample_surface(samples) {
+            let Some(hit) = mesh.closest_surface_point(point) else {
+                continue;
+            };
+            if let Some(from) = previous
+                && crosses_uv_seam(topology, from.1.triangle, hit.triangle)
+            {
+                let (before, after) = seam_crossing(mesh, topology, from, (point, hit));
+                current.push(before);
+                runs.push(std::mem::take(&mut current));
+                current.push(after);
+            }
+            current.push(hit.uv);
+            previous = Some((point, hit));
+        }
+        runs.push(current);
+        runs.retain(|run| !run.is_empty());
+        runs
+    }
+}
+
+/// Where the surface curve from `from` to `to` (curve point and its snap
+/// onto the mesh) crosses from `from`'s UV island into another: the
+/// crossing's UV on each side of the seam.
+fn seam_crossing(
+    mesh: &MeshGeometry,
+    topology: &MeshTopology,
+    (mut from_point, mut from): (Vec3, SurfaceHit),
+    (mut to_point, mut to): (Vec3, SurfaceHit),
+) -> (Vec2, Vec2) {
+    let island = topology.island_of(from.triangle);
+    for _ in 0..SEAM_BISECTIONS {
+        let middle = from_point.lerp(to_point, 0.5);
+        let Some(hit) = mesh.closest_surface_point(middle) else {
+            break;
+        };
+        if topology.island_of(hit.triangle) == island {
+            (from_point, from) = (middle, hit);
+        } else {
+            (to_point, to) = (middle, hit);
+        }
+    }
+    let crossing = from.position.lerp(to.position, 0.5);
+    (
+        mesh.uv_on_plane(from.triangle, crossing).unwrap_or(from.uv),
+        mesh.uv_on_plane(to.triangle, crossing).unwrap_or(to.uv),
+    )
+}
+
+/// Catmull-Rom curve through `controls`, `samples` points per segment,
+/// ending on the last control (or back on the first when `closed`).
+fn catmull_rom<T>(controls: &[T], closed: bool, samples: usize) -> Vec<T>
+where
+    T: Copy + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<f32, Output = T>,
+{
+    let count = controls.len();
+    if count < 2 {
+        return controls.to_vec();
+    }
+    let samples = samples.clamp(1, 64);
+    let at = |index: isize| -> T {
+        if closed {
+            controls[index.rem_euclid(count as isize) as usize]
+        } else {
+            controls[index.clamp(0, count as isize - 1) as usize]
+        }
+    };
+    let segments = if closed { count } else { count - 1 };
+    let mut points = Vec::with_capacity(segments * samples + 1);
+    for segment in 0..segments as isize {
+        let (p0, p1, p2, p3) = (
+            at(segment - 1),
+            at(segment),
+            at(segment + 1),
+            at(segment + 2),
+        );
+        for step in 0..samples {
+            let t = step as f32 / samples as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            points.push(
+                (p1 * 2.0
+                    + (p2 - p0) * t
+                    + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+                    + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3)
+                    * 0.5,
+            );
+        }
+    }
+    points.push(if closed {
+        controls[0]
+    } else {
+        controls[count - 1]
+    });
+    points
 }
 
 #[cfg(test)]
@@ -560,6 +681,7 @@ mod tests {
         let path = PathSpec {
             controls: vec![Vec2::ZERO, Vec2::new(1.0, 1.0), Vec2::new(2.0, 0.0)],
             closed: false,
+            surface: Vec::new(),
         };
         let points = path.sample(8);
         assert_eq!(points.len(), 17);

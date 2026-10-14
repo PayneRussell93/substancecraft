@@ -263,8 +263,9 @@ struct SubstanceCraftApp {
     brush_user: substancecraft_core::UserValues,
     /// Screen point where the last brush dab landed, for Shift-click lines.
     last_paint_screen: Option<egui::Pos2>,
-    /// Control points of a path being placed (UV space).
-    path_controls: Option<Vec<(glam::Vec2, egui::Pos2)>>,
+    /// Control points of a path being placed: UV, the clicked screen point,
+    /// and the object-space surface point under it.
+    path_controls: Option<Vec<(glam::Vec2, egui::Pos2, glam::Vec3)>>,
     /// The next click samples the material into the brush.
     picking_material: bool,
     /// Bitmap scaling skew correction per texel in high-to-low bakes.
@@ -3243,10 +3244,11 @@ impl SubstanceCraftApp {
         }
         if self.path_controls.is_some() {
             if response.clicked()
-                && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
+                && let Some(hit) = pick(self, pointer)
+                && let Some(uv) = hit.uv
                 && let Some(controls) = &mut self.path_controls
             {
-                controls.push((uv, pointer));
+                controls.push((uv, pointer, hit.position));
             }
             return;
         }
@@ -3416,8 +3418,9 @@ impl SubstanceCraftApp {
         }
     }
 
-    /// Turns the placed path into one undoable stroke on the selected
-    /// layer, using the current brush.
+    /// Turns the placed path into strokes on the selected layer, using the
+    /// current brush, as one undo step. The path follows the surface, so
+    /// it gives one stroke per UV island it crosses.
     fn commit_path(&mut self, closed: bool) {
         let Some(controls) = self.path_controls.take() else {
             return;
@@ -3431,8 +3434,9 @@ impl SubstanceCraftApp {
             return;
         }
         let path = substancecraft_core::PathSpec {
-            controls: controls.into_iter().map(|(uv, _)| uv).collect(),
+            controls: controls.iter().map(|(uv, ..)| *uv).collect(),
             closed,
+            surface: controls.iter().map(|(.., position)| *position).collect(),
         };
         let mut template = self.brush_paint_stroke(self.paint_mode == PaintMode::Erase);
         template.stencil = self.active_stencil(texture_set_id);
@@ -3442,15 +3446,26 @@ impl SubstanceCraftApp {
             }
             template.source = self.stroke_tools.stroke_source(path.controls[0]);
         }
-        let stroke = PaintStroke::along_path(path, &template);
-        if self.history.apply(
-            &mut self.project,
-            EditCommand::Paint {
+        let strokes = match (&self.mesh_geometry, &self.mesh_topology) {
+            (Some(mesh), Some(topology)) => {
+                PaintStroke::along_surface_path(path, &template, mesh, topology)
+            }
+            _ => vec![PaintStroke::along_path(path, &template)],
+        };
+        let mut commands: Vec<EditCommand> = strokes
+            .into_iter()
+            .map(|stroke| EditCommand::Paint {
                 texture_set_id,
                 layer_id,
                 stroke,
-            },
-        ) {
+            })
+            .collect();
+        let command = match commands.len() {
+            0 => return,
+            1 => commands.remove(0),
+            _ => EditCommand::Batch(commands),
+        };
+        if self.history.apply(&mut self.project, command) {
             self.invalidate_preview();
         }
     }
@@ -5831,13 +5846,23 @@ impl SubstanceCraftApp {
             }
         }
         if let Some(controls) = &self.path_controls {
-            let screen: Vec<egui::Pos2> = controls.iter().map(|(_, screen)| *screen).collect();
+            // The curve as it will run over the surface, from the current
+            // view, so it stays on the model while the camera moves.
+            let surface = substancecraft_core::PathSpec {
+                surface: controls.iter().map(|(.., position)| *position).collect(),
+                ..Default::default()
+            };
+            let curve: Vec<egui::Pos2> = surface
+                .sample_surface(substancecraft_core::PATH_SAMPLES_PER_SEGMENT)
+                .into_iter()
+                .map(|point| projection.project(point).screen)
+                .collect();
             painter.add(egui::Shape::line(
-                screen.clone(),
+                curve,
                 egui::Stroke::new(1.5, theme::ACCENT),
             ));
-            for point in screen {
-                painter.circle_filled(point, 4.0, theme::ACCENT);
+            for (.., position) in controls {
+                painter.circle_filled(projection.project(*position).screen, 4.0, theme::ACCENT);
             }
         }
 
@@ -7421,11 +7446,20 @@ mod tests {
         assert_eq!(strokes(&app), 2);
 
         // A placed path commits as one stroke that keeps its control points.
-        app.path_controls = Some(vec![
-            (glam::Vec2::new(0.1, 0.6), egui::Pos2::ZERO),
-            (glam::Vec2::new(0.2, 0.8), egui::Pos2::ZERO),
-            (glam::Vec2::new(0.3, 0.6), egui::Pos2::ZERO),
-        ]);
+        let place = |points: &[glam::Vec3]| {
+            points
+                .iter()
+                .map(|point| {
+                    let hit = hit_at(*point);
+                    (hit.uv.unwrap(), egui::Pos2::ZERO, hit.position)
+                })
+                .collect::<Vec<_>>()
+        };
+        app.path_controls = Some(place(&[
+            glam::Vec3::new(-0.3, -0.2, 0.5),
+            glam::Vec3::new(0.0, 0.1, 0.5),
+            glam::Vec3::new(0.3, -0.2, 0.5),
+        ]));
         app.commit_path(false);
         assert!(app.path_controls.is_none());
         let path_stroke = app
@@ -7435,11 +7469,24 @@ mod tests {
             .last()
             .unwrap()
             .clone();
-        assert_eq!(path_stroke.path.as_ref().unwrap().controls.len(), 3);
+        let path = path_stroke.path.as_ref().unwrap();
+        assert_eq!(path.controls.len(), 3);
+        assert_eq!(path.surface.len(), 3);
         assert_eq!(
             path_stroke.points.len(),
-            2 * substancecraft_core::PATH_SAMPLES_PER_SEGMENT + 1
+            2 * substancecraft_core::SURFACE_PATH_SAMPLES_PER_SEGMENT + 1
         );
+        app.undo();
+        assert_eq!(strokes(&app), 2);
+
+        // A path running from the front face over the top follows the
+        // surface across the seam: one stroke per face, one undo step.
+        app.path_controls = Some(place(&[
+            glam::Vec3::new(0.0, 0.2, 0.5),
+            glam::Vec3::new(0.0, 0.5, 0.2),
+        ]));
+        app.commit_path(false);
+        assert_eq!(strokes(&app), 4);
         app.undo();
         assert_eq!(strokes(&app), 2);
 

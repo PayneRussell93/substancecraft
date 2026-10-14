@@ -748,13 +748,35 @@ impl Compositor<'_> {
             over(view, above.truncate(), above.w, self.data);
         }
         let (width, height) = (self.width(), self.height());
-        // Pixel rows run down, so +V is up the texture.
-        let shift_of = |direction: Vec2| match source {
-            StrokeSource::Clone { offset } => Vec2::new(
-                offset.x * width.saturating_sub(1) as f32,
-                -offset.y * height.saturating_sub(1) as f32,
+        let data = self.data;
+        let read = |texel: Vec2, direction: Vec2| match source {
+            // Pixel rows run down, so +V is up the texture.
+            StrokeSource::Clone { offset } => sample_plane(
+                &view,
+                region,
+                (width, height),
+                texel
+                    + Vec2::new(
+                        offset.x * width.saturating_sub(1) as f32,
+                        -offset.y * height.saturating_sub(1) as f32,
+                    ),
+                data,
             ),
-            StrokeSource::Smudge { strength } => -direction * stroke.radius_pixels * strength,
+            StrokeSource::Smudge { strength } => sample_plane(
+                &view,
+                region,
+                (width, height),
+                texel - direction * stroke.radius_pixels * strength,
+                data,
+            ),
+            StrokeSource::Blur { strength } => blur_plane(
+                &view,
+                region,
+                (width, height),
+                texel,
+                stroke.radius_pixels * strength,
+                data,
+            ),
         };
         brush::rasterize_stroke_directed(
             path,
@@ -768,13 +790,7 @@ impl Compositor<'_> {
                     (region.x + index_u32 % region.width) as f32,
                     (region.y + index_u32 / region.width) as f32,
                 );
-                let Some(sample) = sample_plane(
-                    &view,
-                    region,
-                    (width, height),
-                    texel + shift_of(direction),
-                    self.data,
-                ) else {
+                let Some(sample) = read(texel, direction) else {
                     return;
                 };
                 let amount = (coverage * stroke.opacity * limit(index)).clamp(0.0, 1.0);
@@ -798,6 +814,44 @@ impl Compositor<'_> {
         self.stencils.borrow_mut().insert(id, Rc::clone(&values));
         Ok(values)
     }
+}
+
+/// Taps a blur averages over its disc, besides the centre.
+const BLUR_TAPS: usize = 24;
+
+/// Average of a straight-alpha `plane` over the disc of `radius` pixels
+/// around `point`: the centre and [`BLUR_TAPS`] bilinear taps spread
+/// evenly over the disc (a golden-angle spiral). `None` like
+/// [`sample_plane`] when a tap falls outside `region`.
+fn blur_plane(
+    plane: &[Vec4],
+    region: TexelRect,
+    size: (u32, u32),
+    point: Vec2,
+    radius: f32,
+    data: PlaneData,
+) -> Option<Vec4> {
+    const GOLDEN_ANGLE: f32 = 2.399_963;
+    let mut sum = Vec4::ZERO;
+    for tap in 0..=BLUR_TAPS {
+        let offset = if tap == 0 {
+            Vec2::ZERO
+        } else {
+            let angle = tap as f32 * GOLDEN_ANGLE;
+            Vec2::new(angle.cos(), angle.sin()) * radius * (tap as f32 / BLUR_TAPS as f32).sqrt()
+        };
+        let texel = sample_plane(plane, region, size, point + offset, data)?;
+        sum += (texel.truncate() * texel.w).extend(texel.w);
+    }
+    let sum = sum / (BLUR_TAPS + 1) as f32;
+    if sum.w <= 1e-6 {
+        return Some(Vec4::ZERO);
+    }
+    let mut color = sum.truncate() / sum.w;
+    if data == PlaneData::Vector {
+        color = color.normalize_or(Vec3::Z);
+    }
+    Some(color.extend(sum.w.min(1.0)))
 }
 
 /// Bilinear sample of a straight-alpha `plane` (row-major over `region`)

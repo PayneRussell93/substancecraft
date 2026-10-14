@@ -1697,6 +1697,10 @@ pub enum StrokeSource {
     /// Smudge: drags the stack along the stroke, each texel reading from
     /// `strength` brush radii behind it.
     Smudge { strength: f32 },
+    /// Blur: softens the stack under the stroke, each texel taking the
+    /// average of the disc around it whose radius is `strength` brush
+    /// radii.
+    Blur { strength: f32 },
 }
 
 impl StrokeSource {
@@ -1705,7 +1709,9 @@ impl StrokeSource {
             Self::Clone { offset } => {
                 offset.is_finite() && offset.abs().cmple(glam::Vec2::new(10.0, 100.0)).all()
             }
-            Self::Smudge { strength } => strength.is_finite() && strength > 0.0 && strength <= 1.0,
+            Self::Smudge { strength } | Self::Blur { strength } => {
+                strength.is_finite() && strength > 0.0 && strength <= 1.0
+            }
         }
     }
 
@@ -1720,7 +1726,7 @@ impl StrokeSource {
                 ))
             .abs()
             .max_element(),
-            Self::Smudge { strength } => radius_pixels * strength,
+            Self::Smudge { strength } | Self::Blur { strength } => radius_pixels * strength,
         };
         // One more for the bilinear neighbour.
         (texels.ceil() as u32).saturating_add(1)
@@ -1768,6 +1774,34 @@ impl PaintStroke {
         }
     }
 
+    /// Strokes following a path over the surface of `mesh`: one per
+    /// stretch of the path within a single UV island, so the path follows
+    /// the surface across UV seams. The first stroke keeps the path. A path
+    /// without surface points gives the single stroke of
+    /// [`Self::along_path`].
+    pub fn along_surface_path(
+        path: PathSpec,
+        template: &PaintStroke,
+        mesh: &MeshGeometry,
+        topology: &MeshTopology,
+    ) -> Vec<Self> {
+        if !path.on_surface() {
+            return vec![Self::along_path(path, template)];
+        }
+        let runs = path.surface_runs(mesh, topology, SURFACE_PATH_SAMPLES_PER_SEGMENT);
+        let mut path = Some(path);
+        runs.into_iter()
+            .map(|points| Self {
+                points,
+                pressures: Vec::new(),
+                path: path.take(),
+                camera: None,
+                frames: Vec::new(),
+                ..template.clone()
+            })
+            .collect()
+    }
+
     /// A stroke with default material values and a soft round tip.
     pub fn new(points: Vec<glam::Vec2>, radius_pixels: f32, color: [u8; 4]) -> Self {
         Self {
@@ -1795,6 +1829,9 @@ impl PaintStroke {
 
 /// Points sampled per spline segment of a path stroke.
 pub const PATH_SAMPLES_PER_SEGMENT: usize = 12;
+/// Points sampled per segment of a path that follows the surface, dense
+/// enough to bend around the edges it crosses.
+pub const SURFACE_PATH_SAMPLES_PER_SEGMENT: usize = 48;
 
 fn default_stroke_roughness() -> f32 {
     DEFAULT_ROUGHNESS
@@ -2563,6 +2600,7 @@ fn valid_paint_stroke(stroke: &PaintStroke) -> bool {
         && stroke.source.is_none_or(|source| {
             source.is_valid() && stroke.camera.is_none() && !stroke.erase
         })
+        && stroke.path.as_ref().is_none_or(PathSpec::is_valid)
 }
 
 pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {

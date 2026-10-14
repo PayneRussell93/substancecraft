@@ -1,4 +1,5 @@
-//! Clone and smudge brushes, surface-aligned stamps, and the quick mask.
+//! Clone, smudge, and blur brushes, surface-aligned stamps, and the quick
+//! mask.
 //!
 //! A quick mask is painted like a mask, straight into a new
 //! [`Stencil`] of the selected texture set, while the viewport shows it over
