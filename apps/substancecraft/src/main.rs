@@ -42,6 +42,7 @@ mod cameras;
 mod diagnostics;
 mod edges;
 mod environments;
+mod graph_editor;
 mod icons;
 mod incremental;
 mod inspector;
@@ -49,6 +50,7 @@ mod panels;
 mod preferences;
 mod relink;
 mod resource_watch;
+mod stroke_tools;
 mod theme;
 mod turntable;
 mod uv_view;
@@ -255,6 +257,10 @@ struct SubstanceCraftApp {
     symmetry: Option<substancecraft_core::Symmetry>,
     /// Lazy-mouse brush smoothing (radius 0 is off).
     stroke_stabilizer: substancecraft_core::LazyStabilizer,
+    /// Clone, smudge, surface alignment, and the quick mask.
+    stroke_tools: stroke_tools::StrokeTools,
+    /// What the brush paints into each user channel.
+    brush_user: substancecraft_core::UserValues,
     /// Screen point where the last brush dab landed, for Shift-click lines.
     last_paint_screen: Option<egui::Pos2>,
     /// Control points of a path being placed (UV space).
@@ -427,6 +433,8 @@ enum PreviewTarget {
         palette: substancecraft_core::OverlayPalette,
         pattern: bool,
     },
+    /// The shaded material tinted by the quick mask being painted.
+    QuickMask(substancecraft_core::StencilId),
 }
 
 struct BakedPreview {
@@ -850,6 +858,8 @@ impl Default for SubstanceCraftApp {
             stroke_last_triangles: Vec::new(),
             symmetry: None,
             stroke_stabilizer: substancecraft_core::LazyStabilizer::new(0.0),
+            stroke_tools: stroke_tools::StrokeTools::default(),
+            brush_user: substancecraft_core::UserValues::default(),
             last_paint_screen: None,
             path_controls: None,
             picking_material: false,
@@ -1275,7 +1285,9 @@ impl SubstanceCraftApp {
         };
         renderer.set_preview_mode(!matches!(
             target,
-            PreviewTarget::Material | PreviewTarget::MaskOverlay { .. }
+            PreviewTarget::Material
+                | PreviewTarget::MaskOverlay { .. }
+                | PreviewTarget::QuickMask(_)
         ));
         let mut texture_result = Ok(());
         for (slot, source) in plan.into_iter().enumerate() {
@@ -1801,6 +1813,8 @@ impl SubstanceCraftApp {
             slot.clone()
         };
         self.project.texture_sets.push(TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id,
             name,
             material_slot: slot,
@@ -2733,7 +2747,7 @@ impl SubstanceCraftApp {
     /// Adds `uv` to the stroke in progress, starting one when needed. Paint
     /// and ID strokes skip groups; mask strokes work on any layer.
     fn append_stroke_point(&mut self, uv: glam::Vec2) {
-        self.stroke_point(0, uv, false);
+        self.stroke_point(0, uv, None, false);
     }
 
     /// True when strokes are drawn on screen and projected onto the surface:
@@ -2741,12 +2755,20 @@ impl SubstanceCraftApp {
     /// stay in UV space).
     fn projects_strokes(&self) -> bool {
         // Projected strokes rasterise the bind mesh, so they wait for it.
+        // Clone and smudge sample in texture space.
         self.projection_painting
             && !self.is_posed()
             && matches!(
                 self.paint_mode,
                 PaintMode::Paint | PaintMode::Erase | PaintMode::Mask
             )
+            && (self.stroke_tools.source == stroke_tools::BrushSource::Paint
+                || self.paint_mode != PaintMode::Paint
+                || self
+                    .stroke_tools
+                    .quick_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.editing))
     }
 
     /// Adds `point` (viewport pixels) to the projected stroke in progress,
@@ -2758,22 +2780,29 @@ impl SubstanceCraftApp {
         point: glam::Vec2,
         camera: substancecraft_core::StrokeCamera,
     ) {
+        if !self.projects_strokes() {
+            return;
+        }
+        if let Some(set_id) = self.selected_texture_set
+            && self.quick_mask_point(set_id, 0, point, None, Some(camera), false)
+        {
+            return;
+        }
         let (Some(texture_set_id), Some(layer_id)) =
             (self.selected_texture_set, self.selected_layer)
         else {
             return;
         };
-        if !self.projects_strokes() {
-            return;
-        }
         let mode = self.paint_mode;
         let stroke_key = (texture_set_id, layer_id, mode);
         let starts_stroke = self.active_stroke != Some(stroke_key);
         let pressure = self.pen_pressure;
         let pressures = pressure.map(|value| vec![value]).unwrap_or_default();
+        let stencil = self.active_stencil(texture_set_id);
         let paint = PaintStroke {
             camera: Some(camera),
             pressures: pressures.clone(),
+            stencil,
             ..self.brush_paint_stroke(mode == PaintMode::Erase)
         };
         let (radius, tip) = (paint.radius_pixels, paint.tip);
@@ -2781,6 +2810,7 @@ impl SubstanceCraftApp {
             camera: Some(camera),
             tip,
             pressures,
+            stencil,
             ..MaskStroke::new(Vec::new(), radius, self.mask_value)
         };
         let maps = self
@@ -2871,17 +2901,40 @@ impl SubstanceCraftApp {
     }
 
     /// Adds `uv` to stroke path `path` of the current drag (0 is the brush,
-    /// 1 its mirror). `restart` begins a new stroke for that path, e.g. after
+    /// 1 its mirror), with the stamp `frame` there when stamps align to the
+    /// surface. `restart` begins a new stroke for that path, e.g. after
     /// crossing a UV seam. Every stroke a drag creates undoes together.
-    fn stroke_point(&mut self, path: usize, uv: glam::Vec2, restart: bool) {
+    /// While a quick mask is being painted, strokes go into it instead.
+    fn stroke_point(
+        &mut self,
+        path: usize,
+        uv: glam::Vec2,
+        frame: Option<substancecraft_core::StampFrame>,
+        restart: bool,
+    ) {
+        if !self.paint_mode.paints() {
+            return;
+        }
+        if let Some(set_id) = self.selected_texture_set
+            && self.quick_mask_point(set_id, path, uv, frame, None, restart)
+        {
+            return;
+        }
         let (Some(texture_set_id), Some(layer_id)) =
             (self.selected_texture_set, self.selected_layer)
         else {
             return;
         };
-        if !self.paint_mode.paints() {
+        if self.paint_mode == PaintMode::Paint && !self.stroke_tools.ready() {
+            // Clone waits for its source.
             return;
         }
+        let stencil = self.active_stencil(texture_set_id);
+        let source = match self.paint_mode {
+            PaintMode::Paint => self.stroke_tools.stroke_source(uv),
+            _ => None,
+        };
+        let frames = frame.map(|frame| vec![frame]).unwrap_or_default();
         let mode = self.paint_mode;
         let stroke_key = (texture_set_id, layer_id, mode);
         let starts_stroke = self.active_stroke != Some(stroke_key);
@@ -2897,6 +2950,7 @@ impl SubstanceCraftApp {
             self.brush_material_opacity,
         );
         let mask_value = self.mask_value;
+        let user = self.brush_user;
         let Some(texture_set) = self
             .project
             .texture_sets
@@ -2944,6 +2998,10 @@ impl SubstanceCraftApp {
                     erase: mode == PaintMode::Erase,
                     tip,
                     pressures: pressures(pressure),
+                    frames: frames.clone(),
+                    source,
+                    stencil,
+                    user,
                     ..PaintStroke::new(vec![uv], radius_pixels, color)
                 }),
                 PaintMode::Mask => layer.mask_strokes.push(MaskStroke {
@@ -2954,6 +3012,8 @@ impl SubstanceCraftApp {
                     tip,
                     pressures: pressures(pressure),
                     camera: None,
+                    frames: frames.clone(),
+                    stencil,
                 }),
                 PaintMode::Id => layer.id_strokes.push(IdStroke {
                     points: vec![uv],
@@ -2962,6 +3022,7 @@ impl SubstanceCraftApp {
                     opacity: 1.0,
                     tip,
                     pressures: pressures(pressure),
+                    frames: frames.clone(),
                 }),
             }
             if self.stroke_paths.len() <= path {
@@ -2973,6 +3034,7 @@ impl SubstanceCraftApp {
                 &[uv],
                 preview_radius(radius_pixels),
                 tip,
+                &frames,
                 set_width,
                 set_height,
             );
@@ -2988,19 +3050,34 @@ impl SubstanceCraftApp {
             PaintMode::Paint | PaintMode::Erase => {
                 layer.paint_strokes.get_mut(index).map(|stroke| {
                     let shape = (stroke.radius_pixels, stroke.tip);
-                    (&mut stroke.points, &mut stroke.pressures, shape)
+                    (
+                        &mut stroke.points,
+                        &mut stroke.pressures,
+                        &mut stroke.frames,
+                        shape,
+                    )
                 })
             }
             PaintMode::Mask => layer.mask_strokes.get_mut(index).map(|stroke| {
                 let shape = (stroke.radius_pixels, stroke.tip);
-                (&mut stroke.points, &mut stroke.pressures, shape)
+                (
+                    &mut stroke.points,
+                    &mut stroke.pressures,
+                    &mut stroke.frames,
+                    shape,
+                )
             }),
             PaintMode::Id => layer.id_strokes.get_mut(index).map(|stroke| {
                 let shape = (stroke.radius_pixels, stroke.tip);
-                (&mut stroke.points, &mut stroke.pressures, shape)
+                (
+                    &mut stroke.points,
+                    &mut stroke.pressures,
+                    &mut stroke.frames,
+                    shape,
+                )
             }),
         };
-        if let Some((points, pressures, (radius, tip))) = target
+        if let Some((points, pressures, stroke_frames, (radius, tip))) = target
             && points.len() < MAX_STROKE_POINTS
             && points
                 .last()
@@ -3011,11 +3088,18 @@ impl SubstanceCraftApp {
             if !pressures.is_empty() {
                 pressures.push(pressure.unwrap_or(1.0));
             }
+            // An aligned stroke keeps one frame per point; a hit without a
+            // usable frame stamps unaligned.
+            if !stroke_frames.is_empty() {
+                stroke_frames.push(frame.unwrap_or(substancecraft_core::StampFrame::IDENTITY));
+            }
             // Stamps are placed causally, so only the new segment changes.
+            let start = points.len() - 2;
             let bounds = stroke_texel_bounds(
-                &points[points.len() - 2..],
+                &points[start..],
                 preview_radius(radius),
                 tip,
+                stroke_frames.get(start..).unwrap_or_default(),
                 set_width,
                 set_height,
             );
@@ -3024,6 +3108,7 @@ impl SubstanceCraftApp {
     }
 
     fn finish_active_stroke(&mut self) {
+        self.stroke_tools.end_quick_stroke();
         let Some((texture_set_id, layer_id, mode)) = self.active_stroke.take() else {
             return;
         };
@@ -3142,6 +3227,14 @@ impl SubstanceCraftApp {
                 && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
             {
                 self.pick_id_color_at(uv);
+            }
+            return;
+        }
+        if self.stroke_tools.picking_source {
+            if response.clicked()
+                && let Some(uv) = pick(self, pointer).and_then(|hit| hit.uv)
+            {
+                self.stroke_tools.set_clone_source(uv);
             }
             return;
         }
@@ -3341,7 +3434,14 @@ impl SubstanceCraftApp {
             controls: controls.into_iter().map(|(uv, _)| uv).collect(),
             closed,
         };
-        let template = self.brush_paint_stroke(self.paint_mode == PaintMode::Erase);
+        let mut template = self.brush_paint_stroke(self.paint_mode == PaintMode::Erase);
+        template.stencil = self.active_stencil(texture_set_id);
+        if self.paint_mode == PaintMode::Paint {
+            if !self.stroke_tools.ready() {
+                return;
+            }
+            template.source = self.stroke_tools.stroke_source(path.controls[0]);
+        }
         let stroke = PaintStroke::along_path(path, &template);
         if self.history.apply(
             &mut self.project,
@@ -3367,6 +3467,7 @@ impl SubstanceCraftApp {
             material_opacity: self.brush_material_opacity,
             erase,
             tip: self.brush_tip,
+            user: self.brush_user,
             ..PaintStroke::new(Vec::new(), self.brush_radius, color)
         }
     }
@@ -3493,7 +3594,8 @@ impl SubstanceCraftApp {
                 }
                 _ => false,
             };
-            self.stroke_point(path, uv, restart);
+            let frame = self.hit_frame(triangle);
+            self.stroke_point(path, uv, frame, restart);
             if self.stroke_last_triangles.len() <= path {
                 self.stroke_last_triangles.resize(path + 1, None);
             }
@@ -3537,6 +3639,12 @@ impl SubstanceCraftApp {
     }
 
     fn preview_target(&self) -> PreviewTarget {
+        if let Some(id) = self
+            .selected_texture_set
+            .and_then(|set| self.editing_quick_mask(set))
+        {
+            return PreviewTarget::QuickMask(id);
+        }
         match self.active_solo() {
             Some(inspector::Solo::Mask(id)) => return PreviewTarget::LayerMask(id),
             Some(inspector::Solo::Generator(id)) => return PreviewTarget::Generator(id),
@@ -3972,6 +4080,7 @@ impl SubstanceCraftApp {
         }
         if let PreviewTarget::Channel(channel) = key.target
             && !BAKEABLE_CHANNELS.contains(&channel)
+            && channel.user_slot().is_none()
         {
             return;
         }
@@ -4027,6 +4136,17 @@ impl SubstanceCraftApp {
         let job_patch = patch
             .as_ref()
             .map(|(base, regions)| (base.keys(), regions.clone()));
+        // The quick mask tints the last material bake, which painting it
+        // leaves unchanged.
+        let quick_mask_base = key.texture_set.and_then(|set_id| {
+            self.set_materials
+                .get(&set_id)
+                .map(|cached| Arc::clone(&cached.textures))
+        });
+        let quick_mask_overlay = (
+            self.preferences.values.overlay_palette,
+            self.preferences.values.overlay_pattern,
+        );
         let (sender, receiver) = sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("preview-bake".to_owned())
@@ -4069,6 +4189,28 @@ impl SubstanceCraftApp {
                         .ok_or("mask and material sizes differ")?;
                         Ok(PreviewTextures::Material(Arc::new(textures)))
                     }),
+                    (_, PreviewTarget::QuickMask(id)) => {
+                        let base = match quick_mask_base {
+                            Some(base) => Ok(base),
+                            None => inputs.bake_material(&texture_set).map(Arc::new),
+                        };
+                        base.and_then(|base| {
+                            let mask = inputs.bake_stencil(&texture_set, id)?;
+
+                            let mut textures = (*base).clone();
+                            let (palette, pattern) = quick_mask_overlay;
+                            textures.base_color = substancecraft_core::mask_overlay(
+                                &textures.base_color,
+                                &mask,
+                                palette,
+                                0.55,
+                                pattern,
+                            )
+                            .ok_or("mask and material sizes differ")?;
+                            Ok(PreviewTextures::Material(Arc::new(textures)))
+                        })
+                    }
+
                     _ => inputs
                         .bake_material(&texture_set)
                         .map(|textures| PreviewTextures::Material(Arc::new(textures))),
@@ -4292,7 +4434,12 @@ impl SubstanceCraftApp {
         let Some(texture_set) = self.exportable_texture_set(false) else {
             return;
         };
-        let stem = format!("{}_{}", texture_set.name, channel_label(channel));
+        let label = texture_set.user_channel(channel).map_or_else(
+            || channel_label(channel).to_owned(),
+            |user| user.name.clone(),
+        );
+        let stem = format!("{}_{label}", texture_set.name);
+
         let Some(path) = self.texture_save_path(&stem) else {
             return;
         };
@@ -6286,7 +6433,12 @@ impl eframe::App for SubstanceCraftApp {
     }
 }
 
+/// A channel's generic label; a set names its user channels itself (see
+/// `channel_name`).
 fn channel_label(channel: MaterialChannel) -> &'static str {
+    const USER: [&str; substancecraft_core::MAX_USER_CHANNELS as usize] = [
+        "User 0", "User 1", "User 2", "User 3", "User 4", "User 5", "User 6", "User 7",
+    ];
     match channel {
         MaterialChannel::BaseColor => "Base Color",
         MaterialChannel::Id => "ID Mask",
@@ -6297,6 +6449,7 @@ fn channel_label(channel: MaterialChannel) -> &'static str {
         MaterialChannel::AmbientOcclusion => "Ambient Occlusion",
         MaterialChannel::Emissive => "Emissive",
         MaterialChannel::Opacity => "Opacity",
+        MaterialChannel::User(slot) => USER.get(usize::from(slot)).copied().unwrap_or("User"),
     }
 }
 

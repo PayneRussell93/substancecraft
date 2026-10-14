@@ -10,11 +10,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{
-    AnchorMask, BitmapMask, BlendMode, EditCommand, EditHistory, LayerFill, LayerFilter, LayerId,
-    LayerSettings, LayerSlot, MapRequirements, MaskGenerator, MaskStroke, MaterialChannel,
-    MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource, PaintStroke,
-    ParameterValue, PolygonMask, SmartMask, SmartMaterial, TextureProjection, TextureResolution,
-    TextureSet, TextureSetId, mask_drivers, remap_subdivided_triangles,
+    AnchorEffect, AnchorMask, BitmapMask, BlendMode, EditCommand, EditHistory, LayerFill,
+    LayerFilter, LayerId, LayerSettings, LayerSlot, MapRequirements, MaskGenerator, MaskStroke,
+    MaterialChannel, MaterialId, MaterialLayer, MaterialLink, MaterialProject, MaterialResource,
+    PaintStroke, ParameterValue, PolygonMask, SmartMask, SmartMaterial, TextureProjection,
+    TextureResolution, TextureSet, TextureSetId, mask_drivers, remap_subdivided_triangles,
 };
 use thiserror::Error;
 
@@ -417,6 +417,9 @@ pub enum AutomationEdit {
         channels: Option<Vec<String>>,
         #[serde(default)]
         height_strength: Option<f32>,
+        /// Replaces the set's user channels.
+        #[serde(default)]
+        user_channels: Option<Vec<substancecraft_core::UserChannel>>,
     },
     /// Changes the mesh's import scale, smoothing angle, or subdivision
     /// levels; polygon masks follow a subdivision change.
@@ -469,6 +472,13 @@ pub enum AutomationEdit {
         #[serde(default)]
         inverted: Option<bool>,
     },
+    /// Gives a fill layer procedural content: a material graph (as saved in
+    /// project files), or `null` to remove it.
+    SetGraph {
+        texture_set: String,
+        layer: String,
+        graph: Option<substancecraft_core::MaterialGraph>,
+    },
     /// Masks a layer by a channel of the stack as composited through an
     /// earlier layer (`anchor`, by id or name; `none` removes the anchor),
     /// remapping `low..high` to `0..1`, optionally inverted.
@@ -485,6 +495,11 @@ pub enum AutomationEdit {
         high: Option<f32>,
         #[serde(default)]
         invert: Option<bool>,
+        /// Where among the anchor layer's effects to read: `layer` (the
+        /// whole layer), `fill`, `paint`, or `filter N` (through its Nth
+        /// content filter, from 1). Choosing another anchor layer resets it.
+        #[serde(default)]
+        effect: Option<String>,
     },
     /// Inserts a fresh copy of a smart material (project first, then the
     /// built-ins) inside `parent` or at the top level, at `index` from the
@@ -1133,6 +1148,7 @@ fn automation_command(
             resolution,
             channels,
             height_strength,
+            user_channels,
         } => {
             let set = find_set(project, texture_set)?;
             let before = set.properties();
@@ -1170,6 +1186,16 @@ fn automation_command(
                     )));
                 }
                 after.height_strength = *strength;
+            }
+            if let Some(user_channels) = user_channels {
+                if !substancecraft_core::user_channels_valid(user_channels) {
+                    return Err(AutomationError::InvalidValue(format!(
+                        "user channels need slots 0 to {} and unique, non-empty names",
+                        substancecraft_core::MAX_USER_CHANNELS - 1
+                    )));
+                }
+                after.user_channels.clone_from(user_channels);
+                after.user_channels.sort_by_key(|user| user.slot);
             }
             if after == before {
                 return Ok((None, unchanged(None)));
@@ -1374,6 +1400,44 @@ fn automation_command(
             );
             Ok(settings_edit(set, target, before, after, summary))
         }
+        AutomationEdit::SetGraph {
+            texture_set,
+            layer,
+            graph,
+        } => {
+            let set = find_set(project, texture_set)?;
+            let target = find_layer(set, layer)?;
+            if graph.is_some() && (target.is_group() || target.fill.is_none()) {
+                return Err(AutomationError::InvalidValue(
+                    "only fill layers can be procedural; add a fill first".to_owned(),
+                ));
+            }
+            if graph.as_ref().is_some_and(|graph| !graph.is_valid()) {
+                return Err(AutomationError::InvalidValue(format!(
+                    "the graph is invalid: inputs must read earlier nodes, at most {} nodes,                      ramps 2 to {} ordered stops, per-texel filters only, and no ID or                      occlusion outputs",
+                    substancecraft_core::MAX_GRAPH_NODES,
+                    substancecraft_core::MAX_RAMP_STOPS
+                )));
+            }
+            let before = target.settings();
+            let after = LayerSettings {
+                graph: graph.clone(),
+                ..before.clone()
+            };
+            let summary = match graph {
+                Some(graph) => format!(
+                    "made layer {} `{}` procedural ({} nodes)",
+                    target.id.0,
+                    target.name,
+                    graph.nodes.len()
+                ),
+                None => format!(
+                    "removed the graph of layer {} `{}`",
+                    target.id.0, target.name
+                ),
+            };
+            Ok(settings_edit(set, target, before, after, summary))
+        }
         AutomationEdit::SetPolygonMask {
             texture_set,
             layer,
@@ -1431,6 +1495,7 @@ fn automation_command(
             low,
             high,
             invert,
+            effect,
         } => {
             let set = find_set(project, texture_set)?;
             let target = find_layer(set, layer)?;
@@ -1452,10 +1517,14 @@ fn automation_command(
                                 target.name
                             )));
                         }
-                        AnchorMask {
-                            layer: source.id,
-                            ..current
-                                .unwrap_or(AnchorMask::new(source.id, MaterialChannel::BaseColor))
+                        match current {
+                            Some(current) if current.layer == source.id => current,
+                            Some(current) => AnchorMask {
+                                layer: source.id,
+                                effect: None,
+                                ..current
+                            },
+                            None => AnchorMask::new(source.id, MaterialChannel::BaseColor),
                         }
                     }
                     (None, Some(current)) => current,
@@ -1467,7 +1536,7 @@ fn automation_command(
                 };
                 if let Some(channel) = channel {
                     mask.channel = parse_channel(channel)?;
-                    if !AnchorMask::CHANNELS.contains(&mask.channel) {
+                    if !AnchorMask::reads(mask.channel) {
                         return Err(AutomationError::InvalidValue(format!(
                             "anchors cannot read the {:?} channel",
                             mask.channel
@@ -1488,6 +1557,9 @@ fn automation_command(
                 }
                 if let Some(invert) = invert {
                     mask.invert = *invert;
+                }
+                if let Some(effect) = effect {
+                    mask.effect = parse_anchor_effect(effect)?;
                 }
                 after.mask_anchor = Some(mask);
             }
@@ -1819,7 +1891,7 @@ fn slot_index(index: Option<usize>, count: usize) -> Result<usize, AutomationErr
 }
 
 /// A channel by its name, ignoring case and spaces (`Base Color`,
-/// `roughness`, `AmbientOcclusion`).
+/// `roughness`, `AmbientOcclusion`, `User 0` to `User 7`).
 fn parse_channel(name: &str) -> Result<MaterialChannel, AutomationError> {
     let wanted: String = name
         .chars()
@@ -1828,8 +1900,30 @@ fn parse_channel(name: &str) -> Result<MaterialChannel, AutomationError> {
         .to_ascii_lowercase();
     ALL_CHANNELS
         .into_iter()
-        .find(|channel| format!("{channel:?}").to_ascii_lowercase() == wanted)
+        .chain(MaterialChannel::user_slots())
+        .find(|channel| channel.file_name().to_ascii_lowercase() == wanted)
         .ok_or_else(|| AutomationError::InvalidValue(format!("unknown channel `{name}`")))
+}
+
+/// An anchor effect by name: `layer` (none), `fill`, `paint`, or
+/// `filter N` counted from 1.
+fn parse_anchor_effect(name: &str) -> Result<Option<AnchorEffect>, AutomationError> {
+    let wanted = name.trim().to_ascii_lowercase();
+    match wanted.as_str() {
+        "layer" | "whole layer" | "none" => Ok(None),
+        "fill" => Ok(Some(AnchorEffect::Fill)),
+        "paint" => Ok(Some(AnchorEffect::Paint)),
+        _ => wanted
+            .strip_prefix("filter")
+            .and_then(|number| number.trim().parse::<u32>().ok())
+            .filter(|number| (1..=32).contains(number))
+            .map(|number| Some(AnchorEffect::Filter(number - 1)))
+            .ok_or_else(|| {
+                AutomationError::InvalidValue(format!(
+                    "unknown anchor effect `{name}`: use layer, fill, paint, or filter 1 to 32"
+                ))
+            }),
+    }
 }
 
 /// The serialized `kind` tag of a generator.
@@ -1926,6 +2020,8 @@ mod tests {
 
     fn project() -> MaterialProject {
         let set = |id: u64, name: &str, layers: Vec<MaterialLayer>| TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(id),
             name: name.to_owned(),
             material_slot: name.to_owned(),
@@ -2458,6 +2554,93 @@ mod tests {
     }
 
     #[test]
+    fn tc_0367_automation_sets_and_removes_procedural_graphs() {
+        let mut project = project();
+        let graph = r#"{"nodes":[{"Generator":{"kind":"Noise","scale":6.0,"amount":0.5,"contrast":0.5,"seed":3}},{"Ramp":{"input":{"Node":0},"stops":[{"position":0.0,"color":[0,0,0]},{"position":1.0,"color":[255,128,0]}]}}],"outputs":{"BaseColor":{"Node":1},"Roughness":{"Value":[0.3,0.3,0.3]}}}"#;
+        let set_graph = |layer: &str, graph: &str| {
+            format!(
+                r#"{{"edit":"set_graph","texture_set":"Body","layer":"{layer}","graph":{graph}}}"#
+            )
+        };
+        // Only fill layers take a graph.
+        assert!(matches!(
+            refused(&mut project, &set_graph("Base", graph)),
+            AutomationError::InvalidValue(reason) if reason.contains("only fill layers")
+        ));
+        project.texture_sets[0].layers[0].fill = Some(LayerFill::default());
+        let outcome =
+            apply_automation_edit(&mut project, &edit(&set_graph("Base", graph))).unwrap();
+        assert_eq!(outcome.summary, "made layer 1 `Base` procedural (2 nodes)");
+        let stored = project.texture_sets[0].layers[0].graph.clone().unwrap();
+        assert_eq!(stored.nodes.len(), 2);
+        assert_eq!(
+            stored.outputs[&MaterialChannel::BaseColor],
+            substancecraft_core::GraphInput::Node(1)
+        );
+        // A forward reference is refused and changes nothing.
+        let before = project.clone();
+        let forward = graph.replace(r#""input":{"Node":0}"#, r#""input":{"Node":1}"#);
+        assert!(matches!(
+            refused(&mut project, &set_graph("Base", &forward)),
+            AutomationError::InvalidValue(reason) if reason.contains("the graph is invalid")
+        ));
+        assert_eq!(project, before);
+        apply_automation_edit(&mut project, &edit(&set_graph("Base", "null"))).unwrap();
+        assert_eq!(project.texture_sets[0].layers[0].graph, None);
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn tc_0362_automation_defines_user_channels_that_layers_paint() {
+        let mut project = project();
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"set_texture_set","texture_set":"Body","user_channels":[{"slot":3,"name":"Wetness","gray":true,"default":[10,10,10]}]}"#,
+            ),
+        )
+        .unwrap();
+        let body = &project.texture_sets[0];
+        assert_eq!(body.user_channels.len(), 1);
+        assert_eq!(
+            body.user_channel(MaterialChannel::User(3)).unwrap().name,
+            "Wetness"
+        );
+        // Layers and sets name user channels by slot.
+        apply_automation_edit(
+            &mut project,
+            &edit(r#"{"edit":"set_texture_set","texture_set":"Body","channels":["Base Color","User 3"]}"#),
+        )
+        .unwrap();
+        assert!(
+            project.texture_sets[0]
+                .channels
+                .contains(&MaterialChannel::User(3))
+        );
+        apply_automation_edit(
+            &mut project,
+            &edit(
+                r#"{"edit":"paint","texture_set":"Body","layer":"Base","stroke":{"points":[[0.5,0.5]],"radius_pixels":3,"color":[0,0,0,255],"opacity":1,"user":[[0,0,0],[0,0,0],[0,0,0],[255,255,255],[0,0,0],[0,0,0],[0,0,0],[0,0,0]]}}"#,
+            ),
+        )
+        .unwrap();
+        let before = project.clone();
+        for json in [
+            r#"{"edit":"set_texture_set","texture_set":"Body","user_channels":[{"slot":8,"name":"Far"}]}"#,
+            r#"{"edit":"set_texture_set","texture_set":"Body","user_channels":[{"slot":0,"name":"A"},{"slot":1,"name":"a"}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    apply_automation_edit(&mut project, &edit(json)),
+                    Err(AutomationError::InvalidValue(_))
+                ),
+                "{json}"
+            );
+        }
+        assert_eq!(project, before);
+    }
+
+    #[test]
     fn tc_0309_automation_sets_texture_set_and_mesh_properties() {
         let mut project = project();
         apply_automation_edit(
@@ -2827,8 +3010,40 @@ mod tests {
                 low: 0.2,
                 high: 0.8,
                 invert: true,
+                effect: None,
             })
         );
+        // An anchor can read its layer part-way through its effects.
+        let effect_edit = |effect: &str| {
+            format!(
+                r#"{{"edit":"set_anchor_mask","texture_set":"Body","layer":"Scratches","effect":"{effect}"}}"#
+            )
+        };
+        for (name, expected) in [
+            ("paint", Some(substancecraft_core::AnchorEffect::Paint)),
+            (
+                "Filter 2",
+                Some(substancecraft_core::AnchorEffect::Filter(1)),
+            ),
+            ("fill", Some(substancecraft_core::AnchorEffect::Fill)),
+            ("layer", None),
+        ] {
+            apply_automation_edit(&mut project, &edit(&effect_edit(name))).unwrap();
+            assert_eq!(
+                layer(&project, 4).mask_anchor.unwrap().effect,
+                expected,
+                "{name}"
+            );
+        }
+        for name in ["filter 0", "filter 33", "mask"] {
+            assert!(
+                matches!(
+                    refused(&mut project, &effect_edit(name)),
+                    AutomationError::InvalidValue(reason) if reason.contains("unknown anchor effect")
+                ),
+                "{name}"
+            );
+        }
         assert!(
             project_summary(&project).texture_sets[0].layers[1].children[0]
                 .mask

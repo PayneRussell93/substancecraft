@@ -106,6 +106,8 @@ impl ThumbnailStage {
         resources: Option<&ResourceImages>,
     ) -> Result<TextureImage, BakeError> {
         let set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Thumbnail".to_owned(),
             material_slot: "Thumbnail".to_owned(),
@@ -264,6 +266,8 @@ mod tests {
         // Setting one is an undoable edit of the layer it drives.
         let mut project = MaterialProject::empty();
         let mut set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Body".to_owned(),
             material_slot: "Body".to_owned(),

@@ -154,6 +154,12 @@ impl LayerFilter {
         }
     }
 
+    /// True for filters that read only their own texel (all but blur
+    /// and sharpen).
+    pub fn is_per_texel(self) -> bool {
+        !matches!(self, Self::Blur { .. } | Self::Sharpen { .. })
+    }
+
     fn map_value(self, value: f32) -> f32 {
         match self {
             Self::Levels {
@@ -196,7 +202,7 @@ impl LayerFilter {
         }
     }
 
-    fn map_color(self, color: Vec3) -> Vec3 {
+    pub(crate) fn map_color(self, color: Vec3) -> Vec3 {
         match self {
             Self::HueSaturation {
                 hue,

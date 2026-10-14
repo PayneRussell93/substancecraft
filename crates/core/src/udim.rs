@@ -115,6 +115,18 @@ impl TextureSet {
         for layer in &mut set.layers {
             shift_layer(layer, tile.offset(), tile);
         }
+        // Quick masks move with the strokes they limit.
+        for stroke in set
+            .stencils
+            .iter_mut()
+            .flat_map(|stencil| &mut stencil.strokes)
+            .filter(|stroke| stroke.camera.is_none())
+        {
+            stroke
+                .points
+                .iter_mut()
+                .for_each(|point| *point -= tile.offset());
+        }
         set
     }
 
@@ -193,6 +205,8 @@ mod tests {
         stroke.tip.hardness = 1.0;
         layer.paint_strokes.push(stroke);
         let set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Body".to_owned(),
             material_slot: "Body".to_owned(),
@@ -265,6 +279,8 @@ mod tests {
         group.uv_tiles = BTreeSet::from([UdimTile(1001), UdimTile(1002)]);
         group.children = Some(vec![red]);
         let set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Body".to_owned(),
             material_slot: "Body".to_owned(),

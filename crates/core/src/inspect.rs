@@ -332,6 +332,28 @@ impl TextureSet {
         })?;
         Ok(self.texture(rgba8))
     }
+
+    /// Quick mask `id` as opaque grayscale (white is open to paint).
+    pub fn bake_stencil(
+        &self,
+        id: crate::StencilId,
+        context: BakeContext<'_>,
+    ) -> Result<BakedTexture, BakeError> {
+        let [rgba8] = self.bake_in_tiles(&self.bake_tiles()?, |region| {
+            self.validate_for_region(region)?;
+            let values = self.stencil_values(id, context, region)?;
+            let mut rgba8 = Vec::new();
+            rgba8
+                .try_reserve_exact(region.len() * 4)
+                .map_err(|_| BakeError::AllocationFailed)?;
+            for value in values {
+                let gray = unit_to_byte(value);
+                rgba8.extend([gray, gray, gray, 255]);
+            }
+            Ok([rgba8])
+        })?;
+        Ok(self.texture(rgba8))
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +386,8 @@ mod tests {
         group.children = Some(vec![gloss]);
         group.channels = [MaterialChannel::Roughness].into();
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Set".to_owned(),
             material_slot: "Default".to_owned(),

@@ -8,7 +8,8 @@
 //! forgot to invalidate the preview can never leave stale texels behind.
 
 use substancecraft_core::{
-    DirtyTexels, LayerId, LayerSettings, TexelRect, TextureResolution, TextureSet, TextureSetId,
+    DirtyTexels, LayerId, LayerSettings, Stencil, TexelRect, TextureResolution, TextureSet,
+    TextureSetId,
 };
 
 /// Above this share of dirty tiles a full rebake is cheaper than patching.
@@ -20,6 +21,9 @@ const MAX_DIRTY_FRACTION: f32 = 0.5;
 pub(super) struct SetShape {
     resolution: TextureResolution,
     height_strength: f32,
+    /// Clone and smudge strokes widen it as they are painted.
+    halo: u32,
+    stencils: Vec<Stencil>,
     layers: Vec<(LayerId, bool, LayerSettings)>,
 }
 
@@ -28,6 +32,8 @@ impl SetShape {
         Self {
             resolution: set.resolution,
             height_strength: set.height_strength,
+            halo: set.region_halo(),
+            stencils: set.stencils.clone(),
             layers: set
                 .walk_layers()
                 .into_iter()
@@ -42,9 +48,10 @@ pub(super) struct PreviewDirty {
     set_id: TextureSetId,
     base_revision: u64,
     shape: SetShape,
-    /// How far beyond its own texels an edit changes the bake (blur and
-    /// sharpen spread it); fixed while the shape is.
+    /// How far beyond its own texels an edit changes the bake (blur,
+    /// sharpen, clone, and smudge spread it); fixed while the shape is.
     halo: u32,
+
     texels: DirtyTexels,
 }
 
@@ -92,6 +99,8 @@ mod tests {
 
     fn set() -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Set".to_owned(),
             material_slot: "Default".to_owned(),

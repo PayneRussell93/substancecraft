@@ -99,8 +99,14 @@ impl Footprint {
         resources: Option<&ResourceImages>,
     ) -> Option<Self> {
         let (width, height) = camera.size();
-        let bounds =
-            brush::stroke_pixel_bounds(path.points, path.radius_pixels, path.tip, width, height)?;
+        let bounds = brush::stroke_pixel_bounds(
+            path.points,
+            path.radius_pixels,
+            path.tip,
+            path.stretch(),
+            width,
+            height,
+        )?;
         let coverage = brush::coverage_tile(path, path.points, bounds, resources)?;
         let mut depth = Vec::new();
         depth
@@ -367,7 +373,8 @@ pub fn projected_stroke_texel_rects(
     height: u32,
 ) -> Vec<TexelRect> {
     let (screen_width, screen_height) = camera.size();
-    match brush::stroke_pixel_bounds(points, radius_pixels, tip, screen_width, screen_height) {
+    // Projected strokes never carry stamp frames.
+    match brush::stroke_pixel_bounds(points, radius_pixels, tip, 1.0, screen_width, screen_height) {
         Some(bounds) if width > 0 && height > 0 => {
             candidate_rects(camera, maps, bounds, width, height)
         }
@@ -407,6 +414,8 @@ mod tests {
 
     fn set(size: u32, layers: Vec<MaterialLayer>) -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Body".to_owned(),
             material_slot: "Body".to_owned(),

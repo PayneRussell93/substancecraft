@@ -171,6 +171,8 @@ mod tests {
     fn project(name: &str) -> MaterialProject {
         MaterialProject {
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: name.to_owned(),
                 material_slot: "Default".to_owned(),

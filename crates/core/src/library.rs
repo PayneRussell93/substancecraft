@@ -15,8 +15,9 @@ use crate::export::ExportPreset;
 use crate::generators::{Dirt, EdgeWear, MaskGenerator, NoisePattern, Orientation, Thickness};
 use crate::resources::{BitmapMask, ResourceProvenance};
 use crate::{
-    LayerFill, LayerFilter, LayerId, MaterialChannel, MaterialId, MaterialLayer, MaterialProject,
-    ResourceId, valid_layer_strokes,
+    BlendMode, GraphInput, GraphNode, LayerFill, LayerFilter, LayerId, MaterialChannel,
+    MaterialGraph, MaterialId, MaterialLayer, MaterialProject, RampStop, ResourceId,
+    valid_layer_strokes,
 };
 
 /// Licence recorded for built-in library entries.
@@ -75,6 +76,9 @@ pub struct MaterialResource {
     pub provenance: ResourceProvenance,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Procedural content: a graph the fill evaluates per texel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<MaterialGraph>,
 }
 
 impl MaterialResource {
@@ -87,6 +91,7 @@ impl MaterialResource {
                         metallic: f32,
                         roughness: f32,
                         opacity: f32| Self {
+            graph: None,
             id: MaterialId::UNASSIGNED,
             name: name.to_owned(),
             fill: LayerFill {
@@ -113,7 +118,7 @@ impl MaterialResource {
             provenance: built_in_provenance(),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
         };
-        vec![
+        let mut materials = vec![
             material("Steel", &["metal"], [196, 199, 199], 1.0, 0.35, 1.0),
             material("Aluminium", &["metal"], [232, 234, 235], 1.0, 0.3, 1.0),
             material("Copper", &["metal"], [242, 186, 159], 1.0, 0.3, 1.0),
@@ -159,7 +164,9 @@ impl MaterialResource {
                 0.05,
                 0.15,
             ),
-        ]
+        ];
+        materials.extend(procedural_built_ins());
+        materials
     }
 
     /// Captures a fill layer's values as a material.
@@ -171,13 +178,16 @@ impl MaterialResource {
             channels: layer.channels.clone(),
             provenance: ResourceProvenance::default(),
             tags: Vec::new(),
+            graph: layer.graph.clone(),
         })
     }
 
     /// Makes `layer` a fill of this material, keeping its masks and stack
-    /// position. This copies the values: any link to a master is dropped.
+    /// position. This copies the values (and graph): any link to a master
+    /// is dropped.
     pub fn apply_to(&self, layer: &mut MaterialLayer) {
         layer.fill = Some(self.fill);
+        layer.graph.clone_from(&self.graph);
         layer.channels = self.channels.clone();
         layer.material_link = None;
     }
@@ -186,11 +196,111 @@ impl MaterialResource {
         if !valid_name(&self.name) {
             return Err(LibraryError::InvalidName(self.name.clone()));
         }
-        if !self.fill.is_valid() {
+        if !self.fill.is_valid() || self.graph.as_ref().is_some_and(|graph| !graph.is_valid()) {
             return Err(LibraryError::InvalidValues(self.name.clone()));
         }
         Ok(())
     }
+
+    /// True when the material is procedural.
+    pub fn is_procedural(&self) -> bool {
+        self.graph.is_some()
+    }
+}
+
+/// Original procedural built-ins: graphs over the generators.
+fn procedural_built_ins() -> Vec<MaterialResource> {
+    use crate::generators::Pattern;
+    let node = GraphInput::Node;
+    let stop = |position: f32, color: [u8; 3]| RampStop { position, color };
+    let procedural = |name: &str, tags: &[&str], graph: MaterialGraph| MaterialResource {
+        id: MaterialId::UNASSIGNED,
+        name: name.to_owned(),
+        fill: LayerFill::default(),
+        channels: graph.outputs.keys().copied().collect(),
+        provenance: built_in_provenance(),
+        tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        graph: Some(graph),
+    };
+    // Rust gathers in cavities and in blotchy noise; bare steel elsewhere.
+    let rust = MaterialGraph {
+        nodes: vec![
+            GraphNode::Generator(MaskGenerator::Noise(NoisePattern {
+                scale: 8.0,
+                amount: 0.5,
+                contrast: 0.6,
+                seed: 11,
+                feature_size: None,
+            })),
+            GraphNode::Generator(MaskGenerator::Dirt(Dirt::DEFAULT)),
+            GraphNode::Blend {
+                mode: BlendMode::Lighten,
+                a: node(0),
+                b: node(1),
+                amount: GraphInput::gray(1.0),
+            },
+            GraphNode::Ramp {
+                input: node(2),
+                stops: vec![
+                    stop(0.0, [150, 152, 156]),
+                    stop(0.45, [150, 152, 156]),
+                    stop(0.6, [128, 72, 38]),
+                    stop(1.0, [84, 38, 20]),
+                ],
+            },
+            GraphNode::Adjust {
+                input: node(2),
+                filter: LayerFilter::Levels {
+                    in_low: 0.0,
+                    in_high: 1.0,
+                    gamma: 1.0,
+                    out_low: 0.35,
+                    out_high: 0.95,
+                },
+            },
+            GraphNode::Adjust {
+                input: node(2),
+                filter: LayerFilter::Threshold {
+                    level: 0.52,
+                    softness: 0.2,
+                },
+            },
+            GraphNode::Adjust {
+                input: node(5),
+                filter: LayerFilter::Invert,
+            },
+        ],
+        outputs: [
+            (MaterialChannel::BaseColor, node(3)),
+            (MaterialChannel::Roughness, node(4)),
+            (MaterialChannel::Metallic, node(6)),
+        ]
+        .into(),
+    };
+    // Two-colour bands in object space, so they never break at UV seams.
+    let stripes = MaterialGraph {
+        nodes: vec![
+            GraphNode::Generator(MaskGenerator::Pattern(Pattern::DEFAULT)),
+            GraphNode::Ramp {
+                input: node(0),
+                stops: vec![stop(0.0, [235, 232, 222]), stop(1.0, [196, 40, 36])],
+            },
+        ],
+        outputs: [
+            (MaterialChannel::BaseColor, node(1)),
+            (MaterialChannel::Roughness, GraphInput::gray(0.45)),
+            (MaterialChannel::Metallic, GraphInput::gray(0.0)),
+        ]
+        .into(),
+    };
+    vec![
+        procedural("Rust (procedural)", &["metal", "procedural"], rust),
+        procedural(
+            "Painted stripes (procedural)",
+            &["paint", "procedural"],
+            stripes,
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +1088,8 @@ mod tests {
 
     fn set_with(layers: Vec<MaterialLayer>) -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Hull".to_owned(),
             material_slot: "Hull".to_owned(),

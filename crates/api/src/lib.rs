@@ -659,6 +659,8 @@ mod tests {
 
         let project = MaterialProject {
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(2),
                 name: "Body".to_owned(),
                 material_slot: "BodyMaterial".to_owned(),
@@ -669,12 +671,17 @@ mod tests {
                 channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Roughness]),
                 layers: vec![
                     MaterialLayer {
+                        graph: Default::default(),
                         id: LayerId(3),
                         name: "Paint".to_owned(),
                         visible: true,
                         opacity: 0.75,
                         channels: BTreeSet::from([MaterialChannel::BaseColor, MaterialChannel::Id]),
                         paint_strokes: vec![PaintStroke {
+                            user: Default::default(),
+                            frames: Default::default(),
+                            source: Default::default(),
+                            stencil: Default::default(),
                             points: vec![Vec2::new(0.25, 0.75), Vec2::new(0.5, 0.5)],
                             radius_pixels: 8.0,
                             color: [32, 64, 128, 255],
@@ -698,6 +705,8 @@ mod tests {
                             camera: None,
                         }],
                         mask_strokes: vec![MaskStroke {
+                            frames: Default::default(),
+                            stencil: Default::default(),
                             points: vec![Vec2::new(0.5, 0.5)],
                             radius_pixels: 4.0,
                             value: 0.25,
@@ -707,6 +716,7 @@ mod tests {
                             camera: None,
                         }],
                         id_strokes: vec![IdStroke {
+                            frames: Default::default(),
                             points: vec![Vec2::new(0.5, 0.5)],
                             radius_pixels: 4.0,
                             color: [1, 2, 3],

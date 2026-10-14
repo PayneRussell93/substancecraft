@@ -77,7 +77,10 @@ impl InstanceField {
             MaterialChannel::Normal => Some(Self::Normal),
             MaterialChannel::Emissive => Some(Self::Emissive),
             MaterialChannel::Opacity => Some(Self::Opacity),
-            MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
+            // User values follow the master with the rest of its fill.
+            MaterialChannel::Id | MaterialChannel::AmbientOcclusion | MaterialChannel::User(_) => {
+                None
+            }
         }
     }
 
@@ -152,6 +155,8 @@ impl MaterialLink {
 
     /// `settings` as an instance of `master` through this link: overridden
     /// fields keep their values, every other field comes from the master.
+    /// A procedural master's graph always follows the master, except that
+    /// it stops feeding channels whose value the instance overrides.
     pub fn resolve(&self, master: &MaterialResource, settings: &LayerSettings) -> LayerSettings {
         let own = settings.fill.unwrap_or(master.fill);
         let mut fill = master.fill;
@@ -159,8 +164,16 @@ impl MaterialLink {
         for field in &self.overrides {
             field.copy((&own, &settings.channels), (&mut fill, &mut channels));
         }
+        let graph = master.graph.clone().map(|mut graph| {
+            graph.outputs.retain(|channel, _| {
+                InstanceField::for_channel(*channel)
+                    .is_none_or(|field| !self.overrides.contains(&field))
+            });
+            graph
+        });
         LayerSettings {
             fill: Some(fill),
+            graph,
             channels,
             material_link: Some(self.clone()),
             ..settings.clone()
@@ -535,6 +548,8 @@ mod tests {
 
     fn set(id: u64, layers: Vec<MaterialLayer>) -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(id),
             name: format!("Set {id}"),
             material_slot: format!("Slot {id}"),

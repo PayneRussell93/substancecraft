@@ -16,6 +16,7 @@ mod evolution;
 mod export;
 mod filters;
 mod generators;
+mod graph;
 mod inspect;
 mod instances;
 pub mod library;
@@ -32,7 +33,10 @@ mod thumbnails;
 mod topology;
 pub mod udim;
 
-pub use brush::{BrushShape, BrushTip, MAX_BRUSH_SPACING, MIN_BRUSH_SPACING, stroke_texel_bounds};
+pub use brush::{
+    BrushShape, BrushTip, MAX_BRUSH_SPACING, MAX_STAMP_STRETCH, MIN_BRUSH_SPACING, StampFrame,
+    stroke_texel_bounds,
+};
 pub use camera_paint::{MAX_STROKE_VIEWPORT, StrokeCamera, projected_stroke_texel_rects};
 pub use color::ColorSpace;
 pub use compositing::{
@@ -53,6 +57,9 @@ pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
     Axis, Direction, Dirt, EdgeWear, Gradient, IdSelection, MaskGenerator, NoisePattern,
     Orientation, Pattern, PatternKind, Thickness,
+};
+pub use graph::{
+    GraphInput, GraphNode, MAX_GRAPH_NODES, MAX_RAMP_STOPS, MaterialGraph, MathOp, RampStop,
 };
 pub use inspect::{MASK_SHOWN, OverlayPalette, TexelContribution, mask_drivers, mask_overlay};
 pub use instances::{InstanceField, MaterialLink};
@@ -118,6 +125,7 @@ id_type!(BoneId);
 id_type!(PoseId);
 id_type!(ResourceId);
 id_type!(MaterialId);
+id_type!(StencilId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrimitivePreset {
@@ -771,7 +779,9 @@ pub enum PoseError {
     InvalidAnimationFrame,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Project files name channels by variant (`"BaseColor"`), and user
+/// channels as `"User0"` to `"User7"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MaterialChannel {
     BaseColor,
     Id,
@@ -782,6 +792,141 @@ pub enum MaterialChannel {
     AmbientOcclusion,
     Emissive,
     Opacity,
+    /// A user-defined channel: slot `0..MAX_USER_CHANNELS`, described by
+    /// the texture set's [`UserChannel`] of that slot. It composites like
+    /// Base Color and reaches files through export presets that read it.
+    User(u8),
+}
+
+/// User-defined channel slots a texture set has.
+pub const MAX_USER_CHANNELS: u8 = 8;
+
+/// True when `channels` are valid user channels with unique slots and
+/// names (ignoring case and surrounding spaces).
+pub fn user_channels_valid(channels: &[UserChannel]) -> bool {
+    let mut slots = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    channels.iter().all(|user| {
+        user.is_valid() && slots.insert(user.slot) && names.insert(user.name.trim().to_lowercase())
+    })
+}
+
+impl MaterialChannel {
+    /// Every user channel slot, in order.
+    pub fn user_slots() -> impl Iterator<Item = Self> {
+        (0..MAX_USER_CHANNELS).map(Self::User)
+    }
+
+    /// The user channel slot, for [`Self::User`].
+    pub const fn user_slot(self) -> Option<usize> {
+        match self {
+            Self::User(slot) => Some(slot as usize),
+            _ => None,
+        }
+    }
+
+    /// The name project files use.
+    pub fn file_name(self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        Cow::Borrowed(match self {
+            Self::BaseColor => "BaseColor",
+            Self::Id => "Id",
+            Self::Roughness => "Roughness",
+            Self::Metallic => "Metallic",
+            Self::Normal => "Normal",
+            Self::Height => "Height",
+            Self::AmbientOcclusion => "AmbientOcclusion",
+            Self::Emissive => "Emissive",
+            Self::Opacity => "Opacity",
+            Self::User(slot) => return Cow::Owned(format!("User{slot}")),
+        })
+    }
+
+    /// Reads [`Self::file_name`]; user slots must be below
+    /// [`MAX_USER_CHANNELS`].
+    pub fn from_file_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "BaseColor" => Self::BaseColor,
+            "Id" => Self::Id,
+            "Roughness" => Self::Roughness,
+            "Metallic" => Self::Metallic,
+            "Normal" => Self::Normal,
+            "Height" => Self::Height,
+            "AmbientOcclusion" => Self::AmbientOcclusion,
+            "Emissive" => Self::Emissive,
+            "Opacity" => Self::Opacity,
+            _ => {
+                let slot: u8 = name.strip_prefix("User")?.parse().ok()?;
+                // One canonical spelling per slot ("User1", not "User01").
+                (slot < MAX_USER_CHANNELS && name == format!("User{slot}"))
+                    .then_some(Self::User(slot))?
+            }
+        })
+    }
+}
+
+impl Serialize for MaterialChannel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.file_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for MaterialChannel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        Self::from_file_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown material channel `{name}`")))
+    }
+}
+
+/// A channel a texture set adds beyond the built-in ones.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserChannel {
+    /// Slot `0..MAX_USER_CHANNELS`; layers enable it as
+    /// [`MaterialChannel::User`].
+    pub slot: u8,
+    pub name: String,
+    /// Holds one linear value (painted and exported as grey) rather than
+    /// an sRGB colour.
+    #[serde(default)]
+    pub gray: bool,
+    /// Value where no layer paints: sRGB colour, or grey in every
+    /// component.
+    #[serde(default)]
+    pub default: [u8; 3],
+}
+
+/// Longest user channel name, in characters.
+pub const MAX_USER_CHANNEL_NAME_CHARS: usize = 64;
+
+impl UserChannel {
+    fn is_valid(&self) -> bool {
+        let name = self.name.trim();
+        self.slot < MAX_USER_CHANNELS
+            && !name.is_empty()
+            && name.chars().count() <= MAX_USER_CHANNEL_NAME_CHARS
+            && (!self.gray
+                || self.default[0] == self.default[1] && self.default[1] == self.default[2])
+    }
+
+    pub fn channel(&self) -> MaterialChannel {
+        MaterialChannel::User(self.slot)
+    }
+}
+
+/// What a fill or stroke writes to each user channel slot: an sRGB colour,
+/// or grey in every component.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserValues(pub [[u8; 3]; MAX_USER_CHANNELS as usize]);
+
+impl UserValues {
+    pub fn get(&self, slot: usize) -> [u8; 3] {
+        self.0.get(slot).copied().unwrap_or_default()
+    }
+
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -842,8 +987,9 @@ fn default_mesh_scale() -> f32 {
 /// Deepest allowed nesting of layer groups.
 pub const MAX_GROUP_DEPTH: usize = 16;
 
-/// Channels a group passes through by default: every composited channel.
-pub const GROUP_CHANNELS: [MaterialChannel; 8] = [
+/// Channels a group passes through by default: every composited channel,
+/// user channels included.
+pub const GROUP_CHANNELS: [MaterialChannel; 16] = [
     MaterialChannel::BaseColor,
     MaterialChannel::Roughness,
     MaterialChannel::Metallic,
@@ -852,6 +998,14 @@ pub const GROUP_CHANNELS: [MaterialChannel; 8] = [
     MaterialChannel::Emissive,
     MaterialChannel::Opacity,
     MaterialChannel::Id,
+    MaterialChannel::User(0),
+    MaterialChannel::User(1),
+    MaterialChannel::User(2),
+    MaterialChannel::User(3),
+    MaterialChannel::User(4),
+    MaterialChannel::User(5),
+    MaterialChannel::User(6),
+    MaterialChannel::User(7),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -873,6 +1027,11 @@ pub struct MaterialLayer {
     /// material values before any paint strokes are applied.
     #[serde(default)]
     pub fill: Option<LayerFill>,
+    /// Procedural content for the fill: channels the graph outputs take
+    /// its value per texel instead of the fill's value or bitmap. Only fill
+    /// layers have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<MaterialGraph>,
     /// Procedural base for the layer mask; painted mask strokes refine it.
     #[serde(default)]
     pub mask_generator: Option<MaskGenerator>,
@@ -946,6 +1105,7 @@ impl MaterialLayer {
             id_strokes: Vec::new(),
             id_mask_color: None,
             fill: None,
+            graph: None,
             mask_generator: None,
             polygon_mask: None,
             mask_bitmap: None,
@@ -1028,6 +1188,7 @@ impl MaterialLayer {
             channels: self.channels.clone(),
             id_mask_color: self.id_mask_color,
             fill: self.fill,
+            graph: self.graph.clone(),
             mask_generator: self.mask_generator,
             polygon_mask: self.polygon_mask.clone(),
             mask_bitmap: self.mask_bitmap,
@@ -1051,6 +1212,7 @@ impl MaterialLayer {
         self.channels = settings.channels;
         self.id_mask_color = settings.id_mask_color;
         self.fill = settings.fill;
+        self.graph = settings.graph;
         self.mask_generator = settings.mask_generator;
         self.polygon_mask = settings.polygon_mask;
         self.mask_bitmap = settings.mask_bitmap;
@@ -1088,8 +1250,13 @@ impl MaterialLayer {
         {
             return false;
         }
-        // Only fill layers can be material instances.
-        if self.material_link.is_some() && (self.is_group() || self.fill.is_none()) {
+        // Only fill layers can be material instances or procedural.
+        if (self.material_link.is_some() || self.graph.is_some())
+            && (self.is_group() || self.fill.is_none())
+        {
+            return false;
+        }
+        if self.graph.as_ref().is_some_and(|graph| !graph.is_valid()) {
             return false;
         }
         if !self.uv_tiles.iter().all(|tile| tile.is_valid()) {
@@ -1141,6 +1308,7 @@ impl MaterialLayer {
             .flat_map(|fill| fill.textures.all())
             .chain(self.mask_bitmap.map(|bitmap| bitmap.resource))
             .chain(strokes)
+            .chain(self.graph.iter().flat_map(MaterialGraph::resources))
     }
 
     /// True when this layer (not its children) projects bitmaps triplanarly
@@ -1164,6 +1332,10 @@ impl MaterialLayer {
                     && (fill.textures.all().next().is_some()
                         || fill.projection.mode == ProjectionMode::Decal)
             })
+            || self
+                .graph
+                .as_ref()
+                .is_some_and(MaterialGraph::needs_mesh_maps)
     }
 }
 
@@ -1181,6 +1353,13 @@ pub struct FillTextures {
     pub normal: Option<ResourceId>,
     pub emissive: Option<ResourceId>,
     pub opacity: Option<ResourceId>,
+    /// Per user channel slot.
+    #[serde(skip_serializing_if = "no_user_textures")]
+    pub user: [Option<ResourceId>; MAX_USER_CHANNELS as usize],
+}
+
+fn no_user_textures(user: &[Option<ResourceId>; MAX_USER_CHANNELS as usize]) -> bool {
+    user.iter().all(Option::is_none)
 }
 
 impl FillTextures {
@@ -1193,6 +1372,7 @@ impl FillTextures {
             MaterialChannel::Normal => self.normal,
             MaterialChannel::Emissive => self.emissive,
             MaterialChannel::Opacity => self.opacity,
+            MaterialChannel::User(slot) => self.user.get(slot as usize).copied().flatten(),
             MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
         }
     }
@@ -1206,6 +1386,7 @@ impl FillTextures {
             MaterialChannel::Normal => Some(&mut self.normal),
             MaterialChannel::Emissive => Some(&mut self.emissive),
             MaterialChannel::Opacity => Some(&mut self.opacity),
+            MaterialChannel::User(slot) => self.user.get_mut(slot as usize),
             MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
         }
     }
@@ -1221,6 +1402,7 @@ impl FillTextures {
             self.opacity,
         ]
         .into_iter()
+        .chain(self.user)
         .flatten()
     }
 }
@@ -1246,6 +1428,9 @@ pub struct LayerFill {
     pub textures: FillTextures,
     #[serde(default)]
     pub projection: TextureProjection,
+    /// Values written to user channels the layer enables.
+    #[serde(default, skip_serializing_if = "UserValues::is_zero")]
+    pub user: UserValues,
 }
 
 impl LayerFill {
@@ -1273,6 +1458,7 @@ impl Default for LayerFill {
             material_opacity: DEFAULT_OPACITY,
             textures: FillTextures::default(),
             projection: TextureProjection::default(),
+            user: UserValues::default(),
         }
     }
 }
@@ -1303,6 +1489,68 @@ pub struct AnchorMask {
     pub high: f32,
     #[serde(default)]
     pub invert: bool,
+    /// Reads the anchor layer part-way through its own effects; `None`
+    /// reads the whole layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<AnchorEffect>,
+}
+
+/// A point among an anchor layer's own effects (fill, strokes, then its
+/// content filters in order) that an anchor reads at. The layer still
+/// blends through its opacity and mask there; only the later effects are
+/// left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnchorEffect {
+    /// The fill alone, before strokes and filters.
+    Fill,
+    /// The fill and strokes, before any content filter.
+    Paint,
+    /// Through content filter `n` (counted from 0), before the filters
+    /// after it.
+    Filter(u32),
+}
+
+impl AnchorEffect {
+    /// Leaves out of `layer` the effects after this one. The anchor layer
+    /// may change after the anchor was set, so this never fails: a filter
+    /// past the end keeps every filter, and a group (which has no fill or
+    /// strokes) reads its children before its own filters.
+    pub(crate) fn truncate(self, layer: &mut MaterialLayer) {
+        match self {
+            Self::Fill => {
+                layer.paint_strokes.clear();
+                layer.filters.clear();
+            }
+            Self::Paint => layer.filters.clear(),
+            Self::Filter(index) => layer.filters.truncate((index as usize).saturating_add(1)),
+        }
+    }
+
+    /// How the UI names this effect of `layer`.
+    pub fn label(self, layer: &MaterialLayer) -> String {
+        match self {
+            Self::Fill => "Fill".to_owned(),
+            Self::Paint if layer.fill.is_some() => "Fill and strokes".to_owned(),
+            Self::Paint => "Strokes".to_owned(),
+            Self::Filter(index) => match layer.filters.get(index as usize) {
+                Some(filter) => format!("Through {} ({})", filter.name(), index + 1),
+                None => format!("Through filter {}", index + 1),
+            },
+        }
+    }
+
+    /// The effects of `layer` an anchor can read at, in stack order.
+    pub fn of(layer: &MaterialLayer) -> Vec<Self> {
+        let mut effects = Vec::new();
+        if !layer.is_group() {
+            if layer.fill.is_some() {
+                effects.push(Self::Fill);
+            }
+            effects.push(Self::Paint);
+        }
+        effects.extend((0..layer.filters.len() as u32).map(Self::Filter));
+        effects
+    }
 }
 
 impl AnchorMask {
@@ -1323,11 +1571,22 @@ impl AnchorMask {
             low: 0.0,
             high: 1.0,
             invert: false,
+            effect: None,
         }
     }
 
+    /// True when anchors can read `channel`: one of [`Self::CHANNELS`] or a
+    /// user channel.
+    pub fn reads(channel: MaterialChannel) -> bool {
+        Self::CHANNELS.contains(&channel) || channel.user_slot().is_some()
+    }
+
     fn is_valid(self) -> bool {
-        Self::CHANNELS.contains(&self.channel)
+        Self::reads(self.channel)
+            && self
+                .effect
+                .is_none_or(|effect| !matches!(effect, AnchorEffect::Filter(n) if n as usize >= MAX_LAYER_FILTERS))
+
             && self.low.is_finite()
             && self.high.is_finite()
             && (0.0..=1.0).contains(&self.low)
@@ -1350,8 +1609,11 @@ pub struct LayerSettings {
     pub channels: BTreeSet<MaterialChannel>,
     pub id_mask_color: Option<[u8; 3]>,
     pub fill: Option<LayerFill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<MaterialGraph>,
     pub mask_generator: Option<MaskGenerator>,
     pub polygon_mask: Option<PolygonMask>,
+
     pub mask_bitmap: Option<BitmapMask>,
     pub invert_final_mask: bool,
     pub filters: Vec<LayerFilter>,
@@ -1408,6 +1670,88 @@ pub struct PaintStroke {
     /// whatever surface showed there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<StrokeCamera>,
+    /// Surface alignment, one frame per point (or none): each stamp stays
+    /// round and upright on the surface rather than in UV space.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<StampFrame>,
+    /// Takes the material from elsewhere in the stack (clone, smudge)
+    /// instead of the stroke's own values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<StrokeSource>,
+    /// Limits the stroke to a quick mask of its texture set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stencil: Option<StencilId>,
+    /// Values written to user channels the layer enables.
+    #[serde(default, skip_serializing_if = "UserValues::is_zero")]
+    pub user: UserValues,
+}
+
+/// Where a paint stroke's material comes from when it does not paint its
+/// own values. Both read the layer's stack as composited so far (the stack
+/// beneath, within the layer's group, with the layer's earlier strokes on
+/// top) and write what they read into every channel the layer enables.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum StrokeSource {
+    /// Clone stamp: copies the stack from `offset` (in UV) away.
+    Clone { offset: glam::Vec2 },
+    /// Smudge: drags the stack along the stroke, each texel reading from
+    /// `strength` brush radii behind it.
+    Smudge { strength: f32 },
+}
+
+impl StrokeSource {
+    fn is_valid(self) -> bool {
+        match self {
+            Self::Clone { offset } => {
+                offset.is_finite() && offset.abs().cmple(glam::Vec2::new(10.0, 100.0)).all()
+            }
+            Self::Smudge { strength } => strength.is_finite() && strength > 0.0 && strength <= 1.0,
+        }
+    }
+
+    /// Farthest, in texels of a `width` × `height` texture, a stroke of
+    /// this radius reads from the texel it writes.
+    pub(crate) fn reach(self, radius_pixels: f32, width: u32, height: u32) -> u32 {
+        let texels = match self {
+            Self::Clone { offset } => (offset
+                * glam::Vec2::new(
+                    width.saturating_sub(1) as f32,
+                    height.saturating_sub(1) as f32,
+                ))
+            .abs()
+            .max_element(),
+            Self::Smudge { strength } => radius_pixels * strength,
+        };
+        // One more for the bilinear neighbour.
+        (texels.ceil() as u32).saturating_add(1)
+    }
+}
+
+/// A quick mask: grayscale strokes that limit the paint strokes naming it
+/// to where it is white. It starts black (closed) and each stroke blends
+/// toward its value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stencil {
+    pub id: StencilId,
+    pub strokes: Vec<MaskStroke>,
+    /// Paint where the strokes are black instead.
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// Quick masks a texture set may keep.
+pub const MAX_STENCILS: usize = 256;
+/// Strokes one quick mask may hold.
+pub const MAX_STENCIL_STROKES: usize = MAX_LAYER_STROKES;
+
+impl Stencil {
+    fn is_valid(&self) -> bool {
+        self.strokes.len() <= MAX_STENCIL_STROKES
+            && self
+                .strokes
+                .iter()
+                .all(|stroke| stroke.stencil.is_none() && valid_mask_stroke(stroke))
+    }
 }
 
 impl PaintStroke {
@@ -1419,6 +1763,7 @@ impl PaintStroke {
             pressures: Vec::new(),
             path: Some(path),
             camera: None,
+            frames: Vec::new(),
             ..template.clone()
         }
     }
@@ -1440,6 +1785,10 @@ impl PaintStroke {
             pressures: Vec::new(),
             path: None,
             camera: None,
+            frames: Vec::new(),
+            source: None,
+            stencil: None,
+            user: UserValues::default(),
         }
     }
 }
@@ -1492,6 +1841,12 @@ pub struct MaskStroke {
     /// Painted through this view; see [`PaintStroke::camera`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<StrokeCamera>,
+    /// See [`PaintStroke::frames`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<StampFrame>,
+    /// See [`PaintStroke::stencil`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stencil: Option<StencilId>,
 }
 
 impl MaskStroke {
@@ -1505,6 +1860,8 @@ impl MaskStroke {
             tip: BrushTip::ROUND,
             pressures: Vec::new(),
             camera: None,
+            frames: Vec::new(),
+            stencil: None,
         }
     }
 }
@@ -1519,6 +1876,9 @@ pub struct IdStroke {
     pub tip: BrushTip,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pressures: Vec<f32>,
+    /// See [`PaintStroke::frames`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<StampFrame>,
 }
 
 /// Where a layer sits: inside the group `parent` (or the texture set's top
@@ -2132,14 +2492,20 @@ impl MaterialLayer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn valid_stroke(
     points: &[glam::Vec2],
     pressures: &[f32],
+    frames: &[StampFrame],
     radius_pixels: f32,
     opacity: f32,
     tip: BrushTip,
     camera: Option<&StrokeCamera>,
 ) -> bool {
+    // Projected strokes take their shape from the screen.
+    if camera.is_some() && !frames.is_empty() {
+        return false;
+    }
     let points_valid = match camera {
         // Screen-space points of a projected stroke.
         Some(camera) => camera.is_valid() && camera.valid_points(points),
@@ -2158,7 +2524,45 @@ pub(crate) fn valid_stroke(
         && (0.0..=1.0).contains(&opacity)
         && points_valid
         && brush::valid_pressures(points, pressures)
+        && brush::valid_frames(points, frames)
         && tip.is_valid()
+}
+
+fn valid_mask_stroke(stroke: &MaskStroke) -> bool {
+    valid_stroke(
+        &stroke.points,
+        &stroke.pressures,
+        &stroke.frames,
+        stroke.radius_pixels,
+        stroke.opacity,
+        stroke.tip,
+        stroke.camera.as_ref(),
+    ) && stroke.value.is_finite()
+        && (0.0..=1.0).contains(&stroke.value)
+}
+
+fn valid_paint_stroke(stroke: &PaintStroke) -> bool {
+    valid_stroke(
+        &stroke.points,
+        &stroke.pressures,
+        &stroke.frames,
+        stroke.radius_pixels,
+        stroke.opacity,
+        stroke.tip,
+        stroke.camera.as_ref(),
+    ) && [
+        stroke.roughness,
+        stroke.metallic,
+        stroke.height,
+        stroke.material_opacity,
+    ]
+    .iter()
+    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        // Clone and smudge sample in UV space and add paint, so they
+        // neither project nor erase.
+        && stroke.source.is_none_or(|source| {
+            source.is_valid() && stroke.camera.is_none() && !stroke.erase
+        })
 }
 
 pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
@@ -2168,44 +2572,33 @@ pub(crate) fn valid_layer_strokes(layer: &MaterialLayer) -> bool {
         .saturating_add(layer.mask_strokes.len())
         .saturating_add(layer.id_strokes.len())
         <= MAX_LAYER_STROKES
-        && layer.paint_strokes.iter().all(|stroke| {
-            valid_stroke(
-                &stroke.points,
-                &stroke.pressures,
-                stroke.radius_pixels,
-                stroke.opacity,
-                stroke.tip,
-                stroke.camera.as_ref(),
-            ) && [
-                stroke.roughness,
-                stroke.metallic,
-                stroke.height,
-                stroke.material_opacity,
-            ]
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        })
-        && layer.mask_strokes.iter().all(|stroke| {
-            valid_stroke(
-                &stroke.points,
-                &stroke.pressures,
-                stroke.radius_pixels,
-                stroke.opacity,
-                stroke.tip,
-                stroke.camera.as_ref(),
-            ) && stroke.value.is_finite()
-                && (0.0..=1.0).contains(&stroke.value)
-        })
+        && layer.paint_strokes.iter().all(valid_paint_stroke)
+        && layer.mask_strokes.iter().all(valid_mask_stroke)
         && layer.id_strokes.iter().all(|stroke| {
             valid_stroke(
                 &stroke.points,
                 &stroke.pressures,
+                &stroke.frames,
                 stroke.radius_pixels,
                 stroke.opacity,
                 stroke.tip,
                 None,
             )
         })
+}
+
+/// Quick masks `layer`'s strokes name (not its children's).
+fn layer_stencils(layer: &MaterialLayer) -> impl Iterator<Item = StencilId> + '_ {
+    layer
+        .paint_strokes
+        .iter()
+        .filter_map(|stroke| stroke.stencil)
+        .chain(
+            layer
+                .mask_strokes
+                .iter()
+                .filter_map(|stroke| stroke.stencil),
+        )
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2224,6 +2617,12 @@ pub struct TextureSet {
     /// choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<TextureSetExport>,
+    /// Quick masks that strokes of this set may be limited to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stencils: Vec<Stencil>,
+    /// Channels this set adds beyond the built-in ones, by slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_channels: Vec<UserChannel>,
 }
 
 /// Image file formats texture exports can be written in, by extension.
@@ -2259,6 +2658,10 @@ pub struct TextureSetProperties {
     pub channels: BTreeSet<MaterialChannel>,
     pub height_strength: f32,
     pub export: Option<TextureSetExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stencils: Vec<Stencil>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_channels: Vec<UserChannel>,
 }
 
 impl TextureSet {
@@ -2275,6 +2678,8 @@ impl TextureSet {
             channels: self.channels.clone(),
             height_strength: self.height_strength,
             export: self.export.clone(),
+            stencils: self.stencils.clone(),
+            user_channels: self.user_channels.clone(),
         }
     }
 
@@ -2285,6 +2690,40 @@ impl TextureSet {
         self.channels = properties.channels;
         self.height_strength = properties.height_strength;
         self.export = properties.export;
+        self.stencils = properties.stencils;
+        self.user_channels = properties.user_channels;
+    }
+
+    /// The definition of user channel `channel`, when this set has one.
+    pub fn user_channel(&self, channel: MaterialChannel) -> Option<&UserChannel> {
+        let slot = channel.user_slot()?;
+        self.user_channels
+            .iter()
+            .find(|user| usize::from(user.slot) == slot)
+    }
+
+    pub(crate) fn has_valid_user_channels(&self) -> bool {
+        user_channels_valid(&self.user_channels)
+    }
+
+    pub fn stencil(&self, id: StencilId) -> Option<&Stencil> {
+        self.stencils.iter().find(|stencil| stencil.id == id)
+    }
+
+    /// True when the set's quick masks are valid, with unique ids, and
+    /// every stroke naming one finds it.
+    pub(crate) fn has_valid_stencils(&self) -> bool {
+        let mut ids = BTreeSet::new();
+        self.stencils.len() <= MAX_STENCILS
+            && self
+                .stencils
+                .iter()
+                .all(|stencil| stencil.is_valid() && ids.insert(stencil.id))
+            && self
+                .walk_layers()
+                .into_iter()
+                .flat_map(layer_stencils)
+                .all(|id| ids.contains(&id))
     }
 
     /// The power-of-two factor that brings the set's longer edge down to at
@@ -2334,6 +2773,15 @@ impl TextureSet {
             height: self.resolution.height.div_ceil(factor),
         };
         scale(&mut copy.layers, factor as f32);
+        for stroke in copy
+            .stencils
+            .iter_mut()
+            .flat_map(|stencil| &mut stencil.strokes)
+        {
+            if stroke.camera.is_none() {
+                stroke.radius_pixels /= factor as f32;
+            }
+        }
         Some(copy)
     }
 
@@ -2477,7 +2925,10 @@ impl MaterialProject {
 
         for texture_set in &self.texture_sets {
             texture_set.resolution.validate()?;
-            if !valid_height_strength(texture_set.height_strength) {
+            if !valid_height_strength(texture_set.height_strength)
+                || !texture_set.has_valid_stencils()
+                || !texture_set.has_valid_user_channels()
+            {
                 return Err(ProjectError::InvalidTextureSetSettings(texture_set.id));
             }
             if let Some(export) = &texture_set.export {
@@ -2702,6 +3153,8 @@ mod tests {
 
     fn texture_set(id: u64) -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(id),
             name: format!("Material {id}"),
             material_slot: "DefaultMaterial".to_owned(),
@@ -2862,6 +3315,8 @@ mod tests {
         let mut group = MaterialLayer::new_group(LayerId(2), "Group");
         let mut masked = MaterialLayer::new_paint(LayerId(3), "Masked");
         masked.mask_strokes.push(MaskStroke {
+            frames: Default::default(),
+            stencil: Default::default(),
             points: vec![glam::Vec2::splat(0.25)],
             radius_pixels: 32.0,
             value: 0.0,
@@ -2906,6 +3361,7 @@ mod tests {
             height: 16,
         };
         set.layers.push(MaterialLayer {
+            graph: Default::default(),
             id: LayerId(1),
             name: "Paint".to_owned(),
             visible: true,
@@ -2922,6 +3378,8 @@ mod tests {
                 ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
             }],
             mask_strokes: vec![MaskStroke {
+                frames: Default::default(),
+                stencil: Default::default(),
                 points: vec![glam::Vec2::new(7.0 / 15.0, 8.0 / 15.0)],
                 radius_pixels: 2.0,
                 value: 0.0,
@@ -2965,6 +3423,7 @@ mod tests {
         };
         set.channels.insert(MaterialChannel::Id);
         set.layers.push(MaterialLayer {
+            graph: Default::default(),
             id: LayerId(1),
             name: "ID Paint".to_owned(),
             visible: true,
@@ -2973,6 +3432,7 @@ mod tests {
             paint_strokes: Vec::new(),
             mask_strokes: Vec::new(),
             id_strokes: vec![IdStroke {
+                frames: Default::default(),
                 points: vec![glam::Vec2::new(3.0 / 7.0, 4.0 / 7.0)],
                 radius_pixels: 2.0,
                 color: [16, 180, 240],
@@ -3014,6 +3474,7 @@ mod tests {
         };
         set.channels.insert(MaterialChannel::Id);
         set.layers.push(MaterialLayer {
+            graph: Default::default(),
             id: LayerId(1),
             name: "Masked Paint".to_owned(),
             visible: true,
@@ -3031,6 +3492,7 @@ mod tests {
             }],
             mask_strokes: Vec::new(),
             id_strokes: vec![IdStroke {
+                frames: Default::default(),
                 points: vec![glam::Vec2::new(3.0 / 7.0, 4.0 / 7.0)],
                 radius_pixels: 1.0,
                 color: [12, 180, 220],
@@ -3076,6 +3538,8 @@ mod tests {
             ..PaintStroke::new(Vec::new(), 1.0, [0; 4])
         };
         let mask = MaskStroke {
+            frames: Default::default(),
+            stencil: Default::default(),
             points: vec![glam::Vec2::new(0.5, 0.5)],
             radius_pixels: 3.0,
             value: 0.25,
@@ -3085,6 +3549,7 @@ mod tests {
             camera: None,
         };
         let id = IdStroke {
+            frames: Default::default(),
             points: vec![glam::Vec2::new(0.75, 0.25)],
             radius_pixels: 4.0,
             color: [12, 180, 220],
@@ -3094,6 +3559,7 @@ mod tests {
         };
         let mut set = texture_set(1);
         set.layers.push(MaterialLayer {
+            graph: Default::default(),
             id: LayerId(2),
             name: "Paint".to_owned(),
             visible: true,
@@ -3216,6 +3682,7 @@ mod tests {
     fn tc_0005_layer_opacity_must_be_finite_and_in_range() {
         let mut set = texture_set(1);
         set.layers.push(MaterialLayer {
+            graph: Default::default(),
             id: LayerId(4),
             name: "Paint".to_owned(),
             visible: true,
@@ -3260,6 +3727,7 @@ mod tests {
         let mut set = texture_set(1);
         set.layers = vec![
             MaterialLayer {
+                graph: Default::default(),
                 id: LayerId(4),
                 name: "Paint A".to_owned(),
                 visible: true,
@@ -3287,6 +3755,7 @@ mod tests {
                 filter_channels: BTreeSet::new(),
             },
             MaterialLayer {
+                graph: Default::default(),
                 id: LayerId(4),
                 name: "Paint B".to_owned(),
                 visible: true,
@@ -4001,6 +4470,8 @@ mod tests {
         group.opacity = 0.5;
         // Mask out the left half of the group.
         group.mask_strokes.push(MaskStroke {
+            frames: Default::default(),
+            stencil: Default::default(),
             points: vec![glam::Vec2::new(0.0, 0.5)],
             radius_pixels: 3.5,
             value: 0.0,
@@ -4128,6 +4599,8 @@ mod tests {
 
         layer.filters.clear();
         layer.mask_strokes.push(MaskStroke {
+            frames: Default::default(),
+            stencil: Default::default(),
             points: vec![glam::Vec2::new(0.5, 0.5)],
             radius_pixels: 100.0,
             value: 0.0,
@@ -4159,6 +4632,8 @@ mod tests {
             },
         );
         layer.mask_strokes.push(MaskStroke {
+            frames: Default::default(),
+            stencil: Default::default(),
             points: vec![glam::Vec2::new(0.5, 0.5)],
             radius_pixels: 100.0,
             value: 0.0,
@@ -4907,3 +5382,15 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "user_channel_tests.rs"]
+mod user_channel_tests;
+
+#[cfg(test)]
+#[path = "anchor_tests.rs"]
+mod anchor_tests;
+
+#[cfg(test)]
+#[path = "graph_tests.rs"]
+mod graph_tests;

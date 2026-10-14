@@ -5,7 +5,8 @@
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{Axis, MeshGeometry, MeshTopology};
+use crate::brush::{MAX_STAMP_STRETCH, StampFrame};
+use crate::{Axis, MeshGeometry, MeshTopology, MeshVertex};
 
 /// A point on the mesh surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -196,18 +197,8 @@ impl MeshGeometry {
         uv_radius: Vec2,
         segments: usize,
     ) -> Option<Vec<Vec3>> {
-        let corners = self.triangles.get(triangle as usize)?;
-        let [a, b, c] = corners.map(|corner| self.vertices.get(corner as usize).copied());
-        let (a, b, c) = (a?, b?, c?);
-        // Solve dP = du * U + dv * V from the two triangle edges.
-        let (e1, e2) = (b.position - a.position, c.position - a.position);
-        let (t1, t2) = (b.uv - a.uv, c.uv - a.uv);
-        let determinant = t1.x * t2.y - t2.x * t1.y;
-        if !determinant.is_finite() || determinant.abs() < 1e-12 {
-            return None;
-        }
-        let along_u = (e1 * t2.y - e2 * t1.y) / determinant;
-        let along_v = (e2 * t1.x - e1 * t2.x) / determinant;
+        let [a, b, c] = self.triangle_corners(triangle)?;
+        let (along_u, along_v) = uv_axes(a, b, c)?;
         Some(
             (0..segments.max(3))
                 .map(|index| {
@@ -219,6 +210,62 @@ impl MeshGeometry {
                 .collect(),
         )
     }
+
+    /// How a stamp painted on `triangle` must lie in a `width` × `height`
+    /// texture to land round and upright on the surface: its x axis along
+    /// the surface direction of increasing U, its y axis across it, and
+    /// the right way round on mirrored UV islands. `None` when the
+    /// triangle or its UVs are degenerate, or the UVs stretch one way more
+    /// than [`MAX_STAMP_STRETCH`] times.
+    pub fn stamp_frame(&self, triangle: u32, width: u32, height: u32) -> Option<StampFrame> {
+        let [a, b, c] = self.triangle_corners(triangle)?;
+        let (along_u, along_v) = uv_axes(a, b, c)?;
+        // Surface travelled per texel along each texture axis (V up).
+        let per_x = along_u / width.saturating_sub(1).max(1) as f32;
+        let per_y = along_v / height.saturating_sub(1).max(1) as f32;
+        let tangent = per_x.try_normalize()?;
+        let normal = (b.position - a.position)
+            .cross(c.position - a.position)
+            .try_normalize()?;
+        let bitangent = normal.cross(tangent);
+        let raw = [
+            tangent.dot(per_x),
+            bitangent.dot(per_x),
+            tangent.dot(per_y),
+            bitangent.dot(per_y),
+        ];
+        let determinant = raw[0] * raw[3] - raw[1] * raw[2];
+        if !determinant.is_finite() || determinant == 0.0 {
+            return None;
+        }
+        // Keep the texel area: the stamp's radius stays in texels.
+        let scale = determinant.abs().sqrt();
+        let frame = StampFrame(raw.map(|value| value / scale));
+        (frame.0.iter().all(|value| value.is_finite()) && frame.stretch() <= MAX_STAMP_STRETCH)
+            .then_some(frame)
+    }
+
+    fn triangle_corners(&self, triangle: u32) -> Option<[MeshVertex; 3]> {
+        let corners = self.triangles.get(triangle as usize)?;
+        let [a, b, c] = corners.map(|corner| self.vertices.get(corner as usize).copied());
+        Some([a?, b?, c?])
+    }
+}
+
+/// Object-space surface travelled per unit of U and of V across a
+/// triangle, or `None` when its UVs are degenerate.
+fn uv_axes(a: MeshVertex, b: MeshVertex, c: MeshVertex) -> Option<(Vec3, Vec3)> {
+    // Solve dP = du * U + dv * V from the two triangle edges.
+    let (e1, e2) = (b.position - a.position, c.position - a.position);
+    let (t1, t2) = (b.uv - a.uv, c.uv - a.uv);
+    let determinant = t1.x * t2.y - t2.x * t1.y;
+    if !determinant.is_finite() || determinant.abs() < 1e-12 {
+        return None;
+    }
+    Some((
+        (e1 * t2.y - e2 * t1.y) / determinant,
+        (e2 * t1.x - e1 * t2.x) / determinant,
+    ))
 }
 
 /// Lazy-mouse stabilization: the brush trails the cursor on a string of
@@ -375,6 +422,49 @@ mod tests {
             flat.uv_brush_outline(0, Vec3::ZERO, Vec2::splat(0.1), 8)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn tc_0352_stamp_frames_undo_the_uv_stretch_of_the_hit_triangle() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let hit = cube
+            .closest_surface_point(Vec3::new(0.1, 0.1, 0.9))
+            .unwrap();
+        let frame = cube.stamp_frame(hit.triangle, 512, 512).unwrap();
+        let [m00, m10, m01, m11] = frame.0;
+        assert!((m00 * m11 - m01 * m10 - 1.0).abs() < 1e-4, "unit area");
+        assert!(
+            m10.abs() < 1e-4 && m01.abs() < 1e-4,
+            "UV axes square to the face"
+        );
+        // A face spans a third of U and half of V, so a texel covers 1.5
+        // times more surface across than down; the frame lengthens texel
+        // offsets across by the square root of that and shortens them
+        // down by as much.
+        assert!((m00 / m11 - 1.5).abs() < 0.05, "{frame:?}");
+        // Along +U is along +X on the front face, so stamps stay upright.
+        assert!(m00 > 0.0 && m11 > 0.0);
+        // A square texture of the same layout as a 2:3 one undoes the
+        // aspect: texels then cover equal surface both ways.
+        let wide = cube.stamp_frame(hit.triangle, 769, 513).unwrap();
+        assert!((wide.0[0] - wide.0[3]).abs() < 0.05, "{wide:?}");
+
+        // Mirrored UVs flip the frame so stamps read the right way round.
+        let mut mirrored = cube.clone();
+        for vertex in &mut mirrored.vertices {
+            vertex.uv.x = 1.0 - vertex.uv.x;
+        }
+        let flipped = mirrored.stamp_frame(hit.triangle, 512, 512).unwrap();
+        let [a, b, c, d] = flipped.0;
+        assert!((a * d - b * c + 1.0).abs() < 1e-4, "{flipped:?}");
+
+        // Degenerate UVs give no frame.
+        let mut flat = cube.clone();
+        for vertex in &mut flat.vertices {
+            vertex.uv = Vec2::ZERO;
+        }
+        assert!(flat.stamp_frame(hit.triangle, 512, 512).is_none());
+        assert!(cube.stamp_frame(9_999, 512, 512).is_none());
     }
 
     #[test]

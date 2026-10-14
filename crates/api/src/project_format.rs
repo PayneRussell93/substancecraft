@@ -292,6 +292,8 @@ mod tests {
             ));
         MaterialProject {
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Body".to_owned(),
                 material_slot: "Body".to_owned(),

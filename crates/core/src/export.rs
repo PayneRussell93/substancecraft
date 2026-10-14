@@ -112,6 +112,7 @@ impl ExportSource {
 
     /// True when the source holds sRGB-encoded colour (Base Color and
     /// Emissive), which linear file formats such as EXR store decoded.
+    /// User channels are written as stored, like other data.
     pub const fn is_srgb(self) -> bool {
         matches!(
             self,
@@ -120,7 +121,8 @@ impl ExportSource {
         )
     }
 
-    /// True when the source carries different data in R, G, and B.
+    /// True when the source carries different data in R, G, and B (user
+    /// channels may: colour ones do, grey ones hold one value in all three).
     pub const fn is_color(self) -> bool {
         match self {
             Self::Channel(channel) => matches!(
@@ -129,6 +131,7 @@ impl ExportSource {
                     | MaterialChannel::Emissive
                     | MaterialChannel::Normal
                     | MaterialChannel::Id
+                    | MaterialChannel::User(_)
             ),
             Self::MeshMap(kind) => matches!(
                 kind,
@@ -1005,17 +1008,20 @@ impl TextureSet {
                         .collect(),
                 )
             }
-            MaterialChannel::BaseColor => {
-                let default_base = rgb_unit(DEFAULT_BASE_COLOR);
+            MaterialChannel::BaseColor | MaterialChannel::User(_) => {
+                // Over the neutral grey, or the user channel's default.
+                let default = rgb_unit(match self.user_channel(channel) {
+                    Some(user) => user.default,
+                    None if channel == MaterialChannel::BaseColor => DEFAULT_BASE_COLOR,
+                    None => [0, 0, 0],
+                });
                 plane(
                     match self.optional_plane(channel, context, masks, region)? {
                         Some(composite) => composite
                             .iter()
-                            .map(|texel| {
-                                texel.truncate() * texel.w + default_base * (1.0 - texel.w)
-                            })
+                            .map(|texel| texel.truncate() * texel.w + default * (1.0 - texel.w))
                             .collect(),
-                        None => try_filled(pixel_count, default_base)?,
+                        None => try_filled(pixel_count, default)?,
                     },
                 )
             }
@@ -1236,6 +1242,15 @@ impl TextureSet {
                     {
                         Some("The ID map is empty".to_owned())
                     }
+                    MaterialChannel::User(slot) => match self.user_channel(channel) {
+                        None => Some(format!(
+                            "User channel {slot} is not defined on this set, so it is black"
+                        )),
+                        Some(user) if !painted(&[channel]) => {
+                            Some(format!("{} is its uniform default", user.name))
+                        }
+                        Some(_) => None,
+                    },
                     _ => None,
                 },
             };
@@ -1263,6 +1278,8 @@ mod tests {
 
     fn set_with(size: u32, layer: MaterialLayer) -> TextureSet {
         TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Hull Plate".to_owned(),
             material_slot: "Hull".to_owned(),

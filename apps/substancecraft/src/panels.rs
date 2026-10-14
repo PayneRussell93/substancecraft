@@ -11,13 +11,13 @@ use eframe::egui::{
 use substancecraft_api::TextureFormat;
 use substancecraft_core::MIN_TILE_SIZE;
 use substancecraft_core::{
-    Axis, BitDepth, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot, Direction,
-    ExportOutput, ExportSource, InstanceField, LayerFill, LayerFilter, LayerId, MAX_BLUR_RADIUS,
-    MAX_BRUSH_SPACING, MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE, MAX_SUBDIVISION_LEVELS,
-    MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator, MaterialChannel, MaterialId,
-    MaterialLayer, MaterialLink, MeshAsset, MeshId, MeshMapKind, MeshSmoothing, OutputLayout,
-    PreflightSeverity, PrimitivePreset, ProjectionMode, ResourceId, SelectionMode, SourceComponent,
-    TextureProjection, TextureSetId, ViewportCamera,
+    AnchorEffect, Axis, BitDepth, BitmapMask, BoneId, BoneTransform, BrushShape, ChannelSlot,
+    Direction, ExportOutput, ExportSource, InstanceField, LayerFill, LayerFilter, LayerId,
+    MAX_BLUR_RADIUS, MAX_BRUSH_SPACING, MAX_EXPORT_OUTPUTS, MAX_PROJECTION_SCALE,
+    MAX_SUBDIVISION_LEVELS, MIN_BRUSH_SPACING, MIN_PROJECTION_SCALE, MaskGenerator,
+    MaterialChannel, MaterialId, MaterialLayer, MaterialLink, MeshAsset, MeshId, MeshMapKind,
+    MeshSmoothing, OutputLayout, PreflightSeverity, PrimitivePreset, ProjectionMode, ResourceId,
+    SelectionMode, SourceComponent, TextureProjection, TextureSetId, UserChannel, ViewportCamera,
 };
 
 use super::resource_watch::ReloadMode;
@@ -223,7 +223,7 @@ impl SubstanceCraftApp {
         }
     }
 
-    fn set_preview_channel(&mut self, channel: MaterialChannel) {
+    pub(super) fn set_preview_channel(&mut self, channel: MaterialChannel) {
         self.active_channel = channel;
         self.channel_preview = true;
         self.mesh_map_preview = None;
@@ -236,11 +236,112 @@ impl SubstanceCraftApp {
         self.invalidate_preview();
     }
 
-    fn preview_label(&self) -> &'static str {
+    fn preview_label(&self) -> String {
         match self.mesh_map_preview {
-            Some(kind) => kind.name(),
-            None if self.channel_preview => channel_label(self.active_channel),
-            None => "Material",
+            Some(kind) => kind.name().to_owned(),
+            None if self.channel_preview => self.channel_name(self.active_channel),
+            None => "Material".to_owned(),
+        }
+    }
+
+    /// The selected set's user channels.
+    pub(super) fn user_channels(&self) -> Vec<UserChannel> {
+        self.selected_texture_set_ref()
+            .map(|set| set.user_channels.clone())
+            .unwrap_or_default()
+    }
+
+    /// A channel's label, with the selected set's name for user channels.
+    pub(super) fn channel_name(&self, channel: MaterialChannel) -> String {
+        self.selected_texture_set_ref()
+            .and_then(|set| set.user_channel(channel))
+            .map_or_else(
+                || channel_label(channel).to_owned(),
+                |user| user.name.clone(),
+            )
+    }
+
+    /// The selected set's user channels: add, rename, colour or grey,
+    /// default value, and remove. Every edit is undoable.
+    fn user_channel_controls(&mut self, ui: &mut Ui) {
+        let Some(set) = self.selected_texture_set_ref() else {
+            return;
+        };
+        let id = set.id;
+        let original = set.user_channels.clone();
+        let mut channels = original.clone();
+        widgets::caption(ui, "User channels");
+        let mut remove = None;
+        for (index, user) in channels.iter_mut().enumerate() {
+            ui.push_id(("user_channel", user.slot), |ui| {
+                widgets::property_row(ui, &format!("User {}", user.slot), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(
+                            egui::TextEdit::singleline(&mut user.name)
+                                .desired_width((ui.available_width() - 74.0).max(40.0))
+                                .char_limit(substancecraft_core::MAX_USER_CHANNEL_NAME_CHARS)
+                                .margin(vec2(6.0, 3.0)),
+                        );
+                        if widgets::chip(ui, "Grey", user.gray)
+                            .on_hover_text("Hold one linear value instead of an sRGB colour")
+                            .clicked()
+                        {
+                            user.gray = !user.gray;
+                            user.default = [user.default[0]; 3];
+                        }
+                        if widgets::icon_button(ui, Icon::Trash, true, "Remove user channel")
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                let mut default = user.default;
+                if user_value_row(ui, "Default", user.gray, &mut default) {
+                    user.default = default;
+                }
+            });
+        }
+        if let Some(index) = remove {
+            channels.remove(index);
+        }
+        let free = (0..substancecraft_core::MAX_USER_CHANNELS)
+            .find(|slot| channels.iter().all(|user| user.slot != *slot));
+        if let Some(slot) = free
+            && widgets::pill_button(ui, Some(Icon::Plus), "Add user channel", false, true)
+                .on_hover_text("A channel of your own, e.g. a wetness or region map for a game")
+                .clicked()
+        {
+            let mut name = format!("User {slot}");
+            while channels
+                .iter()
+                .any(|user| user.name.trim().eq_ignore_ascii_case(&name))
+            {
+                name.push('+');
+            }
+            channels.push(UserChannel {
+                slot,
+                name,
+                gray: true,
+                default: [0, 0, 0],
+            });
+            channels.sort_by_key(|user| user.slot);
+        }
+        if !original.is_empty() || channels != original {
+            hint(
+                ui,
+                "Layers write user channels they enable (chips under Channels), with the \
+                 values set in their fill and the brush. Export them with the chips below \
+                 or a custom preset.",
+            );
+        }
+        // Names stay as they were while an edit would leave one empty or
+        // shared.
+        if channels != original && substancecraft_core::user_channels_valid(&channels) {
+            self.edit_set_properties_merging(id, |properties| {
+                properties.user_channels = channels;
+            });
         }
     }
 
@@ -426,6 +527,21 @@ impl SubstanceCraftApp {
                                 .clicked()
                             {
                                 chosen = Some(channel);
+                            }
+                        }
+                        let users = self.user_channels();
+                        if !users.is_empty() {
+                            ui.separator();
+                        }
+                        for user in users {
+                            let selected = self.mesh_map_preview.is_none()
+                                && self.channel_preview
+                                && self.active_channel == user.channel();
+                            if ui
+                                .add(egui::Button::selectable(selected, &user.name))
+                                .clicked()
+                            {
+                                chosen = Some(user.channel());
                             }
                         }
                     })
@@ -723,7 +839,10 @@ impl SubstanceCraftApp {
         self.brush_preview(ui);
         self.brush_shelves(ui);
         slider_row(ui, "Size", &mut self.brush_radius, 1.0..=256.0, true, 0);
+        // Clone and smudge take their material from the stack.
+        let sampling = self.paint_mode == PaintMode::Paint && self.brush_source_controls(ui);
         match self.paint_mode {
+            _ if sampling => {}
             PaintMode::Mask => {
                 slider_row(ui, "Mask value", &mut self.mask_value, 0.0..=1.0, false, 2);
             }
@@ -760,6 +879,10 @@ impl SubstanceCraftApp {
                     false,
                     2,
                 );
+                for user in self.user_channels() {
+                    let slot = usize::from(user.slot);
+                    user_value_row(ui, &user.name, user.gray, &mut self.brush_user.0[slot]);
+                }
                 hint(
                     ui,
                     "One stroke paints every channel the layer enables. Height 0.5 is \
@@ -2006,6 +2129,7 @@ impl SubstanceCraftApp {
                         });
                     }
                 }
+                self.user_channel_controls(ui);
 
                 if self.selected_layer().is_some() {
                     self.layer_properties(ui);
@@ -2025,13 +2149,17 @@ impl SubstanceCraftApp {
                 });
                 self.export_preset_controls(ui);
                 ui.add_space(2.0);
+                let users = self.user_channels();
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    for channel in BAKEABLE_CHANNELS {
-                        if widgets::chip(ui, channel_label(channel), false)
+                    let labelled = BAKEABLE_CHANNELS
+                        .into_iter()
+                        .map(|channel| (channel, channel_label(channel).to_owned()))
+                        .chain(users.iter().map(|user| (user.channel(), user.name.clone())));
+                    for (channel, label) in labelled {
+                        if widgets::chip(ui, &label, false)
                             .on_hover_text(format!(
-                                "Export {} as {}",
-                                channel_label(channel),
+                                "Export {label} as {}",
                                 self.selected_format().name()
                             ))
                             .clicked()
@@ -2074,14 +2202,22 @@ impl SubstanceCraftApp {
             .iter()
             .map(|resource| (resource.id, resource.name.clone()))
             .collect::<Vec<_>>();
-        let anchor_candidates: Vec<(LayerId, String)> = self
+        let user_channels = self.user_channels();
+        let anchor_candidates: Vec<AnchorCandidate> = self
             .selected_texture_set_ref()
             .zip(self.selected_layer)
             .map(|(set, selected)| {
                 set.walk_layers()
                     .into_iter()
                     .filter(|candidate| set.anchor_is_valid(selected, candidate.id))
-                    .map(|candidate| (candidate.id, candidate.name.clone()))
+                    .map(|candidate| AnchorCandidate {
+                        id: candidate.id,
+                        name: candidate.name.clone(),
+                        effects: AnchorEffect::of(candidate)
+                            .into_iter()
+                            .map(|effect| (effect, effect.label(candidate)))
+                            .collect(),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2220,6 +2356,20 @@ impl SubstanceCraftApp {
                         }
                     }
                 }
+                for user in &user_channels {
+                    let channel = user.channel();
+                    let enabled = layer.channels.contains(&channel);
+                    if widgets::chip(ui, &user.name, enabled)
+                        .on_hover_text("User channel")
+                        .clicked()
+                    {
+                        if enabled {
+                            layer.channels.remove(&channel);
+                        } else {
+                            layer.channels.insert(channel);
+                        }
+                    }
+                }
             });
         });
         let evolution_action = evolution_controls(ui, layer, recording, &mut evolution_name);
@@ -2239,9 +2389,22 @@ impl SubstanceCraftApp {
                 Id::new(("layer_fill", layer.id.0)),
                 fill,
                 &resources,
+                &user_channels,
                 overrides.as_ref(),
             );
             projection_controls(ui, &mut fill.projection, 0, &mut decal_gizmo);
+            if instance.is_none() {
+                let channels = graph_channels(&layer.channels, &user_channels);
+                crate::graph_editor::graph_controls(
+                    ui,
+                    Id::new(("layer_graph", layer.id.0)),
+                    &mut layer.graph,
+                    &channels,
+                    &resources,
+                );
+            } else if layer.graph.is_some() {
+                hint(ui, "Procedural content follows the master material.");
+            }
         } else {
             ui.add_space(2.0);
             if widgets::pill_button(ui, Some(Icon::Plus), "Add fill", false, true)
@@ -2387,7 +2550,13 @@ impl SubstanceCraftApp {
             projection_controls(ui, &mut mask.projection, 1, &mut decal_gizmo);
         }
 
-        anchor_controls(ui, layer.id, &mut layer.mask_anchor, &anchor_candidates);
+        anchor_controls(
+            ui,
+            layer.id,
+            &mut layer.mask_anchor,
+            &anchor_candidates,
+            &user_channels,
+        );
 
         widgets::property_row(ui, "Invert final mask", |ui| {
             widgets::toggle(ui, &mut layer.invert_final_mask)
@@ -2548,7 +2717,7 @@ impl SubstanceCraftApp {
                             }
                             status_separator(ui);
                             let preview = self.preview_label();
-                            status_text(ui, preview, theme::TEXT_WEAK);
+                            status_text(ui, &preview, theme::TEXT_WEAK);
                             if self.mesh_map_job_running() {
                                 status_separator(ui);
                                 ui.add(egui::Spinner::new().size(11.0));
@@ -2689,7 +2858,7 @@ impl SubstanceCraftApp {
 /// Parameter sliders for one mask generator.
 /// Settings of a mask generator. Returns true when the ID generator asks
 /// to pick its colour from the model.
-fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) -> bool {
+pub(super) fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) -> bool {
     let mut pick = false;
     match generator {
         MaskGenerator::EdgeWear(settings) => {
@@ -2915,7 +3084,7 @@ fn empty_state(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.5).color(theme::TEXT_FAINT));
 }
 
-fn hint(ui: &mut Ui, text: &str) {
+pub(super) fn hint(ui: &mut Ui, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).size(11.5).color(theme::TEXT_WEAK)).wrap());
 }
 
@@ -2929,7 +3098,7 @@ fn status_separator(ui: &mut Ui) {
         .circle_filled(rect.center(), 1.5, theme::TEXT_FAINT);
 }
 
-fn slider_row(
+pub(super) fn slider_row(
     ui: &mut Ui,
     label: &str,
     value: &mut f32,
@@ -3250,6 +3419,7 @@ fn fill_controls(
     id_salt: Id,
     fill: &mut LayerFill,
     resources: &[(ResourceId, String)],
+    user_channels: &[UserChannel],
     overrides: Option<&std::collections::BTreeSet<InstanceField>>,
 ) {
     let marked = |field, label| override_label(overrides, field, label);
@@ -3300,6 +3470,10 @@ fn fill_controls(
         false,
         2,
     );
+    for user in user_channels {
+        let slot = usize::from(user.slot);
+        user_value_row(ui, &user.name, user.gray, &mut fill.user.0[slot]);
+    }
 
     widgets::caption(ui, "Fill textures");
     if resources.is_empty() {
@@ -3329,10 +3503,69 @@ fn fill_controls(
             resource_picker(ui, id_salt.with(("fill_texture", channel)), slot, resources);
         });
     }
+    for user in user_channels {
+        let channel = user.channel();
+        let Some(slot) = fill.textures.slot_mut(channel) else {
+            continue;
+        };
+        widgets::property_row(ui, &user.name, |ui| {
+            resource_picker(ui, id_salt.with(("fill_texture", channel)), slot, resources);
+        });
+    }
+}
+
+/// The channels a fill writes that a graph can feed, labelled (user
+/// channels by their names).
+fn graph_channels(
+    channels: &std::collections::BTreeSet<MaterialChannel>,
+    user_channels: &[UserChannel],
+) -> Vec<(MaterialChannel, String)> {
+    channels
+        .iter()
+        .filter(|channel| {
+            !matches!(
+                channel,
+                MaterialChannel::Id | MaterialChannel::AmbientOcclusion
+            )
+        })
+        .map(|channel| {
+            let label = user_channels
+                .iter()
+                .find(|user| user.channel() == *channel)
+                .map_or_else(
+                    || channel_label(*channel).to_owned(),
+                    |user| user.name.clone(),
+                );
+            (*channel, label)
+        })
+        .collect()
+}
+
+/// Edits one user channel value: a slider for grey channels, else a
+/// colour button. Returns true on change.
+fn user_value_row(ui: &mut Ui, label: &str, gray: bool, value: &mut [u8; 3]) -> bool {
+    if gray {
+        let mut level = f32::from(value[0]) / 255.0;
+        let changed = slider_row(ui, label, &mut level, 0.0..=1.0, false, 2);
+        if changed {
+            *value = [(level.clamp(0.0, 1.0) * 255.0).round() as u8; 3];
+        }
+        changed
+    } else {
+        let mut color = Color32::from_rgb(value[0], value[1], value[2]);
+        widgets::property_row(ui, label, |ui| {
+            let changed = widgets::labeled_color_button(ui, &mut color).changed();
+            if changed {
+                let rgba = color.to_array();
+                *value = [rgba[0], rgba[1], rgba[2]];
+            }
+            changed
+        })
+    }
 }
 
 /// Combo box choosing a bitmap resource or none. Returns true on change.
-fn resource_picker(
+pub(super) fn resource_picker(
     ui: &mut Ui,
     id_salt: Id,
     current: &mut Option<ResourceId>,
@@ -3581,7 +3814,7 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
     }
 }
 
-fn filter_controls(ui: &mut Ui, filter: &mut LayerFilter) {
+pub(super) fn filter_controls(ui: &mut Ui, filter: &mut LayerFilter) {
     match filter {
         LayerFilter::Blur { radius } => {
             slider_row(ui, "Radius", radius, 0.0..=MAX_BLUR_RADIUS, false, 1);
@@ -4119,8 +4352,154 @@ fn slot_editor(ui: &mut Ui, id_salt: &str, slot: &mut ChannelSlot) {
 }
 
 impl SubstanceCraftApp {
+    /// Paint, Clone, or Smudge, with the controls of the chosen one. Returns
+    /// true when the brush takes its material from the stack, so the
+    /// material controls do not apply.
+    fn brush_source_controls(&mut self, ui: &mut Ui) -> bool {
+        use crate::stroke_tools::BrushSource;
+
+        let tools = &mut self.stroke_tools;
+        widgets::property_row(ui, "Tool", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (source, tooltip) in [
+                (BrushSource::Paint, "Paint the brush's own material"),
+                (
+                    BrushSource::Clone,
+                    "Copy the layer stack from a source point you set",
+                ),
+                (BrushSource::Smudge, "Drag the layer stack along the stroke"),
+            ] {
+                if widgets::chip(ui, source.label(), tools.source == source)
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    tools.source = source;
+                    tools.picking_source = false;
+                }
+            }
+        });
+        match tools.source {
+            BrushSource::Paint => return false,
+            BrushSource::Clone => {
+                let picking = tools.picking_source;
+                if widgets::pill_button(
+                    ui,
+                    None,
+                    if picking {
+                        "Click the model or UV view…"
+                    } else {
+                        "Set source"
+                    },
+                    picking,
+                    true,
+                )
+                .on_hover_text("The next click sets the point clone strokes copy from")
+                .clicked()
+                {
+                    tools.picking_source = !picking;
+                }
+                hint(
+                    ui,
+                    if tools.clone_source.is_some() {
+                        "Strokes copy every enabled channel of the stack (beneath and on \
+                         this layer) from the source. The first stroke after setting it \
+                         fixes the offset; later strokes keep it."
+                    } else {
+                        "Set a source first. Clone works in texture space, so it paints \
+                         even with Projection on."
+                    },
+                );
+            }
+            BrushSource::Smudge => {
+                slider_row(
+                    ui,
+                    "Strength",
+                    &mut tools.smudge_strength,
+                    0.05..=1.0,
+                    false,
+                    2,
+                );
+                hint(
+                    ui,
+                    "Drags every enabled channel of the stack along the stroke, up to \
+                     Strength × the brush radius. Smudge works in texture space.",
+                );
+            }
+        }
+        true
+    }
+
+    /// Painting the quick mask, or limiting strokes to it.
+    fn quick_mask_controls(&mut self, ui: &mut Ui) {
+        let Some(set_id) = self.selected_texture_set else {
+            return;
+        };
+        widgets::caption(ui, "Quick mask");
+        let editing = self.editing_quick_mask(set_id).is_some();
+        let active = self.active_stencil(set_id).is_some();
+        let key = self
+            .preferences
+            .values
+            .binding_of(crate::preferences::Action::QuickMask)
+            .map(|binding| format!(" ({})", binding.label()))
+            .unwrap_or_default();
+
+        if editing {
+            hint(
+                ui,
+                "Painting the quick mask: Paint, Mask, and ID open it, Erase closes it. \
+                 The tint shows where strokes will be blocked.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if widgets::pill_button(ui, None, &format!("Use{key}"), true, false)
+                    .on_hover_text("Limit paint and mask strokes to the painted area")
+                    .clicked()
+                {
+                    self.toggle_quick_mask();
+                }
+                if widgets::pill_button(ui, None, "Invert", false, false)
+                    .on_hover_text("Paint where the quick mask is black instead")
+                    .clicked()
+                {
+                    self.invert_quick_mask();
+                }
+                if widgets::pill_button(ui, None, "Discard", false, false).clicked() {
+                    self.clear_quick_mask();
+                }
+            });
+            return;
+        }
+        if active {
+            hint(
+                ui,
+                "Paint and mask strokes on this set stay inside the quick mask.",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            let label = if active {
+                format!("New quick mask{key}")
+            } else {
+                format!("Paint quick mask{key}")
+            };
+            if widgets::pill_button(ui, None, &label, false, true)
+                .on_hover_text("Paint a temporary mask that limits the strokes after it")
+                .clicked()
+            {
+                self.toggle_quick_mask();
+            }
+            if active
+                && widgets::pill_button(ui, None, "Clear", false, false)
+                    .on_hover_text("Stop limiting strokes; earlier strokes keep their shape")
+                    .clicked()
+            {
+                self.clear_quick_mask();
+            }
+        });
+    }
+
     /// Symmetry, stabilization, path placement, and the eyedropper.
     fn stroke_assist(&mut self, ui: &mut Ui) {
+        self.quick_mask_controls(ui);
         widgets::caption(ui, "Assist");
         widgets::property_row(ui, "Projection", |ui| {
             widgets::toggle(ui, &mut self.projection_painting)
@@ -4133,9 +4512,18 @@ impl SubstanceCraftApp {
             hint(
                 ui,
                 "Brush size is in screen pixels. Hidden and back-facing surfaces stay \
-                 unpainted. ID strokes, symmetry, and paths stay in UV space.",
+                 unpainted. ID strokes, symmetry, paths, clone, and smudge stay in UV \
+                 space.",
             );
         }
+        widgets::property_row(ui, "Align to surface", |ui| {
+            widgets::toggle(ui, &mut self.stroke_tools.align_to_surface)
+        })
+        .on_hover_text(
+            "Keep each stamp round and upright on the surface where the UVs stretch or \
+             turn, instead of in texture space (3D view)",
+        );
+
         widgets::property_row(ui, "Symmetry", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if widgets::chip(ui, "Off", self.symmetry.is_none()).clicked() {
@@ -4254,17 +4642,26 @@ impl SubstanceCraftApp {
 }
 
 /// Anchor-point mask: pick an earlier layer and the channel to read.
+/// A layer an anchor may read, with the effects it can read at.
+struct AnchorCandidate {
+    id: LayerId,
+    name: String,
+    effects: Vec<(AnchorEffect, String)>,
+}
+
+/// Anchor-point mask: pick an earlier layer, optionally one of its effects,
+/// and the channel to read.
 fn anchor_controls(
     ui: &mut Ui,
     layer_id: LayerId,
     anchor: &mut Option<substancecraft_core::AnchorMask>,
-    candidates: &[(LayerId, String)],
+    candidates: &[AnchorCandidate],
+    user_channels: &[UserChannel],
 ) {
     widgets::caption(ui, "Anchor mask");
     let current = anchor.map(|anchor| anchor.layer);
-    let label = current
-        .and_then(|id| candidates.iter().find(|(candidate, _)| *candidate == id))
-        .map_or("None", |(_, name)| name.as_str());
+    let source = current.and_then(|id| candidates.iter().find(|candidate| candidate.id == id));
+    let label = source.map_or("None", |candidate| candidate.name.as_str());
     let mut chosen = current;
     widgets::property_row(ui, "Read from", |ui| {
         let combo = egui::ComboBox::from_id_salt(("anchor_layer", layer_id.0))
@@ -4274,9 +4671,12 @@ fn anchor_controls(
                 if ui.selectable_label(current.is_none(), "None").clicked() {
                     chosen = None;
                 }
-                for (id, name) in candidates {
-                    if ui.selectable_label(current == Some(*id), name).clicked() {
-                        chosen = Some(*id);
+                for candidate in candidates {
+                    if ui
+                        .selectable_label(current == Some(candidate.id), &candidate.name)
+                        .clicked()
+                    {
+                        chosen = Some(candidate.id);
                     }
                 }
             });
@@ -4284,8 +4684,10 @@ fn anchor_controls(
     });
     if chosen != current {
         *anchor = chosen.map(|id| match anchor {
+            // Effects belong to the old layer.
             Some(existing) => substancecraft_core::AnchorMask {
                 layer: id,
+                effect: None,
                 ..*existing
             },
             None => substancecraft_core::AnchorMask::new(id, MaterialChannel::BaseColor),
@@ -4299,16 +4701,61 @@ fn anchor_controls(
         );
         return;
     };
+    if let Some(source) = source.filter(|candidate| !candidate.effects.is_empty()) {
+        let selected = anchor.effect.map_or_else(
+            || "Whole layer".to_owned(),
+            |effect| {
+                source
+                    .effects
+                    .iter()
+                    .find(|(candidate, _)| *candidate == effect)
+                    .map_or_else(|| "Every filter".to_owned(), |(_, label)| label.clone())
+            },
+        );
+        widgets::property_row(ui, "Read at", |ui| {
+            let combo = egui::ComboBox::from_id_salt(("anchor_effect", layer_id.0))
+                .width(ui.available_width() - 8.0)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(anchor.effect.is_none(), "Whole layer")
+                        .clicked()
+                    {
+                        anchor.effect = None;
+                    }
+                    for (effect, label) in &source.effects {
+                        if ui
+                            .selectable_label(anchor.effect == Some(*effect), label)
+                            .clicked()
+                        {
+                            anchor.effect = Some(*effect);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Read the layer part-way through its fill, strokes, and filters");
+            widgets::label_from_row(ui, &combo, egui::WidgetType::ComboBox);
+        });
+    }
     widgets::property_row(ui, "Channel", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            for channel in substancecraft_core::AnchorMask::CHANNELS {
-                if widgets::chip(ui, channel_label(channel), anchor.channel == channel).clicked() {
+            let channels = substancecraft_core::AnchorMask::CHANNELS
+                .into_iter()
+                .map(|channel| (channel, channel_label(channel).to_owned()))
+                .chain(
+                    user_channels
+                        .iter()
+                        .map(|user| (user.channel(), user.name.clone())),
+                );
+            for (channel, label) in channels {
+                if widgets::chip(ui, &label, anchor.channel == channel).clicked() {
                     anchor.channel = channel;
                 }
             }
         });
     });
+
     slider_row(ui, "Low", &mut anchor.low, 0.0..=0.99, false, 2);
     slider_row(ui, "High", &mut anchor.high, 0.01..=1.0, false, 2);
     if anchor.high <= anchor.low {
@@ -4645,12 +5092,22 @@ impl SubstanceCraftApp {
                 }
             });
         });
+        let user_channels = self.user_channels();
         fill_controls(
             ui,
             Id::new(("master_fill", original.id.0)),
             &mut edited.fill,
             &resources,
+            &user_channels,
             None,
+        );
+        let channels = graph_channels(&edited.channels, &user_channels);
+        crate::graph_editor::graph_controls(
+            ui,
+            Id::new(("master_graph", original.id.0)),
+            &mut edited.graph,
+            &channels,
+            &resources,
         );
         ui.add_space(4.0);
         if widgets::pill_button(ui, Some(Icon::Trash), "Delete material", false, true)

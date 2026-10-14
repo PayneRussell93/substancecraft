@@ -12,7 +12,8 @@ use super::*;
 use crate::{
     BrushShape, BrushTip, DEFAULT_HEIGHT_STRENGTH, DirtyTexels, Gradient, IdStroke, LayerFilter,
     MaskGenerator, MaskStroke, MeshMapSettings, NoisePattern, PolygonMask, PrimitivePreset,
-    TextureProjection, TextureSetId, bake_mesh_maps, stroke_texel_bounds,
+    StampFrame, Stencil, StencilId, StrokeSource, TextureProjection, TextureSetId, bake_mesh_maps,
+    stroke_texel_bounds,
 };
 
 /// Deterministic generator so failures replay exactly.
@@ -68,6 +69,33 @@ fn random_tip(rng: &mut Lcg) -> BrushTip {
     }
 }
 
+/// A valid surface-alignment frame: a turn, a stretch of up to 3, and a
+/// shear, scaled to unit determinant.
+fn random_frame(rng: &mut Lcg) -> StampFrame {
+    let turn = Vec2::from_angle(rng.unit() * std::f32::consts::TAU);
+    let stretch = 1.0 + rng.unit() * 2.0;
+    let shear = rng.unit() - 0.5;
+    // Columns of turn × [[stretch, shear], [0, 1 / stretch]].
+    let first = turn * stretch;
+    let second = turn * shear + turn.perp() / stretch;
+    let frame = StampFrame([first.x, first.y, second.x, second.y]);
+    if frame.stretch() <= crate::MAX_STAMP_STRETCH {
+        frame
+    } else {
+        StampFrame::IDENTITY
+    }
+}
+
+const STENCILS: [StencilId; 2] = [StencilId(1), StencilId(2)];
+
+fn random_stencil(rng: &mut Lcg) -> Option<StencilId> {
+    match rng.below(4) {
+        0 => Some(STENCILS[0]),
+        1 => Some(STENCILS[1]),
+        _ => None,
+    }
+}
+
 fn checker_image(size: u32) -> TextureImage {
     let rgba8 = (0..size * size)
         .flat_map(|index| {
@@ -117,6 +145,7 @@ fn stack() -> TextureSet {
 
     let mut paint = MaterialLayer::new_paint(PAINT, "Paint");
     paint.channels = all.clone();
+    paint.filters = vec![LayerFilter::Invert];
 
     let mut multiply = MaterialLayer::new_paint(MULTIPLY, "Multiply");
     multiply.channels = all.clone();
@@ -140,6 +169,45 @@ fn stack() -> TextureSet {
         },
     );
     masked.channels = all.clone();
+    // Procedural content: noise over a triplanar bitmap, through a ramp.
+    masked.graph = Some(crate::MaterialGraph {
+        nodes: vec![
+            crate::GraphNode::Generator(MaskGenerator::Noise(NoisePattern::DEFAULT)),
+            crate::GraphNode::Bitmap {
+                resource: ResourceId(1),
+                projection: TextureProjection {
+                    mode: ProjectionMode::Triplanar,
+                    ..TextureProjection::default()
+                },
+            },
+            crate::GraphNode::Blend {
+                mode: BlendMode::Overlay,
+                a: crate::GraphInput::Node(1),
+                b: crate::GraphInput::Node(0),
+                amount: crate::GraphInput::gray(0.7),
+            },
+            crate::GraphNode::MeshMap(crate::MeshMapKind::Curvature),
+            crate::GraphNode::Ramp {
+                input: crate::GraphInput::Node(2),
+                stops: vec![
+                    crate::RampStop {
+                        position: 0.2,
+                        color: [20, 40, 90],
+                    },
+                    crate::RampStop {
+                        position: 0.8,
+                        color: [250, 200, 60],
+                    },
+                ],
+            },
+        ],
+        outputs: [
+            (MaterialChannel::BaseColor, crate::GraphInput::Node(4)),
+            (MaterialChannel::Roughness, crate::GraphInput::Node(3)),
+            (MaterialChannel::Height, crate::GraphInput::Node(0)),
+        ]
+        .into(),
+    });
     masked.mask_generator = Some(MaskGenerator::Gradient(Gradient::DEFAULT));
     masked.mask_filters = vec![LayerFilter::Invert];
     masked.invert_final_mask = true;
@@ -165,6 +233,8 @@ fn stack() -> TextureSet {
         low: 0.1,
         high: 0.6,
         invert: false,
+        // Before the paint layer's Invert filter.
+        effect: Some(crate::AnchorEffect::Paint),
     });
     anchored.polygon_mask = Some(PolygonMask {
         triangles: (0..6).collect(),
@@ -188,7 +258,29 @@ fn stack() -> TextureSet {
     ids.channels.insert(MaterialChannel::Id);
     ids.id_mask_color = Some([0, 0, 255]);
 
+    // Two quick masks: soft dabs, and an inverted stripe.
+    let dabs = Stencil {
+        id: STENCILS[0],
+        strokes: vec![
+            MaskStroke::new(vec![Vec2::new(0.3, 0.3), Vec2::new(0.7, 0.6)], 18.0, 1.0),
+            MaskStroke::new(vec![Vec2::new(0.5, 0.8)], 25.0, 0.6),
+        ],
+        invert: false,
+    };
+    let stripe = Stencil {
+        id: STENCILS[1],
+        strokes: vec![MaskStroke {
+            tip: BrushTip {
+                shape: BrushShape::Square,
+                ..BrushTip::ROUND
+            },
+            ..MaskStroke::new(vec![Vec2::new(0.0, 0.5), Vec2::new(1.0, 0.5)], 12.0, 1.0)
+        }],
+        invert: true,
+    };
     TextureSet {
+        user_channels: Default::default(),
+        stencils: vec![dabs, stripe],
         id: TextureSetId(1),
         name: "Region".to_owned(),
         material_slot: "Default".to_owned(),
@@ -204,15 +296,18 @@ fn stack() -> TextureSet {
     }
 }
 
+/// The per-point lists of a stroke: points, pressures, and stamp frames.
+type PointLists<'a> = (&'a mut Vec<Vec2>, &'a mut Vec<f32>, &'a mut Vec<StampFrame>);
+
 /// Stroke fields the edit needs, whichever kind of stroke it is.
 trait Growable {
-    fn points_mut(&mut self) -> (&mut Vec<Vec2>, &mut Vec<f32>);
+    fn points_mut(&mut self) -> PointLists<'_>;
     fn shape(&self) -> (f32, BrushTip);
 }
 
 impl Growable for PaintStroke {
-    fn points_mut(&mut self) -> (&mut Vec<Vec2>, &mut Vec<f32>) {
-        (&mut self.points, &mut self.pressures)
+    fn points_mut(&mut self) -> PointLists<'_> {
+        (&mut self.points, &mut self.pressures, &mut self.frames)
     }
     fn shape(&self) -> (f32, BrushTip) {
         (self.radius_pixels, self.tip)
@@ -220,8 +315,8 @@ impl Growable for PaintStroke {
 }
 
 impl Growable for MaskStroke {
-    fn points_mut(&mut self) -> (&mut Vec<Vec2>, &mut Vec<f32>) {
-        (&mut self.points, &mut self.pressures)
+    fn points_mut(&mut self) -> PointLists<'_> {
+        (&mut self.points, &mut self.pressures, &mut self.frames)
     }
     fn shape(&self) -> (f32, BrushTip) {
         (self.radius_pixels, self.tip)
@@ -229,22 +324,25 @@ impl Growable for MaskStroke {
 }
 
 impl Growable for IdStroke {
-    fn points_mut(&mut self) -> (&mut Vec<Vec2>, &mut Vec<f32>) {
-        (&mut self.points, &mut self.pressures)
+    fn points_mut(&mut self) -> PointLists<'_> {
+        (&mut self.points, &mut self.pressures, &mut self.frames)
     }
     fn shape(&self) -> (f32, BrushTip) {
         (self.radius_pixels, self.tip)
     }
 }
 
-/// Appends `point` to the last stroke (as a drag does) or starts `new`,
-/// returning the texels that can change.
+/// Appends `point` (with `frame` when the stroke is aligned) to the last
+/// stroke, as a drag does, or starts `new`, returning the texels that can
+/// change.
+#[allow(clippy::too_many_arguments)]
 fn grow_or_start<S: Growable>(
     strokes: &mut Vec<S>,
     new: S,
     grow: bool,
     point: Vec2,
     pressure: f32,
+    frame: StampFrame,
     resolution: TextureResolution,
 ) -> Option<TexelRect> {
     let (width, height) = (resolution.width, resolution.height);
@@ -253,16 +351,22 @@ fn grow_or_start<S: Growable>(
         && stroke.points_mut().0.len() < 64
     {
         let (radius, tip) = stroke.shape();
-        let (points, pressures) = stroke.points_mut();
+        let (points, pressures, frames) = stroke.points_mut();
         points.push(point);
         if !pressures.is_empty() {
             pressures.push(pressure);
         }
-        return stroke_texel_bounds(&points[points.len() - 2..], radius, tip, width, height);
+        if !frames.is_empty() {
+            frames.push(frame);
+        }
+        let start = points.len() - 2;
+        let frames = frames.get(start..).unwrap_or_default();
+        return stroke_texel_bounds(&points[start..], radius, tip, frames, width, height);
     }
     let mut new = new;
     let (radius, tip) = new.shape();
-    let bounds = stroke_texel_bounds(new.points_mut().0, radius, tip, width, height);
+    let (points, _, frames) = new.points_mut();
+    let bounds = stroke_texel_bounds(points, radius, tip, frames, width, height);
     strokes.push(new);
     bounds
 }
@@ -287,9 +391,27 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
     let color = [rng.byte(), 200, rng.byte(), 255];
     let emissive = [rng.byte(), 0, 90];
     let erase = rng.below(5) == 0;
+    let frame = random_frame(rng);
+    let frames = if rng.below(3) == 0 {
+        vec![frame]
+    } else {
+        Vec::new()
+    };
+    let stencil = random_stencil(rng);
+    let source = match rng.below(6) {
+        _ if erase => None,
+        0 => Some(StrokeSource::Clone {
+            offset: (rng.uv() - Vec2::splat(0.5)) * 0.08,
+        }),
+        1 => Some(StrokeSource::Smudge {
+            strength: 0.2 + rng.unit() * 0.8,
+        }),
+        _ => None,
+    };
     let layer = set.layer_mut(layer_id).unwrap();
     if layer_id == IDS {
         let stroke = IdStroke {
+            frames,
             points: vec![point],
             radius_pixels: radius,
             color: [0, 0, 255],
@@ -303,11 +425,14 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
             grow,
             point,
             pressure,
+            frame,
             resolution,
         );
     }
     if mask_stroke {
         let stroke = MaskStroke {
+            frames,
+            stencil,
             points: vec![point],
             radius_pixels: radius,
             value,
@@ -322,10 +447,14 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
             grow,
             point,
             pressure,
+            frame,
             resolution,
         );
     }
     let stroke = PaintStroke {
+        frames,
+        stencil,
+        source,
         roughness: value,
         metallic: 1.0 - value,
         height: value,
@@ -343,6 +472,7 @@ fn edit(set: &mut TextureSet, rng: &mut Lcg) -> Option<TexelRect> {
         grow,
         point,
         pressure,
+        frame,
         resolution,
     )
 }
@@ -372,7 +502,7 @@ fn tc_0257_region_rebakes_stay_exact_through_blur_and_sharpen() {
     set.layer_mut(LayerId(6)).unwrap().mask_anchor = None;
     let halo = set.region_halo();
     assert!(halo > 0 && halo < 256, "halo {halo}");
-    check_random_edits(set, 0xb1, 4);
+    check_random_edits(set, 0xc1, 6);
 }
 
 /// A stack with blur and sharpen on a layer, a mask, and a group (and no
@@ -511,7 +641,6 @@ fn check_random_edits(mut set: TextureSet, seed: u64, rounds: usize) {
         resources: Some(&resources),
     };
     let (width, height) = (set.resolution.width, set.resolution.height);
-    let halo = set.region_halo();
     let mut rng = Lcg(seed);
     let mut material = set.bake_material(context).unwrap();
     let channels = [
@@ -525,8 +654,9 @@ fn check_random_edits(mut set: TextureSet, seed: u64, rounds: usize) {
     for round in 0..rounds {
         let mut dirty = DirtyTexels::new(width, height);
         for _ in 0..1 + rng.below(4) {
+            // Clone and smudge strokes widen the halo as they arrive.
             if let Some(bounds) = edit(&mut set, &mut rng) {
-                dirty.mark(bounds.grow(halo, width, height));
+                dirty.mark(bounds.grow(set.region_halo(), width, height));
             }
         }
         for rect in dirty.rects() {
@@ -578,7 +708,10 @@ fn region_rebake_timing() {
         edit(&mut set, &mut rng);
     }
     set.layers.truncate(3);
-    set.layer_mut(MASKED).unwrap().mask_generator = None;
+    // Without mesh maps: no generator or procedural content.
+    let masked = set.layer_mut(MASKED).unwrap();
+    masked.mask_generator = None;
+    masked.graph = None;
     let context = BakeContext::default();
     let started = std::time::Instant::now();
     let mut material = set.bake_material(context).unwrap();
@@ -587,6 +720,7 @@ fn region_rebake_timing() {
         &[Vec2::new(0.4, 0.4), Vec2::new(0.41, 0.4)],
         24.0,
         BrushTip::ROUND,
+        &[],
         2048,
         2048,
     )
@@ -660,6 +794,7 @@ fn tc_0254_region_rebake_refuses_bad_targets_and_measures_halos() {
         low: 0.0,
         high: 1.0,
         invert: false,
+        effect: None,
     });
     assert_eq!(set.region_halo(), blur * 2);
 }

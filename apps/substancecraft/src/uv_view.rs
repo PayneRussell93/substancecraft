@@ -75,7 +75,16 @@ impl SubstanceCraftApp {
         });
         let pointer = ui.input(|input| input.pointer.interact_pos());
 
-        if response.dragged() && (!painting || shift || middle) {
+        if self.stroke_tools.picking_source {
+            if response.clicked()
+                && let Some(position) = pointer
+            {
+                let uv = self.uv_view.to_uv(area, position);
+                if (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y) {
+                    self.stroke_tools.set_clone_source(uv);
+                }
+            }
+        } else if response.dragged() && (!painting || shift || middle) {
             self.uv_view.pan += ui.input(|input| input.pointer.delta());
         } else if painting
             && response.dragged()
@@ -87,7 +96,7 @@ impl SubstanceCraftApp {
                 // Radial copies have no UV-space equivalent; only mirroring
                 // applies here.
                 if self.symmetry.is_some_and(|symmetry| !symmetry.is_radial()) {
-                    self.stroke_point(1, substancecraft_core::Symmetry::mirror_uv(uv), false);
+                    self.stroke_point(1, substancecraft_core::Symmetry::mirror_uv(uv), None, false);
                 }
             }
         }

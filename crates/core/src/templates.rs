@@ -125,6 +125,8 @@ impl ProjectTemplate {
             .iter()
             .enumerate()
             .map(|(index, slot)| TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(index as u64 + 1),
                 name: slot.clone(),
                 material_slot: slot.clone(),

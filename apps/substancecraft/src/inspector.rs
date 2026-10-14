@@ -70,6 +70,17 @@ impl BakeInputs {
             .bake_layer_mask(layer, generator_only, self.context())
             .map_err(|error| error.to_string())
     }
+
+    /// A quick mask of `texture_set` in grayscale.
+    pub(super) fn bake_stencil(
+        &self,
+        texture_set: &TextureSet,
+        id: substancecraft_core::StencilId,
+    ) -> Result<BakedTexture, String> {
+        texture_set
+            .bake_stencil(id, self.context())
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl SubstanceCraftApp {

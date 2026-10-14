@@ -378,6 +378,8 @@ mod tests {
                 high_poly_hash: None,
             }),
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Crate".to_owned(),
                 material_slot: "Default".to_owned(),

@@ -224,6 +224,24 @@ struct SetTextureSetRequest {
     channels: Option<Vec<String>>,
     #[schemars(description = "Optional Height-to-normal strength, 0-16")]
     height_strength: Option<f32>,
+    #[schemars(
+        description = "Optional replacement list of user-defined channels (at most 8); layers enable them as User 0 to User 7"
+    )]
+    user_channels: Option<Vec<UserChannelRequest>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UserChannelRequest {
+    #[schemars(description = "Slot 0-7; layers and export presets name it User<slot>")]
+    slot: u8,
+    #[schemars(description = "Unique display name")]
+    name: String,
+    #[schemars(
+        description = "Optional: true for one linear grey value, false (default) for sRGB colour"
+    )]
+    gray: Option<bool>,
+    #[schemars(description = "Optional value where nothing paints, sRGB [r, g, b]; default black")]
+    default: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -279,6 +297,20 @@ struct SetBitmapMaskRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetGraphRequest {
+    #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
+    project: String,
+    #[schemars(description = "Texture set id or exact name")]
+    texture_set: String,
+    #[schemars(description = "Fill layer id or exact name")]
+    layer: String,
+    #[schemars(
+        description = "Material graph as in project files: {\"nodes\": [...], \"outputs\": {\"BaseColor\": {\"Node\": 1}}}; nodes are Generator (a mask generator tagged by kind, e.g. {\"Generator\": {\"kind\": \"Noise\", ...}}), MeshMap, Uv, Bitmap, Blend, Math, Adjust, Ramp, Split, each reading only earlier nodes ({\"Node\": i}) or constants ({\"Value\": [r, g, b]}). Null removes the graph."
+    )]
+    graph: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SetPolygonMaskRequest {
     #[schemars(description = "Path of a .sproject file, inside the server's root directory")]
     project: String,
@@ -316,6 +348,10 @@ struct SetAnchorMaskRequest {
     high: Option<f32>,
     #[schemars(description = "Optional: invert the mask")]
     invert: Option<bool>,
+    #[schemars(
+        description = "Optional point among the anchor layer's effects: layer (whole layer), fill, paint, or filter N (through its Nth content filter, from 1)"
+    )]
+    effect: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -678,12 +714,31 @@ impl SubstanceCraftMcp {
     }
 
     #[tool(
-        description = "Change a texture set's name, resolution, enabled channels, or Height-to-normal strength and save the project."
+        description = "Change a texture set's name, resolution, enabled channels, Height-to-normal strength, or user-defined channels and save the project."
     )]
     fn set_texture_set(
         &self,
         Parameters(request): Parameters<SetTextureSetRequest>,
     ) -> Result<String, String> {
+        // Through JSON, so the request needs no core types.
+        let user_channels = request
+            .user_channels
+            .map(|channels| {
+                let channels: Vec<_> = channels
+                    .into_iter()
+                    .map(|user| {
+                        serde_json::json!({
+                            "slot": user.slot,
+                            "name": user.name,
+                            "gray": user.gray.unwrap_or(false),
+                            "default": user.default.unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                serde_json::from_value(serde_json::Value::Array(channels))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
         self.edit(
             &request.project,
             AutomationEdit::SetTextureSet {
@@ -692,6 +747,7 @@ impl SubstanceCraftMcp {
                 resolution: request.resolution,
                 channels: request.channels,
                 height_strength: request.height_strength,
+                user_channels,
             },
         )
     }
@@ -762,6 +818,29 @@ impl SubstanceCraftMcp {
     }
 
     #[tool(
+        description = "Give a fill layer procedural content from a material graph of generators, mesh maps, bitmaps, and adjustments (or remove it) and save the project."
+    )]
+    fn set_graph(
+        &self,
+        Parameters(request): Parameters<SetGraphRequest>,
+    ) -> Result<String, String> {
+        let graph = request
+            .graph
+            .filter(|graph| !graph.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("the graph is not valid: {error}"))?;
+        self.edit(
+            &request.project,
+            AutomationEdit::SetGraph {
+                texture_set: request.texture_set,
+                layer: request.layer,
+                graph,
+            },
+        )
+    }
+
+    #[tool(
         description = "Limit a layer to chosen mesh triangles (or every other triangle), or remove its polygon mask, and save the project."
     )]
     fn set_polygon_mask(
@@ -796,6 +875,7 @@ impl SubstanceCraftMcp {
                 low: request.low,
                 high: request.high,
                 invert: request.invert,
+                effect: request.effect,
             },
         )
     }
@@ -958,6 +1038,8 @@ mod tests {
                 high_poly_hash: None,
             }),
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Body".to_owned(),
                 material_slot: "Body".to_owned(),
@@ -1125,6 +1207,8 @@ mod tests {
                 high_poly_hash: None,
             }),
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Body".to_owned(),
                 material_slot: "Body".to_owned(),
@@ -1205,6 +1289,7 @@ mod tests {
                 resolution: Some([32, 32]),
                 channels: Some(vec!["Base Color".to_owned(), "Height".to_owned()]),
                 height_strength: Some(2.0),
+                user_channels: None,
             }))
             .unwrap();
         server
@@ -1271,6 +1356,8 @@ mod tests {
         let (folder, server) = server();
         let project = MaterialProject {
             texture_sets: vec![TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Body".to_owned(),
                 material_slot: "Body".to_owned(),
@@ -1341,6 +1428,7 @@ mod tests {
             .unwrap();
         server
             .set_anchor_mask(Parameters(SetAnchorMaskRequest {
+                effect: Default::default(),
                 project: file(),
                 texture_set: "Body".to_owned(),
                 layer: "Grime".to_owned(),
@@ -1414,6 +1502,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let error = server
             .set_anchor_mask(Parameters(SetAnchorMaskRequest {
+                effect: Default::default(),
                 project: file(),
                 texture_set: "Body".to_owned(),
                 layer: "Base".to_owned(),

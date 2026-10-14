@@ -34,10 +34,12 @@ pub enum Action {
     HoldPick,
     /// While held: drag orbits and pans instead of painting.
     HoldView,
+    /// Starts painting a quick mask, or finishes the one being painted.
+    QuickMask,
 }
 
 impl Action {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Undo,
         Self::Redo,
         Self::Save,
@@ -48,6 +50,7 @@ impl Action {
         Self::HoldErase,
         Self::HoldPick,
         Self::HoldView,
+        Self::QuickMask,
     ];
 
     pub fn label(self) -> &'static str {
@@ -62,6 +65,7 @@ impl Action {
             Self::HoldErase => "Hold: erase",
             Self::HoldPick => "Hold: pick material",
             Self::HoldView => "Hold: navigate",
+            Self::QuickMask => "Quick mask",
         }
     }
 
@@ -144,6 +148,7 @@ pub fn default_bindings() -> Vec<Binding> {
         Binding::new(HoldErase, Key::X, Modifiers::NONE),
         Binding::new(HoldPick, Key::I, Modifiers::NONE),
         Binding::new(HoldView, Key::Space, Modifiers::NONE),
+        Binding::new(QuickMask, Key::T, Modifiers::NONE),
     ]
 }
 
@@ -333,7 +338,6 @@ impl Preferences {
     }
 
     /// The first binding of `action`, for display.
-    #[cfg(test)]
     pub fn binding_of(&self, action: Action) -> Option<&Binding> {
         self.bindings
             .iter()
@@ -624,6 +628,7 @@ impl SubstanceCraftApp {
             Action::PaintMode => self.set_paint_mode(PaintMode::Paint),
             Action::EraseMode => self.set_paint_mode(PaintMode::Erase),
             Action::MaskMode => self.set_paint_mode(PaintMode::Mask),
+            Action::QuickMask => self.toggle_quick_mask(),
             Action::HoldErase | Action::HoldPick | Action::HoldView => {}
         }
     }
@@ -1097,6 +1102,8 @@ mod tests {
             layer.paint_strokes.push(stroke);
             let mut project = MaterialProject::empty();
             project.texture_sets.push(TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: TextureSetId(1),
                 name: "Set".to_owned(),
                 material_slot: "Set".to_owned(),

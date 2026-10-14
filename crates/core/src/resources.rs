@@ -920,6 +920,8 @@ mod tests {
         );
         layer.channels = [MaterialChannel::Roughness].into();
         let set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Cube".to_owned(),
             material_slot: "Cube".to_owned(),

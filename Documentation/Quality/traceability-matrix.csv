@@ -69,3 +69,8 @@ REQ-0067,Browse smart materials as thumbnails and adjust inserted instances' par
 REQ-0068,Import STEP CAD solids surfaces tessellations and assemblies as meshes,docs/feature-map.md,docs/architecture.md,,TC-0339;TC-0340;TC-0341;TC-0342;TC-0343;TC-0344,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0069,Light the viewport and renders with custom HDR environment maps,docs/feature-map.md,docs/architecture.md,,TC-0345;TC-0346;TC-0347;TC-0348,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0070,Render camera and light turntables as PNG sequences,docs/feature-map.md,docs/architecture.md,,TC-0349;TC-0350;TC-0351,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0071,Keep brush stamps round and upright on the surface where UVs stretch,docs/feature-map.md,docs/architecture.md,,TC-0352;TC-0353,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0072,Clone and smudge the layer stack and limit strokes to a quick mask,docs/feature-map.md,docs/architecture.md,,TC-0354;TC-0355;TC-0356;TC-0357,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0073,Define paint and export user channels per texture set,docs/feature-map.md,docs/architecture.md,,TC-0358;TC-0359;TC-0360;TC-0361;TC-0362,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0074,Anchor masks to individual effects within a layer,docs/feature-map.md,docs/architecture.md,,TC-0363,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0075,Give fills procedural content from material graphs and procedural material resources,docs/feature-map.md,docs/architecture.md,,TC-0364;TC-0365;TC-0366;TC-0367;TC-0368,Documentation/Quality/TestPlan-short.md,Project owner,Verified

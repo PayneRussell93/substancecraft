@@ -50,7 +50,8 @@ enum Command {
     },
     Edit {
         project: String,
-        edit: AutomationEdit,
+        // Boxed: an edit (a whole stroke) dwarfs the other commands.
+        edit: Box<AutomationEdit>,
     },
     Help,
 }
@@ -73,7 +74,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
                     .map_err(|error| format!("the edit is not valid JSON: {error}"))?;
                 Ok(Command::Edit {
                     project: project.clone(),
-                    edit,
+                    edit: Box::new(edit),
                 })
             }
             (Some(_), Some(_), Some(extra)) => Err(format!("unexpected argument `{extra}`")),
@@ -334,13 +335,13 @@ mod tests {
         ]);
         assert!(matches!(
             parsed,
-            Ok(Command::Edit {
-                edit: AutomationEdit::SetLayer {
+            Ok(Command::Edit { ref edit, .. }) if matches!(
+                **edit,
+                AutomationEdit::SetLayer {
                     opacity: Some(0.5),
                     ..
-                },
-                ..
-            })
+                }
+            )
         ));
         let bad = parse(&args("edit a.sproject {not-json}")).unwrap_err();
         assert!(bad.starts_with("the edit is not valid JSON"), "{bad}");
@@ -351,6 +352,8 @@ mod tests {
         let path = folder.path().join("cli.sproject");
         let project = substancecraft_core::MaterialProject {
             texture_sets: vec![substancecraft_core::TextureSet {
+                user_channels: Default::default(),
+                stencils: Default::default(),
                 id: substancecraft_core::TextureSetId(1),
                 name: "Body".to_owned(),
                 material_slot: "Body".to_owned(),

@@ -800,6 +800,7 @@ mod tests {
         let mut ids = MaterialLayer::new_paint(LayerId(1), "IDs");
         ids.channels = BTreeSet::from([MaterialChannel::Id]);
         ids.id_strokes.push(IdStroke {
+            frames: Default::default(),
             points: vec![glam::Vec2::new(0.25, 0.5)],
             radius_pixels: 5.0,
             color: [255, 0, 0],
@@ -821,6 +822,8 @@ mod tests {
         fill.channels = BTreeSet::from([MaterialChannel::BaseColor]);
         fill.mask_generator = Some(MaskGenerator::IdColor(red));
         let set = TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
             id: TextureSetId(1),
             name: "Body".to_owned(),
             material_slot: "Body".to_owned(),

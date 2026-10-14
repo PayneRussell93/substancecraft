@@ -217,6 +217,65 @@ impl BrushTip {
     }
 }
 
+/// Most a surface-aligned stamp may stretch along one texture axis (its
+/// larger singular value); steeper UV distortion stamps unaligned.
+pub const MAX_STAMP_STRETCH: f32 = 8.0;
+
+/// How a surface-aligned stamp lies in texture space: a 2 × 2 matrix,
+/// columns first (`[m00, m10, m01, m11]`), taking a texel offset (x right,
+/// y up the V axis) into the stamp's frame on the surface, in texel-sized
+/// units. Its determinant is ±1, so a stamp keeps its texel area while
+/// staying round and upright on the surface where the UVs stretch, shear,
+/// or turn.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StampFrame(pub [f32; 4]);
+
+impl StampFrame {
+    pub const IDENTITY: Self = Self([1.0, 0.0, 0.0, 1.0]);
+
+    pub(crate) fn apply(self, offset: Vec2) -> Vec2 {
+        let [m00, m10, m01, m11] = self.0;
+        Vec2::new(
+            m00 * offset.x + m01 * offset.y,
+            m10 * offset.x + m11 * offset.y,
+        )
+    }
+
+    /// The largest factor by which the frame lengthens a vector. With a
+    /// determinant of ±1 its inverse has the same factor, so this is how
+    /// far past its radius an aligned stamp reaches in texture space.
+    pub fn stretch(self) -> f32 {
+        let [a, b, c, d] = self.0;
+        let frobenius = a * a + b * b + c * c + d * d;
+        let determinant = a * d - b * c;
+        let spread = (frobenius * frobenius - 4.0 * determinant * determinant)
+            .max(0.0)
+            .sqrt();
+        ((frobenius + spread) * 0.5).sqrt()
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        let [a, b, c, d] = self.0;
+        self.0.iter().all(|value| value.is_finite())
+            && ((a * d - b * c).abs() - 1.0).abs() < 1e-3
+            && self.stretch() <= MAX_STAMP_STRETCH + 1e-3
+    }
+}
+
+/// Valid stamp frames: empty, or one valid frame per point.
+pub(crate) fn valid_frames(points: &[Vec2], frames: &[StampFrame]) -> bool {
+    frames.is_empty()
+        || (frames.len() == points.len() && frames.iter().all(|frame| frame.is_valid()))
+}
+
+/// The farthest any of `frames` stretches a stamp; 1 without frames.
+pub(crate) fn frames_stretch(frames: &[StampFrame]) -> f32 {
+    frames
+        .iter()
+        .map(|frame| frame.stretch())
+        .fold(1.0, f32::max)
+}
+
 /// Geometry of one stroke in UV space.
 pub(crate) struct StrokePath<'a> {
     pub points: &'a [Vec2],
@@ -224,9 +283,23 @@ pub(crate) struct StrokePath<'a> {
     pub pressures: &'a [f32],
     pub radius_pixels: f32,
     pub tip: BrushTip,
+    /// Per-point surface alignment; empty stamps in plain texture space.
+    pub frames: &'a [StampFrame],
 }
 
 impl StrokePath<'_> {
+    fn frame(&self, index: usize) -> StampFrame {
+        self.frames
+            .get(index)
+            .copied()
+            .unwrap_or(StampFrame::IDENTITY)
+    }
+
+    /// Farthest a stamp of this stroke reaches, in radii.
+    pub(crate) fn stretch(&self) -> f32 {
+        frames_stretch(self.frames)
+    }
+
     fn pressure(&self, index: usize) -> f32 {
         self.pressures
             .get(index)
@@ -269,22 +342,32 @@ pub(crate) struct CoverageTile {
     pub(crate) width: i64,
     pub(crate) height: i64,
     values: Vec<f32>,
+    /// When tracked, the unit stroke direction (pixel space) of the stamp
+    /// or segment that gave each pixel its coverage; zero for a lone dab.
+    directions: Option<Vec<Vec2>>,
 }
 
 impl CoverageTile {
-    /// A zeroed tile over the inclusive pixel bounds, or `None` when the
-    /// allocation fails.
-    fn new((min_x, min_y, max_x, max_y): (i64, i64, i64, i64)) -> Option<Self> {
+    /// A zeroed tile over the inclusive pixel bounds, tracking directions
+    /// when `directed`, or `None` when the allocation fails.
+    fn new((min_x, min_y, max_x, max_y): (i64, i64, i64, i64), directed: bool) -> Option<Self> {
         let mut tile = Self {
             min_x,
             min_y,
             width: max_x - min_x + 1,
             height: max_y - min_y + 1,
             values: Vec::new(),
+            directions: None,
         };
         let count = (tile.width * tile.height) as usize;
         tile.values.try_reserve_exact(count).ok()?;
         tile.values.resize(count, 0.0);
+        if directed {
+            let mut directions = Vec::new();
+            directions.try_reserve_exact(count).ok()?;
+            directions.resize(count, Vec2::ZERO);
+            tile.directions = Some(directions);
+        }
         Some(tile)
     }
 
@@ -306,19 +389,25 @@ impl CoverageTile {
         (top * (1.0 - ty) + bottom * ty).min(1.0)
     }
 
-    fn deposit(&mut self, x: i64, y: i64, value: f32) {
+    fn deposit(&mut self, x: i64, y: i64, value: f32, direction: Vec2) {
         let (local_x, local_y) = (x - self.min_x, y - self.min_y);
         if local_x < 0 || local_y < 0 || local_x >= self.width || local_y >= self.height {
             return;
         }
-        let slot = &mut self.values[(local_y * self.width + local_x) as usize];
-        *slot = slot.max(value);
+        let index = (local_y * self.width + local_x) as usize;
+        if value > self.values[index] {
+            self.values[index] = value;
+            if let Some(directions) = &mut self.directions {
+                directions[index] = direction;
+            }
+        }
     }
 }
 
-/// Farthest a texel can sit from the stroke's points and still be painted.
-fn stroke_reach(radius_pixels: f32, tip: BrushTip) -> f32 {
-    radius_pixels * (1.0 + tip.size_jitter) * std::f32::consts::SQRT_2
+/// Farthest a texel can sit from the stroke's points and still be painted;
+/// `stretch` is the most a surface-aligned stamp lengthens (1 when none).
+fn stroke_reach(radius_pixels: f32, tip: BrushTip, stretch: f32) -> f32 {
+    radius_pixels * (1.0 + tip.size_jitter) * std::f32::consts::SQRT_2 * stretch
         + radius_pixels * 2.0 * tip.scatter
         + 1.0
 }
@@ -329,11 +418,12 @@ pub(crate) fn stroke_pixel_bounds(
     pixels: &[Vec2],
     radius_pixels: f32,
     tip: BrushTip,
+    stretch: f32,
     width: u32,
     height: u32,
 ) -> Option<(i64, i64, i64, i64)> {
     let first = *pixels.first()?;
-    let reach = stroke_reach(radius_pixels, tip);
+    let reach = stroke_reach(radius_pixels, tip, stretch);
     let (mut lower, mut upper) = (first, first);
     for pixel in pixels {
         lower = lower.min(*pixel);
@@ -346,14 +436,16 @@ pub(crate) fn stroke_pixel_bounds(
     (min_x <= max_x && min_y <= max_y).then_some((min_x, min_y, max_x, max_y))
 }
 
-/// Texels a stroke through UV `points` (with this radius and tip) can
-/// paint on a `width` × `height` texture, or `None` when it misses it.
-/// Stamps are placed causally along the path, so the texels that change
-/// when a point is appended are the bounds of the last two points alone.
+/// Texels a stroke through UV `points` (with this radius, tip, and stamp
+/// frames: one per point, or none) can paint on a `width` × `height`
+/// texture, or `None` when it misses it. Stamps are placed causally along
+/// the path, so the texels that change when a point is appended are the
+/// bounds of the last two points (with their frames) alone.
 pub fn stroke_texel_bounds(
     points: &[Vec2],
     radius_pixels: f32,
     tip: BrushTip,
+    frames: &[StampFrame],
     width: u32,
     height: u32,
 ) -> Option<TexelRect> {
@@ -364,8 +456,14 @@ pub fn stroke_texel_bounds(
         .iter()
         .map(|point| raster::uv_to_pixel(*point, width, height))
         .collect::<Vec<_>>();
-    let (min_x, min_y, max_x, max_y) =
-        stroke_pixel_bounds(&pixels, radius_pixels, tip, width, height)?;
+    let (min_x, min_y, max_x, max_y) = stroke_pixel_bounds(
+        &pixels,
+        radius_pixels,
+        tip,
+        frames_stretch(frames),
+        width,
+        height,
+    )?;
     Some(TexelRect {
         x: min_x as u32,
         y: min_y as u32,
@@ -385,6 +483,38 @@ pub(crate) fn rasterize_stroke(
     clip: TexelRect,
     mut apply: impl FnMut(usize, f32),
 ) {
+    rasterize(
+        path,
+        (width, height),
+        resources,
+        clip,
+        false,
+        |index, coverage, _| apply(index, coverage),
+    );
+}
+
+/// [`rasterize_stroke`], also passing the unit pixel-space direction the
+/// stroke travelled where it gave each texel its coverage (zero for a
+/// single dab).
+pub(crate) fn rasterize_stroke_directed(
+    path: &StrokePath<'_>,
+    width: u32,
+    height: u32,
+    resources: Option<&ResourceImages>,
+    clip: TexelRect,
+    apply: impl FnMut(usize, f32, Vec2),
+) {
+    rasterize(path, (width, height), resources, clip, true, apply);
+}
+
+fn rasterize(
+    path: &StrokePath<'_>,
+    (width, height): (u32, u32),
+    resources: Option<&ResourceImages>,
+    clip: TexelRect,
+    directed: bool,
+    mut apply: impl FnMut(usize, f32, Vec2),
+) {
     if path.points.is_empty() || width == 0 || height == 0 || clip.is_empty() {
         return;
     }
@@ -393,9 +523,14 @@ pub(crate) fn rasterize_stroke(
         .iter()
         .map(|point| raster::uv_to_pixel(*point, width, height))
         .collect::<Vec<_>>();
-    let Some((min_x, min_y, max_x, max_y)) =
-        stroke_pixel_bounds(&pixels, path.radius_pixels, path.tip, width, height)
-    else {
+    let Some((min_x, min_y, max_x, max_y)) = stroke_pixel_bounds(
+        &pixels,
+        path.radius_pixels,
+        path.tip,
+        path.stretch(),
+        width,
+        height,
+    ) else {
         return;
     };
     let min_x = min_x.max(i64::from(clip.x));
@@ -405,17 +540,23 @@ pub(crate) fn rasterize_stroke(
     if min_x > max_x || min_y > max_y {
         return;
     }
-    let Some(tile) = coverage_tile(path, &pixels, (min_x, min_y, max_x, max_y), resources) else {
+    let bounds = (min_x, min_y, max_x, max_y);
+    let Some(tile) = draw_tile(path, &pixels, bounds, resources, directed) else {
         return;
     };
 
     for local_y in 0..tile.height {
         for local_x in 0..tile.width {
-            let coverage = tile.values[(local_y * tile.width + local_x) as usize];
+            let local = (local_y * tile.width + local_x) as usize;
+            let coverage = tile.values[local];
             if coverage > 0.0 {
                 let index =
                     clip.local_index((tile.min_x + local_x) as u32, (tile.min_y + local_y) as u32);
-                apply(index, coverage.min(1.0));
+                let direction = tile
+                    .directions
+                    .as_ref()
+                    .map_or(Vec2::ZERO, |directions| directions[local]);
+                apply(index, coverage.min(1.0), direction);
             }
         }
     }
@@ -429,8 +570,20 @@ pub(crate) fn coverage_tile(
     bounds: (i64, i64, i64, i64),
     resources: Option<&ResourceImages>,
 ) -> Option<CoverageTile> {
-    let mut tile = CoverageTile::new(bounds)?;
-    if path.tip.continuous() {
+    draw_tile(path, pixels, bounds, resources, false)
+}
+
+fn draw_tile(
+    path: &StrokePath<'_>,
+    pixels: &[Vec2],
+    bounds: (i64, i64, i64, i64),
+    resources: Option<&ResourceImages>,
+    directed: bool,
+) -> Option<CoverageTile> {
+    let mut tile = CoverageTile::new(bounds, directed)?;
+    // Aligned stamps change shape along the path, so they never merge into
+    // capsules.
+    if path.tip.continuous() && path.frames.is_empty() {
         draw_capsules(path, pixels, &mut tile);
     } else {
         draw_stamps(path, pixels, &mut tile, resources);
@@ -457,6 +610,7 @@ fn draw_capsules(path: &StrokePath<'_>, pixels: &[Vec2], tile: &mut CoverageTile
         let upper = start.max(end) + Vec2::splat(reach);
         let span = end - start;
         let length_squared = span.length_squared();
+        let direction = span.normalize_or_zero();
         for y in (lower.y.floor() as i64).max(tile.min_y)
             ..=(upper.y.ceil() as i64).min(tile.min_y + tile.height - 1)
         {
@@ -478,7 +632,7 @@ fn draw_capsules(path: &StrokePath<'_>, pixels: &[Vec2], tile: &mut CoverageTile
                     path.strength_at(pressure_start + (pressure_end - pressure_start) * amount);
                 let coverage = path.tip.falloff(distance) * strength;
                 if coverage > 0.0 {
-                    tile.deposit(x, y, coverage);
+                    tile.deposit(x, y, coverage, direction);
                 }
             }
         }
@@ -499,6 +653,7 @@ fn draw_stamps(
                  center: Vec2,
                  direction: Vec2,
                  pressure: f32,
+                 frame: StampFrame,
                  tile: &mut CoverageTile| {
         let index = index as u32;
         let random = |salt: i32| unit_float(hash3(index as i32, salt, 0, tip.seed));
@@ -510,13 +665,16 @@ fn draw_stamps(
         let mut angle = tip.angle_degrees.to_radians()
             + (random(4) * 2.0 - 1.0) * tip.angle_jitter * std::f32::consts::PI;
         if tip.follow_path && direction.length_squared() > f32::EPSILON {
-            angle += direction.y.atan2(direction.x);
+            // The path's heading in the stamp frame (V up), so the stamp's
+            // x axis runs along it.
+            let heading = frame.apply(Vec2::new(direction.x, -direction.y));
+            angle += heading.y.atan2(heading.x);
         }
         let rotation = Vec2::from_angle(-angle);
         let center = center + scatter;
         let strength = path.strength_at(pressure);
         let stamp_seed = hash3(index as i32, 7, 0, tip.seed);
-        let reach = radius * std::f32::consts::SQRT_2;
+        let reach = radius * std::f32::consts::SQRT_2 * frame.stretch().max(1.0);
         for y in ((center.y - reach).floor() as i64).max(tile.min_y)
             ..=((center.y + reach).ceil() as i64).min(tile.min_y + tile.height - 1)
         {
@@ -525,18 +683,25 @@ fn draw_stamps(
             {
                 let offset = (Vec2::new(x as f32, y as f32) - center) / radius;
                 // Pixel rows run downward; flip so stamps keep their upright
-                // orientation in UV space.
-                let local = rotation.rotate(Vec2::new(offset.x, -offset.y));
+                // orientation in UV space (or on the surface, when aligned).
+                let local = rotation.rotate(frame.apply(Vec2::new(offset.x, -offset.y)));
                 let coverage = tip.stamp_coverage(local, stamp_seed, resources) * strength;
                 if coverage > 0.0 {
-                    tile.deposit(x, y, coverage);
+                    tile.deposit(x, y, coverage, direction);
                 }
             }
         }
     };
 
     if pixels.len() == 1 {
-        place(0, pixels[0], Vec2::ZERO, path.pressure(0), tile);
+        place(
+            0,
+            pixels[0],
+            Vec2::ZERO,
+            path.pressure(0),
+            path.frame(0),
+            tile,
+        );
         return;
     }
     // Distance travelled since the last stamp; the first stamp sits on the
@@ -558,14 +723,30 @@ fn draw_stamps(
             let amount = travelled / length;
             let pressure = path.pressure(segment)
                 + (path.pressure(segment + 1) - path.pressure(segment)) * amount;
-            place(stamps, start + span * amount, direction, pressure, tile);
+            // A stamp takes the frame of the nearer point.
+            let frame = path.frame(if amount < 0.5 { segment } else { segment + 1 });
+            place(
+                stamps,
+                start + span * amount,
+                direction,
+                pressure,
+                frame,
+                tile,
+            );
             stamps += 1;
             travelled += step;
         }
         carried = length - (travelled - step);
     }
     if stamps == 0 {
-        place(0, pixels[0], Vec2::ZERO, path.pressure(0), tile);
+        place(
+            0,
+            pixels[0],
+            Vec2::ZERO,
+            path.pressure(0),
+            path.frame(0),
+            tile,
+        );
     }
 }
 
@@ -590,6 +771,7 @@ mod tests {
     fn tc_0080_round_tip_keeps_linear_falloff_and_hardness_flattens_the_core() {
         let points = [Vec2::splat(0.5)];
         let soft = StrokePath {
+            frames: Default::default(),
             points: &points,
             pressures: &[],
             radius_pixels: 8.0,
@@ -622,6 +804,7 @@ mod tests {
             Vec2::new(0.3, 0.5),
         ];
         let path = StrokePath {
+            frames: Default::default(),
             points: &points,
             pressures: &[],
             radius_pixels: 4.0,
@@ -638,6 +821,7 @@ mod tests {
     fn tc_0082_pressure_scales_radius_and_square_and_bitmap_tips_stamp_their_shape() {
         let points = [Vec2::new(0.2, 0.5), Vec2::new(0.8, 0.5)];
         let path = StrokePath {
+            frames: Default::default(),
             points: &points,
             pressures: &[0.25, 1.0],
             radius_pixels: 8.0,
@@ -651,6 +835,7 @@ mod tests {
         );
 
         let square = StrokePath {
+            frames: Default::default(),
             points: &points[..1],
             pressures: &[],
             radius_pixels: 6.0,
@@ -734,6 +919,7 @@ mod tests {
         // The new shapes paint through the stamp path.
         for shape in [BrushShape::Streak, BrushShape::Ring, BrushShape::Cloud] {
             let path = StrokePath {
+                frames: Default::default(),
                 points: &[Vec2::splat(0.5)],
                 pressures: &[],
                 radius_pixels: 10.0,
@@ -746,10 +932,86 @@ mod tests {
         }
     }
 
+    /// Texels with coverage along row `y` and along column `x`.
+    fn extents(values: &[f32], size: usize, x: usize, y: usize) -> (usize, usize) {
+        let row = (0..size).filter(|i| values[y * size + i] > 0.0).count();
+        let column = (0..size).filter(|i| values[i * size + x] > 0.0).count();
+        (row, column)
+    }
+
+    #[test]
+    fn tc_0352_surface_aligned_stamps_take_the_shape_their_frame_gives() {
+        let point = [Vec2::splat(0.5)];
+        let plain = StrokePath {
+            points: &point,
+            pressures: &[],
+            radius_pixels: 8.0,
+            tip: BrushTip {
+                hardness: 1.0,
+                ..BrushTip::ROUND
+            },
+            frames: &[],
+        };
+        let (row, column) = extents(&coverage(&plain, 65, None), 65, 32, 32);
+        assert_eq!(row, column, "round in texture space");
+        // A frame that doubles x: the surface is squeezed along U, so the
+        // stamp covers half the texels across and twice as many down.
+        let squeeze = [StampFrame([2.0, 0.0, 0.0, 0.5])];
+        assert!((squeeze[0].stretch() - 2.0).abs() < 1e-6);
+        assert!(squeeze[0].is_valid());
+        let aligned = StrokePath {
+            frames: &squeeze,
+            ..plain
+        };
+        let values = coverage(&aligned, 65, None);
+        let (row, column) = extents(&values, 65, 32, 32);
+        assert!((7..=9).contains(&row), "across {row}");
+        assert!((31..=33).contains(&column), "down {column}");
+        // The texel bounds reach as far as the stretched stamp.
+        let bounds = stroke_texel_bounds(&point, 8.0, plain.tip, &squeeze, 65, 65).unwrap();
+        let painted = values.iter().enumerate().filter(|(_, value)| **value > 0.0);
+        for (index, _) in painted {
+            let (x, y) = ((index % 65) as u32, (index / 65) as u32);
+            assert!(bounds.contains(x, y), "({x}, {y}) outside {bounds:?}");
+        }
+        // Frames must keep unit area, stay within the stretch limit, and
+        // come one per point.
+        assert!(!StampFrame([2.0, 0.0, 0.0, 2.0]).is_valid());
+        assert!(!StampFrame([10.0, 0.0, 0.0, 0.1]).is_valid());
+        assert!(valid_frames(&point, &squeeze));
+        assert!(!valid_frames(&[Vec2::ZERO, Vec2::ONE], &squeeze));
+    }
+
+    #[test]
+    fn tc_0353_follow_path_stamps_run_along_diagonal_strokes() {
+        // A thin streak along a 45-degree stroke, spaced wide so stamps
+        // stand apart: each must lie along the diagonal.
+        let points = [Vec2::new(0.2, 0.8), Vec2::new(0.8, 0.2)];
+        let path = StrokePath {
+            points: &points,
+            pressures: &[],
+            radius_pixels: 10.0,
+            tip: BrushTip {
+                shape: BrushShape::Streak,
+                hardness: 1.0,
+                spacing: 3.0,
+                follow_path: true,
+                ..BrushTip::ROUND
+            },
+            frames: &[],
+        };
+        let values = coverage(&path, 101, None);
+        // The first stamp sits on pixel (20, 20); the diagonal through it
+        // is painted, the anti-diagonal is not.
+        assert!(values[(20 + 3) * 101 + 20 + 3] > 0.0, "along the path");
+        assert_eq!(values[(20 - 3) * 101 + 20 + 3], 0.0, "across the path");
+    }
+
     #[test]
     fn tc_0083_stamps_follow_spacing_and_jitter_is_deterministic() {
         let points = [Vec2::new(0.1, 0.5), Vec2::new(0.9, 0.5)];
         let path = StrokePath {
+            frames: Default::default(),
             points: &points,
             pressures: &[],
             radius_pixels: 3.0,

@@ -6,7 +6,9 @@
 //! filters, and then blends over the stack beneath through its opacity and
 //! mask.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use glam::{Vec2, Vec3, Vec4};
 use thiserror::Error;
@@ -19,8 +21,9 @@ use crate::resources::{ProjectionMode, ResourceImages, TextureImage, luminance};
 use crate::{
     DEFAULT_BASE_COLOR, DEFAULT_HEIGHT, DEFAULT_METALLIC, DEFAULT_OPACITY, DEFAULT_ROUGHNESS,
     LayerFill, LayerId, MAX_BAKE_PIXELS, MAX_TEXTURE_DIMENSION, MAX_TEXTURE_SET_PIXELS,
-    MaskGenerator, MaterialChannel, MaterialLayer, MeshGeometry, MeshMaps, PaintStroke, ResourceId,
-    TextureResolution, TextureSet, raster, valid_height_strength, valid_layer_strokes,
+    MaskGenerator, MaskStroke, MaterialChannel, MaterialLayer, MeshGeometry, MeshMaps, PaintStroke,
+    ResourceId, StencilId, StrokeSource, TextureResolution, TextureSet, raster,
+    valid_height_strength, valid_layer_strokes,
 };
 
 /// With strength 1, a full 0..1 height step across this fraction of a
@@ -79,6 +82,11 @@ pub enum BakeError {
     InvalidExportPreset(#[from] crate::export::ExportPresetError),
     #[error("a region rebake needs a target the size of the texture set and a region inside it")]
     RegionMismatch,
+    #[error(
+        "clone and smudge strokes read the layers beneath theirs, so their layer cannot be \
+         flattened on its own"
+    )]
+    FlattenReadsStack,
 }
 
 /// Data a texture bake may need: geometry for polygon masks, baked mesh
@@ -100,7 +108,8 @@ impl<'a> BakeContext<'a> {
     }
 }
 
-/// Channels [`TextureSet::flatten_layer`] bakes.
+/// Built-in channels [`TextureSet::flatten_layer`] bakes; it bakes user
+/// channels too.
 pub const FLATTEN_CHANNELS: [MaterialChannel; 7] = [
     MaterialChannel::BaseColor,
     MaterialChannel::Roughness,
@@ -220,19 +229,21 @@ pub(crate) struct LayerMasks(BTreeMap<LayerId, Vec<f32>>);
 
 pub(crate) fn plane_data(channel: MaterialChannel) -> PlaneData {
     match channel {
-        MaterialChannel::BaseColor | MaterialChannel::Emissive | MaterialChannel::Id => {
-            PlaneData::Color
-        }
+        MaterialChannel::BaseColor
+        | MaterialChannel::Emissive
+        | MaterialChannel::Id
+        | MaterialChannel::User(_) => PlaneData::Color,
         MaterialChannel::Normal => PlaneData::Vector,
         _ => PlaneData::Scalar,
     }
 }
 
-/// Texel of a channel no layer has painted.
+/// Texel of a channel no layer has painted. Base Color and user channels
+/// start transparent and are laid over their defaults when exported.
 pub(crate) fn base_texel(channel: MaterialChannel) -> Result<Vec4, BakeError> {
     let scalar = |value: f32| Vec4::new(value, value, value, 1.0);
     Ok(match channel {
-        MaterialChannel::BaseColor => Vec4::ZERO,
+        MaterialChannel::BaseColor | MaterialChannel::User(_) => Vec4::ZERO,
         MaterialChannel::Emissive => Vec4::new(0.0, 0.0, 0.0, 1.0),
         MaterialChannel::Roughness => scalar(DEFAULT_ROUGHNESS),
         MaterialChannel::Metallic => scalar(DEFAULT_METALLIC),
@@ -373,6 +384,7 @@ fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
         MaterialChannel::Metallic => scalar(fill.metallic),
         MaterialChannel::Height => scalar(fill.height),
         MaterialChannel::Opacity => scalar(fill.material_opacity),
+        MaterialChannel::User(slot) => rgb_unit(fill.user.get(slot.into())).extend(1.0),
         _ => Vec4::new(0.0, 0.0, 1.0, 1.0),
     }
 }
@@ -401,6 +413,7 @@ fn stroke_value(stroke: &PaintStroke, channel: MaterialChannel) -> (Vec3, f32) {
         MaterialChannel::Metallic => (Vec3::splat(stroke.metallic), 1.0),
         MaterialChannel::Height => (Vec3::splat(stroke.height), 1.0),
         MaterialChannel::Opacity => (Vec3::splat(stroke.material_opacity), 1.0),
+        MaterialChannel::User(slot) => (rgb_unit(stroke.user.get(slot.into())), 1.0),
         _ => (Vec3::Z, 1.0),
     }
 }
@@ -462,6 +475,8 @@ struct Compositor<'a> {
     region: TexelRect,
     /// Records each layer's values at one texel (the surface inspector).
     probe: Option<&'a crate::inspect::Probe>,
+    /// Quick masks evaluated over `region` so far.
+    stencils: RefCell<BTreeMap<StencilId, Rc<Vec<f32>>>>,
 }
 
 impl Compositor<'_> {
@@ -498,10 +513,10 @@ impl Compositor<'_> {
                 self.composite(children, &mut local)?;
             } else {
                 if let Some(fill) = &layer.fill {
-                    self.render_fill(fill, &mut local)?;
+                    self.render_fill(fill, layer.graph.as_ref(), &mut local)?;
                 }
                 for stroke in &layer.paint_strokes {
-                    self.render_stroke(stroke, &mut local)?;
+                    self.render_stroke(stroke, target, &mut local)?;
                 }
             }
             filters::apply_to_plane(
@@ -578,7 +593,17 @@ impl Compositor<'_> {
         Ok(())
     }
 
-    fn render_fill(&self, fill: &LayerFill, local: &mut [Vec4]) -> Result<(), BakeError> {
+    fn render_fill(
+        &self,
+        fill: &LayerFill,
+        graph: Option<&crate::MaterialGraph>,
+        local: &mut [Vec4],
+    ) -> Result<(), BakeError> {
+        if let Some(graph) = graph
+            && let Some(output) = graph.outputs.get(&self.channel).copied()
+        {
+            return self.render_graph(graph, output, local);
+        }
         let Some(resource) = fill.textures.for_channel(self.channel) else {
             let texel = fill_texel(fill, self.channel);
             if fill.projection.mode == ProjectionMode::Decal {
@@ -635,16 +660,58 @@ impl Compositor<'_> {
         Ok(())
     }
 
-    fn render_stroke(&self, stroke: &PaintStroke, local: &mut [Vec4]) -> Result<(), BakeError> {
-        let (value, color_alpha) = stroke_value(stroke, self.channel);
+    /// Fills `local` with a graph output, opaque, converted for the
+    /// channel: colour as sRGB, scalars as luminance, normals decoded.
+    fn render_graph(
+        &self,
+        graph: &crate::MaterialGraph,
+        output: crate::GraphInput,
+        local: &mut [Vec4],
+    ) -> Result<(), BakeError> {
+        let maps = if graph.needs_mesh_maps() {
+            Some(self.context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?)
+        } else {
+            None
+        };
+        let evaluator = graph.evaluator(self.context.resources)?;
+        let data = self.data;
+        parallel_fill_region(local, self.region, self.width(), self.height(), |uv| {
+            let sample = maps.map(|maps| maps.sample(uv));
+            let value = evaluator.evaluate(output, uv, sample.as_ref());
+            match data {
+                PlaneData::Color => value.clamp(Vec3::ZERO, Vec3::ONE).extend(1.0),
+                PlaneData::Scalar => {
+                    Vec3::splat(luminance(value.extend(1.0)).clamp(0.0, 1.0)).extend(1.0)
+                }
+                PlaneData::Vector => (value * 2.0 - Vec3::ONE).normalize_or(Vec3::Z).extend(1.0),
+            }
+        });
+        Ok(())
+    }
+
+    /// Renders a paint stroke into the layer's `local` buffer; `backdrop`
+    /// is the stack beneath the layer, which clone and smudge read.
+    fn render_stroke(
+        &self,
+        stroke: &PaintStroke,
+        backdrop: &[Vec4],
+        local: &mut [Vec4],
+    ) -> Result<(), BakeError> {
+        let stencil = stroke.stencil.map(|id| self.stencil(id)).transpose()?;
+        let limit = |index: usize| stencil.as_ref().map_or(1.0, |values| values[index]);
         let path = StrokePath {
             points: &stroke.points,
             pressures: &stroke.pressures,
             radius_pixels: stroke.radius_pixels,
             tip: stroke.tip,
+            frames: &stroke.frames,
         };
+        if let Some(source) = stroke.source {
+            return self.render_sampled_stroke(stroke, source, &path, backdrop, local, limit);
+        }
+        let (value, color_alpha) = stroke_value(stroke, self.channel);
         let apply = |index: usize, coverage: f32| {
-            let amount = (coverage * stroke.opacity).clamp(0.0, 1.0);
+            let amount = (coverage * stroke.opacity * limit(index)).clamp(0.0, 1.0);
             if stroke.erase {
                 local[index].w *= 1.0 - amount;
             } else {
@@ -660,12 +727,135 @@ impl Compositor<'_> {
             apply,
         )
     }
+
+    /// Clone and smudge: each texel the stroke covers takes the stack as
+    /// composited so far (`backdrop` with the layer's `local` content over
+    /// it) from where `source` points. What the stroke reads is fixed
+    /// before it writes, so stamps never read each other.
+    fn render_sampled_stroke(
+        &self,
+        stroke: &PaintStroke,
+        source: StrokeSource,
+        path: &StrokePath<'_>,
+        backdrop: &[Vec4],
+        local: &mut [Vec4],
+        limit: impl Fn(usize) -> f32,
+    ) -> Result<(), BakeError> {
+        let region = self.region;
+        let mut view = try_filled(region.len(), Vec4::ZERO)?;
+        for ((view, below), above) in view.iter_mut().zip(backdrop).zip(local.iter()) {
+            *view = *below;
+            over(view, above.truncate(), above.w, self.data);
+        }
+        let (width, height) = (self.width(), self.height());
+        // Pixel rows run down, so +V is up the texture.
+        let shift_of = |direction: Vec2| match source {
+            StrokeSource::Clone { offset } => Vec2::new(
+                offset.x * width.saturating_sub(1) as f32,
+                -offset.y * height.saturating_sub(1) as f32,
+            ),
+            StrokeSource::Smudge { strength } => -direction * stroke.radius_pixels * strength,
+        };
+        brush::rasterize_stroke_directed(
+            path,
+            width,
+            height,
+            self.context.resources,
+            region,
+            |index, coverage, direction| {
+                let index_u32 = index as u32;
+                let texel = Vec2::new(
+                    (region.x + index_u32 % region.width) as f32,
+                    (region.y + index_u32 / region.width) as f32,
+                );
+                let Some(sample) = sample_plane(
+                    &view,
+                    region,
+                    (width, height),
+                    texel + shift_of(direction),
+                    self.data,
+                ) else {
+                    return;
+                };
+                let amount = (coverage * stroke.opacity * limit(index)).clamp(0.0, 1.0);
+                over(
+                    &mut local[index],
+                    sample.truncate(),
+                    amount * sample.w,
+                    self.data,
+                );
+            },
+        );
+        Ok(())
+    }
+
+    /// Quick mask `id` over the region, evaluated once per compositor.
+    fn stencil(&self, id: StencilId) -> Result<Rc<Vec<f32>>, BakeError> {
+        if let Some(values) = self.stencils.borrow().get(&id) {
+            return Ok(Rc::clone(values));
+        }
+        let values = Rc::new(self.set.stencil_values(id, self.context, self.region)?);
+        self.stencils.borrow_mut().insert(id, Rc::clone(&values));
+        Ok(values)
+    }
+}
+
+/// Bilinear sample of a straight-alpha `plane` (row-major over `region`)
+/// at pixel `point`, clamped to the `width` × `height` texture. `None` when
+/// a neighbour lies outside `region`, which only happens in the halo of a
+/// region rebake, never in a full bake.
+fn sample_plane(
+    plane: &[Vec4],
+    region: TexelRect,
+    (width, height): (u32, u32),
+    point: Vec2,
+    data: PlaneData,
+) -> Option<Vec4> {
+    if !point.is_finite() || width == 0 || height == 0 {
+        return None;
+    }
+    let (last_x, last_y) = (width - 1, height - 1);
+    let point = point.clamp(Vec2::ZERO, Vec2::new(last_x as f32, last_y as f32));
+    let (x0, y0) = (point.x.floor() as u32, point.y.floor() as u32);
+    let (x1, y1) = ((x0 + 1).min(last_x), (y0 + 1).min(last_y));
+    let inside = |x: u32, y: u32| {
+        x >= region.x && x < region.right() && y >= region.y && y < region.bottom()
+    };
+    if !inside(x0, y0) || !inside(x1, y1) {
+        return None;
+    }
+    let (tx, ty) = (point.x - x0 as f32, point.y - y0 as f32);
+    // Interpolate premultiplied, so transparent texels carry no colour.
+    let mut sum = Vec4::ZERO;
+    for (x, y, weight) in [
+        (x0, y0, (1.0 - tx) * (1.0 - ty)),
+        (x1, y0, tx * (1.0 - ty)),
+        (x0, y1, (1.0 - tx) * ty),
+        (x1, y1, tx * ty),
+    ] {
+        let texel = plane[region.local_index(x, y)];
+        sum += (texel.truncate() * texel.w).extend(texel.w) * weight;
+    }
+    if sum.w <= 1e-6 {
+        return Some(Vec4::ZERO);
+    }
+    let mut color = sum.truncate() / sum.w;
+    if data == PlaneData::Vector {
+        color = color.normalize_or(Vec3::Z);
+    }
+    Some(color.extend(sum.w.min(1.0)))
 }
 
 impl TextureSet {
     /// True when a visible layer uses a mask generator or triplanar bitmap,
-    /// so baking needs mesh maps.
+    /// or a quick mask was painted through the camera, so baking needs mesh
+    /// maps.
     pub fn requires_mesh_maps(&self) -> bool {
+        let projected_stencil = self
+            .stencils
+            .iter()
+            .flat_map(|stencil| &stencil.strokes)
+            .any(|stroke| stroke.camera.is_some());
         fn visible_need(layers: &[MaterialLayer]) -> bool {
             layers.iter().any(|layer| {
                 layer.shown()
@@ -673,7 +863,7 @@ impl TextureSet {
                         || layer.children.as_deref().is_some_and(visible_need))
             })
         }
-        visible_need(&self.layers)
+        projected_stencil || visible_need(&self.layers)
     }
 
     /// Every bitmap resource the layer tree references.
@@ -695,7 +885,7 @@ impl TextureSet {
         region: TexelRect,
     ) -> Result<Option<Vec<u8>>, BakeError> {
         let layers = self.walk_layers();
-        if layers.iter().any(|layer| !valid_layer_strokes(layer)) {
+        if layers.iter().any(|layer| !valid_layer_strokes(layer)) || !self.has_valid_stencils() {
             return Err(BakeError::InvalidStrokeData);
         }
         if layers.iter().any(|layer| !layer.has_valid_settings())
@@ -739,11 +929,26 @@ impl TextureSet {
                     + filters::spatial_halo(&layer.mask_filters, self.resolution.width)
             })
             .sum();
+        // Clone and smudge strokes read the stack some way off.
+        let sources: u32 = layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .paint_strokes
+                    .iter()
+                    .filter_map(|stroke| {
+                        let (width, height) = (self.resolution.width, self.resolution.height);
+                        Some(stroke.source?.reach(stroke.radius_pixels, width, height))
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .fold(0, u32::saturating_add);
         let anchors = layers
             .iter()
             .filter(|layer| layer.mask_anchor.is_some())
             .count() as u32;
-        filters.saturating_mul(anchors + 1)
+        filters.saturating_add(sources).saturating_mul(anchors + 1)
     }
 
     /// Rebakes only `region` of `textures`, a [`Self::bake_material`]
@@ -830,6 +1035,8 @@ impl TextureSet {
     /// Composites every visible layer that enables `channel`.
     ///
     /// - Base Color: straight-alpha RGBA.
+    /// - User channels: opaque RGB over the channel's default (straight
+    ///   alpha when the set does not define the channel).
     /// - Emissive: opaque RGB over black.
     /// - Roughness, Metallic, Height, Opacity: opaque grayscale starting from
     ///   [`DEFAULT_ROUGHNESS`], [`DEFAULT_METALLIC`], [`DEFAULT_HEIGHT`],
@@ -972,10 +1179,15 @@ impl TextureSet {
             )
         } else {
             let masks = self.layer_masks_in(&[channel], context, id_map, region)?;
-            plane_to_rgba8(
-                &self.composite_region(channel, context, &masks, None, region)?,
-                plane_data(channel),
-            )
+            let mut plane = self.composite_region(channel, context, &masks, None, region)?;
+            if let Some(user) = self.user_channel(channel) {
+                // A user channel's map is opaque, over its default.
+                let default = rgb_unit(user.default);
+                for texel in &mut plane {
+                    *texel = (texel.truncate() * texel.w + default * (1.0 - texel.w)).extend(1.0);
+                }
+            }
+            plane_to_rgba8(&plane, plane_data(channel))
         })
     }
 
@@ -1196,6 +1408,7 @@ impl TextureSet {
             masks,
             region,
             probe,
+            stencils: RefCell::default(),
         }
         .composite(&self.layers, &mut plane)?;
         Ok(plane)
@@ -1324,25 +1537,7 @@ impl TextureSet {
                 *value *= anchored;
             }
         }
-        for stroke in &layer.mask_strokes {
-            let path = StrokePath {
-                points: &stroke.points,
-                pressures: &stroke.pressures,
-                radius_pixels: stroke.radius_pixels,
-                tip: stroke.tip,
-            };
-            rasterize_any_stroke(
-                &path,
-                stroke.camera.as_ref(),
-                context,
-                (width, height),
-                region,
-                |index, coverage| {
-                    let alpha = (stroke.opacity * coverage).clamp(0.0, 1.0);
-                    values[index] += (stroke.value - values[index]) * alpha;
-                },
-            )?;
-        }
+        self.apply_mask_strokes(&layer.mask_strokes, context, region, &mut values)?;
         let grid = PlaneGrid {
             region,
             width,
@@ -1395,6 +1590,66 @@ impl TextureSet {
             *value = value.clamp(0.0, 1.0);
         }
         Ok(Some(values))
+    }
+
+    /// Blends grayscale `strokes` over `values` (row-major over `region`),
+    /// each limited by its quick mask.
+    fn apply_mask_strokes(
+        &self,
+        strokes: &[MaskStroke],
+        context: BakeContext<'_>,
+        region: TexelRect,
+        values: &mut [f32],
+    ) -> Result<(), BakeError> {
+        let (width, height) = (self.resolution.width, self.resolution.height);
+        let mut stencils: BTreeMap<StencilId, Vec<f32>> = BTreeMap::new();
+        for stroke in strokes {
+            if let Some(id) = stroke.stencil
+                && !stencils.contains_key(&id)
+            {
+                stencils.insert(id, self.stencil_values(id, context, region)?);
+            }
+            let stencil = stroke.stencil.and_then(|id| stencils.get(&id));
+            let path = StrokePath {
+                points: &stroke.points,
+                pressures: &stroke.pressures,
+                radius_pixels: stroke.radius_pixels,
+                tip: stroke.tip,
+                frames: &stroke.frames,
+            };
+            rasterize_any_stroke(
+                &path,
+                stroke.camera.as_ref(),
+                context,
+                (width, height),
+                region,
+                |index, coverage| {
+                    let limit = stencil.map_or(1.0, |values| values[index]);
+                    let alpha = (stroke.opacity * coverage * limit).clamp(0.0, 1.0);
+                    values[index] += (stroke.value - values[index]) * alpha;
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Quick mask `id` over `region`, row-major within it: 0 is closed and
+    /// 1 open.
+    pub(crate) fn stencil_values(
+        &self,
+        id: StencilId,
+        context: BakeContext<'_>,
+        region: TexelRect,
+    ) -> Result<Vec<f32>, BakeError> {
+        let stencil = self.stencil(id).ok_or(BakeError::InvalidStrokeData)?;
+        let mut values = try_filled(region.len(), 0.0_f32)?;
+        self.apply_mask_strokes(&stencil.strokes, context, region, &mut values)?;
+        if stencil.invert {
+            for value in &mut values {
+                *value = 1.0 - *value;
+            }
+        }
+        Ok(values)
     }
 
     /// True when `layer` may anchor to `anchor`: the anchor exists, is
@@ -1453,9 +1708,15 @@ impl TextureSet {
         if !self.anchor_is_valid(layer, anchor.layer) {
             return Err(BakeError::InvalidLayerSettings);
         }
-        let stack = self
+        let mut stack = self
             .truncated_through(anchor.layer)
             .ok_or(BakeError::InvalidLayerSettings)?;
+        if let Some(effect) = anchor.effect
+            && let Some(source) = stack.layer_mut(anchor.layer)
+        {
+            effect.truncate(source);
+        }
+
         let id_map = stack.validate_for_region(region)?;
         let masks = stack.layer_masks_in(&[anchor.channel], context, id_map.as_deref(), region)?;
         let plane = stack.composite_region(anchor.channel, context, &masks, None, region)?;
@@ -1482,8 +1743,19 @@ impl TextureSet {
         let layer = self
             .layer(layer_id)
             .ok_or(BakeError::InvalidLayerSettings)?;
+        // Flattening bakes the layer alone, so strokes that read the stack
+        // beneath it would bake differently.
+        if layer.walk().iter().any(|inner| {
+            inner
+                .paint_strokes
+                .iter()
+                .any(|stroke| stroke.source.is_some())
+        }) {
+            return Err(BakeError::FlattenReadsStack);
+        }
         let channels: Vec<MaterialChannel> = FLATTEN_CHANNELS
             .into_iter()
+            .chain(MaterialChannel::user_slots())
             .filter(|channel| contributes(layer, &[*channel]))
             .collect();
         let textures =
@@ -1502,6 +1774,7 @@ impl TextureSet {
                         masks: &masks,
                         region,
                         probe: None,
+                        stencils: RefCell::default(),
                     }
                     .composite(std::slice::from_ref(layer), &mut plane)?;
                     let mut rgba8 = Vec::new();
@@ -1666,6 +1939,7 @@ impl TextureSet {
                     pressures: &stroke.pressures,
                     radius_pixels: stroke.radius_pixels,
                     tip: stroke.tip,
+                    frames: &stroke.frames,
                 };
                 brush::rasterize_stroke(
                     &path,
@@ -1841,3 +2115,7 @@ fn checked_region(region: TexelRect) -> Result<(), BakeError> {
 #[cfg(test)]
 #[path = "compositing_region_tests.rs"]
 mod region_tests;
+
+#[cfg(test)]
+#[path = "compositing_stroke_tests.rs"]
+mod stroke_tests;
