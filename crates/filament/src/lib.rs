@@ -26,6 +26,8 @@ const MAX_MESH_VERTICES: usize = 3_000_000;
 const FLOATS_PER_VERTEX: usize = 9;
 
 static VIEWPORT_MATERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/viewport.filamat"));
+static BACKGROUND_MATERIAL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/background.filamat"));
 
 mod mips;
 
@@ -45,6 +47,8 @@ mod ffi {
         pub fn sc_renderer_create(
             material: *const u8,
             material_len: usize,
+            background: *const u8,
+            background_len: usize,
             width: u32,
             height: u32,
         ) -> *mut ScRenderer;
@@ -127,6 +131,12 @@ mod ffi {
             has_sun: bool,
             sun_direction: *const f32,
         );
+        pub fn sc_renderer_set_background(renderer: *mut ScRenderer, show: bool, blur: f32);
+        pub fn sc_renderer_set_global_illumination(
+            renderer: *mut ScRenderer,
+            enabled: bool,
+            radius: f32,
+        );
     }
 }
 
@@ -182,6 +192,8 @@ pub struct FilamentRuntime {
     /// triangles.
     slot_primitives: Vec<Option<u32>>,
     preview_mode: Option<bool>,
+    /// Screen-space global illumination (AO, contact shadows, reflections).
+    global_illumination: bool,
     mesh_bounds: Option<(Vec3, Vec3)>,
     target_size: [u32; 2],
 }
@@ -194,6 +206,8 @@ impl FilamentRuntime {
             ffi::sc_renderer_create(
                 VIEWPORT_MATERIAL.as_ptr(),
                 VIEWPORT_MATERIAL.len(),
+                BACKGROUND_MATERIAL.as_ptr(),
+                BACKGROUND_MATERIAL.len(),
                 size[0],
                 size[1],
             )
@@ -205,6 +219,7 @@ impl FilamentRuntime {
             retained: None,
             slot_primitives: vec![Some(0)],
             preview_mode: None,
+            global_illumination: false,
             mesh_bounds: None,
             target_size: size,
         };
@@ -477,6 +492,21 @@ impl FilamentRuntime {
         }
     }
 
+    /// Shows the environment behind the mesh (`Some(blur)`, blur `0..=1` from sharp to its
+    /// roughest prefiltered level) through a virtual perspective lens aimed like the camera, or
+    /// hides it (`None`). It appears once an environment is set.
+    pub fn set_background(&mut self, background: Option<f32>) {
+        let blur = background.map_or(0.0, |blur| finite_or_zero(blur).clamp(0.0, 1.0));
+        // SAFETY: `raw` is a live renderer owned by `self`.
+        unsafe { ffi::sc_renderer_set_background(self.raw.as_ptr(), background.is_some(), blur) };
+    }
+
+    /// Turns screen-space global illumination on or off: ambient occlusion with bent normals
+    /// and sun contact shadows, plus screen-space reflections, scaled to the mesh.
+    pub fn set_global_illumination(&mut self, enabled: bool) {
+        self.global_illumination = enabled;
+    }
+
     /// Renders one frame and schedules an RGBA8 readback (rows top to bottom). Returns
     /// `Ok(false)` when Filament skipped the frame, in which case `readback` is dropped unused.
     /// Otherwise `readback` runs from a later [`FilamentRuntime::poll`] call.
@@ -500,6 +530,16 @@ impl FilamentRuntime {
             return Err(FilamentError::InvalidMesh);
         };
         self.configure_camera(bounds, camera, size, pixels_per_point);
+        // Effects reach a fraction of the mesh size, whatever its units; applied each frame so
+        // contact shadows follow the sun.
+        // SAFETY: `raw` is a live renderer owned by `self`.
+        unsafe {
+            ffi::sc_renderer_set_global_illumination(
+                self.raw.as_ptr(),
+                self.global_illumination,
+                bounds.1.length().max(0.01),
+            );
+        }
 
         let user = Box::into_raw(Box::new(Readback {
             width: size[0],

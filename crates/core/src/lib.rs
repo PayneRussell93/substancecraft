@@ -1000,6 +1000,11 @@ pub struct HighToLowOptions {
     /// parts needing a tighter or looser cage than the rest.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cage_scales: BTreeMap<String, f32>,
+    /// Skew map painted in the app: grayscale UV strokes over black, white
+    /// applying skew correction fully. Used instead of a skew-map bitmap
+    /// when present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skew_strokes: Vec<MaskStroke>,
 }
 
 /// Range of a part's cage-distance multiplier.
@@ -1019,6 +1024,45 @@ impl HighToLowOptions {
         self.cage_scales
             .values()
             .all(|scale| scale.is_finite() && CAGE_SCALE_RANGE.contains(scale))
+            && self.skew_strokes.len() <= MAX_STENCIL_STROKES
+            && self.skew_strokes.iter().all(|stroke| {
+                stroke.camera.is_none() && stroke.stencil.is_none() && valid_mask_stroke(stroke)
+            })
+    }
+
+    /// The painted skew map as a `resolution`² grayscale bitmap, or `None`
+    /// when nothing is painted.
+    pub fn skew_image(&self, resolution: u32) -> Option<TextureImage> {
+        if self.skew_strokes.is_empty() {
+            return None;
+        }
+        let id = StencilId(1);
+        let set = TextureSet {
+            id: TextureSetId(0),
+            name: String::new(),
+            material_slot: String::new(),
+            resolution: TextureResolution {
+                width: resolution,
+                height: resolution,
+            },
+            channels: BTreeSet::new(),
+            layers: Vec::new(),
+            height_strength: DEFAULT_HEIGHT_STRENGTH,
+            export: None,
+            stencils: vec![Stencil {
+                id,
+                strokes: self.skew_strokes.clone(),
+                invert: false,
+            }],
+            user_channels: Vec::new(),
+        };
+        let baked = set.bake_stencil(id, BakeContext::default()).ok()?;
+        Some(TextureImage {
+            width: baked.width,
+            height: baked.height,
+            rgba8: baked.rgba8,
+            color_space: ColorSpace::Raw,
+        })
     }
 }
 

@@ -52,6 +52,17 @@ pub fn relink_mesh_sources(project: &mut MaterialProject, roots: &[PathBuf]) -> 
         notes.push(format!("high-poly mesh → {}", found.display()));
         mesh.high_poly_source = Some(found.to_string_lossy().into_owned());
     }
+    // The cage keeps no content hash, so it is found by name.
+    if let Some(cage) = mesh.high_to_low.cage_source.clone()
+        && !std::path::Path::new(&cage).exists()
+        && let Some(found) =
+            find_relink_candidates_by_content(std::path::Path::new(&cage), None, roots)
+                .into_iter()
+                .next()
+    {
+        notes.push(format!("cage mesh → {}", found.display()));
+        mesh.high_to_low.cage_source = Some(found.to_string_lossy().into_owned());
+    }
     notes
 }
 

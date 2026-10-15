@@ -114,38 +114,34 @@ impl SubstanceCraftApp {
         let texture = self.uv_preview_texture(ui.ctx());
         // Each UDIM tile sits in its own unit square, showing its cell of
         // the atlas; without tiles the preview fills the 0..1 square.
-        let tiles: Vec<(Option<substancecraft_core::UdimTile>, Rect, Rect)> =
-            match &self.udim_atlas {
-                Some(atlas) => {
-                    let (columns, rows) = atlas.grid();
-                    atlas
-                        .tiles()
-                        .iter()
-                        .enumerate()
-                        .map(|(index, tile)| {
-                            let offset = tile.offset();
-                            let rect = square.translate(vec2(
-                                offset.x * square.width(),
-                                -offset.y * square.height(),
-                            ));
-                            let (column, row) = (index as u32 % columns, index as u32 / columns);
-                            let cell = Rect::from_min_size(
-                                pos2(
-                                    column as f32 / columns as f32,
-                                    (rows - 1 - row) as f32 / rows as f32,
-                                ),
-                                vec2(1.0 / columns as f32, 1.0 / rows as f32),
-                            );
-                            (Some(*tile), rect, cell)
-                        })
-                        .collect()
-                }
-                None => vec![(
-                    None,
-                    square,
-                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                )],
-            };
+        let tiles: Vec<(Option<substancecraft_core::UdimTile>, Rect, Rect)> = match &self.udim_atlas
+        {
+            Some(atlas) => {
+                let (columns, rows) = atlas.grid();
+                atlas
+                    .tiles()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tile)| {
+                        let offset = tile.offset();
+                        let rect = square.translate(vec2(
+                            offset.x * square.width(),
+                            -offset.y * square.height(),
+                        ));
+                        let (column, row) = (index as u32 % columns, index as u32 / columns);
+                        let cell = Rect::from_min_size(
+                            pos2(
+                                column as f32 / columns as f32,
+                                (rows - 1 - row) as f32 / rows as f32,
+                            ),
+                            vec2(1.0 / columns as f32, 1.0 / rows as f32),
+                        );
+                        (Some(*tile), rect, cell)
+                    })
+                    .collect()
+            }
+            None => vec![(None, square, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)))],
+        };
         for (tile, rect, cell) in &tiles {
             paint_checker(&painter, *rect);
             if let Some(texture) = &texture {

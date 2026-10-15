@@ -110,7 +110,12 @@ fn shift_layer(layer: &mut MaterialLayer, offset: Vec2, tile: UdimTile) {
 /// texels of a texture `size` texels across, less one) may touch the unit
 /// square. Generous: it allows for size jitter, scatter, and stamp frames
 /// that stretch a stamp up to [`crate::brush::MAX_STAMP_STRETCH`] times.
-fn reaches_unit_square(points: &[Vec2], radius_pixels: f32, tip: crate::BrushTip, size: Vec2) -> bool {
+fn reaches_unit_square(
+    points: &[Vec2],
+    radius_pixels: f32,
+    tip: crate::BrushTip,
+    size: Vec2,
+) -> bool {
     let stretch = crate::brush::MAX_STAMP_STRETCH.sqrt();
     let reach = radius_pixels.max(1.0)
         * (1.0 + tip.size_jitter.max(0.0))
@@ -118,8 +123,7 @@ fn reaches_unit_square(points: &[Vec2], radius_pixels: f32, tip: crate::BrushTip
         / size
         + Vec2::splat(1e-3);
     points.iter().any(|point| {
-        !point.is_finite()
-            || (point.cmpge(-reach).all() && point.cmple(Vec2::ONE + reach).all())
+        !point.is_finite() || (point.cmpge(-reach).all() && point.cmple(Vec2::ONE + reach).all())
     })
 }
 
@@ -298,11 +302,21 @@ impl TextureSet {
             for layer in layers {
                 layer.paint_strokes.retain(|stroke| {
                     stroke.camera.is_some()
-                        || reaches_unit_square(&stroke.points, stroke.radius_pixels, stroke.tip, size)
+                        || reaches_unit_square(
+                            &stroke.points,
+                            stroke.radius_pixels,
+                            stroke.tip,
+                            size,
+                        )
                 });
                 layer.mask_strokes.retain(|stroke| {
                     stroke.camera.is_some()
-                        || reaches_unit_square(&stroke.points, stroke.radius_pixels, stroke.tip, size)
+                        || reaches_unit_square(
+                            &stroke.points,
+                            stroke.radius_pixels,
+                            stroke.tip,
+                            size,
+                        )
                 });
                 layer.id_strokes.retain(|stroke| {
                     reaches_unit_square(&stroke.points, stroke.radius_pixels, stroke.tip, size)
@@ -485,7 +499,10 @@ mod tests {
         assert_eq!(packed.pixel(5, 2).unwrap()[0], 3);
         assert_eq!(packed.pixel(0, 0).unwrap()[0], 4, "1011 top left");
         assert_eq!(packed.pixel(5, 0).unwrap(), [0; 4], "empty cell");
-        assert!(five.assemble(&tiles[..4].iter().collect::<Vec<_>>()).is_none());
+        assert!(
+            five.assemble(&tiles[..4].iter().collect::<Vec<_>>())
+                .is_none()
+        );
 
         // A tile's copy keeps only strokes that can reach it, so painting
         // another tile leaves it unchanged.
@@ -509,7 +526,11 @@ mod tests {
         };
         let first = set.for_tile(UdimTile(1001));
         let second = set.for_tile(UdimTile(1002));
-        assert_eq!(first.layers[0].paint_strokes.len(), 2, "the edge dab reaches back");
+        assert_eq!(
+            first.layers[0].paint_strokes.len(),
+            2,
+            "the edge dab reaches back"
+        );
         assert_eq!(second.layers[0].paint_strokes.len(), 2);
         let mut more = set.clone();
         more.layers[0].paint_strokes.push(dab(1.7));

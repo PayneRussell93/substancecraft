@@ -61,6 +61,17 @@ struct ScRenderer {
     Texture* reflections = nullptr;
     Texture* irradiance = nullptr;
     IBLPrefilterContext* iblContext = nullptr;
+    // Environment rotation about +Y (radians), shared by the light and the background.
+    float environmentRotation = 0.0f;
+    // Environment background: a full-screen triangle drawn behind the mesh.
+    Material* backgroundMaterial = nullptr;
+    MaterialInstance* backgroundInstance = nullptr;
+    VertexBuffer* backgroundVertices = nullptr;
+    IndexBuffer* backgroundIndices = nullptr;
+    Entity backgroundEntity;
+    bool backgroundWanted = false;
+    bool backgroundInScene = false;
+    float backgroundBlur = 0.0f;
     Material* material = nullptr;
     // One instance per mesh primitive (material slot), with its own maps indexed by map slot:
     // 0 base colour, 1 ORM, 2 normal, 3 emissive.
@@ -172,6 +183,14 @@ void destroyAll(ScRenderer* r) {
     Engine* engine = r->engine;
     destroyMesh(r);
     destroyInstances(r, 0);
+    if (!r->backgroundEntity.isNull()) {
+        engine->destroy(r->backgroundEntity);
+        EntityManager::get().destroy(r->backgroundEntity);
+    }
+    if (r->backgroundInstance) engine->destroy(r->backgroundInstance);
+    if (r->backgroundMaterial) engine->destroy(r->backgroundMaterial);
+    if (r->backgroundVertices) engine->destroy(r->backgroundVertices);
+    if (r->backgroundIndices) engine->destroy(r->backgroundIndices);
     if (r->material) engine->destroy(r->material);
     if (r->indirectLight) engine->destroy(r->indirectLight);
     if (r->reflections) engine->destroy(r->reflections);
@@ -317,12 +336,96 @@ bool ensureInstances(ScRenderer* r, uint32_t count) {
     return true;
 }
 
+// A full-screen triangle in device coordinates at the far plane, as Filament draws its skybox.
+math::float4 const BACKGROUND_TRIANGLE[3] = {
+        {-1.0f, -1.0f, 1.0f, 1.0f}, {3.0f, -1.0f, 1.0f, 1.0f}, {-1.0f, 3.0f, 1.0f, 1.0f}};
+uint16_t const BACKGROUND_INDICES[3] = {0, 1, 2};
+
+// Builds the background renderable once its material is loaded.
+bool createBackground(ScRenderer* r) {
+    if (r->backgroundInstance) {
+        return true;
+    }
+    if (!r->backgroundMaterial) {
+        return false;
+    }
+    r->backgroundVertices = VertexBuffer::Builder()
+                                    .vertexCount(3)
+                                    .bufferCount(1)
+                                    .attribute(VertexAttribute::POSITION, 0,
+                                            VertexBuffer::AttributeType::FLOAT4, 0, 16)
+                                    .build(*r->engine);
+    r->backgroundIndices = IndexBuffer::Builder()
+                                   .indexCount(3)
+                                   .bufferType(IndexBuffer::IndexType::USHORT)
+                                   .build(*r->engine);
+    r->backgroundInstance = r->backgroundMaterial->createInstance();
+    if (!r->backgroundVertices || !r->backgroundIndices || !r->backgroundInstance) {
+        return false;
+    }
+    r->backgroundVertices->setBufferAt(*r->engine, 0,
+            VertexBuffer::BufferDescriptor(BACKGROUND_TRIANGLE, sizeof(BACKGROUND_TRIANGLE)));
+    r->backgroundIndices->setBuffer(*r->engine,
+            IndexBuffer::BufferDescriptor(BACKGROUND_INDICES, sizeof(BACKGROUND_INDICES)));
+    r->backgroundInstance->setParameter("blur", 0.0f);
+    r->backgroundInstance->setParameter("strength", 1.0f);
+    r->backgroundEntity = EntityManager::get().create();
+    RenderableManager::Builder(1)
+            .geometry(0, RenderableManager::PrimitiveType::TRIANGLES, r->backgroundVertices,
+                    r->backgroundIndices)
+            .material(0, r->backgroundInstance)
+            .castShadows(false)
+            .receiveShadows(false)
+            .priority(7)
+            .culling(false)
+            .build(*r->engine, r->backgroundEntity);
+    return true;
+}
+
+// Shows the background when it is wanted and an environment cubemap exists to show.
+void syncBackground(ScRenderer* r) {
+    bool const show = r->backgroundWanted && r->reflections && createBackground(r);
+    if (show && r->backgroundInstance) {
+        TextureSampler const sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
+                TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::CLAMP_TO_EDGE);
+        r->backgroundInstance->setParameter("environment", r->reflections, sampler);
+        float const lastLevel = float(r->reflections->getLevels() - 1);
+        r->backgroundInstance->setParameter("blur", r->backgroundBlur * lastLevel);
+    }
+    if (show && !r->backgroundInScene) {
+        r->scene->addEntity(r->backgroundEntity);
+        r->backgroundInScene = true;
+    } else if (!show && r->backgroundInScene) {
+        r->scene->remove(r->backgroundEntity);
+        r->backgroundInScene = false;
+    }
+}
+
+// Aims the background's virtual lens like the camera: view rays turned into world space by
+// the camera, then into the environment's frame by undoing its rotation.
+void aimBackground(ScRenderer* r) {
+    if (!r->backgroundInScene || r->width == 0 || r->height == 0) {
+        return;
+    }
+    math::mat4 const model = r->camera->getModelMatrix();
+    // Undo the environment turn: a rotation about +Y by the opposite angle.
+    math::mat3f const unturn =
+            math::mat3f::rotation(-r->environmentRotation, math::float3{0, 1, 0});
+    math::mat3f const turn =
+            math::mat3f::rotation(r->environmentRotation, math::float3{0, 1, 0});
+    r->backgroundInstance->setParameter("viewToEnvironment", unturn * worldFromView);
+    // A 50 degree vertical field of view.
+    float const halfHeight = std::tan(0.5f * 50.0f * 3.14159265f / 180.0f);
+    float const aspect = float(r->width) / float(r->height);
+    r->backgroundInstance->setParameter("lensScale", math::float2{halfHeight * aspect, halfHeight});
+}
+
 } // namespace
 
 extern "C" {
 
-ScRenderer* sc_renderer_create(uint8_t const* material, size_t material_len, uint32_t width,
-        uint32_t height) {
+ScRenderer* sc_renderer_create(uint8_t const* material, size_t material_len,
+        uint8_t const* background, size_t background_len, uint32_t width, uint32_t height) {
     auto* r = new (std::nothrow) ScRenderer();
     if (!r) {
         return nullptr;
@@ -363,6 +466,9 @@ ScRenderer* sc_renderer_create(uint8_t const* material, size_t material_len, uin
         r->scene->setIndirectLight(r->indirectLight);
 
         r->material = Material::Builder().package(material, material_len).build(*r->engine);
+        // Without its material the background simply stays off.
+        r->backgroundMaterial =
+                Material::Builder().package(background, background_len).build(*r->engine);
         if (!r->material) {
             destroyAll(r);
             delete r;
@@ -621,6 +727,7 @@ bool sc_renderer_render(ScRenderer* r, sc_readback_fn callback, void* user) {
         if (!r->renderer->beginFrame(r->swapChain)) {
             return false;
         }
+        aimBackground(r);
         r->renderer->render(r->view);
 
         size_t const size = size_t(r->width) * size_t(r->height) * 4;
@@ -725,6 +832,8 @@ bool sc_renderer_set_environment(ScRenderer* r, float const* rgb, uint32_t width
         r->indirectLight = light;
         r->reflections = reflections;
         r->irradiance = irradiance;
+        r->environmentRotation = rotation;
+        syncBackground(r);
 
         // The renderer rotates shading space by the IBL rotation's transpose, so the
         // environment turns by `turn`; the sun turns with it.
@@ -762,11 +871,56 @@ void sc_renderer_set_environment_transform(ScRenderer* r, float intensity, float
         math::mat3f const turn = math::mat3f::rotation(rotation, math::float3{0, 1, 0});
         r->indirectLight->setIntensity(intensity);
         r->indirectLight->setRotation(turn);
+        r->environmentRotation = rotation;
         if (has_sun) {
             auto& lights = r->engine->getLightManager();
             lights.setDirection(lights.getInstance(r->sunEntity),
                     turn * math::float3{sun_direction[0], sun_direction[1], sun_direction[2]});
         }
+    } catch (...) {
+    }
+}
+
+// Shows or hides the environment behind the mesh; `blur` (0..1) moves from the sharp image
+// to its roughest prefiltered level.
+void sc_renderer_set_background(ScRenderer* r, bool show, float blur) {
+    try {
+        r->backgroundWanted = show;
+        r->backgroundBlur = std::fmin(std::fmax(blur, 0.0f), 1.0f);
+        syncBackground(r);
+    } catch (...) {
+    }
+}
+
+// Screen-space global illumination: ambient occlusion with bent normals and contact shadows
+// from the sun, plus screen-space reflections, over `radius` world units (the mesh's scale).
+void sc_renderer_set_global_illumination(ScRenderer* r, bool enabled, float radius) {
+    try {
+        float const reach = std::fmax(radius, 1e-4f);
+        View::AmbientOcclusionOptions ao;
+        ao.enabled = enabled;
+        ao.radius = reach * 0.3f;
+        ao.bias = reach * 0.0005f;
+        ao.intensity = 1.0f;
+        ao.power = 1.2f;
+        ao.bentNormals = true;
+        ao.quality = View::QualityLevel::HIGH;
+        ao.lowPassFilter = View::QualityLevel::HIGH;
+        ao.upsampling = View::QualityLevel::HIGH;
+        ao.ssct.enabled = enabled && r->sunInScene;
+        ao.ssct.shadowDistance = reach * 0.3f;
+        ao.ssct.contactDistanceMax = reach;
+        if (r->sunInScene) {
+            auto& lights = r->engine->getLightManager();
+            ao.ssct.lightDirection = lights.getDirection(lights.getInstance(r->sunEntity));
+        }
+        r->view->setAmbientOcclusionOptions(ao);
+        View::ScreenSpaceReflectionsOptions ssr;
+        ssr.enabled = enabled;
+        ssr.thickness = reach * 0.05f;
+        ssr.bias = reach * 0.005f;
+        ssr.maxDistance = reach * 2.0f;
+        r->view->setScreenSpaceReflectionsOptions(ssr);
     } catch (...) {
     }
 }

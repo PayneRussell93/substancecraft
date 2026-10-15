@@ -1,4 +1,4 @@
-//! Links the vendored Filament fork (third_party/filament), compiles the viewport material
+//! Links the vendored Filament fork (third_party/filament), compiles the viewport materials
 //! with that build's `matc`, and builds the C ABI shim in `cpp/shim.cpp`.
 //!
 //! Filament is located through `FILAMENT_DIR`, defaulting to `third_party/filament-install`
@@ -28,6 +28,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FILAMENT_DIR");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=materials/viewport.mat");
+    println!("cargo:rerun-if-changed=materials/background.mat");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let filament_dir = env::var_os("FILAMENT_DIR")
@@ -56,6 +57,11 @@ fn main() {
         &matc,
         &manifest_dir.join("materials/viewport.mat"),
         &out_dir.join("viewport.filamat"),
+    );
+    compile_material(
+        &matc,
+        &manifest_dir.join("materials/background.mat"),
+        &out_dir.join("background.filamat"),
     );
 
     cc::Build::new()

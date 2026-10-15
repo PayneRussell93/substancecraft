@@ -481,7 +481,10 @@ fn planes_meeting(a: Vec3, a_normal: Vec3, b: Vec3, b_normal: Vec3) -> Option<(V
 /// ending on the last control (or back on the first when `closed`).
 fn catmull_rom<T>(controls: &[T], closed: bool, samples: usize) -> Vec<T>
 where
-    T: Copy + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<f32, Output = T>,
+    T: Copy
+        + std::ops::Add<Output = T>
+        + std::ops::Sub<Output = T>
+        + std::ops::Mul<f32, Output = T>,
 {
     let count = controls.len();
     if count < 2 {

@@ -47,6 +47,9 @@ pub(super) struct QuickMask {
     pub(super) editing: bool,
     /// The set's properties before the stencil was added, for undo.
     before: Box<TextureSetProperties>,
+    /// Paints the mesh's skew map rather than a mask limiting strokes: the
+    /// stencil only borrows the set while it is painted.
+    pub(super) skew: bool,
 }
 
 /// Brush-tool state for clone, smudge, alignment, and the quick mask.
@@ -160,6 +163,46 @@ impl SubstanceCraftApp {
         }
     }
 
+    /// True while the skew map is being painted.
+    pub(super) fn painting_skew(&self) -> bool {
+        self.stroke_tools
+            .quick_mask
+            .as_ref()
+            .is_some_and(|mask| mask.editing && mask.skew)
+    }
+
+    /// Starts painting the mesh's skew map (white applies skew correction)
+    /// over the selected set, or finishes painting it.
+    pub(super) fn toggle_skew_paint(&mut self) {
+        if self.painting_skew() {
+            self.finish_active_stroke();
+            self.finish_quick_mask();
+            return;
+        }
+        self.clear_quick_mask();
+        self.finish_active_stroke();
+        let strokes = self.high_to_low_options().skew_strokes;
+        self.start_quick_mask();
+        let Some(mask) = self.stroke_tools.quick_mask.as_mut() else {
+            return;
+        };
+        mask.skew = true;
+        let (set_id, id) = (mask.set, mask.id);
+        if let Some(stencil) = self
+            .project
+            .texture_sets
+            .iter_mut()
+            .find(|set| set.id == set_id)
+            .and_then(|set| set.stencils.iter_mut().find(|stencil| stencil.id == id))
+        {
+            stencil.strokes = strokes;
+        }
+        if self.paint_mode == super::PaintMode::View {
+            self.set_paint_mode(super::PaintMode::Paint);
+        }
+        self.invalidate_preview();
+    }
+
     fn start_quick_mask(&mut self) {
         let Some(set_id) = self.selected_texture_set else {
             return;
@@ -194,6 +237,7 @@ impl SubstanceCraftApp {
             id,
             editing: true,
             before,
+            skew: false,
         });
         self.invalidate_preview();
     }
@@ -213,6 +257,21 @@ impl SubstanceCraftApp {
         else {
             return;
         };
+        if mask.skew {
+            // The strokes become the mesh's skew map; the set gives the
+            // borrowed stencil back unrecorded.
+            let strokes = set
+                .stencil(mask.id)
+                .map(|stencil| stencil.strokes.clone())
+                .unwrap_or_default();
+            set.stencils.retain(|stencil| stencil.id != mask.id);
+            self.set_high_to_low(substancecraft_core::HighToLowOptions {
+                skew_strokes: strokes,
+                ..self.high_to_low_options()
+            });
+            self.invalidate_preview();
+            return;
+        }
         let painted = set
             .stencil(mask.id)
             .is_some_and(|stencil| !stencil.strokes.is_empty());
@@ -549,6 +608,85 @@ mod tests {
         app.undo();
         assert!(app.user_channels().is_empty());
         assert_eq!(app.channel_name(channel), "User 2");
+    }
+
+    #[test]
+    fn tc_0377_skew_maps_are_painted_in_the_app_and_drive_the_bake() {
+        let mut app = app();
+        app.select_primitive(PrimitivePreset::Sphere);
+        app.select_primitive(PrimitivePreset::Cube);
+        let set_id = app.selected_texture_set.unwrap();
+        let stencils =
+            |app: &SubstanceCraftApp| app.selected_texture_set_ref().unwrap().stencils.len();
+        app.projection_painting = true;
+
+        // Painting the skew map borrows a quick mask, in texture space.
+        app.toggle_skew_paint();
+        assert!(app.painting_skew());
+        assert!(!app.projects_strokes(), "skew strokes stay in UV space");
+        let id = app.editing_quick_mask(set_id).unwrap();
+        assert_eq!(app.preview_target(), PreviewTarget::QuickMask(id));
+        app.append_stroke_point(glam::Vec2::new(0.2, 0.5));
+        app.append_stroke_point(glam::Vec2::new(0.3, 0.5));
+        app.finish_active_stroke();
+        assert!(strokes(&app).is_empty(), "the layer is untouched");
+
+        // Done: the strokes belong to the mesh, the set gives the stencil
+        // back, and nothing limits later strokes.
+        app.toggle_skew_paint();
+        assert!(!app.painting_skew());
+        assert!(app.stroke_tools.quick_mask.is_none());
+        assert_eq!(stencils(&app), 0);
+        let options = app.high_to_low_options();
+        assert_eq!(options.skew_strokes.len(), 1);
+        let image = options.skew_image(64).unwrap();
+        let gray = |u: f32| (image.sample(glam::Vec2::new(u, 0.5), false).x * 255.0).round();
+        assert!(gray(0.25) > 200.0, "painted white");
+        assert_eq!(gray(0.8), 0.0, "black elsewhere");
+
+        // Editing again starts from the saved strokes; discarding keeps them.
+        app.toggle_skew_paint();
+        let id = app.editing_quick_mask(set_id).unwrap();
+        assert_eq!(
+            app.selected_texture_set_ref()
+                .unwrap()
+                .stencil(id)
+                .unwrap()
+                .strokes
+                .len(),
+            1
+        );
+        app.clear_quick_mask();
+        assert_eq!(stencils(&app), 0);
+        assert_eq!(app.high_to_low_options().skew_strokes.len(), 1);
+
+        // One undo step removes it.
+        app.undo();
+        assert!(app.high_to_low_options().skew_strokes.is_empty());
+        app.redo();
+        assert_eq!(app.high_to_low_options().skew_strokes.len(), 1);
+
+        // The bake applies skew only where it was painted.
+        let low = app.mesh_geometry.as_deref().unwrap().clone();
+        let settings = substancecraft_core::MeshMapSettings {
+            resolution: 64,
+            ao_samples: 2,
+            cage_distance: 0.1,
+            skew: 1.0,
+            ..substancecraft_core::MeshMapSettings::default()
+        };
+        let skew = options.skew_image(64).unwrap();
+        let maps = substancecraft_core::bake_mesh_maps_corrected(
+            &low,
+            Some(&low),
+            &settings,
+            Some(&skew),
+            None,
+        )
+        .unwrap();
+        let applied = |uv: glam::Vec2| maps.sample(uv).skew;
+        assert!(applied(glam::Vec2::new(0.25, 0.5)) > 0.5);
+        assert!(applied(glam::Vec2::new(0.8, 0.5)) < 0.05);
     }
 
     #[test]

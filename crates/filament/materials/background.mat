@@ -1,0 +1,59 @@
+// Viewport environment background for SubstanceCraft. Compiled by build.rs with the matc
+// from the vendored Filament build.
+//
+// The viewport camera is orthographic, so Filament's skybox (which follows the camera's own
+// rays) would show a single colour. This draws a full-screen triangle behind everything and
+// looks up the prefiltered environment along the rays of a virtual perspective lens aimed
+// like the viewport camera: `viewToEnvironment` turns view-space rays into the environment's
+// frame (camera rotation, then the environment rotation undone), `lensScale` holds the lens's
+// half extents at unit distance, and `blur` picks a prefiltered (rougher) mip level.
+material {
+    name : SubstanceCraftBackground,
+    shadingModel : unlit,
+    vertexDomain : device,
+    depthWrite : false,
+    culling : none,
+    parameters : [
+        {
+            type : samplerCubemap,
+            name : environment,
+            stages : [ "fragment" ]
+        },
+        {
+            type : mat3,
+            name : viewToEnvironment
+        },
+        {
+            type : float2,
+            name : lensScale
+        },
+        {
+            type : float,
+            name : blur
+        },
+        {
+            type : float,
+            name : strength
+        }
+    ],
+    variables : [
+        viewRay
+    ],
+    variantFilter : [ skinning, shadowReceiver, vsm ],
+    featureLevel : 1
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        material.viewRay.xyz = vec3(getPosition().xy * materialParams.lensScale, -1.0);
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        vec3 direction = normalize(materialParams.viewToEnvironment * variable_viewRay.xyz);
+        vec3 sky = textureLod(materialParams_environment, direction, materialParams.blur).rgb;
+        material.baseColor = vec4(sky * frameUniforms.iblLuminance * materialParams.strength, 1.0);
+    }
+}

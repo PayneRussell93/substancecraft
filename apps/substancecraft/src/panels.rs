@@ -1433,10 +1433,43 @@ impl SubstanceCraftApp {
                 .map(|resource| (resource.id, resource.name.clone()))
                 .collect::<Vec<_>>();
             let mut skew_map = self.skew_map;
+            let painted = !self.high_to_low_options().skew_strokes.is_empty();
             widgets::property_row(ui, "Skew map", |ui| {
-                resource_picker(ui, Id::new("skew_map"), &mut skew_map, &resources);
+                if painted {
+                    ui.label(RichText::new("Painted").size(11.5).color(theme::TEXT_WEAK));
+                } else {
+                    resource_picker(ui, Id::new("skew_map"), &mut skew_map, &resources);
+                }
             });
             self.skew_map = skew_map;
+            let painting = self.painting_skew();
+            let (mut toggle, mut clear) = (false, false);
+            ui.horizontal_wrapped(|ui| {
+                let label = match (painting, painted) {
+                    (true, _) => "Done painting",
+                    (false, true) => "Edit painted skew",
+                    (false, false) => "Paint skew map",
+                };
+                toggle = widgets::pill_button(ui, None, label, painting, !painting)
+                    .on_hover_text(
+                        "Paint where skew correction applies, on the model or in the UV \
+                         view: Paint opens it, Erase closes it. It is saved with the mesh \
+                         and used instead of a skew-map bitmap.",
+                    )
+                    .clicked();
+                clear = painted
+                    && !painting
+                    && widgets::pill_button(ui, Some(Icon::Close), "Clear painted", false, false)
+                        .clicked();
+            });
+            if toggle {
+                self.toggle_skew_paint();
+            } else if clear {
+                self.set_high_to_low(substancecraft_core::HighToLowOptions {
+                    skew_strokes: Vec::new(),
+                    ..self.high_to_low_options()
+                });
+            }
             hint(
                 ui,
                 "Skew fix sends cage rays straight out of flat faces so details beside \
@@ -4453,6 +4486,23 @@ impl SubstanceCraftApp {
         let Some(set_id) = self.selected_texture_set else {
             return;
         };
+        if self.painting_skew() {
+            widgets::caption(ui, "Skew map");
+            hint(
+                ui,
+                "Painting the skew map: Paint applies skew correction, Erase removes it. \
+                 The tint shows where it does not apply.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if widgets::pill_button(ui, None, "Done", true, false).clicked() {
+                    self.toggle_skew_paint();
+                }
+                if widgets::pill_button(ui, None, "Discard", false, false).clicked() {
+                    self.clear_quick_mask();
+                }
+            });
+            return;
+        }
         widgets::caption(ui, "Quick mask");
         let editing = self.editing_quick_mask(set_id).is_some();
         let active = self.active_stencil(set_id).is_some();
@@ -5301,6 +5351,81 @@ impl SubstanceCraftApp {
         }
         if !reload.is_empty() {
             self.reload_changed_resources(&reload);
+        }
+    }
+}
+
+impl SubstanceCraftApp {
+    /// High-to-low pairing: name matching, a cage mesh, and per-part cage
+    /// distance. Each change is one undoable mesh edit.
+    fn high_to_low_controls(&mut self, ui: &mut Ui) {
+        let mut options = self.high_to_low_options();
+        widgets::caption(ui, "High to low");
+        widgets::property_row(ui, "Match by name", |ui| {
+            widgets::toggle(ui, &mut options.match_by_name).on_hover_text(
+                "Each low part takes detail only from high-poly meshes of the same \
+                 name (ignoring case and _low/_high suffixes)",
+            );
+        });
+        if options.match_by_name {
+            let unmatched = self.unmatched_low_parts();
+            if !unmatched.is_empty() {
+                hint(
+                    ui,
+                    &format!(
+                        "No high-poly mesh matches {}; those parts use the whole high mesh.",
+                        unmatched.join(", ")
+                    ),
+                );
+            }
+        }
+        let mut pick_cage = false;
+        widgets::property_row(ui, "Cage mesh", |ui| {
+            let label = self
+                .cage_mesh
+                .as_ref()
+                .map_or("None".to_owned(), |(path, _)| crate::path_label(path));
+            ui.label(RichText::new(label).size(11.5).color(theme::TEXT_WEAK));
+            pick_cage = widgets::pill_button(ui, Some(Icon::Import), "Load…", false, false)
+                .on_hover_text(
+                    "A copy of the low mesh pushed out around the high mesh (same \
+                     vertices); rays start on it instead of at Cage distance",
+                )
+                .clicked();
+            if options.cage_source.is_some()
+                && widgets::pill_button(ui, Some(Icon::Close), "Remove", false, false).clicked()
+            {
+                options.cage_source = None;
+            }
+        });
+        if let Some(mesh) = self.mesh_geometry.as_deref()
+            && mesh.material_slot_count() > 1
+            && options.cage_source.is_none()
+        {
+            widgets::caption(ui, "Cage distance per part");
+            for slot in 0..mesh.material_slot_count() as u32 {
+                let name = mesh.material_slot_name(slot);
+                let mut scale = options.cage_scale(&name);
+                if slider_row(
+                    ui,
+                    &format!("{name} ×"),
+                    &mut scale,
+                    substancecraft_core::CAGE_SCALE_RANGE,
+                    true,
+                    2,
+                ) {
+                    if (scale - 1.0).abs() < 1e-3 {
+                        options.cage_scales.remove(&name);
+                    } else {
+                        options.cage_scales.insert(name, scale);
+                    }
+                }
+            }
+        }
+        if pick_cage {
+            self.pick_cage();
+        } else {
+            self.set_high_to_low(options);
         }
     }
 }

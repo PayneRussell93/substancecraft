@@ -2811,9 +2811,11 @@ impl SubstanceCraftApp {
     /// stay in UV space).
     fn projects_strokes(&self) -> bool {
         // Projected strokes rasterise the bind mesh, so they wait for it.
-        // Clone and smudge sample in texture space.
+        // Clone and smudge sample in texture space. The skew map feeds the
+        // mesh-map bake, so it cannot wait for maps of its own.
         self.projection_painting
             && !self.is_posed()
+            && !self.painting_skew()
             && matches!(
                 self.paint_mode,
                 PaintMode::Paint | PaintMode::Erase | PaintMode::Mask
@@ -3771,7 +3773,7 @@ impl SubstanceCraftApp {
         if baked.high_poly_revision != current.high_poly_revision {
             Some("High-poly source changed")
         } else if baked.high_to_low != current.high_to_low {
-            Some("Cage or name matching changed")
+            Some("High-to-low options changed")
         } else if baked.import_scale != current.import_scale {
             Some("Scale changed")
         } else if baked.smoothing != current.smoothing {
@@ -3846,10 +3848,10 @@ impl SubstanceCraftApp {
             .high_poly
             .as_ref()
             .map(|source| source.geometry.clone());
-        let skew_map = self
+        let settings = self.effective_mesh_map_settings();
+        let skew_bitmap = self
             .skew_map
             .and_then(|id| self.resource_images.get(&id).cloned());
-        let settings = self.effective_mesh_map_settings();
         let cancel = Arc::new(AtomicBool::new(false));
         let summary = bake_log::settings_summary(&settings, high.is_some());
         let mut plan = HighToLowPlan {
@@ -3871,6 +3873,12 @@ impl SubstanceCraftApp {
             .spawn(move || {
                 // The cage is smoothed like the low mesh so they still pair.
                 plan.cage = cage.and_then(|cage| smoothing.apply(&cage).ok());
+                // A skew map painted in the app wins over a bitmap.
+                let skew_map = plan
+                    .options
+                    .skew_image(settings.resolution)
+                    .map(Arc::new)
+                    .or(skew_bitmap);
                 let _ = sender.send(bake_slot_mesh_maps(
                     &mesh,
                     high.as_ref(),
@@ -4506,9 +4514,9 @@ impl SubstanceCraftApp {
     /// Longest texture-set edge the viewport bakes: smaller per tile when a
     /// UDIM atlas packs several tiles into one texture.
     fn preview_edge(&self) -> u32 {
-        self.udim_atlas
-            .as_ref()
-            .map_or(PREVIEW_MAX_EDGE, |atlas| atlas.tile_edge_limit(PREVIEW_MAX_EDGE))
+        self.udim_atlas.as_ref().map_or(PREVIEW_MAX_EDGE, |atlas| {
+            atlas.tile_edge_limit(PREVIEW_MAX_EDGE)
+        })
     }
 
     fn poll_preview_job(&mut self, context: &egui::Context) {
@@ -6671,7 +6679,6 @@ fn load_high_poly(path: &std::path::Path, scale: f32) -> Result<HighPolySource, 
     })
 }
 
-
 /// How a high-to-low bake pairs each low part with the high mesh.
 #[derive(Clone, Debug, Default)]
 struct HighToLowPlan {
@@ -7283,6 +7290,115 @@ mod tests {
     }
 
     #[test]
+    fn tc_0376_high_to_low_bakes_match_parts_by_name_and_scale_cages_per_part() {
+        use substancecraft_core::{HighToLowOptions, MeshVertex};
+
+        // A flat quad over x in `x0..x0 + 1` at height `y`, UVs `u0..u0 + 0.5`.
+        let quad = |x0: f32, y: f32, u0: f32| {
+            let vertex = |x: f32, z: f32| MeshVertex {
+                position: glam::Vec3::new(x0 + x, y, z),
+                uv: glam::Vec2::new(u0 + x * 0.5, z),
+            };
+            MeshGeometry {
+                vertices: vec![
+                    vertex(0.0, 0.0),
+                    vertex(1.0, 0.0),
+                    vertex(1.0, 1.0),
+                    vertex(0.0, 1.0),
+                ],
+                triangles: vec![[0, 2, 1], [0, 3, 2]],
+                ..MeshGeometry::default()
+            }
+        };
+        // Low: a Lid quad and a Body quad, one material slot each.
+        let mut low = quad(0.0, 0.0, 0.0);
+        low.append(&quad(2.0, 0.0, 0.5)).unwrap();
+        low.triangle_materials = vec![0, 0, 1, 1];
+        low.material_slots = vec!["Lid".to_owned(), "Body".to_owned()];
+        // High: the lid's detail sits well above it, the body's just above
+        // the body, and a stray body piece just above the lid.
+        let parts = vec![
+            ("Lid_high".to_owned(), quad(0.0, 0.3, 0.0)),
+            ("Body_high".to_owned(), quad(2.0, 0.05, 0.5)),
+            ("body_high".to_owned(), quad(0.0, 0.05, 0.0)),
+        ];
+        let mut high = MeshGeometry::default();
+        for (_, part) in &parts {
+            high.append(part).unwrap();
+        }
+        let settings = MeshMapSettings {
+            resolution: 16,
+            ao_samples: 2,
+            cage_distance: 0.05,
+            ..MeshMapSettings::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let bake = |options: HighToLowOptions| {
+            let plan = HighToLowPlan {
+                parts: parts.clone(),
+                options,
+                low_name: "Crate".to_owned(),
+                cage: None,
+            };
+            bake_slot_mesh_maps(&low, Some(&high), &settings, None, &plan, &cancel)
+                .unwrap()
+                .iter()
+                .map(MeshMaps::miss_fraction)
+                .collect::<Vec<_>>()
+        };
+
+        // Without matching the lid catches the stray body piece.
+        let caught = |misses: &[f32]| misses.iter().all(|miss| *miss < 0.3);
+        assert!(caught(&bake(HighToLowOptions::default())));
+        // Matched by name it only sees its own detail, out of reach...
+        let matched = HighToLowOptions {
+            match_by_name: true,
+            ..HighToLowOptions::default()
+        };
+        let misses = bake(matched.clone());
+        assert!(misses[0] > 0.9 && misses[1] < 0.3, "{misses:?}");
+        // ...until its cage alone grows.
+        let mut wider = matched.clone();
+        wider.cage_scales.insert("Lid".to_owned(), 6.0);
+        assert!(caught(&bake(wider.clone())));
+
+        // Through the app: options are mesh edits that undo, stale the maps,
+        // and name parts without a match.
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(low.clone()));
+        app.project.mesh = Some(MeshAsset {
+            id: MeshId(1),
+            source: "crate.fbx".to_owned(),
+            scale: 1.0,
+            smoothing: MeshSmoothing::default(),
+            high_poly_source: None,
+            content_hash: None,
+            high_poly_hash: None,
+            high_to_low: Default::default(),
+        });
+        app.high_poly = Some(HighPolySource {
+            path: "sculpt.fbx".into(),
+            geometry: high.clone(),
+            parts: vec![("Lid_high".to_owned(), quad(0.0, 0.3, 0.0))],
+        });
+        let key = app.bake_key();
+        app.set_high_to_low(wider.clone());
+        assert_ne!(app.bake_key().high_to_low, key.high_to_low);
+        assert_eq!(app.unmatched_low_parts(), ["Body"]);
+        let mut invalid = wider.clone();
+        invalid.cage_scales.insert("Body".to_owned(), 50.0);
+        app.set_high_to_low(invalid);
+        assert_eq!(
+            app.high_to_low_options(),
+            wider,
+            "out-of-range scale refused"
+        );
+        app.undo();
+        assert_eq!(app.high_to_low_options(), HighToLowOptions::default());
+        assert_eq!(app.bake_key().high_to_low, key.high_to_low);
+    }
+
+    #[test]
     fn tc_0374_udim_tiles_show_and_paint_in_the_viewports_and_cache_per_tile() {
         use substancecraft_core::MeshVertex;
 
@@ -7313,7 +7429,9 @@ mod tests {
         app.set_paint_mode(PaintMode::Paint);
         app.brush_color = egui::Color32::WHITE;
         app.brush_radius = 2.0;
-        let hit = mesh.closest_surface_point(glam::Vec3::new(1.6, 0.5, 0.0)).unwrap();
+        let hit = mesh
+            .closest_surface_point(glam::Vec3::new(1.6, 0.5, 0.0))
+            .unwrap();
         app.paint_hit(TriangleHit {
             triangle: hit.triangle,
             uv: Some(hit.uv),
@@ -7325,9 +7443,13 @@ mod tests {
 
         // The preview is the atlas: tile 1002 (right half) shows the dab,
         // tile 1001 does not.
-        let shown = |app: &SubstanceCraftApp| match app.displayed_preview() {
-            Some(PreviewTextures::Material(material)) => material.base_color.clone(),
-            _ => panic!("no material preview"),
+        let shown = |app: &SubstanceCraftApp| {
+            let preview = app.displayed_preview();
+            let material = preview.and_then(|preview| match preview {
+                PreviewTextures::Material(material) => Some(material),
+                PreviewTextures::Single(_) => None,
+            });
+            material.unwrap().base_color.clone()
         };
         app.invalidate_preview();
         tests::pump_until(&mut app, &context, |app| {
@@ -7340,7 +7462,9 @@ mod tests {
 
         // Painting tile 1002 again rebakes only that tile.
         let hits = app.udim_cache.lock().unwrap().hits;
-        let hit = mesh.closest_surface_point(glam::Vec3::new(1.8, 0.3, 0.0)).unwrap();
+        let hit = mesh
+            .closest_surface_point(glam::Vec3::new(1.8, 0.3, 0.0))
+            .unwrap();
         app.paint_hit(TriangleHit {
             triangle: hit.triangle,
             uv: Some(hit.uv),
@@ -7351,10 +7475,17 @@ mod tests {
         tests::pump_until(&mut app, &context, |app| {
             app.preview_failed
                 || (app.preview_job.is_none()
-                    && app.baked_preview.as_ref().is_some_and(|preview| preview.key == app.preview_key()))
+                    && app
+                        .baked_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.key == app.preview_key()))
         });
         assert_eq!(app.bake_error, None);
-        assert_eq!(app.udim_cache.lock().unwrap().hits, hits + 1, "tile 1001 reused");
+        assert_eq!(
+            app.udim_cache.lock().unwrap().hits,
+            hits + 1,
+            "tile 1001 reused"
+        );
         assert_eq!(shown(&app).pixel(8, 8), atlas_texture.pixel(8, 8));
 
         // Mesh-map previews show every tile's maps side by side, baking
@@ -7366,12 +7497,18 @@ mod tests {
         app.mesh_map_preview = Some(MeshMapKind::WorldNormal);
         tests::pump_until(&mut app, &context, |app| {
             app.preview_job.is_none()
-                && app.baked_preview.as_ref().is_some_and(|preview| preview.key == app.preview_key())
+                && app
+                    .baked_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.key == app.preview_key())
         });
-        let maps = match app.displayed_preview() {
-            Some(PreviewTextures::Single(texture)) => texture.clone(),
-            _ => panic!("no mesh-map preview"),
-        };
+        let maps = app
+            .displayed_preview()
+            .and_then(|preview| match preview {
+                PreviewTextures::Single(texture) => Some(texture.clone()),
+                PreviewTextures::Material(_) => None,
+            })
+            .unwrap();
         assert_eq!((maps.width, maps.height), (64, 32));
         // Both quads face +Z, so both halves carry the same normal.
         assert_eq!(maps.pixel(16, 16), maps.pixel(48, 16));
@@ -7800,7 +7937,8 @@ mod tests {
         write(PrimitivePreset::Sphere);
         app.high_poly = Some(load_high_poly(&path, 1.0).unwrap());
         app.high_poly_changed();
-        let vertices = |app: &SubstanceCraftApp| app.high_poly.as_ref().unwrap().geometry.vertices.len();
+        let vertices =
+            |app: &SubstanceCraftApp| app.high_poly.as_ref().unwrap().geometry.vertices.len();
         let sphere = vertices(&app);
 
         // Auto: a re-export reloads the high poly and starts a rebake.
@@ -7831,7 +7969,12 @@ mod tests {
         app.resource_watcher.expire();
         app.poll_resource_files(&context);
         assert_eq!(vertices(&app), sphere);
-        assert!(app.mesh_map_error.as_deref().unwrap().contains("keeping the previous"));
+        assert!(
+            app.mesh_map_error
+                .as_deref()
+                .unwrap()
+                .contains("keeping the previous")
+        );
     }
 
     #[test]
