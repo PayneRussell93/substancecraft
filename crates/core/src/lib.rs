@@ -82,7 +82,8 @@ pub use painting::{
 };
 pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{
-    BitmapMask, ContentHash, ContentHasher, DecalPlacement, MAX_DECAL_SIZE, MAX_PROJECTION_SCALE,
+    BitmapMask, ContentHash, ContentHasher, DecalPlacement, ImageSequence, MAX_SEQUENCE_FPS,
+    MAX_SEQUENCE_FRAMES, MIN_SEQUENCE_FPS, sequence_frame_path, split_frame_number, MAX_DECAL_SIZE, MAX_PROJECTION_SCALE,
     MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_DECAL_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE,
     ProjectResource, ProjectionMode, ResourceImages, ResourceProvenance, TextureImage,
     TextureProjection,
@@ -3162,6 +3163,9 @@ impl MaterialProject {
             if !resource_ids.insert(resource.id) {
                 return Err(ProjectError::DuplicateResourceId(resource.id));
             }
+            if !resource.is_valid() {
+                return Err(ProjectError::InvalidResource(resource.id));
+            }
         }
 
         let mut texture_set_ids = BTreeSet::new();
@@ -3403,6 +3407,8 @@ pub enum ProjectError {
     DuplicatePoseName(String),
     #[error("resource id {0:?} is duplicated")]
     DuplicateResourceId(ResourceId),
+    #[error("resource {0:?} has an invalid image sequence")]
+    InvalidResource(ResourceId),
     #[error("a layer references resource {0:?}, which the project does not list")]
     MissingResource(ResourceId),
     #[error("export preset `{name}` is invalid: {error}")]

@@ -47,10 +47,12 @@ mod graph_editor;
 mod icons;
 mod incremental;
 mod inspector;
+mod library_panel;
 mod panels;
 mod preferences;
 mod relink;
 mod resource_watch;
+mod sequences;
 mod stroke_tools;
 mod theme;
 mod turntable;
@@ -342,6 +344,7 @@ struct SubstanceCraftApp {
     loaded_resource_sources: Vec<(ResourceId, String)>,
     bake_log: bake_log::BakeLog,
     cache: cache::CacheState,
+    library: library_panel::LibraryState,
 }
 
 struct FilamentFrame {
@@ -946,6 +949,7 @@ impl Default for SubstanceCraftApp {
             loaded_resource_sources: Vec::new(),
             bake_log: bake_log::BakeLog::default(),
             cache: cache::CacheState::default(),
+            library: library_panel::LibraryState::default(),
         };
         app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
         app.loaded_mesh = app.project.mesh.clone();
@@ -5477,14 +5481,14 @@ impl SubstanceCraftApp {
             .project
             .resources
             .iter()
-            .map(|resource| (resource.id, resource.source.clone()))
+            .map(|resource| (resource.id, resource.active_source()))
             .collect();
         self.resource_images = images;
         self.resource_thumbnails.clear();
         self.resource_watcher.reset();
         for resource in &self.project.resources {
             self.resource_watcher
-                .remember(resource.id, std::path::Path::new(&resource.source));
+                .remember(resource.id, std::path::Path::new(&resource.active_source()));
         }
         if let Some((id, error)) = failures.first() {
             let name = self
@@ -6845,6 +6849,7 @@ impl eframe::App for SubstanceCraftApp {
         self.enforce_cache_budget();
         self.update_pose_transition(ui.ctx());
         self.advance_animation(ui.ctx());
+        self.follow_animation_with_sequences();
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
         self.sync_layer_history(ui.ctx());

@@ -275,6 +275,8 @@ pub struct Preferences {
     pub exposure: f32,
     /// `.cube` display LUT applied after the view transform.
     pub display_lut: Option<PathBuf>,
+    /// Folder of the shared asset library; `None` uses the default.
+    pub shared_library: Option<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -296,6 +298,7 @@ impl Default for Preferences {
             view_transform: substancecraft_core::ViewTransform::Standard,
             exposure: 0.0,
             display_lut: None,
+            shared_library: None,
         }
     }
 }

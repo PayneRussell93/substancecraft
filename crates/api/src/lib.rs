@@ -568,9 +568,48 @@ pub fn existing_export_files(
 /// missing texture still opens.
 /// Loads one resource's pixels, tagged with its colour space.
 pub fn load_resource_image(resource: &ProjectResource) -> Result<TextureImage, TextureIoError> {
-    let mut image = load_texture_image(&resource.source)?;
+    let mut image = load_texture_image(resource.active_source())?;
     image.color_space = resource.color_space;
     Ok(image)
+}
+
+/// The numbered image sequence `path` belongs to: the files in its folder
+/// named like it with another frame number of the same zero padding, in an
+/// unbroken run through `path`'s frame, which the sequence shows. `None`
+/// when the name has no frame number or no neighbouring frame exists.
+pub fn detect_image_sequence(path: &Path) -> Option<substancecraft_core::ImageSequence> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let (prefix, number, digits, suffix) = substancecraft_core::split_frame_number(&name)?;
+    let folder = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut frames = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(folder).ok()?.filter_map(Result::ok) {
+        let other = entry.file_name().to_string_lossy().into_owned();
+        if let Some((other_prefix, frame, other_digits, other_suffix)) =
+            substancecraft_core::split_frame_number(&other)
+            && other_prefix == prefix
+            && other_suffix.eq_ignore_ascii_case(suffix)
+            && other_digits == digits
+        {
+            frames.insert(frame);
+        }
+    }
+    let mut first = number;
+    while first > 0 && frames.contains(&(first - 1)) {
+        first -= 1;
+    }
+    let mut last = number;
+    while frames.contains(&(last + 1))
+        && last - first + 1 < substancecraft_core::MAX_SEQUENCE_FRAMES
+    {
+        last += 1;
+    }
+    (first < last).then(|| substancecraft_core::ImageSequence {
+        frame: number,
+        ..substancecraft_core::ImageSequence::new(first, last)
+    })
 }
 
 pub fn load_project_resources(

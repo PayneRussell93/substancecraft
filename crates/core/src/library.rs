@@ -1752,6 +1752,101 @@ mod tests {
     }
 
     #[test]
+    fn tc_0387_filters_generators_and_environments_are_library_resources() {
+        // Built-ins validate and are searchable by kind.
+        for preset in FilterPreset::built_in() {
+            preset.validate().unwrap();
+        }
+        for preset in GeneratorPreset::built_in() {
+            preset.validate().unwrap();
+        }
+        let mut project = MaterialProject::empty();
+        let names = |project: &MaterialProject, query: &str, kind| -> Vec<String> {
+            project
+                .search_assets(query, Some(kind))
+                .into_iter()
+                .map(|asset| asset.name)
+                .collect()
+        };
+        assert_eq!(names(&project, "threshold", AssetKind::Filter), ["Hard edge"]);
+        assert_eq!(names(&project, "chips", AssetKind::Generator), ["Fine chips"]);
+
+        // Filter stacks append to content or mask filters, within limits.
+        let mut layer = MaterialLayer::new_paint(LayerId(1), "Paint");
+        layer.filters = vec![LayerFilter::Invert];
+        let captured = FilterPreset::from_filters(&layer.filters, "Flip").unwrap();
+        assert!(FilterPreset::from_filters(&[], "Empty").is_none());
+        let hard = FilterPreset::built_in()
+            .into_iter()
+            .find(|preset| preset.name == "Hard edge")
+            .unwrap();
+        assert!(hard.apply_to(&mut layer, true));
+        assert_eq!(layer.mask_filters, hard.filters);
+        assert!(hard.apply_to(&mut layer, false));
+        assert_eq!(layer.filters.len(), 3);
+        layer.filters = vec![LayerFilter::Invert; crate::MAX_LAYER_FILTERS];
+        assert!(!hard.apply_to(&mut layer, false), "too many filters");
+        assert_eq!(layer.filters.len(), crate::MAX_LAYER_FILTERS);
+
+        // Generators swap only the generator and keep the rest of the mask.
+        let mut target = MaterialLayer::new_paint(LayerId(2), "Grime");
+        target.mask_filters = vec![LayerFilter::Invert];
+        let grime = GeneratorPreset::built_in().remove(1);
+        grime.apply_to(&mut target);
+        assert_eq!(target.mask_generator, Some(grime.generator));
+        assert_eq!(target.mask_filters, [LayerFilter::Invert]);
+        let recaptured = GeneratorPreset::from_layer(&target, "Mine").unwrap();
+        assert_eq!(recaptured.generator, grime.generator);
+        assert!(GeneratorPreset::from_layer(&MaterialLayer::new_paint(LayerId(3), "x"), "x").is_none());
+
+        // Environments keep their file, rotation, and strength.
+        let mut sky = EnvironmentResource::new("Studio sky", "sky.hdr");
+        sky.rotation_degrees = 90.0;
+        sky.strength = 1.5;
+        sky.validate().unwrap();
+
+        // The project keeps all three; validation names what is wrong.
+        project.filter_presets.push(captured.clone());
+        project.generator_presets.push(recaptured.clone());
+        project.environments.push(sky.clone());
+        project.validate().unwrap();
+        assert_eq!(names(&project, "project", AssetKind::Environment), ["Studio sky"]);
+        let json = serde_json::to_string(&project).unwrap();
+        let back: MaterialProject = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.environments, project.environments);
+        assert_eq!(back.filter_presets, project.filter_presets);
+
+        let mut broken = project.clone();
+        broken.environments[0].strength = MAX_ENVIRONMENT_STRENGTH + 1.0;
+        assert!(broken.validate().is_err());
+        let mut broken = project.clone();
+        broken.filter_presets[0].filters = vec![LayerFilter::Blur { radius: -1.0 }];
+        assert!(broken.validate().is_err());
+        let mut broken = project.clone();
+        broken.generator_presets.push(recaptured.clone());
+        assert_eq!(
+            broken.validate(),
+            Err(crate::ProjectError::InvalidLibraryEntry(LibraryError::DuplicateName(
+                "Mine".to_owned()
+            )))
+        );
+
+        // Saving them is undoable.
+        let mut history = crate::EditHistory::default();
+        let before = project.environments.clone();
+        assert!(history.apply(
+            &mut project,
+            crate::EditCommand::Environments {
+                before,
+                after: Vec::new()
+            },
+        ));
+        assert!(project.environments.is_empty());
+        assert!(history.undo(&mut project));
+        assert_eq!(project.environments, [sky]);
+    }
+
+    #[test]
     fn tc_0141_tagged_linear_and_acescg_bitmaps_convert_for_color_channels_only() {
         // One mid-grey texel in linear light.
         let linear = 55; // 0.214 linear = 0.5 sRGB

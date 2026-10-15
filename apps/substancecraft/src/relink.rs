@@ -188,7 +188,7 @@ impl SubstanceCraftApp {
             .project
             .resources
             .iter()
-            .map(|resource| (resource.id, resource.source.clone()))
+            .map(|resource| (resource.id, resource.active_source()))
             .collect();
         if sources != self.loaded_resource_sources {
             self.reload_resources();

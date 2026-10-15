@@ -47,7 +47,7 @@ const VIEW_MODES: [(ViewMode, &str); 3] = [
     (ViewMode::Uv, "UV"),
 ];
 const MESH_MAP_RESOLUTIONS: [u32; 4] = [256, 512, 1024, 2048];
-const WARNING: Color32 = Color32::from_rgb(240, 180, 80);
+pub(super) const WARNING: Color32 = Color32::from_rgb(240, 180, 80);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Drawer {
@@ -1079,6 +1079,14 @@ impl SubstanceCraftApp {
         {
             self.import_resources();
         }
+        if widgets::pill_button(ui, Some(Icon::Import), "Import image sequence…", false, true)
+            .on_hover_text(
+                "Pick one frame of a numbered series (name_0001.png, …); the resource shows \n                 one frame at a time and can follow animation playback",
+            )
+            .clicked()
+        {
+            self.pick_image_sequence();
+        }
         if !self.pending_import_assignments.is_empty() {
             widgets::caption(ui, "Assign imported bitmaps");
             hint(
@@ -1160,6 +1168,8 @@ impl SubstanceCraftApp {
         self.asset_search(ui);
         self.project_materials(ui);
         self.project_smart_masks(ui);
+        self.library_resources_section(ui);
+        self.shared_library_section(ui);
         hint(
             ui,
             "Bitmaps are referenced by path, like the mesh. Assign them to fill channels \
@@ -1192,6 +1202,22 @@ impl SubstanceCraftApp {
         );
         widgets::caption(ui, "Bitmaps");
         self.resource_details(ui);
+        let sequences: Vec<(ResourceId, String)> = self
+            .project
+            .resources
+            .iter()
+            .filter(|resource| resource.sequence.is_some())
+            .map(|resource| (resource.id, resource.name.clone()))
+            .collect();
+        if !sequences.is_empty() {
+            widgets::caption(ui, "Image sequences");
+            for (id, name) in sequences {
+                ui.push_id(("sequence", id.0), |ui| {
+                    ui.label(RichText::new(name).size(12.0).color(theme::TEXT));
+                    self.sequence_controls(ui, id);
+                });
+            }
+        }
         let resources = self
             .project
             .resources
@@ -5243,7 +5269,7 @@ impl SubstanceCraftApp {
         }
     }
 
-    /// Search over every asset (project and built-in) by name, kind, tag,
+    /// Search over every asset (project, shared library, and built-in) by name, kind, tag,
     /// author, or licence.
     fn asset_search(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
@@ -5256,7 +5282,8 @@ impl SubstanceCraftApp {
         if self.asset_query.trim().is_empty() {
             return;
         }
-        let results = self.project.search_assets(&self.asset_query, None);
+        let query = self.asset_query.clone();
+        let results = self.search_all_assets(&query);
         if results.is_empty() {
             hint(ui, "No assets match.");
         }
@@ -5267,7 +5294,12 @@ impl SubstanceCraftApp {
             } else {
                 asset.provenance.license.clone()
             };
-            ui.label(RichText::new(&asset.name).size(12.5).color(theme::TEXT));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&asset.name).size(12.5).color(theme::TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.asset_result_action(ui, asset);
+                });
+            });
             ui.label(
                 RichText::new(format!("{} · {origin} · {license}", asset.kind.name()))
                     .size(11.0)

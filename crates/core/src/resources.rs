@@ -43,6 +43,102 @@ pub struct ProjectResource {
     /// renamed copy can still be found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<ContentHash>,
+    /// A numbered image sequence (`source` is one of its frames); the
+    /// resource shows the sequence's current frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<ImageSequence>,
+}
+
+/// Most frames an image sequence may span.
+pub const MAX_SEQUENCE_FRAMES: u32 = 100_000;
+/// Playback rates an image sequence accepts, in frames per second.
+pub const MIN_SEQUENCE_FPS: f32 = 1.0;
+pub const MAX_SEQUENCE_FPS: f32 = 240.0;
+
+/// The frames of a numbered image sequence (`name_0001.png`,
+/// `name_0002.png`, …) and which one a resource shows. Frame files are
+/// named like the resource's source with its trailing frame number
+/// replaced, keeping its zero padding.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImageSequence {
+    pub first: u32,
+    pub last: u32,
+    /// The frame shown, exported, and baked.
+    pub frame: u32,
+    /// Frames per second when the frame follows animation playback.
+    #[serde(default = "default_sequence_fps")]
+    pub fps: f32,
+    /// Take the frame from the Poses drawer's clip time (looping), so an
+    /// animated texture plays with the mesh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follow_animation: bool,
+}
+
+fn default_sequence_fps() -> f32 {
+    24.0
+}
+
+impl ImageSequence {
+    pub fn new(first: u32, last: u32) -> Self {
+        Self {
+            first,
+            last,
+            frame: first,
+            fps: default_sequence_fps(),
+            follow_animation: false,
+        }
+    }
+
+    pub fn len(self) -> u32 {
+        self.last.saturating_sub(self.first) + 1
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.first <= self.last
+            && self.last - self.first < MAX_SEQUENCE_FRAMES
+            && (self.first..=self.last).contains(&self.frame)
+            && self.fps.is_finite()
+            && (MIN_SEQUENCE_FPS..=MAX_SEQUENCE_FPS).contains(&self.fps)
+    }
+
+    /// The frame shown at `seconds` into playback, looping over the range.
+    pub fn frame_at(self, seconds: f32) -> u32 {
+        if !seconds.is_finite() {
+            return self.first;
+        }
+        let index = (seconds.max(0.0) * self.fps).floor() as u64;
+        self.first + (index % u64::from(self.len())) as u32
+    }
+}
+
+/// Splits a file path into the text before its frame number, the number,
+/// its digit count, and the text after it. The frame number is the last
+/// run of digits in the file name (not the folder), e.g. `wave.0012.png`
+/// or `wave_12.png`.
+pub fn split_frame_number(path: &str) -> Option<(&str, u32, usize, &str)> {
+    let name_start = path.rfind(['/', '\\']).map_or(0, |slash| slash + 1);
+    let name = &path[name_start..];
+    let stem_len = name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len());
+    let stem = &name[..stem_len];
+    let digits = stem.len() - stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let number_start = name_start + stem_len - digits;
+    let number_end = name_start + stem_len;
+    let number = path[number_start..number_end].parse().ok()?;
+    Some((&path[..number_start], number, digits, &path[number_end..]))
+}
+
+/// The path of `frame` in the sequence `source` belongs to, padded like
+/// `source`; `None` when `source` has no frame number.
+pub fn sequence_frame_path(source: &str, frame: u32) -> Option<String> {
+    let (prefix, _, digits, suffix) = split_frame_number(source)?;
+    Some(format!("{prefix}{frame:0digits$}{suffix}"))
 }
 
 /// A file's size and 64-bit FNV-1a hash, recorded when it is imported so a
@@ -107,7 +203,24 @@ impl ProjectResource {
             provenance: ResourceProvenance::default(),
             tags: Vec::new(),
             content_hash: None,
+            sequence: None,
         }
+    }
+
+    /// The file holding the pixels shown now: the sequence's current frame
+    /// for an image sequence, else `source`.
+    pub fn active_source(&self) -> String {
+        self.sequence
+            .and_then(|sequence| sequence_frame_path(&self.source, sequence.frame))
+            .unwrap_or_else(|| self.source.clone())
+    }
+
+    /// True when the resource's settings are in range: a sequence needs a
+    /// frame number in its source and a valid frame range.
+    pub fn is_valid(&self) -> bool {
+        self.sequence.is_none_or(|sequence| {
+            sequence.is_valid() && split_frame_number(&self.source).is_some()
+        })
     }
 }
 

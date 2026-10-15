@@ -885,7 +885,9 @@ mod tests {
         other
             .resources
             .push(ProjectResource::new(ResourceId(2), "Mine", "mine.png"));
-        other.smart_masks.push(mask.clone());
+        let mut plain = mask.clone();
+        plain.bitmap = None;
+        other.smart_masks.push(plain);
         let import = library
             .import(AssetKind::SmartMask, "STAINED", &other)
             .unwrap();

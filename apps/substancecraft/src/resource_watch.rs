@@ -127,7 +127,7 @@ impl ResourceWatcher {
         self.pending.retain(|id| self.stamps.contains_key(id));
         let mut changed = Vec::new();
         for resource in resources {
-            let current = stamp(Path::new(&resource.source));
+            let current = stamp(Path::new(&resource.active_source()));
             match self.stamps.insert(resource.id, current) {
                 Some(previous) if previous != current => changed.push(resource.id),
                 _ => {}
