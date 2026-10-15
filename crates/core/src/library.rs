@@ -54,6 +54,10 @@ pub enum LibraryError {
     DanglingParameter { name: String, parameter: String },
     #[error("smart mask `{0}` has an invalid generator, bitmap projection, or filter")]
     InvalidMask(String),
+    #[error("filter preset `{0}` is empty, too long, or has out-of-range filters")]
+    InvalidFilters(String),
+    #[error("`{0}` is named twice")]
+    DuplicateName(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +917,276 @@ impl SmartMask {
 }
 
 // ---------------------------------------------------------------------------
+// Filter, generator, and environment resources
+
+/// A reusable filter stack, appended to a layer's content filters or to
+/// its mask filters.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilterPreset {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub filters: Vec<LayerFilter>,
+    #[serde(default)]
+    pub provenance: ResourceProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl FilterPreset {
+    /// Captures a filter stack, or `None` when it is empty.
+    pub fn from_filters(filters: &[LayerFilter], name: impl Into<String>) -> Option<Self> {
+        (!filters.is_empty()).then(|| Self {
+            name: name.into(),
+            description: String::new(),
+            filters: filters.to_vec(),
+            provenance: ResourceProvenance::default(),
+            tags: Vec::new(),
+        })
+    }
+
+    /// Appends the stack to `layer`'s mask filters (`mask`) or content
+    /// filters. Returns false, changing nothing, when the layer would
+    /// exceed its filter limit.
+    pub fn apply_to(&self, layer: &mut MaterialLayer, mask: bool) -> bool {
+        let target = if mask {
+            &mut layer.mask_filters
+        } else {
+            &mut layer.filters
+        };
+        if target.len() + self.filters.len() > crate::MAX_LAYER_FILTERS {
+            return false;
+        }
+        target.extend_from_slice(&self.filters);
+        true
+    }
+
+    pub fn validate(&self) -> Result<(), LibraryError> {
+        if !valid_name(&self.name) {
+            return Err(LibraryError::InvalidName(self.name.clone()));
+        }
+        if self.filters.is_empty()
+            || self.filters.len() > crate::MAX_LAYER_FILTERS
+            || !self.filters.iter().all(|filter| filter.is_valid())
+        {
+            return Err(LibraryError::InvalidFilters(self.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Original filter stacks for common adjustments.
+    pub fn built_in() -> Vec<Self> {
+        let preset = |name: &str, description: &str, filters: Vec<LayerFilter>, tags: &[&str]| {
+            Self {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                filters,
+                provenance: built_in_provenance(),
+                tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            }
+        };
+        vec![
+            preset(
+                "Soften",
+                "A light blur that takes the edge off painted detail.",
+                vec![LayerFilter::Blur { radius: 2.0 }],
+                &["blur", "soft"],
+            ),
+            preset(
+                "Crisp",
+                "Sharpens detail without changing the overall values.",
+                vec![LayerFilter::Sharpen {
+                    radius: 2.0,
+                    amount: 0.8,
+                }],
+                &["sharpen", "detail"],
+            ),
+            preset(
+                "Punchy",
+                "More contrast with the mid-tones kept in place.",
+                vec![LayerFilter::BrightnessContrast {
+                    brightness: 0.0,
+                    contrast: 0.35,
+                }],
+                &["contrast"],
+            ),
+            preset(
+                "Hard edge",
+                "Turns a soft mask into a crisp shape.",
+                vec![
+                    LayerFilter::Blur { radius: 1.0 },
+                    LayerFilter::Threshold {
+                        level: 0.5,
+                        softness: 0.05,
+                    },
+                ],
+                &["mask", "threshold", "edge"],
+            ),
+            preset(
+                "Faded",
+                "Desaturates and lifts colour, like sun-bleached paint.",
+                vec![
+                    LayerFilter::HueSaturation {
+                        hue: 0.0,
+                        saturation: 0.55,
+                        lightness: 0.08,
+                    },
+                    LayerFilter::Levels {
+                        in_low: 0.0,
+                        in_high: 1.0,
+                        gamma: 1.0,
+                        out_low: 0.08,
+                        out_high: 0.95,
+                    },
+                ],
+                &["colour", "color", "weathering"],
+            ),
+        ]
+    }
+}
+
+/// A reusable mask generator with its settings. Applying one swaps a
+/// layer's generator and keeps the rest of its mask (unlike a
+/// [`SmartMask`], which replaces the whole setup).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeneratorPreset {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub generator: MaskGenerator,
+    #[serde(default)]
+    pub provenance: ResourceProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl GeneratorPreset {
+    /// Captures a layer's generator, or `None` when it has none.
+    pub fn from_layer(layer: &MaterialLayer, name: impl Into<String>) -> Option<Self> {
+        layer.mask_generator.map(|generator| Self {
+            name: name.into(),
+            description: String::new(),
+            generator,
+            provenance: ResourceProvenance::default(),
+            tags: Vec::new(),
+        })
+    }
+
+    pub fn apply_to(&self, layer: &mut MaterialLayer) {
+        layer.mask_generator = Some(self.generator);
+    }
+
+    pub fn validate(&self) -> Result<(), LibraryError> {
+        if !valid_name(&self.name) {
+            return Err(LibraryError::InvalidName(self.name.clone()));
+        }
+        if !self.generator.is_valid() {
+            return Err(LibraryError::InvalidMask(self.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Tuned generator settings beyond the defaults.
+    pub fn built_in() -> Vec<Self> {
+        let preset = |name: &str, description: &str, generator, tags: &[&str]| Self {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            generator,
+            provenance: built_in_provenance(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        };
+        vec![
+            preset(
+                "Fine chips",
+                "Thin, broken wear along sharp edges.",
+                MaskGenerator::EdgeWear(EdgeWear {
+                    amount: 0.35,
+                    contrast: 0.8,
+                    breakup: 0.7,
+                    ..EdgeWear::DEFAULT
+                }),
+                &["edge", "wear", "chips"],
+            ),
+            preset(
+                "Heavy grime",
+                "Dirt that fills cavities and creeps out of them.",
+                MaskGenerator::Dirt(Dirt {
+                    amount: 0.8,
+                    cavity_weight: 0.9,
+                    ..Dirt::DEFAULT
+                }),
+                &["dirt", "grime", "cavity"],
+            ),
+            preset(
+                "Upward faces",
+                "Faces pointing up, for dust, snow, or moss.",
+                MaskGenerator::Orientation(Orientation::DEFAULT),
+                &["orientation", "dust", "snow"],
+            ),
+        ]
+    }
+}
+
+/// Smallest and largest environment strength, relative to the
+/// environment's own brightness.
+pub const MIN_ENVIRONMENT_STRENGTH: f32 = 0.0;
+pub const MAX_ENVIRONMENT_STRENGTH: f32 = 8.0;
+
+/// A lighting environment: an HDR panorama file with the rotation and
+/// strength it lights at.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentResource {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The `.hdr` or `.exr` panorama.
+    pub source: String,
+    /// Turn about the vertical axis, in degrees.
+    #[serde(default)]
+    pub rotation_degrees: f32,
+    /// Light strength; 1 is the environment's own (normalized) brightness.
+    #[serde(default = "unit_strength")]
+    pub strength: f32,
+    #[serde(default)]
+    pub provenance: ResourceProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+fn unit_strength() -> f32 {
+    1.0
+}
+
+impl EnvironmentResource {
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: String::new(),
+            source: source.into(),
+            rotation_degrees: 0.0,
+            strength: 1.0,
+            provenance: ResourceProvenance::default(),
+            tags: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), LibraryError> {
+        if !valid_name(&self.name) {
+            return Err(LibraryError::InvalidName(self.name.clone()));
+        }
+        if self.source.trim().is_empty()
+            || !self.rotation_degrees.is_finite()
+            || !(-360.0..=360.0).contains(&self.rotation_degrees)
+            || !self.strength.is_finite()
+            || !(MIN_ENVIRONMENT_STRENGTH..=MAX_ENVIRONMENT_STRENGTH).contains(&self.strength)
+        {
+            return Err(LibraryError::InvalidValues(self.name.clone()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Asset index
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -922,14 +1196,20 @@ pub enum AssetKind {
     SmartMaterial,
     SmartMask,
     ExportPreset,
+    Filter,
+    Generator,
+    Environment,
 }
 
 impl AssetKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Bitmap,
         Self::Material,
         Self::SmartMaterial,
         Self::SmartMask,
+        Self::Filter,
+        Self::Generator,
+        Self::Environment,
         Self::ExportPreset,
     ];
 
@@ -940,23 +1220,53 @@ impl AssetKind {
             Self::SmartMaterial => "Smart material",
             Self::SmartMask => "Smart mask",
             Self::ExportPreset => "Export preset",
+            Self::Filter => "Filter",
+            Self::Generator => "Generator",
+            Self::Environment => "Environment",
         }
     }
 }
 
-/// One searchable asset, from the project or the built-in library.
+/// Where an asset lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AssetOrigin {
+    /// Saved in the project.
+    Project,
+    /// In the shared on-disk library, outside any project.
+    Shared,
+    /// Shipped with SubstanceCraft.
+    BuiltIn,
+}
+
+impl AssetOrigin {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Shared => "library",
+            Self::BuiltIn => "built-in",
+        }
+    }
+}
+
+/// One searchable asset, from the project, the shared library, or the
+/// built-in library.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssetEntry {
     pub kind: AssetKind,
     pub name: String,
-    pub built_in: bool,
+    pub origin: AssetOrigin,
     pub provenance: ResourceProvenance,
     pub tags: Vec<String>,
 }
 
 impl AssetEntry {
+    pub fn built_in(&self) -> bool {
+        self.origin == AssetOrigin::BuiltIn
+    }
+
     /// True when every whitespace-separated term of `query` appears
-    /// (case-insensitively) in the name, kind, tags, author, or licence.
+    /// (case-insensitively) in the name, kind, tags, author, licence, or
+    /// origin.
     pub fn matches(&self, query: &str) -> bool {
         let haystack = format!(
             "{} {} {} {} {} {}",
@@ -965,7 +1275,7 @@ impl AssetEntry {
             self.tags.join(" "),
             self.provenance.author,
             self.provenance.license,
-            if self.built_in { "built-in" } else { "project" },
+            self.origin.name(),
         )
         .to_lowercase();
         query
@@ -980,11 +1290,15 @@ impl MaterialProject {
     /// the built-in library's.
     pub fn assets(&self) -> Vec<AssetEntry> {
         let entry =
-            |kind, name: &str, built_in, provenance: &ResourceProvenance, tags: &[String]| {
+            |kind, name: &str, built_in: bool, provenance: &ResourceProvenance, tags: &[String]| {
                 AssetEntry {
                     kind,
                     name: name.to_owned(),
-                    built_in,
+                    origin: if built_in {
+                        AssetOrigin::BuiltIn
+                    } else {
+                        AssetOrigin::Project
+                    },
                     provenance: provenance.clone(),
                     tags: tags.to_vec(),
                 }
@@ -1042,6 +1356,43 @@ impl MaterialProject {
                     &mask.tags,
                 ));
             }
+        }
+        for (presets, is_built_in) in [
+            (self.filter_presets.clone(), false),
+            (FilterPreset::built_in(), true),
+        ] {
+            for preset in &presets {
+                assets.push(entry(
+                    AssetKind::Filter,
+                    &preset.name,
+                    is_built_in,
+                    &preset.provenance,
+                    &preset.tags,
+                ));
+            }
+        }
+        for (presets, is_built_in) in [
+            (self.generator_presets.clone(), false),
+            (GeneratorPreset::built_in(), true),
+        ] {
+            for preset in &presets {
+                assets.push(entry(
+                    AssetKind::Generator,
+                    &preset.name,
+                    is_built_in,
+                    &preset.provenance,
+                    &preset.tags,
+                ));
+            }
+        }
+        for environment in &self.environments {
+            assets.push(entry(
+                AssetKind::Environment,
+                &environment.name,
+                false,
+                &environment.provenance,
+                &environment.tags,
+            ));
         }
         for preset in &self.export_presets {
             assets.push(entry(
@@ -1252,7 +1603,7 @@ mod tests {
         assert!(all.iter().any(|asset| asset.kind == AssetKind::Bitmap));
         assert!(
             all.iter()
-                .any(|asset| asset.kind == AssetKind::Material && asset.built_in)
+                .any(|asset| asset.kind == AssetKind::Material && asset.built_in())
         );
         assert!(
             all.iter()
@@ -1286,7 +1637,7 @@ mod tests {
             project
                 .search_assets(BUILT_IN_LICENSE, Some(AssetKind::Material))
                 .iter()
-                .all(|asset| asset.built_in)
+                .all(|asset| asset.built_in())
         );
     }
 

@@ -68,6 +68,8 @@ pub use instances::{InstanceField, MaterialLink};
 pub use library::{
     AssetEntry, AssetKind, BUILT_IN_LICENSE, ExposedParameter, ExposedProperty, LibraryError,
     MapRequirements, MaterialResource, ParameterValue, SmartMask, SmartMaterial,
+    AssetOrigin, EnvironmentResource, FilterPreset, GeneratorPreset, MAX_ENVIRONMENT_STRENGTH,
+    MIN_ENVIRONMENT_STRENGTH,
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
@@ -1400,6 +1402,48 @@ impl MaterialLayer {
             .chain(self.graph.iter().flat_map(MaterialGraph::resources))
     }
 
+    /// Every bitmap this layer and its children use, each once, in order.
+    pub fn resources(&self) -> Vec<ResourceId> {
+        let mut seen = BTreeSet::new();
+        self.walk()
+            .into_iter()
+            .flat_map(|layer| layer.own_resources().collect::<Vec<_>>())
+            .filter(|resource| seen.insert(*resource))
+            .collect()
+    }
+
+    /// Rewrites every bitmap reference of this layer and its children
+    /// through `map`, as when the layer moves to a project that numbers its
+    /// resources differently.
+    pub fn remap_resources(&mut self, map: &mut impl FnMut(ResourceId) -> ResourceId) {
+        if let Some(fill) = &mut self.fill {
+            fill.textures.remap(map);
+        }
+        if let Some(bitmap) = &mut self.mask_bitmap {
+            bitmap.resource = map(bitmap.resource);
+        }
+        let mut remap_tip = |tip: &mut BrushTip| {
+            if let BrushShape::Bitmap(id) = &mut tip.shape {
+                *id = map(*id);
+            }
+        };
+        for stroke in &mut self.paint_strokes {
+            remap_tip(&mut stroke.tip);
+        }
+        for stroke in &mut self.mask_strokes {
+            remap_tip(&mut stroke.tip);
+        }
+        for stroke in &mut self.id_strokes {
+            remap_tip(&mut stroke.tip);
+        }
+        if let Some(graph) = &mut self.graph {
+            graph.remap_resources(map);
+        }
+        for child in self.children.iter_mut().flatten() {
+            child.remap_resources(map);
+        }
+    }
+
     /// True when this layer (not its children) projects bitmaps triplanarly
     /// or uses a generator, so baking needs mesh maps.
     fn own_needs_mesh_maps(&self) -> bool {
@@ -1428,7 +1472,7 @@ impl MaterialLayer {
     }
 }
 
-const MAX_LAYER_FILTERS: usize = 32;
+pub(crate) const MAX_LAYER_FILTERS: usize = 32;
 
 /// Bitmaps a fill layer uses instead of its uniform values, per channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1477,6 +1521,26 @@ impl FillTextures {
             MaterialChannel::Opacity => Some(&mut self.opacity),
             MaterialChannel::User(slot) => self.user.get_mut(slot as usize),
             MaterialChannel::Id | MaterialChannel::AmbientOcclusion => None,
+        }
+    }
+
+    /// Rewrites every assigned bitmap through `map`.
+    pub fn remap(&mut self, map: &mut impl FnMut(ResourceId) -> ResourceId) {
+        for slot in [
+            &mut self.base_color,
+            &mut self.roughness,
+            &mut self.metallic,
+            &mut self.height,
+            &mut self.normal,
+            &mut self.emissive,
+            &mut self.opacity,
+        ]
+        .into_iter()
+        .chain(self.user.iter_mut())
+        {
+            if let Some(id) = slot {
+                *id = map(*id);
+            }
         }
     }
 
@@ -2081,6 +2145,21 @@ pub enum EditCommand {
         before: Vec<SmartMask>,
         after: Vec<SmartMask>,
     },
+    /// Replaced the project's filter presets.
+    FilterPresets {
+        before: Vec<FilterPreset>,
+        after: Vec<FilterPreset>,
+    },
+    /// Replaced the project's generator presets.
+    GeneratorPresets {
+        before: Vec<GeneratorPreset>,
+        after: Vec<GeneratorPreset>,
+    },
+    /// Replaced the project's lighting environments.
+    Environments {
+        before: Vec<EnvironmentResource>,
+        after: Vec<EnvironmentResource>,
+    },
     /// Replaced a texture set's own properties (all but its layers).
     TextureSetProperties {
         texture_set_id: TextureSetId,
@@ -2344,6 +2423,15 @@ fn apply_command(project: &mut MaterialProject, command: &EditCommand) -> bool {
         EditCommand::SmartMasks { before, after } => {
             replace_value(&mut project.smart_masks, before, after)
         }
+        EditCommand::FilterPresets { before, after } => {
+            replace_value(&mut project.filter_presets, before, after)
+        }
+        EditCommand::GeneratorPresets { before, after } => {
+            replace_value(&mut project.generator_presets, before, after)
+        }
+        EditCommand::Environments { before, after } => {
+            replace_value(&mut project.environments, before, after)
+        }
         EditCommand::TextureSetProperties {
             texture_set_id,
             before,
@@ -2423,6 +2511,15 @@ fn revert_command(project: &mut MaterialProject, command: &EditCommand) -> bool 
         }
         EditCommand::SmartMasks { before, after } => {
             replace_value(&mut project.smart_masks, after, before)
+        }
+        EditCommand::FilterPresets { before, after } => {
+            replace_value(&mut project.filter_presets, after, before)
+        }
+        EditCommand::GeneratorPresets { before, after } => {
+            replace_value(&mut project.generator_presets, after, before)
+        }
+        EditCommand::Environments { before, after } => {
+            replace_value(&mut project.environments, after, before)
         }
         EditCommand::TextureSetProperties {
             texture_set_id,
@@ -3013,6 +3110,15 @@ pub struct MaterialProject {
     /// Saved smart masks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub smart_masks: Vec<SmartMask>,
+    /// Saved filter stacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter_presets: Vec<FilterPreset>,
+    /// Saved mask generators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generator_presets: Vec<GeneratorPreset>,
+    /// Saved lighting environments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<EnvironmentResource>,
     /// Saved inspection cameras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cameras: Vec<NamedCamera>,
@@ -3037,6 +3143,9 @@ impl MaterialProject {
             materials: Vec::new(),
             smart_materials: Vec::new(),
             smart_masks: Vec::new(),
+            filter_presets: Vec::new(),
+            generator_presets: Vec::new(),
+            environments: Vec::new(),
             cameras: Vec::new(),
             light_rig: None,
             shader: None,
@@ -3188,6 +3297,28 @@ impl MaterialProject {
                 .find(|resource| !resource_ids.contains(resource))
             {
                 return Err(ProjectError::MissingResource(missing));
+            }
+        }
+
+        let mut names = BTreeSet::new();
+        for preset in &self.filter_presets {
+            preset.validate()?;
+            if !names.insert(preset.name.trim().to_lowercase()) {
+                return Err(LibraryError::DuplicateName(preset.name.clone()).into());
+            }
+        }
+        names.clear();
+        for preset in &self.generator_presets {
+            preset.validate()?;
+            if !names.insert(preset.name.trim().to_lowercase()) {
+                return Err(LibraryError::DuplicateName(preset.name.clone()).into());
+            }
+        }
+        names.clear();
+        for environment in &self.environments {
+            environment.validate()?;
+            if !names.insert(environment.name.trim().to_lowercase()) {
+                return Err(LibraryError::DuplicateName(environment.name.clone()).into());
             }
         }
 

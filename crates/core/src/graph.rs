@@ -299,6 +299,15 @@ impl MaterialGraph {
         })
     }
 
+    /// Rewrites every bitmap node's resource through `map`.
+    pub fn remap_resources(&mut self, map: &mut impl FnMut(ResourceId) -> ResourceId) {
+        for node in &mut self.nodes {
+            if let GraphNode::Bitmap { resource, .. } = node {
+                *resource = map(*resource);
+            }
+        }
+    }
+
     /// Removes node `index`: inputs that read it become a constant mid
     /// grey, and later references shift down.
     pub fn remove_node(&mut self, index: usize) {

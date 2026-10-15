@@ -5261,11 +5261,7 @@ impl SubstanceCraftApp {
             hint(ui, "No assets match.");
         }
         for asset in results.iter().take(24) {
-            let origin = if asset.built_in {
-                "built-in"
-            } else {
-                "project"
-            };
+            let origin = asset.origin.name();
             let license = if asset.provenance.license.is_empty() {
                 "no licence recorded".to_owned()
             } else {

@@ -13,6 +13,7 @@ mod jobs;
 mod project_format;
 mod recovery;
 mod relink;
+mod shared_library;
 mod step;
 mod step_face;
 mod step_geom;
@@ -53,6 +54,11 @@ pub use recovery::{RecoveryCandidate, RecoveryStore};
 pub use relink::{
     MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, file_content_hash, find_relink_candidates,
     find_relink_candidates_by_content, missing_project_files,
+};
+pub use shared_library::{
+    LibraryAsset, MAX_SHARED_ASSET_BYTES, MAX_SHARED_ASSETS, SHARED_ASSET_EXTENSION,
+    SHARED_LIBRARY_FORMAT, SharedBitmap, SharedEntry, SharedImport, SharedLibrary,
+    SharedLibraryError, add_imported_asset, default_shared_library_root, project_asset,
 };
 pub use step::{
     MAX_STEP_BYTES, STEP_EXTENSIONS, StepImportError, StepImportReport, StepTessellation,
