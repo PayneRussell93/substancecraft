@@ -9,10 +9,10 @@ description = "Headless SubstanceCraft jobs for build and VFX pipelines"
 [dependencies]
 serde_json.workspace = true
 substancecraft-api = { path = "../api" }
+substancecraft-core = { path = "../core" }
 
 [dev-dependencies]
 tempfile.workspace = true
-substancecraft-core = { path = "../core" }
 
 [lints]
 workspace = true

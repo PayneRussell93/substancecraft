@@ -10,6 +10,8 @@ mod gltf_import;
 mod history_file;
 mod interchange;
 mod jobs;
+mod ocio;
+mod ocio_yaml;
 mod project_format;
 mod recovery;
 mod relink;
@@ -46,7 +48,7 @@ pub use interchange::{
     write_openpbr_materialx,
 };
 pub use jobs::{
-    DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, load_mesh_file, load_project_mesh,
+    DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, OcioExport, load_mesh_file, load_project_mesh,
     run_export_job, run_export_jobs,
 };
 pub use project_format::{MigrationReport, decode_project_json_with_report};
@@ -54,6 +56,10 @@ pub use recovery::{RecoveryCandidate, RecoveryStore};
 pub use relink::{
     MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, file_content_hash, find_relink_candidates,
     find_relink_candidates_by_content, missing_project_files,
+};
+pub use ocio::{
+    MAX_OCIO_CONFIG_BYTES, OCIO_BAKE_SIZE, OCIO_HEADROOM_STOPS, OcioConfig, OcioDisplay, OcioError,
+    OcioProcessor, OcioView,
 };
 pub use shared_library::{
     LibraryAsset, MAX_SHARED_ASSET_BYTES, MAX_SHARED_ASSETS, SHARED_ASSET_EXTENSION,

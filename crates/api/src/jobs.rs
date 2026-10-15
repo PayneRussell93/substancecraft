@@ -131,6 +131,18 @@ pub struct ExportJob {
     pub udim: bool,
     /// Mesh-map bake settings; the resolution follows each texture set.
     pub mesh_maps: MeshMapSettings,
+    /// Converts colour outputs into a colour space of an OpenColorIO config.
+    pub ocio: Option<OcioExport>,
+}
+
+/// Colour outputs (Base Color, Emissive) written in colour space
+/// `colorspace` of the OpenColorIO config at `config`, converted from the
+/// sRGB the project stores through the config's linear Rec.709 space. Data
+/// outputs are untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OcioExport {
+    pub config: PathBuf,
+    pub colorspace: String,
 }
 
 impl ExportJob {
@@ -142,6 +154,7 @@ impl ExportJob {
             format: None,
             udim: false,
             mesh_maps: MeshMapSettings::default(),
+            ocio: None,
         }
     }
 }
@@ -242,6 +255,20 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
     if let Some(name) = &job.preset {
         find_preset(name)?;
     }
+    let ocio = job
+        .ocio
+        .as_ref()
+        .map(|ocio| -> Result<crate::OcioProcessor, JobError> {
+            let config = crate::OcioConfig::load(&ocio.config)
+                .map_err(|error| JobError::Project(format!("OCIO config: {error}")))?;
+            let linear = config.linear_rec709_space().ok_or_else(|| {
+                JobError::Project("the OCIO config has no linear Rec.709 colour space".to_owned())
+            })?;
+            config
+                .colorspace_processor(linear, &ocio.colorspace)
+                .map_err(|error| JobError::Project(format!("OCIO: {error}")))
+        })
+        .transpose()?;
     std::fs::create_dir_all(&job.output).map_err(|error| JobError::Project(error.to_string()))?;
 
     let mut written = Vec::new();
@@ -313,11 +340,16 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
             {
                 return Err(fail(error.message));
             }
-            let files = match tile {
+            let mut files = match tile {
                 Some(tile) => set.bake_export_tile(&preset, tile, context),
                 None => set.bake_export(&preset, context),
             }
             .map_err(|error| fail(error.to_string()))?;
+            if let Some(processor) = &ocio {
+                for file in &mut files {
+                    convert_colour_output(file, processor);
+                }
+            }
             written.extend(
                 write_exported_textures(&job.output, &files, format)
                     .map_err(|error| fail(error.to_string()))?,
@@ -325,6 +357,37 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
         }
     }
     Ok(written)
+}
+
+/// Rewrites the sRGB colour channels of `file` through `processor`
+/// (linear Rec.709 in, the target colour space out), clamped to `0..=1`,
+/// and marks them as no longer sRGB so linear formats store them as is.
+fn convert_colour_output(
+    file: &mut substancecraft_core::ExportedTexture,
+    processor: &crate::OcioProcessor,
+) {
+    if !(file.srgb[0] && file.srgb[1] && file.srgb[2]) {
+        return;
+    }
+    let decode = |value: f64| f64::from(substancecraft_core::color::srgb_to_linear(value as f32));
+    let texels = file.texture.rgba8.len() / 4;
+    for texel in 0..texels {
+        let encoded: [f64; 3] = match &file.rgba16 {
+            Some(samples) => std::array::from_fn(|c| f64::from(samples[texel * 4 + c]) / 65535.0),
+            None => std::array::from_fn(|c| f64::from(file.texture.rgba8[texel * 4 + c]) / 255.0),
+        };
+        let out = processor.apply(encoded.map(decode));
+        for (c, value) in out.into_iter().enumerate() {
+            let value = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
+            file.texture.rgba8[texel * 4 + c] = (value * 255.0).round() as u8;
+            if let Some(samples) = &mut file.rgba16 {
+                samples[texel * 4 + c] = (value * 65535.0).round() as u16;
+            }
+        }
+    }
+    for flag in &mut file.srgb[..3] {
+        *flag = false;
+    }
 }
 
 /// [`load_project_resources`] with relative resource paths resolved

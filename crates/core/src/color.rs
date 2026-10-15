@@ -285,6 +285,19 @@ impl CubeLut {
         Ok(Self { title, size, data })
     }
 
+    /// The table as `.cube` text, which [`Self::parse`] reads back.
+    pub fn to_cube_text(&self) -> String {
+        let mut text = String::new();
+        if !self.title.is_empty() {
+            text.push_str(&format!("TITLE \"{}\"\n", self.title.replace('"', "'")));
+        }
+        text.push_str(&format!("LUT_3D_SIZE {}\n", self.size));
+        for entry in &self.data {
+            text.push_str(&format!("{:.6} {:.6} {:.6}\n", entry.x, entry.y, entry.z));
+        }
+        text
+    }
+
     /// The table applied to `color` (each channel clamped to `0..=1`),
     /// interpolated trilinearly.
     pub fn apply(&self, color: Vec3) -> Vec3 {

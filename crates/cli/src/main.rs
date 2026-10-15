@@ -6,10 +6,14 @@
 //! ```text
 //! substancecraft-cli export <project.sproject> --out <dir>
 //!     [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]
+//!     [--ocio <config.ocio> --colorspace <name>]
 //! substancecraft-cli batch <jobs.txt> [--workers <n>]
 //! substancecraft-cli presets
 //! substancecraft-cli inspect <project.sproject>
 //! substancecraft-cli edit <project.sproject> '<edit as JSON>'
+//! substancecraft-cli ocio <config.ocio>
+//! substancecraft-cli ocio-bake <config.ocio> --display <name> --view <name> --out <file.cube>
+//!     [--input <colorspace>] [--size <n>]
 //! ```
 //!
 //! A job file lists one export per line, written as the arguments after
@@ -23,6 +27,11 @@
 //! through the project's undoable command model, saves the project, and
 //! prints the outcome as JSON.
 //!
+//! `--ocio` writes colour outputs (Base Color, Emissive) in a colour space of
+//! an OpenColorIO config, such as ACEScg for EXR exports. `ocio` lists a
+//! config's displays, views, and colour spaces as JSON; `ocio-bake` bakes a
+//! view into the `.cube` display LUT the viewport and renders apply.
+//!
 //! Exit status is 0 on success, 1 when the job fails, and 2 for bad
 //! arguments. The same project and options always write the same bytes.
 
@@ -30,11 +39,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use substancecraft_api::{
-    AutomationEdit, ExportJob, TextureFormat, edit_project_file, list_export_presets,
-    load_project_file_with_report, project_summary, run_export_job, run_export_jobs,
+    AutomationEdit, ExportJob, OCIO_BAKE_SIZE, OcioConfig, OcioExport, TextureFormat,
+    edit_project_file, list_export_presets, load_project_file_with_report, project_summary,
+    run_export_job, run_export_jobs,
 };
+use substancecraft_core::MAX_CUBE_LUT_SIZE;
 
-const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets\n  substancecraft-cli inspect <project.sproject>\n  substancecraft-cli edit <project.sproject> '<edit as JSON>'";
+const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>] [--ocio <config.ocio> --colorspace <name>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets\n  substancecraft-cli inspect <project.sproject>\n  substancecraft-cli edit <project.sproject> '<edit as JSON>'\n  substancecraft-cli ocio <config.ocio>\n  substancecraft-cli ocio-bake <config.ocio> --display <name> --view <name> --out <file.cube> [--input <colorspace>] [--size <n>]";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -53,7 +64,60 @@ enum Command {
         // Boxed: an edit (a whole stroke) dwarfs the other commands.
         edit: Box<AutomationEdit>,
     },
+    Ocio {
+        config: String,
+    },
+    OcioBake(OcioBake),
     Help,
+}
+
+/// An OCIO view to bake into a `.cube` display LUT.
+#[derive(Debug, PartialEq)]
+struct OcioBake {
+    config: String,
+    display: String,
+    view: String,
+    /// Colour space the renderer's linear Rec.709 light is read as;
+    /// `None` finds it in the config.
+    input: Option<String>,
+    out: String,
+    size: usize,
+}
+
+impl Default for OcioBake {
+    fn default() -> Self {
+        Self {
+            config: String::new(),
+            display: String::new(),
+            view: String::new(),
+            input: None,
+            out: String::new(),
+            size: OCIO_BAKE_SIZE,
+        }
+    }
+}
+
+/// The displays, views, and colour spaces of an OCIO config, as JSON.
+fn ocio_summary(config: &Path) -> Result<String, String> {
+    let config = OcioConfig::load(config).map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&config.summary()).map_err(|error| error.to_string())
+}
+
+/// Bakes an OCIO view for the viewport's display LUT and writes it.
+fn ocio_bake(bake: &OcioBake) -> Result<String, String> {
+    let config = OcioConfig::load(&bake.config).map_err(|error| error.to_string())?;
+    let input = match &bake.input {
+        Some(input) => input.clone(),
+        None => config
+            .linear_rec709_space()
+            .ok_or("the config has no linear Rec.709 colour space; pass --input")?
+            .to_owned(),
+    };
+    let lut = config
+        .bake_view(&input, &bake.display, &bake.view, bake.size)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&bake.out, lut.to_cube_text()).map_err(|error| error.to_string())?;
+    Ok(bake.out.clone())
 }
 
 fn parse(args: &[String]) -> Result<Command, String> {
@@ -112,6 +176,8 @@ fn parse(args: &[String]) -> Result<Command, String> {
             let mut format = None;
             let mut udim = false;
             let mut ao_samples = None;
+            let mut ocio_config = None;
+            let mut colorspace = None;
             while let Some(arg) = args.next() {
                 let mut value = |flag: &str| {
                     args.next()
@@ -129,6 +195,8 @@ fn parse(args: &[String]) -> Result<Command, String> {
                         );
                     }
                     "--udim" => udim = true,
+                    "--ocio" => ocio_config = Some(value("--ocio")?),
+                    "--colorspace" => colorspace = Some(value("--colorspace")?),
                     "--ao-samples" => {
                         let text = value("--ao-samples")?;
                         ao_samples = Some(
@@ -152,7 +220,59 @@ fn parse(args: &[String]) -> Result<Command, String> {
             if let Some(samples) = ao_samples {
                 job.mesh_maps.ao_samples = samples;
             }
+            job.ocio = match (ocio_config, colorspace) {
+                (Some(config), Some(colorspace)) => Some(OcioExport {
+                    config: config.into(),
+                    colorspace,
+                }),
+                (None, None) => None,
+                _ => return Err("--ocio and --colorspace go together".to_owned()),
+            };
             Ok(Command::Export(job))
+        }
+        Some("ocio") => match (args.next(), args.next()) {
+            (Some(config), None) => Ok(Command::Ocio {
+                config: config.clone(),
+            }),
+            (None, _) => Err("ocio needs a config file".to_owned()),
+            (Some(_), Some(extra)) => Err(format!("unexpected argument `{extra}`")),
+        },
+        Some("ocio-bake") => {
+            let mut config = None;
+            let mut bake = OcioBake::default();
+            while let Some(arg) = args.next() {
+                let mut value = |flag: &str| {
+                    args.next()
+                        .cloned()
+                        .ok_or_else(|| format!("{flag} needs a value"))
+                };
+                match arg.as_str() {
+                    "--display" => bake.display = value("--display")?,
+                    "--view" => bake.view = value("--view")?,
+                    "--input" => bake.input = Some(value("--input")?),
+                    "--out" => bake.out = value("--out")?,
+                    "--size" => {
+                        let text = value("--size")?;
+                        bake.size = text
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|size| (2..=MAX_CUBE_LUT_SIZE).contains(size))
+                            .ok_or_else(|| {
+                                format!("--size: `{text}` is not 2 to {MAX_CUBE_LUT_SIZE}")
+                            })?;
+                    }
+                    flag if flag.starts_with("--") => {
+                        return Err(format!("unknown option `{flag}`"));
+                    }
+                    path if config.is_none() => config = Some(path.to_owned()),
+                    extra => return Err(format!("unexpected argument `{extra}`")),
+                }
+            }
+            bake.config = config.ok_or("ocio-bake needs a config file")?;
+            if bake.display.is_empty() || bake.view.is_empty() || bake.out.is_empty() {
+                return Err("ocio-bake needs --display, --view, and --out".to_owned());
+            }
+            Ok(Command::OcioBake(bake))
         }
         Some(other) => Err(format!("unknown command `{other}`")),
     }
@@ -203,6 +323,11 @@ fn parse_job_file(text: &str, base: &Path) -> Result<Vec<ExportJob>, String> {
         }
         if job.output.is_relative() {
             job.output = base.join(&job.output);
+        }
+        if let Some(ocio) = &mut job.ocio
+            && ocio.config.is_relative()
+        {
+            ocio.config = base.join(&ocio.config);
         }
         jobs.push(job);
     }
@@ -275,6 +400,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Inspect { project }) => report(inspect(Path::new(&project))),
+        Ok(Command::Ocio { config }) => report(ocio_summary(Path::new(&config))),
+        Ok(Command::OcioBake(bake)) => report(ocio_bake(&bake)),
         Ok(Command::Edit {
             project,
             edit: change,
