@@ -46,6 +46,109 @@ pub struct SunLight {
     pub illuminance: f32,
 }
 
+/// Lights a rig may hold.
+pub const MAX_RIG_LIGHTS: usize = 4;
+/// Brightest rig light, in lux.
+pub const MAX_RIG_LUX: f32 = 200_000.0;
+
+/// One directional light of a [`LightRig`], placed by where it shines
+/// from: `elevation_degrees` above the horizon and `azimuth_degrees` round
+/// +Y from +Z (the front).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RigLight {
+    pub elevation_degrees: f32,
+    pub azimuth_degrees: f32,
+    /// Linear colour, each channel `0..=1`.
+    pub color: [f32; 3],
+    /// Illuminance in lux.
+    pub lux: f32,
+}
+
+impl RigLight {
+    /// The light as the renderer takes it, turned about +Y by `rotation`
+    /// radians with the environment.
+    pub fn sun(self, rotation: f32) -> SunLight {
+        SunLight {
+            direction: rotate_about_up(
+                -direction(
+                    self.elevation_degrees.to_radians(),
+                    self.azimuth_degrees.to_radians(),
+                ),
+                rotation,
+            ),
+            color: Vec3::from(self.color),
+            illuminance: self.lux,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        (-90.0..=90.0).contains(&self.elevation_degrees)
+            && self.azimuth_degrees.is_finite()
+            && self
+                .color
+                .iter()
+                .all(|channel| (0.0..=1.0).contains(channel))
+            && (0.0..=MAX_RIG_LUX).contains(&self.lux)
+    }
+}
+
+/// Directional lights added to the environment, saved with the project so
+/// every view and render of it is lit the same way.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LightRig {
+    pub name: String,
+    pub lights: Vec<RigLight>,
+}
+
+impl LightRig {
+    /// Starting points: classic studio arrangements.
+    pub fn built_in() -> Vec<LightRig> {
+        let light = |elevation_degrees: f32, azimuth_degrees: f32, color: [f32; 3], lux: f32| {
+            RigLight {
+                elevation_degrees,
+                azimuth_degrees,
+                color,
+                lux,
+            }
+        };
+        let white = [1.0, 1.0, 1.0];
+        vec![
+            LightRig {
+                name: "Three-point".to_owned(),
+                lights: vec![
+                    light(35.0, -45.0, [1.0, 0.96, 0.9], 60_000.0),
+                    light(15.0, 50.0, [0.85, 0.9, 1.0], 20_000.0),
+                    light(40.0, 160.0, white, 45_000.0),
+                ],
+            },
+            LightRig {
+                name: "Rim".to_owned(),
+                lights: vec![
+                    light(20.0, 135.0, white, 60_000.0),
+                    light(20.0, -135.0, white, 60_000.0),
+                ],
+            },
+            LightRig {
+                name: "Top".to_owned(),
+                lights: vec![light(80.0, 0.0, white, 70_000.0)],
+            },
+            LightRig {
+                name: "Clamshell".to_owned(),
+                lights: vec![
+                    light(45.0, 0.0, [1.0, 0.97, 0.93], 55_000.0),
+                    light(-30.0, 0.0, white, 18_000.0),
+                ],
+            },
+        ]
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.lights.len() <= MAX_RIG_LIGHTS
+            && self.name.chars().count() <= 64
+            && self.lights.iter().all(|light| light.is_valid())
+    }
+}
+
 /// A linear RGB equirectangular image, rows top (+Y) to bottom.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnvironmentImage {
@@ -671,5 +774,61 @@ mod tests {
             .normalized_lux(),
             CUSTOM_ENVIRONMENT_LUX
         );
+    }
+
+    #[test]
+    fn tc_0380_light_rigs_place_lights_turn_with_the_environment_and_validate() {
+        let rigs = LightRig::built_in();
+        assert_eq!(rigs.len(), 4);
+        assert!(rigs.iter().all(LightRig::is_valid));
+        assert!(rigs.iter().all(|rig| !rig.lights.is_empty()));
+
+        // A light in front, level: it shines back along -Z.
+        let front = RigLight {
+            elevation_degrees: 0.0,
+            azimuth_degrees: 0.0,
+            color: [1.0, 0.5, 0.25],
+            lux: 10_000.0,
+        };
+        let sun = front.sun(0.0);
+        assert!((sun.direction - Vec3::NEG_Z).length() < 1e-5);
+        assert_eq!(sun.color, Vec3::new(1.0, 0.5, 0.25));
+        assert_eq!(sun.illuminance, 10_000.0);
+        // Overhead shines down; turning the environment turns the light.
+        let top = RigLight {
+            elevation_degrees: 90.0,
+            ..front
+        };
+        assert!((top.sun(0.0).direction - Vec3::NEG_Y).length() < 1e-5);
+        let turned = front.sun(std::f32::consts::FRAC_PI_2);
+        assert!((turned.direction - rotate_about_up(Vec3::NEG_Z, std::f32::consts::FRAC_PI_2)).length() < 1e-5);
+
+        // Out-of-range lights and too many lights are refused.
+        for bad in [
+            RigLight { lux: -1.0, ..front },
+            RigLight { lux: MAX_RIG_LUX * 2.0, ..front },
+            RigLight { elevation_degrees: 91.0, ..front },
+            RigLight { color: [1.5, 0.0, 0.0], ..front },
+            RigLight { azimuth_degrees: f32::NAN, ..front },
+        ] {
+            assert!(!bad.is_valid(), "{bad:?}");
+        }
+        let crowded = LightRig {
+            name: "Crowded".to_owned(),
+            lights: vec![front; MAX_RIG_LIGHTS + 1],
+        };
+        assert!(!crowded.is_valid());
+        let project = crate::MaterialProject {
+            light_rig: Some(crowded),
+            ..crate::MaterialProject::empty()
+        };
+        assert_eq!(project.validate(), Err(crate::ProjectError::InvalidLightRig));
+        let saved = crate::MaterialProject {
+            light_rig: Some(rigs[0].clone()),
+            ..crate::MaterialProject::empty()
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let loaded: crate::MaterialProject = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, saved);
     }
 }

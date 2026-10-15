@@ -12,8 +12,8 @@ use std::ptr::NonNull;
 
 use glam::{Mat3, Quat, Vec3};
 use substancecraft_core::{
-    EnvironmentImage, MeshGeometry, SunLight, TexelRect, ViewportCamera, vertex_normals,
-    vertex_tangents,
+    CubeLut, EnvironmentImage, MeshGeometry, SunLight, TexelRect, ViewTransform, ViewportCamera,
+    vertex_normals, vertex_tangents,
 };
 use thiserror::Error;
 
@@ -132,6 +132,20 @@ mod ffi {
             sun_direction: *const f32,
         );
         pub fn sc_renderer_set_background(renderer: *mut ScRenderer, show: bool, blur: f32);
+        pub fn sc_renderer_set_rig_lights(
+            renderer: *mut ScRenderer,
+            count: u32,
+            directions: *const f32,
+            colors: *const f32,
+            lux: *const f32,
+        );
+        pub fn sc_renderer_set_color_grading(
+            renderer: *mut ScRenderer,
+            tone_mapper: u32,
+            exposure: f32,
+            lut: *const f32,
+            lut_size: u32,
+        ) -> bool;
         pub fn sc_renderer_set_global_illumination(
             renderer: *mut ScRenderer,
             enabled: bool,
@@ -194,6 +208,10 @@ pub struct FilamentRuntime {
     preview_mode: Option<bool>,
     /// Screen-space global illumination (AO, contact shadows, reflections).
     global_illumination: bool,
+    /// Rig lights last sent to the renderer.
+    rig_lights: Vec<SunLight>,
+    /// Colour grading last applied: view transform, exposure, and LUT identity.
+    grading: Option<(ViewTransform, u32, usize)>,
     mesh_bounds: Option<(Vec3, Vec3)>,
     target_size: [u32; 2],
 }
@@ -220,6 +238,8 @@ impl FilamentRuntime {
             slot_primitives: vec![Some(0)],
             preview_mode: None,
             global_illumination: false,
+            rig_lights: Vec::new(),
+            grading: None,
             mesh_bounds: None,
             target_size: size,
         };
@@ -499,6 +519,85 @@ impl FilamentRuntime {
         let blur = background.map_or(0.0, |blur| finite_or_zero(blur).clamp(0.0, 1.0));
         // SAFETY: `raw` is a live renderer owned by `self`.
         unsafe { ffi::sc_renderer_set_background(self.raw.as_ptr(), background.is_some(), blur) };
+    }
+
+    /// Lights the scene with up to four extra directional lights (a light rig); an empty list
+    /// removes them.
+    pub fn set_rig_lights(&mut self, lights: &[SunLight]) {
+        let lights = &lights[..lights.len().min(4)];
+        if lights == self.rig_lights.as_slice() {
+            return;
+        }
+        let mut directions = Vec::with_capacity(lights.len() * 3);
+        let mut colors = Vec::with_capacity(lights.len() * 3);
+        let mut lux = Vec::with_capacity(lights.len());
+        for light in lights {
+            let (direction, color, illuminance) = sun_parameters(Some(*light));
+            directions.extend(direction);
+            colors.extend(color);
+            lux.push(illuminance);
+        }
+        // SAFETY: `raw` is live; each array holds `lights.len()` entries, read during the call.
+        unsafe {
+            ffi::sc_renderer_set_rig_lights(
+                self.raw.as_ptr(),
+                lights.len() as u32,
+                directions.as_ptr(),
+                colors.as_ptr(),
+                lux.as_ptr(),
+            );
+        }
+        self.rig_lights = lights.to_vec();
+    }
+
+    /// Sets the view transform, exposure (stops), and an optional display LUT applied to the
+    /// display-referred sRGB image, for the viewport and renders alike.
+    pub fn set_color_grading(
+        &mut self,
+        transform: ViewTransform,
+        exposure: f32,
+        lut: Option<&CubeLut>,
+    ) -> Result<(), FilamentError> {
+        let exposure = finite_or_zero(exposure).clamp(-10.0, 10.0);
+        let key = (
+            transform,
+            exposure.to_bits(),
+            lut.map_or(0, |lut| lut.data.as_ptr() as usize),
+        );
+        if self.grading == Some(key) {
+            return Ok(());
+        }
+        let data: Vec<f32> = lut
+            .map(|lut| lut.data.iter().flat_map(|entry| entry.to_array()).collect())
+            .unwrap_or_default();
+        let size = lut.map_or(0, |lut| lut.size as u32);
+        let tone_mapper = match transform {
+            ViewTransform::Standard => 0,
+            ViewTransform::Aces => 1,
+            ViewTransform::Filmic => 2,
+            ViewTransform::Agx => 3,
+            ViewTransform::PbrNeutral => 4,
+            ViewTransform::Linear => 5,
+        };
+        // SAFETY: `raw` is live; `data` holds `size`³ RGB entries, read during the call.
+        let applied = unsafe {
+            ffi::sc_renderer_set_color_grading(
+                self.raw.as_ptr(),
+                tone_mapper,
+                exposure,
+                if data.is_empty() {
+                    std::ptr::null()
+                } else {
+                    data.as_ptr()
+                },
+                size,
+            )
+        };
+        if !applied {
+            return Err(FilamentError::ColorGradingUnavailable);
+        }
+        self.grading = Some(key);
+        Ok(())
     }
 
     /// Turns screen-space global illumination on or off: ambient occlusion with bent normals
@@ -843,6 +942,8 @@ pub enum FilamentError {
     InvalidTexture,
     #[error("Filament could not prefilter the lighting environment")]
     EnvironmentUnavailable,
+    #[error("Filament could not build the colour grading")]
+    ColorGradingUnavailable,
 }
 
 #[cfg(test)]
@@ -1145,6 +1246,189 @@ mod tests {
             };
         }
         last
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0378_environment_backgrounds_follow_the_view_and_gi_renders() {
+        use glam::Vec3;
+        use substancecraft_core::EnvironmentImage;
+
+        let image = EnvironmentImage::from_fn(128, |d| d.max(Vec3::ZERO).powf(4.0) * 3.0);
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        renderer
+            .set_mesh(&PrimitivePreset::Cube.build_mesh(), 0.0)
+            .expect("cube mesh upload");
+        renderer.set_preview_mode(false);
+        renderer
+            .set_environment(&image, 30_000.0, 0.0, None)
+            .expect("environment");
+        // From the -X side looking towards +X, where the environment is red.
+        let camera = (0..4)
+            .map(|yaw| ViewportCamera {
+                yaw: yaw as f32 * std::f32::consts::FRAC_PI_2,
+                pitch: 0.0,
+                ..ViewportCamera::default()
+            })
+            .find(|camera| (camera.rotation().inverse() * Vec3::Z).dot(Vec3::NEG_X) > 0.99)
+            .expect("a camera on the -X side");
+        let corner = |frame: &[u8]| [frame[0], frame[1], frame[2]];
+
+        let plain = render_with_camera(&mut renderer, camera);
+        renderer.set_background(Some(0.0));
+        let shown = render_with_camera(&mut renderer, camera);
+        assert!(
+            corner(&shown)[0] > corner(&plain)[0] + 40,
+            "the red sky shows behind the mesh: {:?} vs {:?}",
+            corner(&shown),
+            corner(&plain)
+        );
+        assert!(corner(&shown)[0] > corner(&shown)[2] + 40);
+        // The mesh still covers the middle (up to dithering).
+        let center = (32 * 64 + 32) * 4;
+        assert!(
+            shown[center..center + 3]
+                .iter()
+                .zip(&plain[center..center + 3])
+                .all(|(a, b)| a.abs_diff(*b) <= 3)
+        );
+
+        // Turning the environment half round turns the sky with it.
+        renderer.set_environment_transform(30_000.0, std::f32::consts::PI, None);
+        let turned = render_with_camera(&mut renderer, camera);
+        assert!(corner(&turned)[0] + 40 < corner(&shown)[0], "{:?}", corner(&turned));
+        renderer.set_environment_transform(30_000.0, 0.0, None);
+
+        // A blurred background is still the environment's colour.
+        renderer.set_background(Some(1.0));
+        let blurred = render_with_camera(&mut renderer, camera);
+        assert!(corner(&blurred)[0] > corner(&plain)[0]);
+
+        // Hidden again, the clear colour returns.
+        renderer.set_background(None);
+        let hidden = corner(&render_with_camera(&mut renderer, camera));
+        assert!(hidden.iter().zip(corner(&plain)).all(|(a, b)| a.abs_diff(b) <= 3));
+
+        // Screen-space GI renders and keeps the frame recognisable.
+        renderer.set_global_illumination(true);
+        let lit = render_with_camera(&mut renderer, camera);
+        assert_eq!(lit.len(), plain.len());
+        let difference: i32 = lit[center..center + 3]
+            .iter()
+            .zip(&plain[center..center + 3])
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .sum();
+        assert!(difference < 120, "{:?} vs {:?}", &lit[center..center + 3], &plain[center..center + 3]);
+
+        // In a concave corner (a floor meeting a wall) GI darkens the crease.
+        use substancecraft_core::{MeshGeometry, MeshVertex};
+        let vertex = |x: f32, y: f32, z: f32, u: f32, v: f32| MeshVertex {
+            position: Vec3::new(x, y, z),
+            uv: glam::Vec2::new(u, v),
+        };
+        let corner_mesh = MeshGeometry {
+            vertices: vec![
+                // Floor (y = 0), facing up.
+                vertex(-1.0, 0.0, 1.0, 0.0, 0.0),
+                vertex(1.0, 0.0, 1.0, 0.5, 0.0),
+                vertex(1.0, 0.0, -1.0, 0.5, 1.0),
+                vertex(-1.0, 0.0, -1.0, 0.0, 1.0),
+                // Wall (z = -1), facing the camera.
+                vertex(-1.0, 0.0, -1.0, 0.5, 0.0),
+                vertex(1.0, 0.0, -1.0, 1.0, 0.0),
+                vertex(1.0, 2.0, -1.0, 1.0, 1.0),
+                vertex(-1.0, 2.0, -1.0, 0.5, 1.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+            ..MeshGeometry::default()
+        };
+        renderer.set_global_illumination(false);
+        renderer.set_mesh(&corner_mesh, 0.0).expect("corner mesh");
+        renderer
+            .set_environment(&EnvironmentImage::from_fn(64, |_| Vec3::ONE), 30_000.0, 0.0, None)
+            .expect("even environment");
+        let view = ViewportCamera {
+            pitch: 0.5,
+            ..ViewportCamera::default()
+        };
+        let brightness = |frame: &[u8]| frame.iter().map(|v| u64::from(*v)).sum::<u64>();
+        let off = render_with_camera(&mut renderer, view);
+        let again = render_with_camera(&mut renderer, view);
+        renderer.set_global_illumination(true);
+        let on = render_with_camera(&mut renderer, view);
+        let noise = brightness(&off).abs_diff(brightness(&again));
+        assert!(noise < 1_000, "frames repeat: {noise}");
+        assert!(
+            brightness(&on) + 10_000 < brightness(&off),
+            "occlusion darkens the crease: {} vs {}",
+            brightness(&on),
+            brightness(&off)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an OpenGL driver for Filament's headless swap chain"]
+    fn tc_0381_light_rigs_and_view_transforms_change_the_frame() {
+        use glam::Vec3;
+        use substancecraft_core::{CubeLut, EnvironmentImage, SunLight, ViewTransform};
+
+        let mut renderer = FilamentRuntime::new(64, 64).expect("Filament runtime");
+        renderer
+            .set_mesh(&PrimitivePreset::Cube.build_mesh(), 0.0)
+            .expect("cube mesh upload");
+        renderer.set_preview_mode(false);
+        renderer
+            .set_environment(&EnvironmentImage::from_fn(32, |_| Vec3::splat(0.2)), 5_000.0, 0.0, None)
+            .expect("dim environment");
+        let camera = ViewportCamera::default();
+        let center = (32 * 64 + 32) * 4;
+        let luma = |frame: &[u8]| frame[center..center + 3].iter().map(|v| u32::from(*v)).sum::<u32>();
+
+        // A rig light shining at the camera-facing side brightens it; removing it restores.
+        let toward = camera.rotation().inverse() * Vec3::Z;
+        let dim = render_with_camera(&mut renderer, camera);
+        renderer.set_rig_lights(&[SunLight {
+            direction: -toward,
+            color: Vec3::ONE,
+            illuminance: 60_000.0,
+        }]);
+        let lit = render_with_camera(&mut renderer, camera);
+        assert!(luma(&lit) > luma(&dim) + 60, "{} vs {}", luma(&lit), luma(&dim));
+        renderer.set_rig_lights(&[]);
+        assert!(luma(&render_with_camera(&mut renderer, camera)).abs_diff(luma(&dim)) <= 6);
+
+        // Exposure and view transforms change the image; Standard with nothing else is the
+        // default look.
+        renderer
+            .set_color_grading(ViewTransform::Standard, 2.0, None)
+            .expect("grading");
+        assert!(luma(&render_with_camera(&mut renderer, camera)) > luma(&dim) + 30);
+        renderer
+            .set_color_grading(ViewTransform::Linear, 0.0, None)
+            .expect("grading");
+        let linear = render_with_camera(&mut renderer, camera);
+        assert_ne!(luma(&linear), luma(&dim));
+
+        // A display LUT that inverts colours inverts the frame.
+        let mut text = String::from("LUT_3D_SIZE 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    text.push_str(&format!("{} {} {}\n", 1 - r, 1 - g, 1 - b));
+                }
+            }
+        }
+        let invert = CubeLut::parse(&text).expect("inverting LUT");
+        renderer
+            .set_color_grading(ViewTransform::Standard, 0.0, Some(&invert))
+            .expect("grading with LUT");
+        let inverted = render_with_camera(&mut renderer, camera);
+        let corner = |frame: &[u8]| u32::from(frame[0]) + u32::from(frame[1]) + u32::from(frame[2]);
+        assert!(corner(&inverted) > 600, "the dark background turns light: {}", corner(&inverted));
+        renderer
+            .set_color_grading(ViewTransform::Standard, 0.0, None)
+            .expect("default grading");
+        assert!(luma(&render_with_camera(&mut renderer, camera)).abs_diff(luma(&dim)) <= 6);
     }
 
     #[test]

@@ -134,6 +134,166 @@ impl ColorSpace {
     }
 }
 
+/// How the viewport and renders map scene light to the display: the tone
+/// curve applied before the sRGB encoding (and any display LUT).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewTransform {
+    /// The renderer's default curve (ACES, legacy fit).
+    #[default]
+    Standard,
+    /// ACES reference rendering transform.
+    Aces,
+    /// Filmic curve.
+    Filmic,
+    /// AgX: gentle highlight roll-off that keeps hues.
+    Agx,
+    /// Khronos PBR Neutral: base colours stay close to their values.
+    PbrNeutral,
+    /// No tone curve: linear light clipped at white.
+    Linear,
+}
+
+impl ViewTransform {
+    pub const ALL: [Self; 6] = [
+        Self::Standard,
+        Self::Aces,
+        Self::Filmic,
+        Self::Agx,
+        Self::PbrNeutral,
+        Self::Linear,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Aces => "ACES",
+            Self::Filmic => "Filmic",
+            Self::Agx => "AgX",
+            Self::PbrNeutral => "PBR Neutral",
+            Self::Linear => "Linear",
+        }
+    }
+}
+
+/// Largest 3D LUT edge accepted (the renderer takes up to 255; files from
+/// colour pipelines use 17 to 65).
+pub const MAX_CUBE_LUT_SIZE: usize = 129;
+
+/// A 3D colour lookup table from an Adobe/Resolve `.cube` file, as colour
+/// pipelines (OpenColorIO's `ociobakelut`, grading tools) export display
+/// transforms and looks. Entries run red fastest, then green, then blue.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CubeLut {
+    pub title: String,
+    pub size: usize,
+    pub data: Vec<Vec3>,
+}
+
+impl CubeLut {
+    /// Parses `.cube` text. Input domains other than `0..1` are not
+    /// supported, nor are 1D-only tables.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut title = String::new();
+        let mut size = None;
+        let mut data = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut words = line.split_whitespace();
+            let keyword = words.next().unwrap_or_default();
+            let numbers = || -> Result<Vec<f32>, String> {
+                line.split_whitespace()
+                    .skip(1)
+                    .map(|word| {
+                        word.parse::<f32>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| format!("line {}: `{word}` is not a number", number + 1))
+                    })
+                    .collect()
+            };
+            match keyword {
+                "TITLE" => title = line["TITLE".len()..].trim().trim_matches('"').to_owned(),
+                "LUT_3D_SIZE" => {
+                    let edge = words
+                        .next()
+                        .and_then(|word| word.parse::<usize>().ok())
+                        .filter(|edge| (2..=MAX_CUBE_LUT_SIZE).contains(edge))
+                        .ok_or_else(|| {
+                            format!("line {}: LUT_3D_SIZE must be 2 to {MAX_CUBE_LUT_SIZE}", number + 1)
+                        })?;
+                    size = Some(edge);
+                    data.reserve(edge * edge * edge);
+                }
+                "LUT_1D_SIZE" => return Err("1D LUTs are not supported; use a 3D LUT".to_owned()),
+                "DOMAIN_MIN" | "DOMAIN_MAX" => {
+                    let expected = if keyword == "DOMAIN_MIN" { 0.0 } else { 1.0 };
+                    if numbers()?.iter().any(|value| (value - expected).abs() > 1e-6) {
+                        return Err(format!(
+                            "line {}: only the 0..1 input domain is supported",
+                            number + 1
+                        ));
+                    }
+                }
+                "LUT_3D_INPUT_RANGE" | "LUT_1D_INPUT_RANGE" => {
+                    return Err(format!(
+                        "line {}: only the 0..1 input domain is supported",
+                        number + 1
+                    ));
+                }
+                _ if keyword.starts_with(|first: char| first.is_ascii_digit() || first == '-' || first == '.') => {
+                    let values: Vec<f32> = std::iter::once(keyword)
+                        .chain(words)
+                        .map(|word| {
+                            word.parse::<f32>().ok().filter(|value| value.is_finite()).ok_or_else(
+                                || format!("line {}: `{word}` is not a number", number + 1),
+                            )
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let [red, green, blue] = values[..] else {
+                        return Err(format!("line {}: expected three values", number + 1));
+                    };
+                    data.push(Vec3::new(red, green, blue));
+                }
+                // Other keywords (vendor extensions) are ignored.
+                _ => {}
+            }
+        }
+        let size = size.ok_or("the file has no LUT_3D_SIZE")?;
+        if data.len() != size * size * size {
+            return Err(format!(
+                "expected {} entries for a {size}³ LUT, found {}",
+                size * size * size,
+                data.len()
+            ));
+        }
+        Ok(Self { title, size, data })
+    }
+
+    /// The table applied to `color` (each channel clamped to `0..=1`),
+    /// interpolated trilinearly.
+    pub fn apply(&self, color: Vec3) -> Vec3 {
+        let last = (self.size - 1) as f32;
+        let at = color.clamp(Vec3::ZERO, Vec3::ONE) * last;
+        let low = at.floor().min(Vec3::splat(last - 1.0)).max(Vec3::ZERO);
+        let t = at - low;
+        let index = |r: usize, g: usize, b: usize| self.data[r + self.size * (g + self.size * b)];
+        let (r0, g0, b0) = (low.x as usize, low.y as usize, low.z as usize);
+        let mut result = Vec3::ZERO;
+        for (db, wb) in [(0, 1.0 - t.z), (1, t.z)] {
+            for (dg, wg) in [(0, 1.0 - t.y), (1, t.y)] {
+                for (dr, wr) in [(0, 1.0 - t.x), (1, t.x)] {
+                    result += index(r0 + dr, g0 + dg, b0 + db) * (wr * wg * wb);
+                }
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +367,51 @@ mod tests {
             ColorSpace::AcesCg.to_srgb8(Vec3::new(f32::NAN, 0.0, 0.0)),
             ([0, 0, 0], true)
         );
+    }
+
+    #[test]
+    fn tc_0379_cube_luts_parse_and_interpolate_and_reject_what_they_cannot_hold() {
+        // A 2³ table that swaps red and blue.
+        let mut text = String::from("# swap\nTITLE \"Swap R/B\"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    text.push_str(&format!("{b} {g} {r}\n"));
+                }
+            }
+        }
+        let lut = CubeLut::parse(&text).unwrap();
+        assert_eq!((lut.title.as_str(), lut.size), ("Swap R/B", 2));
+        assert!(close(
+            lut.apply(Vec3::new(0.8, 0.3, 0.1)),
+            Vec3::new(0.1, 0.3, 0.8),
+            1e-5
+        ));
+        assert!(close(lut.apply(Vec3::splat(2.0)), Vec3::ONE, 1e-5), "clamped");
+
+        // An identity table of edge 17 passes colours through.
+        let mut identity = String::from("LUT_3D_SIZE 17\n");
+        for b in 0..17 {
+            for g in 0..17 {
+                for r in 0..17 {
+                    identity.push_str(&format!("{} {} {}\n", r as f32 / 16.0, g as f32 / 16.0, b as f32 / 16.0));
+                }
+            }
+        }
+        let identity = CubeLut::parse(&identity).unwrap();
+        let color = Vec3::new(0.123, 0.5, 0.987);
+        assert!(close(identity.apply(color), color, 1e-4));
+
+        for (bad, why) in [
+            ("LUT_3D_SIZE 2\n0 0 0\n", "too few entries"),
+            ("0 0 0\n", "no size"),
+            ("LUT_3D_SIZE 1\n0 0 0\n", "size too small"),
+            ("LUT_1D_SIZE 4\n", "1D"),
+            ("LUT_3D_SIZE 2\nDOMAIN_MAX 2 2 2\n", "domain"),
+            ("LUT_3D_SIZE 2\n0 0 x\n", "not a number"),
+            ("LUT_3D_SIZE 2\n0 0\n", "two values"),
+        ] {
+            assert!(CubeLut::parse(bad).is_err(), "{why}");
+        }
     }
 }

@@ -1720,6 +1720,34 @@ impl SubstanceCraftApp {
             false,
             2,
         );
+        let before = (
+            self.preferences.values.environment_background,
+            self.preferences.values.background_blur,
+            self.preferences.values.global_illumination,
+        );
+        let values = &mut self.preferences.values;
+        widgets::property_row(ui, "Background", |ui| {
+            widgets::toggle(ui, &mut values.environment_background)
+        })
+        .on_hover_text("Show the environment behind the model, in the viewport and in renders");
+        if values.environment_background {
+            slider_row(ui, "Blur", &mut values.background_blur, 0.0..=1.0, false, 2);
+        }
+        widgets::property_row(ui, "Screen-space GI", |ui| {
+            widgets::toggle(ui, &mut values.global_illumination)
+        })
+        .on_hover_text(
+            "Ambient occlusion with bent normals, contact shadows from the sun, and \
+             screen-space reflections between parts of the model",
+        );
+        let after = (
+            values.environment_background,
+            values.background_blur,
+            values.global_illumination,
+        );
+        if after != before {
+            self.save_preferences();
+        }
 
         widgets::caption(ui, "Render");
         let mut long_edge = None;

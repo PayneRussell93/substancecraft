@@ -38,13 +38,14 @@ pub use brush::{
     stroke_texel_bounds,
 };
 pub use camera_paint::{MAX_STROKE_VIEWPORT, StrokeCamera, projected_stroke_texel_rects};
-pub use color::ColorSpace;
+pub use color::{ColorSpace, CubeLut, MAX_CUBE_LUT_SIZE, ViewTransform};
 pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
     MaterialSample, MaterialTextures,
 };
 pub use environment::{
-    CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightingPreset, PanoramaError, SunLight,
+    CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightRig, LightingPreset, MAX_RIG_LIGHTS, MAX_RIG_LUX,
+    PanoramaError, RigLight, SunLight,
 };
 pub use evolution::{Evolution, EvolutionDrive, MAX_EVOLUTION_DRIVES, MAX_EVOLUTIONS};
 pub use export::{
@@ -3013,6 +3014,9 @@ pub struct MaterialProject {
     /// Saved inspection cameras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cameras: Vec<NamedCamera>,
+    /// Lights added to the viewport environment, in views and renders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_rig: Option<LightRig>,
 }
 
 impl MaterialProject {
@@ -3029,6 +3033,7 @@ impl MaterialProject {
             smart_materials: Vec::new(),
             smart_masks: Vec::new(),
             cameras: Vec::new(),
+            light_rig: None,
         }
     }
 
@@ -3113,6 +3118,9 @@ impl MaterialProject {
                 || !mesh.high_to_low.is_valid())
         {
             return Err(ProjectError::InvalidMeshSettings);
+        }
+        if self.light_rig.as_ref().is_some_and(|rig| !rig.is_valid()) {
+            return Err(ProjectError::InvalidLightRig);
         }
 
         let mut pose_ids = BTreeSet::new();
@@ -3241,6 +3249,8 @@ pub enum ProjectError {
     InvalidTextureSetSettings(TextureSetId),
     #[error("mesh scale or smoothing settings are out of range")]
     InvalidMeshSettings,
+    #[error("the light rig has too many lights or out-of-range values")]
+    InvalidLightRig,
     #[error("pose id {0:?} is duplicated")]
     DuplicatePoseId(PoseId),
     #[error("pose name `{0}` is duplicated")]

@@ -42,6 +42,7 @@ mod cameras;
 mod diagnostics;
 mod edges;
 mod environments;
+mod grading;
 mod graph_editor;
 mod icons;
 mod incremental;
@@ -171,6 +172,10 @@ struct SubstanceCraftApp {
     filament_environment: Option<(environments::EnvironmentSource, f32, f32)>,
     /// A loaded HDR panorama lighting the viewport instead of the preset.
     custom_environment: Option<environments::CustomEnvironment>,
+    /// Display LUT applied after the view transform.
+    display_lut: Option<grading::DisplayLut>,
+    /// Why the display LUT did not load, when it did not.
+    grading_status: Option<String>,
     /// Loads of custom environments so far.
     environment_revision: u64,
     /// Result of the last custom environment load.
@@ -814,6 +819,8 @@ impl Default for SubstanceCraftApp {
             filament_mesh_revision: None,
             filament_environment: None,
             custom_environment: None,
+            display_lut: None,
+            grading_status: None,
             environment_revision: 0,
             environment_status: None,
             filament_renderer: None,
@@ -1277,6 +1284,25 @@ impl SubstanceCraftApp {
         ) {
             self.filament_error = Some(error.to_string());
             return;
+        }
+        let preferences = &self.preferences.values;
+        renderer.set_background(
+            preferences
+                .environment_background
+                .then_some(preferences.background_blur),
+        );
+        renderer.set_global_illumination(preferences.global_illumination);
+        if let Err(error) = renderer.set_color_grading(
+            preferences.view_transform,
+            preferences.exposure,
+            self.display_lut.as_ref().map(|lut| lut.lut.as_ref()),
+        ) {
+            self.filament_error = Some(error.to_string());
+            return;
+        }
+        let rig = self.rig_suns(lighting.rotation);
+        if let Some(renderer) = self.filament_renderer.as_mut() {
+            renderer.set_rig_lights(&rig);
         }
 
         let patch = self

@@ -14,6 +14,8 @@ use crate::{theme, widgets};
 
 pub const MIN_UI_SCALE: f32 = 0.75;
 pub const MAX_UI_SCALE: f32 = 2.0;
+/// Widest exposure adjustment, in stops either way.
+pub const MAX_EXPOSURE_STOPS: f32 = 6.0;
 /// Recent brush materials kept.
 pub const MAX_RECENT: usize = 12;
 pub const MAX_FAVORITES: usize = 24;
@@ -261,6 +263,18 @@ pub struct Preferences {
     pub environment_file: Option<PathBuf>,
     /// Colour space the brush colour's numeric fields are shown in.
     pub picker_color_space: substancecraft_core::ColorSpace,
+    /// Shows the lighting environment behind the model.
+    pub environment_background: bool,
+    /// Blur of the background, `0..=1`.
+    pub background_blur: f32,
+    /// Screen-space global illumination in the viewport and renders.
+    pub global_illumination: bool,
+    /// Tone curve from scene light to the display.
+    pub view_transform: substancecraft_core::ViewTransform,
+    /// Exposure adjustment in stops.
+    pub exposure: f32,
+    /// `.cube` display LUT applied after the view transform.
+    pub display_lut: Option<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -276,6 +290,12 @@ impl Default for Preferences {
             lighting_preset: substancecraft_core::LightingPreset::default(),
             environment_file: None,
             picker_color_space: substancecraft_core::ColorSpace::Srgb,
+            environment_background: false,
+            background_blur: 0.0,
+            global_illumination: false,
+            view_transform: substancecraft_core::ViewTransform::Standard,
+            exposure: 0.0,
+            display_lut: None,
         }
     }
 }
@@ -319,6 +339,16 @@ impl Preferences {
     }
 
     fn sanitize(&mut self) {
+        self.exposure = if self.exposure.is_finite() {
+            self.exposure.clamp(-MAX_EXPOSURE_STOPS, MAX_EXPOSURE_STOPS)
+        } else {
+            0.0
+        };
+        self.background_blur = if self.background_blur.is_finite() {
+            self.background_blur.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self.ui_scale = if self.ui_scale.is_finite() {
             self.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
         } else {
@@ -387,6 +417,7 @@ impl SubstanceCraftApp {
         self.viewport_lighting.preset = self.preferences.values.lighting_preset;
         self.preferences.path = Some(path);
         self.restore_custom_environment();
+        self.restore_display_lut();
     }
 
     /// Lights the viewport (and still renders) with `preset`, in place of

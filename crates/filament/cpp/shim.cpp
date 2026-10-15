@@ -5,6 +5,8 @@
 // need to keep their slices alive for the duration of the call.
 
 #include <filament/Camera.h>
+#include <filament/ColorGrading.h>
+#include <filament/ToneMapper.h>
 #include <filament/Engine.h>
 #include <filament/IndexBuffer.h>
 #include <filament/IndirectLight.h>
@@ -72,6 +74,11 @@ struct ScRenderer {
     bool backgroundWanted = false;
     bool backgroundInScene = false;
     float backgroundBlur = 0.0f;
+    // Directional lights of the project's light rig; null until first used.
+    std::array<Entity, 4> rigLights{};
+    uint32_t rigLightsInScene = 0;
+    // View transform and display LUT; null keeps Filament's default grading.
+    ColorGrading* colorGrading = nullptr;
     Material* material = nullptr;
     // One instance per mesh primitive (material slot), with its own maps indexed by map slot:
     // 0 base colour, 1 ORM, 2 normal, 3 emissive.
@@ -183,6 +190,16 @@ void destroyAll(ScRenderer* r) {
     Engine* engine = r->engine;
     destroyMesh(r);
     destroyInstances(r, 0);
+    for (Entity& light : r->rigLights) {
+        if (!light.isNull()) {
+            engine->destroy(light);
+            EntityManager::get().destroy(light);
+        }
+    }
+    if (r->colorGrading) {
+        if (r->view) r->view->setColorGrading(nullptr);
+        engine->destroy(r->colorGrading);
+    }
     if (!r->backgroundEntity.isNull()) {
         engine->destroy(r->backgroundEntity);
         EntityManager::get().destroy(r->backgroundEntity);
@@ -385,7 +402,9 @@ bool createBackground(ScRenderer* r) {
 // Shows the background when it is wanted and an environment cubemap exists to show.
 void syncBackground(ScRenderer* r) {
     bool const show = r->backgroundWanted && r->reflections && createBackground(r);
-    if (show && r->backgroundInstance) {
+    // Once built, the instance always holds the current cubemap, shown or not, so no
+    // destroyed texture stays bound to it.
+    if (r->backgroundInstance && r->reflections) {
         TextureSampler const sampler(TextureSampler::MinFilter::LINEAR_MIPMAP_LINEAR,
                 TextureSampler::MagFilter::LINEAR, TextureSampler::WrapMode::CLAMP_TO_EDGE);
         r->backgroundInstance->setParameter("environment", r->reflections, sampler);
@@ -408,11 +427,11 @@ void aimBackground(ScRenderer* r) {
         return;
     }
     math::mat4 const model = r->camera->getModelMatrix();
+    math::mat3f const worldFromView(math::float3(model[0].xyz), math::float3(model[1].xyz),
+            math::float3(model[2].xyz));
     // Undo the environment turn: a rotation about +Y by the opposite angle.
     math::mat3f const unturn =
             math::mat3f::rotation(-r->environmentRotation, math::float3{0, 1, 0});
-    math::mat3f const turn =
-            math::mat3f::rotation(r->environmentRotation, math::float3{0, 1, 0});
     r->backgroundInstance->setParameter("viewToEnvironment", unturn * worldFromView);
     // A 50 degree vertical field of view.
     float const halfHeight = std::tan(0.5f * 50.0f * 3.14159265f / 180.0f);
@@ -826,14 +845,18 @@ bool sc_renderer_set_environment(ScRenderer* r, float const* rgb, uint32_t width
             return false;
         }
         r->scene->setIndirectLight(light);
-        if (r->indirectLight) r->engine->destroy(r->indirectLight);
-        if (r->reflections) r->engine->destroy(r->reflections);
-        if (r->irradiance) r->engine->destroy(r->irradiance);
+        IndirectLight* const oldLight = r->indirectLight;
+        Texture* const oldReflections = r->reflections;
+        Texture* const oldIrradiance = r->irradiance;
         r->indirectLight = light;
         r->reflections = reflections;
         r->irradiance = irradiance;
         r->environmentRotation = rotation;
+        // Rebind the background before the old cubemap it may hold goes away.
         syncBackground(r);
+        if (oldLight) r->engine->destroy(oldLight);
+        if (oldReflections) r->engine->destroy(oldReflections);
+        if (oldIrradiance) r->engine->destroy(oldIrradiance);
 
         // The renderer rotates shading space by the IBL rotation's transpose, so the
         // environment turns by `turn`; the sun turns with it.
@@ -889,6 +912,93 @@ void sc_renderer_set_background(ScRenderer* r, bool show, float blur) {
         r->backgroundBlur = std::fmin(std::fmax(blur, 0.0f), 1.0f);
         syncBackground(r);
     } catch (...) {
+    }
+}
+
+// Lights the scene with `count` (at most 4) extra directional lights: `directions` (where each
+// shines, xyz), linear `colors` (rgb), and `lux`, three floats per light for the first two.
+void sc_renderer_set_rig_lights(ScRenderer* r, uint32_t count, float const* directions,
+        float const* colors, float const* lux) {
+    try {
+        count = count < r->rigLights.size() ? count : uint32_t(r->rigLights.size());
+        auto& lights = r->engine->getLightManager();
+        for (uint32_t index = 0; index < r->rigLights.size(); index++) {
+            Entity& entity = r->rigLights[index];
+            if (index < count) {
+                math::float3 const direction{directions[index * 3], directions[index * 3 + 1],
+                        directions[index * 3 + 2]};
+                math::float3 const color{colors[index * 3], colors[index * 3 + 1],
+                        colors[index * 3 + 2]};
+                if (entity.isNull()) {
+                    entity = EntityManager::get().create();
+                    LightManager::Builder(LightManager::Type::DIRECTIONAL)
+                            .castShadows(false)
+                            .build(*r->engine, entity);
+                }
+                auto const instance = lights.getInstance(entity);
+                lights.setDirection(instance, direction);
+                lights.setColor(instance, color);
+                lights.setIntensity(instance, lux[index]);
+                if (index >= r->rigLightsInScene) {
+                    r->scene->addEntity(entity);
+                }
+            } else if (index < r->rigLightsInScene) {
+                r->scene->remove(entity);
+            }
+        }
+        r->rigLightsInScene = count;
+    } catch (...) {
+    }
+}
+
+// Sets the view transform: tone mapper 0 standard (Filament's default), 1 ACES, 2 filmic, 3 AgX,
+// 4 Khronos PBR Neutral, 5 linear (none); `exposure` in stops; and an optional display LUT of
+// `lut_size`³ RGB entries (red fastest) applied to the display-referred sRGB result. Returns
+// false when the grading cannot be built.
+bool sc_renderer_set_color_grading(ScRenderer* r, uint32_t tone_mapper, float exposure,
+        float const* lut, uint32_t lut_size) {
+    try {
+        ColorGrading* grading = nullptr;
+        bool const plain = tone_mapper == 0 && exposure == 0.0f && lut_size == 0;
+        if (!plain) {
+            LinearToneMapper linear;
+            ACESToneMapper aces;
+            ACESLegacyToneMapper legacy;
+            FilmicToneMapper filmic;
+            AgxToneMapper agx;
+            PBRNeutralToneMapper neutral;
+            ToneMapper const* mapper = &legacy;
+            switch (tone_mapper) {
+                case 1: mapper = &aces; break;
+                case 2: mapper = &filmic; break;
+                case 3: mapper = &agx; break;
+                case 4: mapper = &neutral; break;
+                case 5: mapper = &linear; break;
+                default: break;
+            }
+            ColorGrading::Builder builder;
+            builder.quality(ColorGrading::QualityLevel::HIGH).toneMapper(mapper).exposure(exposure);
+            if (lut && lut_size >= 2 && lut_size <= 255) {
+                size_t const entries = size_t(lut_size) * lut_size * lut_size;
+                utils::FixedCapacityVector<math::float3> data(entries);
+                for (size_t index = 0; index < entries; index++) {
+                    data[index] = {lut[index * 3], lut[index * 3 + 1], lut[index * 3 + 2]};
+                }
+                builder.customLut(std::move(data), uint8_t(lut_size));
+            }
+            grading = builder.build(*r->engine);
+            if (!grading) {
+                return false;
+            }
+        }
+        r->view->setColorGrading(grading);
+        if (r->colorGrading) {
+            r->engine->destroy(r->colorGrading);
+        }
+        r->colorGrading = grading;
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 
