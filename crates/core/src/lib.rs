@@ -70,7 +70,8 @@ pub use library::{
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
     MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
-    bake_mesh_maps_corrected, bake_mesh_maps_from, cage_ray_direction,
+    bake_mesh_maps_caged, bake_mesh_maps_corrected, bake_mesh_maps_from, bake_name_key,
+    cage_ray_direction,
 };
 pub use painting::{
     LazyStabilizer, MAX_RADIAL_COPIES, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points,
@@ -94,7 +95,7 @@ pub use smoothing::{
 pub use templates::ProjectTemplate;
 pub use thumbnails::{MAX_THUMBNAIL_SIZE, THUMBNAIL_BAKE_RESOLUTION, ThumbnailStage};
 pub use topology::{DiagnosticEdge, EdgeFlags, MeshTopology, SelectionMode, diagnostic_edges};
-pub use udim::{UDIM_TOKEN, UdimTile};
+pub use udim::{UDIM_TOKEN, UdimAtlas, UdimTile};
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_TEXTURE_DIMENSION: u32 = 32_768;
@@ -978,6 +979,47 @@ pub struct MeshAsset {
     /// Likewise for the high-poly file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_poly_hash: Option<ContentHash>,
+    /// How high-to-low bakes pair and reach the high mesh.
+    #[serde(default, skip_serializing_if = "HighToLowOptions::is_default")]
+    pub high_to_low: HighToLowOptions,
+}
+
+/// Per-mesh controls of high-to-low baking.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HighToLowOptions {
+    /// Each low part (material slot, or the mesh itself) takes detail only
+    /// from high-poly parts of the same name ([`bake_name_key`]); parts
+    /// without a match use the whole high mesh.
+    #[serde(default)]
+    pub match_by_name: bool,
+    /// Cage mesh file: the low mesh pushed out around the high mesh, with
+    /// the same vertices and triangles. Loaded with the mesh's scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cage_source: Option<String>,
+    /// Cage distance multiplier per low part (material slot name), for
+    /// parts needing a tighter or looser cage than the rest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cage_scales: BTreeMap<String, f32>,
+}
+
+/// Range of a part's cage-distance multiplier.
+pub const CAGE_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
+
+impl HighToLowOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The cage-distance multiplier of part `name`.
+    pub fn cage_scale(&self, name: &str) -> f32 {
+        self.cage_scales.get(name).copied().unwrap_or(1.0)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.cage_scales
+            .values()
+            .all(|scale| scale.is_finite() && CAGE_SCALE_RANGE.contains(scale))
+    }
 }
 
 fn default_mesh_scale() -> f32 {
@@ -3021,7 +3063,10 @@ impl MaterialProject {
         }
 
         if let Some(mesh) = &self.mesh
-            && (!mesh.smoothing.is_valid() || !mesh.scale.is_finite() || mesh.scale <= 0.0)
+            && (!mesh.smoothing.is_valid()
+                || !mesh.scale.is_finite()
+                || mesh.scale <= 0.0
+                || !mesh.high_to_low.is_valid())
         {
             return Err(ProjectError::InvalidMeshSettings);
         }
@@ -3317,6 +3362,7 @@ mod tests {
             high_poly_source: None,
             content_hash: None,
             high_poly_hash: None,
+            high_to_low: Default::default(),
         };
         let old_mesh = project.mesh.clone();
         assert!(history.apply(

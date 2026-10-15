@@ -357,6 +357,7 @@ impl SubstanceCraftApp {
             high_poly_source: None,
             content_hash: None,
             high_poly_hash: None,
+            high_to_low: Default::default(),
         });
         self.set_base_geometry(Some(preset.build_mesh()));
         self.high_poly = None;
@@ -1443,6 +1444,7 @@ impl SubstanceCraftApp {
                  areas, and the edge guard keeps bevels themselves smooth. Inspect the \
                  result with the Skew map preview, then bake again.",
             );
+            self.high_to_low_controls(ui);
         }
 
         widgets::caption(ui, "Settings");
@@ -2834,10 +2836,10 @@ impl SubstanceCraftApp {
             });
 
         if reload {
-            let pending: Vec<ResourceId> = self.resource_watcher.pending.iter().copied().collect();
-            self.reload_changed_resources(&pending);
+            self.reload_pending();
         } else if ignore {
             self.resource_watcher.pending.clear();
+            self.resource_watcher.high_poly_pending = false;
         }
         for slot in dismissed {
             match slot {
@@ -4368,6 +4370,7 @@ impl SubstanceCraftApp {
                     "Copy the layer stack from a source point you set",
                 ),
                 (BrushSource::Smudge, "Drag the layer stack along the stroke"),
+                (BrushSource::Blur, "Soften the layer stack under the stroke"),
             ] {
                 if widgets::chip(ui, source.label(), tools.source == source)
                     .on_hover_text(tooltip)
@@ -4423,6 +4426,22 @@ impl SubstanceCraftApp {
                     ui,
                     "Drags every enabled channel of the stack along the stroke, up to \
                      Strength × the brush radius. Smudge works in texture space.",
+                );
+            }
+            BrushSource::Blur => {
+                slider_row(
+                    ui,
+                    "Strength",
+                    &mut tools.blur_strength,
+                    0.05..=1.0,
+                    false,
+                    2,
+                );
+                hint(
+                    ui,
+                    "Averages every enabled channel of the stack over Strength × the \
+                     brush radius around each texel. Use it with Draw path to blur along \
+                     a path. Blur works in texture space.",
                 );
             }
         }
@@ -4589,7 +4608,7 @@ impl SubstanceCraftApp {
                     if widgets::pill_button(ui, None, "Draw path", false, true)
                         .on_hover_text(
                             "Click points on the mesh; the stroke follows a smooth curve \
-                             through them",
+                             through them over the surface, across UV seams",
                         )
                         .clicked()
                     {

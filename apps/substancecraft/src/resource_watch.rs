@@ -1,5 +1,6 @@
-//! Notices when bitmap resources change on disk, so edits made in an
-//! external image editor show up without re-importing.
+//! Notices when bitmap resources or the high-poly bake source change on
+//! disk, so edits made in an image editor or a re-export from a modelling
+//! tool show up without re-importing.
 //!
 //! Files are polled (modification time and size) rather than watched through
 //! OS notifications: projects reference few bitmaps, polling needs no extra
@@ -7,7 +8,7 @@
 //! file and renaming it over the original.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use substancecraft_core::{ProjectResource, ResourceId};
@@ -57,6 +58,11 @@ pub(super) struct ResourceWatcher {
     last_scan: Option<Instant>,
     /// Changes waiting for confirmation in [`ReloadMode::Ask`].
     pub(super) pending: BTreeSet<ResourceId>,
+    /// The high-poly bake source and its last seen stamp, so re-exporting
+    /// it rebakes the mesh maps.
+    high_poly: Option<(PathBuf, Option<FileStamp>)>,
+    /// The high-poly source changed and waits for confirmation.
+    pub(super) high_poly_pending: bool,
 }
 
 impl ResourceWatcher {
@@ -75,6 +81,28 @@ impl ResourceWatcher {
     #[cfg(test)]
     pub(super) fn expire(&mut self) {
         self.last_scan = None;
+    }
+
+    /// Watches the high-poly source at `path` (or nothing), taking its
+    /// current state as the baseline.
+    pub(super) fn watch_high_poly(&mut self, path: Option<&Path>) {
+        self.high_poly = path.map(|path| (path.to_path_buf(), stamp(path)));
+        self.high_poly_pending = false;
+    }
+
+    /// True when a high-poly source is watched.
+    pub(super) fn watches_high_poly(&self) -> bool {
+        self.high_poly.is_some()
+    }
+
+    /// True once each time the watched high-poly file changes (including
+    /// disappearing or reappearing).
+    pub(super) fn scan_high_poly(&mut self) -> bool {
+        let Some((path, last)) = &mut self.high_poly else {
+            return false;
+        };
+        let current = stamp(path);
+        std::mem::replace(last, current) != current
     }
 
     pub(super) fn forget(&mut self, id: ResourceId) {

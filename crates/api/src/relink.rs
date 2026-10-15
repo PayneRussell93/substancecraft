@@ -176,6 +176,7 @@ mod tests {
                 high_poly_source: Some("sculpt.fbx".to_owned()),
                 content_hash: None,
                 high_poly_hash: None,
+                high_to_low: Default::default(),
             }),
             resources: vec![
                 ProjectResource::new(ResourceId(1), "Grunge", "textures/old/grunge.png"),

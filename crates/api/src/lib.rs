@@ -866,6 +866,7 @@ mod tests {
                 high_poly_source: Some("sculpt.fbx".to_owned()),
                 content_hash: None,
                 high_poly_hash: None,
+                high_to_low: Default::default(),
             }),
             ..MaterialProject::empty()
         };

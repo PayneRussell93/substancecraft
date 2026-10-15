@@ -376,6 +376,7 @@ mod tests {
                 high_poly_source: None,
                 content_hash: None,
                 high_poly_hash: None,
+                high_to_low: Default::default(),
             }),
             texture_sets: vec![TextureSet {
                 user_channels: Default::default(),

@@ -228,6 +228,26 @@ pub enum MeshMapError {
     Cancelled,
     #[error("unable to allocate mesh map buffers")]
     AllocationFailed,
+    #[error("the cage mesh does not match the low mesh's vertices and triangles")]
+    CageMismatch,
+}
+
+/// The part of a mesh name that high-to-low name matching compares:
+/// lowercase, without a trailing `_high`/`_low` style suffix, so
+/// `Crate_low` matches `crate_HIGH`.
+pub fn bake_name_key(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    for suffix in [
+        "_high", "_low", "_hp", "_lp", "_hi", "_lo", ".high", ".low", " high", " low", "-high",
+        "-low",
+    ] {
+        if let Some(stem) = lower.strip_suffix(suffix)
+            && !stem.is_empty()
+        {
+            return stem.to_owned();
+        }
+    }
+    lower
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -499,10 +519,36 @@ pub fn bake_mesh_maps_corrected(
     skew_map: Option<&TextureImage>,
     cancel: Option<&AtomicBool>,
 ) -> Result<MeshMaps, MeshMapError> {
+    bake_mesh_maps_caged(low, high, settings, skew_map, None, cancel)
+}
+
+/// [`bake_mesh_maps_corrected`] with an explicit cage: a copy of the low
+/// mesh (same vertices and triangles) pushed out around the high mesh.
+/// Each texel's ray starts on the cage and runs through the low surface to
+/// as far inside, so the search distance follows the cage shape instead of
+/// [`MeshMapSettings::cage_distance`], and skew correction does not apply.
+pub fn bake_mesh_maps_caged(
+    low: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    skew_map: Option<&TextureImage>,
+    cage_mesh: Option<&MeshGeometry>,
+    cancel: Option<&AtomicBool>,
+) -> Result<MeshMaps, MeshMapError> {
     settings.validate()?;
     low.validate()?;
     if let Some(high) = high {
         high.validate()?;
+    }
+    if let Some(cage) = cage_mesh
+        && (cage.vertices.len() != low.vertices.len()
+            || cage.triangles != low.triangles
+            || cage
+                .vertices
+                .iter()
+                .any(|vertex| !vertex.position.is_finite()))
+    {
+        return Err(MeshMapError::CageMismatch);
     }
     let is_cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
@@ -619,17 +665,35 @@ pub fn bake_mesh_maps_corrected(
                             let (x, y) = (index as u32 % width, index as u32 / width);
                             luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
                         });
-                        let (direction, applied_skew) = cage_ray_direction(
+                        let (mut direction, applied_skew) = cage_ray_direction(
                             basis.normal,
                             low_geometry.face_normals[triangle as usize],
                             settings.skew * map_weight,
                             settings.skew_edge_degrees,
                         );
+                        let mut reach = cage;
+                        // An explicit cage sets each ray's start and length.
+                        if let Some(cage_mesh) = cage_mesh {
+                            let corners = low.triangles[triangle as usize];
+                            let weight = weights[index];
+                            let point = corners
+                                .iter()
+                                .zip([weight.x, weight.y, weight.z])
+                                .map(|(corner, weight)| {
+                                    cage_mesh.vertices[*corner as usize].position * weight
+                                })
+                                .sum::<Vec3>();
+                            let offset = point - basis.position;
+                            if let Some(outward) = offset.try_normalize() {
+                                direction = outward;
+                                reach = offset.length();
+                            }
+                        }
                         let projected = high_context.as_ref().and_then(|context| {
-                            let origin = basis.position + direction * cage;
+                            let origin = basis.position + direction * reach;
                             context
                                 .bvh
-                                .closest_hit(origin, -direction, 0.0, cage * 2.0)
+                                .closest_hit(origin, -direction, 0.0, reach * 2.0)
                                 .map(|hit| {
                                     context.evaluate(hit.triangle, hit.weights, index as u32)
                                 })
@@ -641,7 +705,7 @@ pub fn bake_mesh_maps_corrected(
                             low_context.evaluate(triangle, weights[index], index as u32)
                         });
                         value.tangent_normal = basis.to_tangent(value.normal);
-                        value.skew = if high_context.is_some() {
+                        value.skew = if high_context.is_some() && cage_mesh.is_none() {
                             applied_skew
                         } else {
                             0.0
@@ -1616,6 +1680,45 @@ mod tests {
         let plain = bake_mesh_maps(&low, &settings, None).unwrap();
         assert!(!plain.from_high_poly());
         assert!((plain.sample(Vec2::splat(0.5)).tangent_normal - Vec3::Z).length() < 1e-4);
+    }
+
+    #[test]
+    fn tc_0375_cage_meshes_set_ray_reach_and_names_match_high_to_low() {
+        let low = PrimitivePreset::Plane.build_mesh();
+        // Detail well above the low plane: a tiny cage distance misses it.
+        let raised = tilted_quad(20.0, 0.4);
+        let settings = MeshMapSettings {
+            cage_distance: 0.01,
+            ..fast_settings(16)
+        };
+        let plain = bake_mesh_maps_from(&low, Some(&raised), &settings, None).unwrap();
+        assert!(plain.miss_fraction() > 0.99);
+
+        // A cage pushed out past it catches every texel.
+        let mut cage = low.clone();
+        for vertex in &mut cage.vertices {
+            vertex.position.y += 1.0;
+        }
+        let caged =
+            bake_mesh_maps_caged(&low, Some(&raised), &settings, None, Some(&cage), None).unwrap();
+        assert_eq!(caged.miss_fraction(), 0.0);
+        assert!(caged.sample(Vec2::splat(0.5)).normal.x > 0.3, "high detail");
+        assert_eq!(caged.sample(Vec2::splat(0.5)).skew, 0.0);
+
+        // A cage of another shape is refused.
+        let mut other = cage.clone();
+        other.triangles.pop();
+        assert_eq!(
+            bake_mesh_maps_caged(&low, Some(&raised), &settings, None, Some(&other), None).err(),
+            Some(MeshMapError::CageMismatch)
+        );
+
+        // Names match without case or a high/low suffix.
+        assert_eq!(bake_name_key("Crate_low"), bake_name_key("crate_HIGH"));
+        assert_eq!(bake_name_key(" Lid_hp"), "lid");
+        assert_eq!(bake_name_key("Body.low"), bake_name_key("body"));
+        assert_ne!(bake_name_key("Body"), bake_name_key("Lid"));
+        assert_eq!(bake_name_key("_low"), "_low", "a bare suffix is a name");
     }
 
     #[test]

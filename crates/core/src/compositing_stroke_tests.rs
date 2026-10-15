@@ -132,6 +132,29 @@ fn tc_0355_smudge_strokes_drag_the_stack_along_their_path() {
 }
 
 #[test]
+fn tc_0370_blur_strokes_soften_the_stack_under_them() {
+    let red = || paint_layer(1, vec![dab(&[(0.3, 0.5)], 5.0, RED)]);
+    let blur = PaintStroke {
+        source: Some(StrokeSource::Blur { strength: 0.5 }),
+        ..dab(&[(0.4, 0.5)], 8.0, [0, 0, 255, 255])
+    };
+    let before = set(vec![red()]).bake_base_color().unwrap();
+    let after = set(vec![red(), paint_layer(2, vec![blur])])
+        .bake_base_color()
+        .unwrap();
+    let at = |texture: &BakedTexture, x: u32| texture.pixel(x, 31).unwrap();
+    // The dab's right edge (pixel 24) is hard before and soft after: just
+    // outside it some red bleeds in. Like smudge, blur paints over the
+    // stack, so it softens edges outward without thinning what is there.
+    assert_eq!(at(&before, 26)[3], 0);
+    let outside = at(&after, 26);
+    assert!(outside[3] > 0 && outside[3] < 255, "{outside:?}");
+    assert_eq!(&outside[..3], &RED[..3], "blur adds no colour of its own");
+    // Outside the brush the dab is untouched.
+    assert_eq!(at(&after, 15), RED);
+}
+
+#[test]
 fn tc_0356_quick_masks_limit_paint_and_mask_strokes() {
     // A quick mask open around u = 0.25 only; a stroke across the whole
     // texture paints there alone.

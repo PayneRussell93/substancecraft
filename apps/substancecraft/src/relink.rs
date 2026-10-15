@@ -242,6 +242,7 @@ mod tests {
                 high_poly_source: None,
                 content_hash: None,
                 high_poly_hash: None,
+                high_to_low: Default::default(),
             }),
             ..MaterialProject::empty()
         };
@@ -296,6 +297,7 @@ mod tests {
             high_poly_source: None,
             content_hash: None,
             high_poly_hash: None,
+            high_to_low: Default::default(),
         });
         app.loaded_mesh = app.project.mesh.clone();
         assert!(app.mesh_file_missing());

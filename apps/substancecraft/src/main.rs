@@ -53,6 +53,7 @@ mod resource_watch;
 mod stroke_tools;
 mod theme;
 mod turntable;
+mod udim_view;
 mod uv_view;
 mod widgets;
 
@@ -156,6 +157,10 @@ struct SubstanceCraftApp {
     /// Smoothed/subdivided geometry used for display, painting, and baking.
     mesh_geometry: Option<Arc<MeshGeometry>>,
     mesh_topology: Option<MeshTopology>,
+    /// How the viewport shows UDIM tiles beyond 1001, when the mesh has any.
+    udim_atlas: Option<substancecraft_core::UdimAtlas>,
+    /// Baked UDIM tiles and tile mesh maps, shared with background bakes.
+    udim_cache: Arc<std::sync::Mutex<udim_view::TileCache>>,
     mesh_center: glam::Vec3,
     mesh_smoothing: MeshSmoothing,
     mesh_error: Option<String>,
@@ -307,6 +312,8 @@ struct SubstanceCraftApp {
     mesh_maps: Option<Arc<Vec<MeshMaps>>>,
     mesh_maps_key: Option<BakeKey>,
     high_poly: Option<HighPolySource>,
+    /// The cage mesh file, scaled but not yet smoothed.
+    cage_mesh: Option<(std::path::PathBuf, MeshGeometry)>,
     high_poly_revision: u64,
     mesh_map_job: Option<MeshMapJob>,
     mesh_map_error: Option<String>,
@@ -565,6 +572,9 @@ struct BakeInputs {
     /// Mesh material slot whose maps the set uses.
     slot: usize,
     resources: ResourceImages,
+    /// Set for meshes with UDIM tiles beyond 1001: previews bake every
+    /// tile into an atlas.
+    udim: Option<udim_view::UdimInputs>,
 }
 
 impl BakeInputs {
@@ -579,6 +589,13 @@ impl BakeInputs {
         texture_set: &TextureSet,
         channel: MaterialChannel,
     ) -> Result<BakedTexture, String> {
+        if let Some(udim) = &self.udim {
+            let kind = format!("{channel:?}");
+            return udim.bake_single(self, texture_set, Some(&kind), |set, context| {
+                set.bake_channel(channel, context)
+                    .map_err(|error| error.to_string())
+            });
+        }
         bake_texture_set_channel(
             texture_set,
             channel,
@@ -590,6 +607,9 @@ impl BakeInputs {
     }
 
     fn bake_material(&self, texture_set: &TextureSet) -> Result<MaterialTextures, String> {
+        if let Some(udim) = &self.udim {
+            return udim.bake_material(self, texture_set);
+        }
         bake_texture_set_material(
             texture_set,
             self.mesh.as_deref(),
@@ -713,12 +733,16 @@ struct BakeKey {
     settings: MeshMapSettings,
     skew_map: Option<ResourceId>,
     skew_map_revision: u64,
+    /// Hash of the high-to-low options and the loaded cage.
+    high_to_low: u64,
 }
 
 /// Optional high-resolution source for high-to-low mesh-map baking.
 struct HighPolySource {
     path: std::path::PathBuf,
     geometry: MeshGeometry,
+    /// The file's meshes by name, scaled, for name-matched bakes.
+    parts: Vec<(String, MeshGeometry)>,
 }
 
 struct MeshMapJob {
@@ -765,6 +789,7 @@ impl Default for SubstanceCraftApp {
                     high_poly_source: None,
                     content_hash: None,
                     high_poly_hash: None,
+                    high_to_low: Default::default(),
                 }),
                 ..MaterialProject::empty()
             },
@@ -780,6 +805,8 @@ impl Default for SubstanceCraftApp {
             base_geometry: None,
             mesh_geometry: None,
             mesh_topology: None,
+            udim_atlas: None,
+            udim_cache: Arc::default(),
             mesh_center: glam::Vec3::ZERO,
             mesh_smoothing: MeshSmoothing::default(),
             mesh_error: None,
@@ -887,6 +914,7 @@ impl Default for SubstanceCraftApp {
             mesh_maps: None,
             mesh_maps_key: None,
             high_poly: None,
+            cage_mesh: None,
             high_poly_revision: 0,
             mesh_map_job: None,
             mesh_map_error: None,
@@ -1020,6 +1048,10 @@ impl SubstanceCraftApp {
             }))
         });
         self.mesh_topology = self.mesh_geometry.as_deref().map(MeshTopology::build);
+        self.udim_atlas = self
+            .mesh_geometry
+            .as_deref()
+            .and_then(|mesh| substancecraft_core::UdimAtlas::new(&mesh.udim_tiles()));
         self.mesh_center = self
             .mesh_geometry
             .as_deref()
@@ -1131,6 +1163,7 @@ impl SubstanceCraftApp {
             high_poly_source: None,
             content_hash: substancecraft_api::file_content_hash(path).ok(),
             high_poly_hash: None,
+            high_to_low: Default::default(),
         });
         self.imported_meshes = meshes;
         self.selected_imported_mesh = Some(0);
@@ -1192,8 +1225,19 @@ impl SubstanceCraftApp {
         let Some(renderer) = self.filament_renderer.as_mut() else {
             return;
         };
+        // UDIM meshes sample one atlas of every tile.
+        fn in_atlas<'a>(
+            atlas: Option<&substancecraft_core::UdimAtlas>,
+            mesh: &'a MeshGeometry,
+        ) -> std::borrow::Cow<'a, MeshGeometry> {
+            atlas.map_or(std::borrow::Cow::Borrowed(mesh), |atlas| {
+                std::borrow::Cow::Owned(atlas.mesh(mesh))
+            })
+        }
+        let atlas = self.udim_atlas.as_ref();
+        let atlas_mesh = |mesh| in_atlas(atlas, mesh);
         if self.filament_mesh_revision != Some(self.mesh_revision) {
-            match renderer.set_mesh(mesh, self.mesh_smoothing.angle_degrees) {
+            match renderer.set_mesh(&atlas_mesh(mesh), self.mesh_smoothing.angle_degrees) {
                 Ok(()) => {
                     self.filament_mesh_revision = Some(self.mesh_revision);
                     self.filament_pose = Some(None);
@@ -1207,7 +1251,7 @@ impl SubstanceCraftApp {
         if self.filament_pose.as_ref() != Some(&pose)
             && let Some(shown) = &shown
         {
-            match renderer.update_vertices(shown, self.mesh_smoothing.angle_degrees) {
+            match renderer.update_vertices(&atlas_mesh(shown), self.mesh_smoothing.angle_degrees) {
                 Ok(()) => self.filament_pose = Some(pose),
                 Err(error) => {
                     self.filament_error = Some(error.to_string());
@@ -1480,7 +1524,13 @@ impl SubstanceCraftApp {
             Ok(()) => {
                 self.project_error = save_project_history(&path, &self.history)
                     .err()
-                    .map(|error| format!("Saved, but the undo history was not: {error}"));
+                    .map(|error| format!("Saved, but the undo history was not: {error}"))
+                    .or_else(|| {
+                        self.bake_log
+                            .save(&path)
+                            .err()
+                            .map(|error| format!("Saved, but the bake log was not: {error}"))
+                    });
                 self.project_path = Some(path);
                 self.mark_project_settled();
                 self.discard_autosave();
@@ -1542,6 +1592,10 @@ impl SubstanceCraftApp {
         let scene = Self::restore_project_mesh(&project)?;
         self.project = project;
         self.project_path = path.clone();
+        self.bake_log = path
+            .as_deref()
+            .map(bake_log::BakeLog::load)
+            .unwrap_or_default();
         self.selected_primitive = scene.selected_primitive;
         self.imported_meshes = scene.imported_meshes;
         self.selected_imported_mesh = scene.selected_imported_mesh;
@@ -1763,6 +1817,7 @@ impl SubstanceCraftApp {
             high_poly_source: None,
             content_hash: substancecraft_api::file_content_hash(path).ok(),
             high_poly_hash: None,
+            high_to_low: Default::default(),
         });
         let slots = if first_geometry.material_slot_count() > 1 {
             first_geometry.material_slots.clone()
@@ -3573,21 +3628,28 @@ impl SubstanceCraftApp {
             .enumerate()
             .filter_map(|(index, copy)| Some((index + 1, copy?)))
             .filter(|(_, copy)| {
-                self.triangle_in_selected_set(copy.triangle)
-                    && copy.uv.cmpge(glam::Vec2::ZERO).all()
-                    && copy.uv.cmple(glam::Vec2::ONE).all()
+                self.triangle_in_selected_set(copy.triangle) && self.paintable_uv(copy.uv)
             })
             .collect()
+    }
+
+    /// True when strokes may land at `uv`: in tile 1001, or in any UDIM
+    /// tile the mesh uses.
+    fn paintable_uv(&self, uv: glam::Vec2) -> bool {
+        if uv.cmpge(glam::Vec2::ZERO).all() && uv.cmple(glam::Vec2::ONE).all() {
+            return true;
+        }
+        self.udim_atlas.as_ref().is_some_and(|atlas| {
+            substancecraft_core::UdimTile::of_uv(uv)
+                .is_some_and(|tile| atlas.tiles().contains(&tile))
+        })
     }
 
     /// Paints at a picked surface point: continues the brush stroke
     /// (restarting it when the pointer crosses into another UV island) and,
     /// with symmetry on, the mirrored stroke on the other side.
     fn paint_hit(&mut self, hit: TriangleHit) {
-        let Some(uv) = hit
-            .uv
-            .filter(|uv| uv.cmpge(glam::Vec2::ZERO).all() && uv.cmple(glam::Vec2::ONE).all())
-        else {
+        let Some(uv) = hit.uv.filter(|uv| self.paintable_uv(*uv)) else {
             return;
         };
         if self.active_stroke.is_none() {
@@ -3692,6 +3754,7 @@ impl SubstanceCraftApp {
             settings: self.effective_mesh_map_settings(),
             skew_map: self.skew_map,
             skew_map_revision: self.skew_map_revision,
+            high_to_low: self.high_to_low_key(),
         }
     }
 
@@ -3707,6 +3770,8 @@ impl SubstanceCraftApp {
         }
         if baked.high_poly_revision != current.high_poly_revision {
             Some("High-poly source changed")
+        } else if baked.high_to_low != current.high_to_low {
+            Some("Cage or name matching changed")
         } else if baked.import_scale != current.import_scale {
             Some("Scale changed")
         } else if baked.smoothing != current.smoothing {
@@ -3787,16 +3852,31 @@ impl SubstanceCraftApp {
         let settings = self.effective_mesh_map_settings();
         let cancel = Arc::new(AtomicBool::new(false));
         let summary = bake_log::settings_summary(&settings, high.is_some());
+        let mut plan = HighToLowPlan {
+            parts: self
+                .high_poly
+                .as_ref()
+                .map(|source| source.parts.clone())
+                .unwrap_or_default(),
+            options: self.high_to_low_options(),
+            low_name: self.low_mesh_name(),
+            cage: None,
+        };
+        let cage = self.cage_mesh.as_ref().map(|(_, cage)| cage.clone());
+        let smoothing = self.mesh_smoothing;
         let (sender, receiver) = sync_channel(1);
         let worker_cancel = Arc::clone(&cancel);
         let spawned = std::thread::Builder::new()
             .name("mesh-map-bake".to_owned())
             .spawn(move || {
+                // The cage is smoothed like the low mesh so they still pair.
+                plan.cage = cage.and_then(|cage| smoothing.apply(&cage).ok());
                 let _ = sender.send(bake_slot_mesh_maps(
                     &mesh,
                     high.as_ref(),
                     &settings,
                     skew_map.as_deref(),
+                    &plan,
                     &worker_cancel,
                 ));
             });
@@ -3862,6 +3942,8 @@ impl SubstanceCraftApp {
 
     /// Mesh maps become stale whenever the high-poly source changes.
     fn high_poly_changed(&mut self) {
+        self.resource_watcher
+            .watch_high_poly(self.high_poly.as_ref().map(|high| high.path.as_path()));
         self.high_poly_revision = self.high_poly_revision.wrapping_add(1);
         self.cancel_mesh_map_job();
         self.mesh_map_error = None;
@@ -3875,8 +3957,8 @@ impl SubstanceCraftApp {
         else {
             return;
         };
-        match load_merged_mesh(&path, self.import_scale) {
-            Ok(geometry) => {
+        match load_high_poly(&path, self.import_scale) {
+            Ok(source) => {
                 let before = self.project.mesh.clone();
                 if let Some(mesh) = self.project.mesh.as_mut() {
                     mesh.high_poly_source = Some(path.to_string_lossy().into_owned());
@@ -3885,11 +3967,37 @@ impl SubstanceCraftApp {
                 self.history.end_merge();
                 self.record_mesh_edit(before, Vec::new());
                 self.history.end_merge();
-                self.high_poly = Some(HighPolySource { path, geometry });
+                self.high_poly = Some(source);
                 self.high_poly_changed();
                 self.start_mesh_map_bake();
             }
             Err(error) => self.mesh_map_error = Some(format!("High poly: {error}")),
+        }
+    }
+
+    /// Re-reads the high-poly source after it changed on disk and rebakes
+    /// the mesh maps from it. A file that cannot be read (gone, or caught
+    /// mid-export) keeps the previous high poly and is reported.
+    fn reload_high_poly(&mut self) {
+        self.resource_watcher.high_poly_pending = false;
+        let Some(path) = self.high_poly.as_ref().map(|high| high.path.clone()) else {
+            return;
+        };
+        match load_high_poly(&path, self.import_scale) {
+            Ok(source) => {
+                if let Some(mesh) = self.project.mesh.as_mut() {
+                    mesh.high_poly_hash = substancecraft_api::file_content_hash(&path).ok();
+                }
+                self.high_poly = Some(source);
+                self.high_poly_changed();
+                self.start_mesh_map_bake();
+            }
+            Err(error) => {
+                self.mesh_map_error = Some(format!(
+                    "Could not reload high poly `{}`: {error}; keeping the previous one.",
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -3906,9 +4014,108 @@ impl SubstanceCraftApp {
         self.high_poly_changed();
     }
 
+    /// The mesh's high-to-low options.
+    fn high_to_low_options(&self) -> substancecraft_core::HighToLowOptions {
+        self.project
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.high_to_low.clone())
+            .unwrap_or_default()
+    }
+
+    /// Bake-key part of the high-to-low options and the loaded cage.
+    fn high_to_low_key(&self) -> u64 {
+        udim_view::key_hash(&(
+            self.high_to_low_options(),
+            self.cage_mesh
+                .as_ref()
+                .map(|(_, cage)| (cage.vertices.len(), cage.triangles.len())),
+        ))
+    }
+
+    /// Changes the high-to-low options as one undoable mesh edit; mesh maps
+    /// go stale and rebake when next needed.
+    fn set_high_to_low(&mut self, options: substancecraft_core::HighToLowOptions) {
+        if !options.is_valid() || options == self.high_to_low_options() {
+            return;
+        }
+        let before = self.project.mesh.clone();
+        let Some(mesh) = self.project.mesh.as_mut() else {
+            return;
+        };
+        mesh.high_to_low = options;
+        self.history.end_merge();
+        self.record_mesh_edit(before, Vec::new());
+        self.history.end_merge();
+        self.restore_cage();
+        self.high_poly_changed();
+    }
+
+    /// The low mesh's own name, for name matching when it has one slot.
+    fn low_mesh_name(&self) -> String {
+        self.selected_imported_mesh
+            .and_then(|index| self.imported_meshes.get(index))
+            .map(|mesh| mesh.name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                let source = &self.project.mesh.as_ref()?.source;
+                std::path::Path::new(source)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Low parts no high-poly part matches by name, when matching.
+    fn unmatched_low_parts(&self) -> Vec<String> {
+        let (Some(mesh), Some(high)) = (self.mesh_geometry.as_deref(), &self.high_poly) else {
+            return Vec::new();
+        };
+        HighToLowPlan {
+            parts: high.parts.clone(),
+            options: self.high_to_low_options(),
+            low_name: self.low_mesh_name(),
+            cage: None,
+        }
+        .unmatched(mesh)
+    }
+
+    fn pick_cage(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D mesh (FBX, glTF, STEP)", &MESH_EXTENSIONS)
+            .pick_file()
+        else {
+            return;
+        };
+        if let Err(error) = load_high_poly(&path, self.import_scale) {
+            self.mesh_map_error = Some(format!("Cage: {error}"));
+            return;
+        }
+        self.set_high_to_low(substancecraft_core::HighToLowOptions {
+            cage_source: Some(path.to_string_lossy().into_owned()),
+            ..self.high_to_low_options()
+        });
+    }
+
+    /// Loads the cage file the options name, reporting (not failing on) a
+    /// missing or unreadable one.
+    fn restore_cage(&mut self) {
+        self.cage_mesh = None;
+        if let Some(source) = self.high_to_low_options().cage_source {
+            let path = std::path::PathBuf::from(source);
+            match load_high_poly(&path, self.import_scale) {
+                Ok(cage) => self.cage_mesh = Some((path, cage.geometry)),
+                Err(error) => {
+                    self.mesh_map_error = Some(format!("Cage `{}`: {error}", path.display()));
+                }
+            }
+        }
+    }
+
     /// Reloads the project's high-poly reference, reporting (not failing on)
     /// a missing or unreadable file.
     fn restore_high_poly(&mut self) {
+        self.restore_cage();
         self.high_poly = None;
         let source = self
             .project
@@ -3917,8 +4124,8 @@ impl SubstanceCraftApp {
             .and_then(|mesh| mesh.high_poly_source.clone());
         if let Some(source) = source {
             let path = std::path::PathBuf::from(source);
-            match load_merged_mesh(&path, self.import_scale) {
-                Ok(geometry) => self.high_poly = Some(HighPolySource { path, geometry }),
+            match load_high_poly(&path, self.import_scale) {
+                Ok(source) => self.high_poly = Some(source),
                 Err(error) => {
                     self.mesh_map_error = Some(format!("High poly `{}`: {error}", path.display()));
                 }
@@ -4040,6 +4247,10 @@ impl SubstanceCraftApp {
     /// for `key`, when it shows the same view and only strokes changed the
     /// set since it was baked; `None` means a full rebake.
     fn preview_patch(&self, key: &PreviewKey) -> Option<(PreviewTextures, Vec<TexelRect>)> {
+        // UDIM atlases rebake whole tiles, unchanged ones from the cache.
+        if self.udim_atlas.is_some() {
+            return None;
+        }
         let preview = self.baked_preview.as_ref()?;
         if preview.key.texture_set != key.texture_set
             || preview.key.target != key.target
@@ -4079,6 +4290,31 @@ impl SubstanceCraftApp {
             return;
         }
         if let PreviewTarget::MeshMap(kind) = key.target {
+            if self.udim_atlas.is_some() && self.fresh_mesh_maps().is_some() {
+                // Every tile's maps, some baked on first use: a job.
+                let inputs = self.bake_inputs(self.selected_texture_set.unwrap_or(TextureSetId(0)));
+                let (sender, receiver) = sync_channel(1);
+                let spawned = std::thread::Builder::new()
+                    .name("preview-bake".to_owned())
+                    .spawn(move || {
+                        let result = inputs
+                            .udim
+                            .as_ref()
+                            .ok_or_else(|| "no UDIM atlas".to_owned())
+                            .and_then(|udim| udim.mesh_map(&inputs, kind))
+                            .map(|texture| PreviewTextures::Single(Arc::new(texture)));
+                        let _ = sender.send((result, false));
+                    });
+                if spawned.is_ok() {
+                    self.preview_job = Some(PreviewJob {
+                        receiver,
+                        key,
+                        set_revision: 0,
+                        patch: None,
+                    });
+                }
+                return;
+            }
             if let Some(maps) = self.fresh_mesh_maps() {
                 // Mesh-map previews are cheap conversions; no job needed.
                 let texture = maps.to_texture(kind);
@@ -4109,7 +4345,7 @@ impl SubstanceCraftApp {
             None => texture_set,
         };
         let texture_set = texture_set
-            .downscaled(PREVIEW_MAX_EDGE)
+            .downscaled(self.preview_edge())
             .unwrap_or(texture_set);
         if texture_set.requires_mesh_maps() && !self.mesh_maps_fresh() {
             // Keep the previous preview until fresh maps arrive.
@@ -4121,6 +4357,7 @@ impl SubstanceCraftApp {
         let patch = self.preview_patch(&key);
         // Strokes from here on are tracked against this bake.
         self.preview_dirty = match key.target {
+            _ if self.udim_atlas.is_some() => None,
             PreviewTarget::Material | PreviewTarget::Channel(_) => self
                 .selected_texture_set_ref()
                 .map(|set| incremental::PreviewDirty::new(&preview_copy(set), set_revision)),
@@ -4256,7 +4493,22 @@ impl SubstanceCraftApp {
             mesh_maps: self.mesh_maps.clone().filter(|_| self.mesh_maps_fresh()),
             slot: self.set_slot(set_id) as usize,
             resources: self.resource_images.clone(),
+            udim: self.udim_atlas.clone().map(|atlas| udim_view::UdimInputs {
+                atlas,
+                cache: Arc::clone(&self.udim_cache),
+                maps_key: udim_view::key_hash(&self.bake_key()),
+                mesh_revision: self.mesh_revision,
+                settings: self.effective_mesh_map_settings(),
+            }),
         }
+    }
+
+    /// Longest texture-set edge the viewport bakes: smaller per tile when a
+    /// UDIM atlas packs several tiles into one texture.
+    fn preview_edge(&self) -> u32 {
+        self.udim_atlas
+            .as_ref()
+            .map_or(PREVIEW_MAX_EDGE, |atlas| atlas.tile_edge_limit(PREVIEW_MAX_EDGE))
     }
 
     fn poll_preview_job(&mut self, context: &egui::Context) {
@@ -4353,7 +4605,7 @@ impl SubstanceCraftApp {
             return;
         }
         let texture_set = texture_set
-            .downscaled(PREVIEW_MAX_EDGE)
+            .downscaled(self.preview_edge())
             .unwrap_or(texture_set);
         let revision = self.set_revision(set_id);
         let inputs = self.bake_inputs(set_id);
@@ -5396,7 +5648,9 @@ impl SubstanceCraftApp {
     fn poll_resource_files(&mut self, context: &egui::Context) {
         use resource_watch::{ReloadMode, SCAN_INTERVAL};
 
-        if self.project.resources.is_empty() || self.resource_watcher.mode == ReloadMode::Off {
+        if (self.project.resources.is_empty() && !self.resource_watcher.watches_high_poly())
+            || self.resource_watcher.mode == ReloadMode::Off
+        {
             return;
         }
         // Keep polling while the window is idle.
@@ -5406,9 +5660,18 @@ impl SubstanceCraftApp {
             return;
         }
         let changed = self.resource_watcher.scan(&self.project.resources, now);
+        let high_poly = self.resource_watcher.scan_high_poly();
         match self.resource_watcher.mode {
-            ReloadMode::Auto => self.reload_changed_resources(&changed),
-            ReloadMode::Ask => self.resource_watcher.pending.extend(changed),
+            ReloadMode::Auto => {
+                self.reload_changed_resources(&changed);
+                if high_poly {
+                    self.reload_high_poly();
+                }
+            }
+            ReloadMode::Ask => {
+                self.resource_watcher.pending.extend(changed);
+                self.resource_watcher.high_poly_pending |= high_poly;
+            }
             ReloadMode::Off => {}
         }
     }
@@ -5462,12 +5725,28 @@ impl SubstanceCraftApp {
 
     /// Names of resources waiting for a reload confirmation.
     fn pending_reload_names(&self) -> Vec<String> {
-        self.project
+        let mut names: Vec<String> = self
+            .project
             .resources
             .iter()
             .filter(|resource| self.resource_watcher.pending.contains(&resource.id))
             .map(|resource| resource.name.clone())
-            .collect()
+            .collect();
+        if self.resource_watcher.high_poly_pending
+            && let Some(high) = &self.high_poly
+        {
+            names.push(format!("High poly {}", path_label(&high.path)));
+        }
+        names
+    }
+
+    /// Reloads everything waiting for confirmation.
+    fn reload_pending(&mut self) {
+        let pending: Vec<ResourceId> = self.resource_watcher.pending.iter().copied().collect();
+        self.reload_changed_resources(&pending);
+        if self.resource_watcher.high_poly_pending {
+            self.reload_high_poly();
+        }
     }
 
     /// True when a layer or the current brush uses `id`.
@@ -6370,56 +6649,130 @@ fn load_mesh_file(path: &std::path::Path) -> Result<Vec<ImportedMesh>, String> {
     import_fbx_meshes(&bytes).map_err(|error| error.to_string())
 }
 
-/// Reads every mesh in a file and merges them into one scaled geometry, as
-/// a high-poly source for baking.
-fn load_merged_mesh(path: &std::path::Path, scale: f32) -> Result<MeshGeometry, String> {
+/// Reads every mesh in a file as a high-poly source for baking: merged into
+/// one scaled geometry, and kept by name for name-matched bakes.
+fn load_high_poly(path: &std::path::Path, scale: f32) -> Result<HighPolySource, String> {
+    let scale = sanitize_mesh_scale(scale);
     let mut merged = MeshGeometry::default();
+    let mut parts = Vec::new();
     for mesh in load_mesh_file(path)? {
         merged
             .append(&mesh.geometry)
             .map_err(|_| "merged mesh has too many vertices".to_owned())?;
+        parts.push((mesh.name, scaled_geometry(&mesh.geometry, scale)));
     }
     if merged.triangles.is_empty() {
         return Err("the file contains no mesh geometry".to_owned());
     }
-    Ok(scaled_geometry(&merged, sanitize_mesh_scale(scale)))
+    Ok(HighPolySource {
+        path: path.to_path_buf(),
+        geometry: scaled_geometry(&merged, scale),
+        parts,
+    })
+}
+
+
+/// How a high-to-low bake pairs each low part with the high mesh.
+#[derive(Clone, Debug, Default)]
+struct HighToLowPlan {
+    /// The high-poly file's meshes by name, for name matching.
+    parts: Vec<(String, MeshGeometry)>,
+    options: substancecraft_core::HighToLowOptions,
+    /// The low mesh's own name: its part name when it has one slot.
+    low_name: String,
+    /// Cage mesh, smoothed like the low mesh so the two still match.
+    cage: Option<MeshGeometry>,
+}
+
+impl HighToLowPlan {
+    /// The high-poly parts low part `name` takes detail from, merged:
+    /// those of the same name when matching by name, else (or when none
+    /// match) `None` for the whole high mesh.
+    fn matched_high(&self, name: &str) -> Option<MeshGeometry> {
+        if !self.options.match_by_name {
+            return None;
+        }
+        let key = substancecraft_core::bake_name_key(name);
+        let mut merged = MeshGeometry::default();
+        for (part, geometry) in &self.parts {
+            if substancecraft_core::bake_name_key(part) == key {
+                merged.append(geometry).ok()?;
+            }
+        }
+        (!merged.triangles.is_empty()).then_some(merged)
+    }
+
+    /// Names of low parts no high part matches.
+    fn unmatched(&self, mesh: &MeshGeometry) -> Vec<String> {
+        if !self.options.match_by_name {
+            return Vec::new();
+        }
+        part_names(mesh, &self.low_name)
+            .into_iter()
+            .filter(|name| self.matched_high(name).is_none())
+            .collect()
+    }
+}
+
+/// Low part names: material slots, or `low_name` for a single-slot mesh.
+fn part_names(mesh: &MeshGeometry, low_name: &str) -> Vec<String> {
+    match mesh.material_slot_count() {
+        0 | 1 => vec![low_name.to_owned()],
+        count => (0..count as u32)
+            .map(|slot| mesh.material_slot_name(slot))
+            .collect(),
+    }
 }
 
 /// Bakes mesh maps for each material slot from that slot's triangles, so
 /// slots sharing UV space get their own maps. A single-slot mesh bakes
-/// whole; an empty slot falls back to the whole mesh.
+/// whole; an empty slot falls back to the whole mesh. With a high mesh,
+/// `plan` picks each part's high parts, cage scale, and cage.
 fn bake_slot_mesh_maps(
     mesh: &MeshGeometry,
     high: Option<&MeshGeometry>,
     settings: &MeshMapSettings,
     skew_map: Option<&substancecraft_core::TextureImage>,
+    plan: &HighToLowPlan,
     cancel: &AtomicBool,
 ) -> Result<Vec<MeshMaps>, MeshMapError> {
-    let slot_count = mesh.material_slot_count();
-    if slot_count <= 1 {
-        return Ok(vec![substancecraft_core::bake_mesh_maps_corrected(
-            mesh,
-            high,
-            settings,
+    let names = part_names(mesh, &plan.low_name);
+    // The cage takes the low mesh's slots so it splits the same way.
+    let cage = plan.cage.as_ref().map(|cage| MeshGeometry {
+        triangle_materials: mesh.triangle_materials.clone(),
+        material_slots: mesh.material_slots.clone(),
+        ..cage.clone()
+    });
+    let bake_part = |low: &MeshGeometry, cage: Option<&MeshGeometry>, name: &str| {
+        let matched = high.and_then(|_| plan.matched_high(name));
+        let settings = MeshMapSettings {
+            cage_distance: (settings.cage_distance * plan.options.cage_scale(name))
+                .clamp(0.0001, 0.5),
+            ..*settings
+        };
+        substancecraft_core::bake_mesh_maps_caged(
+            low,
+            matched.as_ref().or(high),
+            &settings,
             skew_map,
+            cage.filter(|_| high.is_some()),
             Some(cancel),
-        )?]);
+        )
+    };
+    if names.len() <= 1 {
+        return Ok(vec![bake_part(mesh, cage.as_ref(), &names[0])?]);
     }
-    (0..slot_count as u32)
-        .map(|slot| {
-            let submesh = mesh.submesh(slot);
-            let source = if submesh.triangles.is_empty() {
-                mesh
+    names
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            let submesh = mesh.submesh(slot as u32);
+            if submesh.triangles.is_empty() {
+                bake_part(mesh, cage.as_ref(), name)
             } else {
-                &submesh
-            };
-            substancecraft_core::bake_mesh_maps_corrected(
-                source,
-                high,
-                settings,
-                skew_map,
-                Some(cancel),
-            )
+                let cage = cage.as_ref().map(|cage| cage.submesh(slot as u32));
+                bake_part(&submesh, cage.as_ref(), name)
+            }
         })
         .collect()
 }
@@ -6930,6 +7283,102 @@ mod tests {
     }
 
     #[test]
+    fn tc_0374_udim_tiles_show_and_paint_in_the_viewports_and_cache_per_tile() {
+        use substancecraft_core::MeshVertex;
+
+        // Two quads, in tiles 1001 and 1002.
+        let mut mesh = MeshGeometry::default();
+        for tile in 0..2 {
+            let base = mesh.vertices.len() as u32;
+            for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                mesh.vertices.push(MeshVertex {
+                    position: glam::Vec3::new(x + tile as f32 * 1.1, y, 0.0),
+                    uv: glam::Vec2::new(x + tile as f32, y),
+                });
+            }
+            mesh.triangles.push([base, base + 1, base + 2]);
+            mesh.triangles.push([base, base + 2, base + 3]);
+        }
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(mesh.clone()));
+        app.add_paint_layer();
+        small_sets(&mut app, 16);
+        let atlas = app.udim_atlas.clone().unwrap();
+        assert_eq!(atlas.grid(), (2, 1));
+        assert!(app.paintable_uv(glam::Vec2::new(1.5, 0.5)));
+        assert!(!app.paintable_uv(glam::Vec2::new(2.5, 0.5)), "no tile 1003");
+
+        // A dab on the second quad lands in tile 1002.
+        app.set_paint_mode(PaintMode::Paint);
+        app.brush_color = egui::Color32::WHITE;
+        app.brush_radius = 2.0;
+        let hit = mesh.closest_surface_point(glam::Vec3::new(1.6, 0.5, 0.0)).unwrap();
+        app.paint_hit(TriangleHit {
+            triangle: hit.triangle,
+            uv: Some(hit.uv),
+            position: hit.position,
+        });
+        app.finish_active_stroke();
+        let points = &app.selected_layer().unwrap().paint_strokes[0].points;
+        assert!(points[0].x > 1.0);
+
+        // The preview is the atlas: tile 1002 (right half) shows the dab,
+        // tile 1001 does not.
+        let shown = |app: &SubstanceCraftApp| match app.displayed_preview() {
+            Some(PreviewTextures::Material(material)) => material.base_color.clone(),
+            _ => panic!("no material preview"),
+        };
+        app.invalidate_preview();
+        tests::pump_until(&mut app, &context, |app| {
+            app.preview_job.is_none() && app.displayed_preview().is_some()
+        });
+        let atlas_texture = shown(&app);
+        assert_eq!((atlas_texture.width, atlas_texture.height), (32, 16));
+        assert!(atlas_texture.pixel(24, 8).unwrap()[0] > 200, "painted");
+        assert!(atlas_texture.pixel(8, 8).unwrap()[0] < 200, "unpainted");
+
+        // Painting tile 1002 again rebakes only that tile.
+        let hits = app.udim_cache.lock().unwrap().hits;
+        let hit = mesh.closest_surface_point(glam::Vec3::new(1.8, 0.3, 0.0)).unwrap();
+        app.paint_hit(TriangleHit {
+            triangle: hit.triangle,
+            uv: Some(hit.uv),
+            position: hit.position,
+        });
+        app.finish_active_stroke();
+        app.invalidate_preview();
+        tests::pump_until(&mut app, &context, |app| {
+            app.preview_failed
+                || (app.preview_job.is_none()
+                    && app.baked_preview.as_ref().is_some_and(|preview| preview.key == app.preview_key()))
+        });
+        assert_eq!(app.bake_error, None);
+        assert_eq!(app.udim_cache.lock().unwrap().hits, hits + 1, "tile 1001 reused");
+        assert_eq!(shown(&app).pixel(8, 8), atlas_texture.pixel(8, 8));
+
+        // Mesh-map previews show every tile's maps side by side, baking
+        // tile 1002's maps from its shifted UVs.
+        app.mesh_map_settings.resolution = 32;
+        app.mesh_map_settings.ao_samples = 2;
+        app.start_mesh_map_bake();
+        tests::pump_until(&mut app, &context, |app| app.mesh_map_job.is_none());
+        app.mesh_map_preview = Some(MeshMapKind::WorldNormal);
+        tests::pump_until(&mut app, &context, |app| {
+            app.preview_job.is_none()
+                && app.baked_preview.as_ref().is_some_and(|preview| preview.key == app.preview_key())
+        });
+        let maps = match app.displayed_preview() {
+            Some(PreviewTextures::Single(texture)) => texture.clone(),
+            _ => panic!("no mesh-map preview"),
+        };
+        assert_eq!((maps.width, maps.height), (64, 32));
+        // Both quads face +Z, so both halves carry the same normal.
+        assert_eq!(maps.pixel(16, 16), maps.pixel(48, 16));
+        assert!(maps.pixel(48, 16).unwrap()[3] > 0, "tile 1002 is covered");
+    }
+
+    #[test]
     fn tc_0101_gltf_material_slots_become_texture_sets_that_each_show_on_their_slot() {
         let context = egui::Context::default();
         let folder = tempfile::tempdir().unwrap();
@@ -7334,6 +7783,55 @@ mod tests {
         app.resource_watcher.expire();
         app.poll_resource_files(&context);
         assert_eq!(first_pixel(&app, resource), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn tc_0372_re_exported_high_poly_sources_reload_and_rebake() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("high.gltf");
+        let write = |preset: PrimitivePreset| {
+            substancecraft_api::write_gltf(&path, &preset.build_mesh(), 30.0, &[]).unwrap();
+        };
+        let context = egui::Context::default();
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.mesh_map_settings.resolution = 32;
+        app.mesh_map_settings.ao_samples = 2;
+        write(PrimitivePreset::Sphere);
+        app.high_poly = Some(load_high_poly(&path, 1.0).unwrap());
+        app.high_poly_changed();
+        let vertices = |app: &SubstanceCraftApp| app.high_poly.as_ref().unwrap().geometry.vertices.len();
+        let sphere = vertices(&app);
+
+        // Auto: a re-export reloads the high poly and starts a rebake.
+        let revision = app.high_poly_revision;
+        write(PrimitivePreset::Cube);
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_ne!(vertices(&app), sphere);
+        assert_ne!(app.high_poly_revision, revision);
+        assert!(app.mesh_map_job.is_some(), "rebaking from the new source");
+        app.cancel_mesh_map_job();
+
+        // Ask: the change waits in the reload prompt.
+        app.resource_watcher.mode = resource_watch::ReloadMode::Ask;
+        write(PrimitivePreset::Sphere);
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_ne!(vertices(&app), sphere);
+        assert_eq!(app.pending_reload_names(), ["High poly high.gltf"]);
+        app.reload_pending();
+        assert_eq!(vertices(&app), sphere);
+        assert!(app.pending_reload_names().is_empty());
+        app.cancel_mesh_map_job();
+
+        // A file caught mid-export keeps the previous high poly.
+        app.resource_watcher.mode = resource_watch::ReloadMode::Auto;
+        std::fs::write(&path, b"{ half").unwrap();
+        app.resource_watcher.expire();
+        app.poll_resource_files(&context);
+        assert_eq!(vertices(&app), sphere);
+        assert!(app.mesh_map_error.as_deref().unwrap().contains("keeping the previous"));
     }
 
     #[test]

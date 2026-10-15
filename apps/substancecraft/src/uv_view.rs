@@ -80,7 +80,7 @@ impl SubstanceCraftApp {
                 && let Some(position) = pointer
             {
                 let uv = self.uv_view.to_uv(area, position);
-                if (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y) {
+                if self.paintable_uv(uv) {
                     self.stroke_tools.set_clone_source(uv);
                 }
             }
@@ -91,7 +91,7 @@ impl SubstanceCraftApp {
             && let Some(position) = pointer
         {
             let uv = self.uv_view.to_uv(area, position);
-            if (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y) {
+            if self.paintable_uv(uv) {
                 self.append_stroke_point(uv);
                 // Radial copies have no UV-space equivalent; only mirroring
                 // applies here.
@@ -111,22 +111,62 @@ impl SubstanceCraftApp {
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, theme::VIEWPORT_BG);
         let square = self.uv_view.square(area);
-        paint_checker(&painter, square);
         let texture = self.uv_preview_texture(ui.ctx());
-        if let Some(texture) = &texture {
-            painter.image(
-                texture.id(),
-                square,
-                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                Color32::WHITE,
+        // Each UDIM tile sits in its own unit square, showing its cell of
+        // the atlas; without tiles the preview fills the 0..1 square.
+        let tiles: Vec<(Option<substancecraft_core::UdimTile>, Rect, Rect)> =
+            match &self.udim_atlas {
+                Some(atlas) => {
+                    let (columns, rows) = atlas.grid();
+                    atlas
+                        .tiles()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, tile)| {
+                            let offset = tile.offset();
+                            let rect = square.translate(vec2(
+                                offset.x * square.width(),
+                                -offset.y * square.height(),
+                            ));
+                            let (column, row) = (index as u32 % columns, index as u32 / columns);
+                            let cell = Rect::from_min_size(
+                                pos2(
+                                    column as f32 / columns as f32,
+                                    (rows - 1 - row) as f32 / rows as f32,
+                                ),
+                                vec2(1.0 / columns as f32, 1.0 / rows as f32),
+                            );
+                            (Some(*tile), rect, cell)
+                        })
+                        .collect()
+                }
+                None => vec![(
+                    None,
+                    square,
+                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                )],
+            };
+        for (tile, rect, cell) in &tiles {
+            paint_checker(&painter, *rect);
+            if let Some(texture) = &texture {
+                painter.image(texture.id(), *rect, *cell, Color32::WHITE);
+            }
+            painter.rect_stroke(
+                *rect,
+                0.0,
+                Stroke::new(1.0, Color32::from_white_alpha(60)),
+                egui::StrokeKind::Outside,
             );
+            if let Some(tile) = tile {
+                painter.text(
+                    rect.left_top() + vec2(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    tile.0.to_string(),
+                    egui::FontId::proportional(11.0),
+                    theme::TEXT_WEAK,
+                );
+            }
         }
-        painter.rect_stroke(
-            square,
-            0.0,
-            Stroke::new(1.0, Color32::from_white_alpha(60)),
-            egui::StrokeKind::Outside,
-        );
         self.paint_uv_wireframe(&painter, square);
 
         let label = self.selected_texture_set_ref().map_or_else(

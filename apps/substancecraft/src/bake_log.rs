@@ -1,10 +1,14 @@
 //! A log of mesh-map bakes: when each ran, with what settings, how long it
-//! took, and how it ended. Shown in the Bake drawer and copyable as text.
+//! took, and how it ended. Shown in the Bake drawer, copyable as text, and
+//! saved beside the project (`name.sproject.bakelog`) so it survives
+//! reopening.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, RichText, Ui};
+use serde::{Deserialize, Serialize};
 use substancecraft_core::{MeshMapSettings, MeshMaps};
 
 use super::SubstanceCraftApp;
@@ -13,7 +17,7 @@ use crate::{theme, widgets};
 /// Entries kept; older ones drop off.
 pub const MAX_BAKE_LOG: usize = 64;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BakeOutcome {
     Finished {
         slots: usize,
@@ -27,7 +31,7 @@ pub enum BakeOutcome {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BakeLogEntry {
     /// Seconds since the Unix epoch when the bake started.
     pub started: u64,
@@ -88,7 +92,7 @@ pub fn settings_summary(settings: &MeshMapSettings, high_poly: bool) -> String {
     )
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BakeLog {
     entries: VecDeque<BakeLogEntry>,
 }
@@ -120,6 +124,62 @@ impl BakeLog {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Writes the log beside the project file at `project`; an empty log
+    /// removes the sidecar instead.
+    pub fn save(&self, project: &Path) -> std::io::Result<()> {
+        let sidecar = log_path(project);
+        if self.entries.is_empty() {
+            return match std::fs::remove_file(&sidecar) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
+        }
+        let file = BakeLogFile {
+            version: BAKE_LOG_VERSION,
+            log: self.clone(),
+        };
+        let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
+        let mut temporary = sidecar.clone().into_os_string();
+        temporary.push(".tmp");
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(&temporary, &sidecar)
+    }
+
+    /// The log saved beside the project file at `project`, or an empty one
+    /// when there is none or it cannot be read.
+    pub fn load(project: &Path) -> Self {
+        std::fs::read(log_path(project))
+            .ok()
+            .filter(|bytes| bytes.len() <= MAX_BAKE_LOG_BYTES)
+            .and_then(|bytes| serde_json::from_slice::<BakeLogFile>(&bytes).ok())
+            .filter(|file| file.version == BAKE_LOG_VERSION)
+            .map(|file| {
+                let mut log = file.log;
+                while log.entries.len() > MAX_BAKE_LOG {
+                    log.entries.pop_front();
+                }
+                log
+            })
+            .unwrap_or_default()
+    }
+}
+
+const BAKE_LOG_VERSION: u32 = 1;
+/// Larger sidecars are not read.
+const MAX_BAKE_LOG_BYTES: usize = 1 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct BakeLogFile {
+    version: u32,
+    log: BakeLog,
+}
+
+/// Where the bake log of the project at `project` is saved.
+pub fn log_path(project: &Path) -> PathBuf {
+    let mut name = project.as_os_str().to_owned();
+    name.push(".bakelog");
+    PathBuf::from(name)
 }
 
 /// Outcome of a finished high-to-low or plain bake.
@@ -139,7 +199,7 @@ impl SubstanceCraftApp {
         widgets::caption(ui, "Bake log");
         if self.bake_log.len() == 0 {
             ui.label(
-                RichText::new("No bakes yet this session.")
+                RichText::new("No bakes logged for this project yet.")
                     .size(11.5)
                     .color(theme::TEXT_FAINT),
             );
@@ -206,5 +266,40 @@ mod tests {
         }
         assert_eq!(app.bake_log.len(), MAX_BAKE_LOG);
         assert_eq!(clock(3_661), "01:01:01 UTC");
+    }
+
+    #[test]
+    fn tc_0371_bake_log_is_saved_with_the_project_and_restored_on_open() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("scene.sproject");
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        let entry = |outcome| BakeLogEntry {
+            started: 3_661,
+            duration: Duration::from_millis(1_500),
+            settings: "32² · 2 AO samples · from mesh".to_owned(),
+            outcome,
+        };
+        app.bake_log.record(entry(BakeOutcome::Finished {
+            slots: 2,
+            miss_percent: Some(1.5),
+        }));
+        app.bake_log
+            .record(entry(BakeOutcome::Failed("no mesh".to_owned())));
+        app.project_path = Some(path.clone());
+        app.save_project();
+        assert!(log_path(&path).exists());
+
+        let mut reopened = SubstanceCraftApp::default();
+        reopened.open_project_path(path.clone());
+        assert_eq!(reopened.bake_log, app.bake_log);
+        assert_eq!(reopened.bake_log.to_text(), app.bake_log.to_text());
+
+        // A cleared log removes the sidecar; a damaged one reads as empty.
+        reopened.bake_log.clear();
+        reopened.save_project();
+        assert!(!log_path(&path).exists());
+        std::fs::write(log_path(&path), b"{not json").unwrap();
+        assert_eq!(BakeLog::load(&path).len(), 0);
     }
 }

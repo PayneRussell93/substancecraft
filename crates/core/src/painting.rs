@@ -448,11 +448,33 @@ fn seam_crossing(
             (to_point, to) = (middle, hit);
         }
     }
-    let crossing = from.position.lerp(to.position, 0.5);
+    // Snapping jumps over folds (the chord cuts a corner and lands on one
+    // face or the other), so the crossing is where the two faces' planes
+    // meet, nearest the jump; between near-parallel faces, its middle.
+    let middle = from.position.lerp(to.position, 0.5);
+    let crossing = planes_meeting(from.position, from.normal, to.position, to.normal)
+        .map_or(middle, |(point, direction)| {
+            point + direction * direction.dot(middle - point)
+        });
     (
         mesh.uv_on_plane(from.triangle, crossing).unwrap_or(from.uv),
         mesh.uv_on_plane(to.triangle, crossing).unwrap_or(to.uv),
     )
+}
+
+/// The line where the plane through `a` facing `a_normal` meets the one
+/// through `b` facing `b_normal`, as a point and unit direction. `None`
+/// for near-parallel planes.
+fn planes_meeting(a: Vec3, a_normal: Vec3, b: Vec3, b_normal: Vec3) -> Option<(Vec3, Vec3)> {
+    let direction = a_normal.cross(b_normal);
+    let length_squared = direction.length_squared();
+    if !length_squared.is_finite() || length_squared < 1e-4 {
+        return None;
+    }
+    let point = (b_normal.cross(direction) * a_normal.dot(a)
+        + direction.cross(a_normal) * b_normal.dot(b))
+        / length_squared;
+    Some((point, direction / length_squared.sqrt()))
 }
 
 /// Catmull-Rom curve through `controls`, `samples` points per segment,
@@ -693,5 +715,56 @@ mod tests {
             ..path
         };
         assert_eq!(closed.sample(4).last(), Some(&Vec2::ZERO));
+    }
+
+    #[test]
+    fn tc_0369_surface_paths_follow_the_model_across_uv_seams() {
+        let cube = PrimitivePreset::Cube.build_mesh();
+        let topology = MeshTopology::build(&cube);
+        let on = |point: Vec3| cube.closest_surface_point(point).unwrap();
+        let place = |points: &[Vec3]| PathSpec {
+            controls: points.iter().map(|point| on(*point).uv).collect(),
+            closed: false,
+            surface: points.iter().map(|point| on(*point).position).collect(),
+        };
+
+        // Within one face the path is one stretch through its controls.
+        let flat = place(&[Vec3::new(-0.3, 0.0, 0.5), Vec3::new(0.3, 0.1, 0.5)]);
+        assert!(flat.on_surface() && flat.is_valid());
+        let runs = flat.surface_runs(&cube, &topology, 16);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 17);
+        assert!((runs[0][0] - flat.controls[0]).length() < 1e-5);
+        assert!((runs[0][16] - flat.controls[1]).length() < 1e-5);
+
+        // From the front face over the top edge onto the top face: two
+        // stretches, each running up to the edge in its own island.
+        let front = on(Vec3::new(0.0, 0.2, 0.5));
+        let top = on(Vec3::new(0.0, 0.5, 0.2));
+        let over = place(&[front.position, top.position]);
+        let runs = over.surface_runs(&cube, &topology, 16);
+        assert_eq!(runs.len(), 2);
+        let edge = Vec3::new(0.0, 0.5, 0.5);
+        let front_edge = cube.uv_on_plane(front.triangle, edge).unwrap();
+        let top_edge = cube.uv_on_plane(top.triangle, edge).unwrap();
+        assert!((*runs[0].last().unwrap() - front_edge).length() < 1e-3);
+        assert!((runs[1][0] - top_edge).length() < 1e-3);
+        assert!((front_edge - top_edge).length() > 0.05, "a real UV seam");
+        // Each stretch stays in its own face's UV island.
+        assert!((runs[0][0] - front.uv).length() < 1e-5);
+        assert!((*runs[1].last().unwrap() - top.uv).length() < 1e-5);
+
+        // Without surface points, or with mismatched ones, the path is the
+        // plain UV curve.
+        let uv_only = PathSpec {
+            surface: Vec::new(),
+            ..over.clone()
+        };
+        assert_eq!(uv_only.surface_runs(&cube, &topology, 16).len(), 1);
+        let broken = PathSpec {
+            surface: vec![Vec3::NAN; 2],
+            ..over
+        };
+        assert!(!broken.is_valid());
     }
 }

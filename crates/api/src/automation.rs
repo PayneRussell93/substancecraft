@@ -2709,6 +2709,7 @@ mod tests {
             high_poly_source: None,
             content_hash: None,
             high_poly_hash: None,
+            high_to_low: Default::default(),
         });
         project.texture_sets[0].layers[0].polygon_mask = Some(substancecraft_core::PolygonMask {
             triangles: [0, 2].into(),

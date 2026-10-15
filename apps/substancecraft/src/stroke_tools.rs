@@ -24,6 +24,8 @@ pub(super) enum BrushSource {
     Clone,
     /// The stack dragged along the stroke.
     Smudge,
+    /// The stack softened under the stroke.
+    Blur,
 }
 
 impl BrushSource {
@@ -32,6 +34,7 @@ impl BrushSource {
             Self::Paint => "Paint",
             Self::Clone => "Clone",
             Self::Smudge => "Smudge",
+            Self::Blur => "Blur",
         }
     }
 }
@@ -54,6 +57,8 @@ pub(super) struct StrokeTools {
     pub(super) align_to_surface: bool,
     /// How far smudging drags, in brush radii.
     pub(super) smudge_strength: f32,
+    /// Radius of the disc blurring averages, in brush radii.
+    pub(super) blur_strength: f32,
     /// UV point clone strokes copy from.
     pub(super) clone_source: Option<glam::Vec2>,
     /// Offset from the brush to the source, fixed by the first stroke after
@@ -72,6 +77,7 @@ impl Default for StrokeTools {
             source: BrushSource::Paint,
             align_to_surface: false,
             smudge_strength: 0.5,
+            blur_strength: 0.3,
             clone_source: None,
             clone_offset: None,
             picking_source: false,
@@ -97,6 +103,9 @@ impl StrokeTools {
             BrushSource::Paint => None,
             BrushSource::Smudge => Some(StrokeSource::Smudge {
                 strength: self.smudge_strength.clamp(0.05, 1.0),
+            }),
+            BrushSource::Blur => Some(StrokeSource::Blur {
+                strength: self.blur_strength.clamp(0.05, 1.0),
             }),
             BrushSource::Clone => {
                 let source = self.clone_source?;
@@ -450,7 +459,7 @@ mod tests {
                 .source
                 .and_then(|source| match source {
                     StrokeSource::Clone { offset } => Some(offset),
-                    StrokeSource::Smudge { .. } => None,
+                    StrokeSource::Smudge { .. } | StrokeSource::Blur { .. } => None,
                 })
                 .unwrap()
         };
@@ -493,6 +502,24 @@ mod tests {
         assert!(!app.projects_strokes());
         app.stroke_tools.source = BrushSource::Paint;
         assert!(app.projects_strokes());
+    }
+
+    #[test]
+    fn tc_0370_blur_strokes_record_their_strength_and_bake() {
+        let mut app = app();
+        app.stroke_tools.source = BrushSource::Blur;
+        app.stroke_tools.blur_strength = 0.4;
+        app.append_stroke_point(glam::Vec2::new(0.4, 0.5));
+        app.append_stroke_point(glam::Vec2::new(0.5, 0.5));
+        app.finish_active_stroke();
+        assert_eq!(
+            strokes(&app)[0].source,
+            Some(StrokeSource::Blur { strength: 0.4 })
+        );
+        app.projection_painting = true;
+        assert!(!app.projects_strokes(), "blur stays in texture space");
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        assert!(set.bake_base_color().is_ok());
     }
 
     #[test]

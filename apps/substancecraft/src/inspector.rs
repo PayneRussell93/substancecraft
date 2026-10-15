@@ -66,6 +66,12 @@ impl BakeInputs {
         layer: LayerId,
         generator_only: bool,
     ) -> Result<BakedTexture, String> {
+        if let Some(udim) = &self.udim {
+            return udim.bake_single(self, texture_set, None, |set, context| {
+                set.bake_layer_mask(layer, generator_only, context)
+                    .map_err(|error| error.to_string())
+            });
+        }
         texture_set
             .bake_layer_mask(layer, generator_only, self.context())
             .map_err(|error| error.to_string())
@@ -77,6 +83,12 @@ impl BakeInputs {
         texture_set: &TextureSet,
         id: substancecraft_core::StencilId,
     ) -> Result<BakedTexture, String> {
+        if let Some(udim) = &self.udim {
+            return udim.bake_single(self, texture_set, None, |set, context| {
+                set.bake_stencil(id, context)
+                    .map_err(|error| error.to_string())
+            });
+        }
         texture_set
             .bake_stencil(id, self.context())
             .map_err(|error| error.to_string())
