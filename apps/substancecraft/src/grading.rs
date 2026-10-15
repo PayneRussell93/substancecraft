@@ -1,4 +1,4 @@
-//! Colour management and light rigs of the viewport and renders.
+//! Colour management, light rigs, and shaders of the viewport and renders.
 //!
 //! Colour: a view transform (tone curve), an exposure adjustment, and an
 //! optional display LUT from a `.cube` file, which is how colour pipelines
@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Id, RichText, Ui};
 use substancecraft_core::{
-    CubeLut, LightRig, MAX_RIG_LIGHTS, MAX_RIG_LUX, RigLight, SunLight, ViewTransform,
+    CubeLut, LightRig, MAX_RIG_LIGHTS, MAX_RIG_LUX, MAX_SHADER_FILE_BYTES, RigLight,
+    ShaderDefinition, SunLight, ViewTransform,
 };
 
 use super::SubstanceCraftApp;
@@ -159,8 +160,22 @@ impl SubstanceCraftApp {
                             remove = Some(index);
                         }
                     });
-                    slider_row(ui, "Height°", &mut light.elevation_degrees, -90.0..=90.0, false, 0);
-                    slider_row(ui, "Around°", &mut light.azimuth_degrees, -180.0..=180.0, false, 0);
+                    slider_row(
+                        ui,
+                        "Height°",
+                        &mut light.elevation_degrees,
+                        -90.0..=90.0,
+                        false,
+                        0,
+                    );
+                    slider_row(
+                        ui,
+                        "Around°",
+                        &mut light.azimuth_degrees,
+                        -180.0..=180.0,
+                        false,
+                        0,
+                    );
                     slider_row(ui, "Lux", &mut light.lux, 0.0..=MAX_RIG_LUX, true, 0);
                 });
             }
@@ -198,7 +213,8 @@ impl SubstanceCraftApp {
         widgets::property_row(ui, "View", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for transform in ViewTransform::ALL {
-                if widgets::chip(ui, transform.name(), values.view_transform == transform).clicked() {
+                if widgets::chip(ui, transform.name(), values.view_transform == transform).clicked()
+                {
                     values.view_transform = transform;
                 }
             }
@@ -238,5 +254,278 @@ impl SubstanceCraftApp {
         } else if clear {
             self.clear_display_lut();
         }
+    }
+
+    /// The folder user shader definitions are read from: `shaders` beside
+    /// the preferences file.
+    pub(super) fn shader_folder(&self) -> Option<PathBuf> {
+        let preferences = self
+            .preferences
+            .path
+            .clone()
+            .or_else(crate::preferences::Preferences::default_path)?;
+        Some(preferences.parent()?.join("shaders"))
+    }
+
+    /// Re-reads the user shader definitions (`*.json` in the shader folder),
+    /// skipping, and reporting, files that are not valid definitions.
+    pub(super) fn refresh_user_shaders(&mut self) {
+        self.user_shaders.clear();
+        let Some(folder) = self.shader_folder() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        paths.sort();
+        let mut failures = Vec::new();
+        for path in paths {
+            match load_shader_file(&path) {
+                Ok(shader) => self.user_shaders.push(shader),
+                Err(error) => failures.push(format!("{}: {error}", crate::path_label(&path))),
+            }
+        }
+        self.shader_status = failures.first().map(|first| match failures.len() {
+            1 => format!("Skipped {first}"),
+            count => format!("Skipped {first} (and {} more)", count - 1),
+        });
+    }
+
+    /// The shader the viewport uses: the project's, else the default.
+    pub(super) fn viewport_shader(&self) -> ShaderDefinition {
+        self.project.shader.clone().unwrap_or_default()
+    }
+
+    /// Sets the project's viewport shader; the default is stored as none.
+    pub(super) fn set_viewport_shader(&mut self, shader: ShaderDefinition) {
+        if !shader.is_valid() {
+            return;
+        }
+        self.project.shader = (shader != ShaderDefinition::default()).then_some(shader);
+    }
+
+    /// The Shader section of the Light drawer.
+    pub(super) fn shader_section(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Shader");
+        let current = self.viewport_shader();
+        let mut chosen = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for shader in ShaderDefinition::built_in()
+                .into_iter()
+                .chain(self.user_shaders.iter().cloned())
+            {
+                if widgets::chip(ui, &shader.name, shader == current)
+                    .on_hover_text(&shader.description)
+                    .clicked()
+                {
+                    chosen = Some(shader);
+                }
+            }
+        });
+        if !current.description.is_empty() {
+            hint(ui, &current.description);
+        }
+        let (mut load, mut refresh) = (false, false);
+        ui.horizontal(|ui| {
+            load = widgets::pill_button(ui, Some(Icon::Import), "Load…", false, false)
+                .on_hover_text("Use a shader definition (.json) for this project")
+                .clicked();
+            refresh = widgets::pill_button(ui, None, "Rescan", false, false)
+                .on_hover_text(
+                    self.shader_folder()
+                        .map_or("No shader folder".to_owned(), |folder| {
+                            format!("List the .json definitions in {}", folder.display())
+                        }),
+                )
+                .clicked();
+        });
+        if let Some(status) = &self.shader_status {
+            hint(ui, status);
+        }
+        if let Some(shader) = chosen {
+            self.set_viewport_shader(shader);
+        }
+        if refresh {
+            self.refresh_user_shaders();
+        }
+        if load
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Shader definition", &["json"])
+                .pick_file()
+        {
+            match load_shader_file(&path) {
+                Ok(shader) => {
+                    self.shader_status = None;
+                    self.set_viewport_shader(shader);
+                }
+                Err(error) => {
+                    self.shader_status = Some(format!(
+                        "Could not load {}: {error}",
+                        crate::path_label(&path)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Reads a shader definition file; missing fields take their defaults.
+pub fn load_shader_file(path: &Path) -> Result<ShaderDefinition, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > MAX_SHADER_FILE_BYTES as u64 {
+        return Err("the file is too large for a shader definition".to_owned());
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let shader: ShaderDefinition =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if shader.is_valid() {
+        Ok(shader)
+    } else {
+        Err("a value is out of range or the name is empty".to_owned())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use substancecraft_core::PrimitivePreset;
+
+    #[test]
+    fn tc_0382_display_luts_and_light_rigs_are_kept_and_restored() {
+        let folder = tempfile::tempdir().unwrap();
+        let preferences = folder.path().join("preferences.json");
+        let mut app = SubstanceCraftApp::default();
+        app.load_preferences(preferences.clone());
+
+        // A LUT loads, is remembered, and comes back next session.
+        let mut text = String::from("LUT_3D_SIZE 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    text.push_str(&format!("{r} {g} {b}\n"));
+                }
+            }
+        }
+        let lut_path = folder.path().join("look.cube");
+        std::fs::write(&lut_path, text).unwrap();
+        app.load_display_lut(lut_path.clone()).unwrap();
+        assert_eq!(app.display_lut.as_ref().unwrap().lut.size, 2);
+        app.preferences.values.view_transform = ViewTransform::Agx;
+        app.preferences.values.exposure = 1.5;
+        app.save_preferences();
+        let mut later = SubstanceCraftApp::default();
+        later.load_preferences(preferences.clone());
+        assert!(later.display_lut.is_some());
+        assert_eq!(later.preferences.values.view_transform, ViewTransform::Agx);
+        assert_eq!(later.preferences.values.exposure, 1.5);
+
+        // A broken file keeps the current LUT and says why; clearing forgets it.
+        let broken = folder.path().join("broken.cube");
+        std::fs::write(&broken, "LUT_3D_SIZE 2\n0 0 0\n").unwrap();
+        assert!(later.load_display_lut(broken).is_err());
+        assert_eq!(later.display_lut.as_ref().unwrap().path, lut_path);
+        assert!(later.grading_status.is_some());
+        later.clear_display_lut();
+        assert!(later.display_lut.is_none());
+        assert_eq!(
+            crate::preferences::Preferences::load(&preferences).display_lut,
+            None
+        );
+
+        // A rig is saved with the project and reopened with it; invalid
+        // rigs are refused; rig lights turn with the environment.
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        let rig = LightRig::built_in().remove(0);
+        app.set_light_rig(Some(rig.clone()));
+        let mut crowded = rig.clone();
+        crowded.lights.extend(rig.lights.clone());
+        app.set_light_rig(Some(crowded));
+        assert_eq!(app.project.light_rig.as_ref(), Some(&rig));
+        assert_eq!(app.rig_suns(0.0).len(), 3);
+        assert_ne!(
+            app.rig_suns(1.0)[0].direction,
+            app.rig_suns(0.0)[0].direction
+        );
+        let project_path = folder.path().join("lit.sproject");
+        app.project_path = Some(project_path.clone());
+        app.save_project();
+        let mut reopened = SubstanceCraftApp::default();
+        reopened.open_project_path(project_path);
+        assert_eq!(reopened.project.light_rig, Some(rig));
+        reopened.set_light_rig(None);
+        assert!(reopened.rig_suns(0.0).is_empty());
+    }
+
+    #[test]
+    fn tc_0385_shader_definitions_are_listed_swapped_and_saved_with_the_project() {
+        let folder = tempfile::tempdir().unwrap();
+        let shaders = folder.path().join("shaders");
+        std::fs::create_dir(&shaders).unwrap();
+        std::fs::write(
+            shaders.join("wet.json"),
+            r#"{ "name": "Wet", "description": "Rain-soaked", "clear_coat": 0.9 }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            shaders.join("broken.json"),
+            r#"{ "name": "", "unlit": true }"#,
+        )
+        .unwrap();
+        std::fs::write(shaders.join("notes.txt"), "not a shader").unwrap();
+
+        // The folder beside the preferences lists valid definitions and
+        // says which files it skipped.
+        let mut app = SubstanceCraftApp::default();
+        app.load_preferences(folder.path().join("preferences.json"));
+        assert_eq!(app.shader_folder(), Some(shaders.clone()));
+        assert_eq!(app.user_shaders.len(), 1);
+        assert_eq!(app.user_shaders[0].name, "Wet");
+        assert!(
+            app.shader_status
+                .as_deref()
+                .unwrap()
+                .contains("broken.json")
+        );
+
+        // The default is stored as none; others are saved in the project.
+        assert_eq!(app.viewport_shader(), ShaderDefinition::default());
+        let wet = app.user_shaders[0].clone();
+        app.set_viewport_shader(wet.clone());
+        assert_eq!(app.viewport_shader(), wet);
+        let mut invalid = wet.clone();
+        invalid.emissive_scale = 100.0;
+        app.set_viewport_shader(invalid);
+        assert_eq!(
+            app.viewport_shader(),
+            wet,
+            "invalid definitions are refused"
+        );
+        let project = folder.path().join("wet.sproject");
+        app.set_base_geometry(Some(
+            substancecraft_core::PrimitivePreset::Cube.build_mesh(),
+        ));
+        app.project_path = Some(project.clone());
+        app.save_project();
+        let mut reopened = SubstanceCraftApp::default();
+        reopened.open_project_path(project);
+        assert_eq!(reopened.viewport_shader(), wet);
+        reopened.set_viewport_shader(ShaderDefinition::default());
+        assert_eq!(reopened.project.shader, None);
+
+        // Files load on their own too.
+        assert_eq!(load_shader_file(&shaders.join("wet.json")).unwrap(), wet);
+        assert!(load_shader_file(&shaders.join("broken.json")).is_err());
     }
 }

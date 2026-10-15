@@ -27,6 +27,7 @@ mod raster;
 mod region;
 mod resources;
 pub mod rig;
+mod shader;
 mod smoothing;
 mod templates;
 mod thumbnails;
@@ -44,8 +45,8 @@ pub use compositing::{
     MaterialSample, MaterialTextures,
 };
 pub use environment::{
-    CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightRig, LightingPreset, MAX_RIG_LIGHTS, MAX_RIG_LUX,
-    PanoramaError, RigLight, SunLight,
+    CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightRig, LightingPreset, MAX_RIG_LIGHTS,
+    MAX_RIG_LUX, PanoramaError, RigLight, SunLight,
 };
 pub use evolution::{Evolution, EvolutionDrive, MAX_EVOLUTION_DRIVES, MAX_EVOLUTIONS};
 pub use export::{
@@ -88,6 +89,7 @@ pub use rig::{
     AnimationClip, ClipSample, Influence, Joint, JointAnimation, MAX_INFLUENCES, Rig, RigError,
     SkinBinding, Track, strongest_influences,
 };
+pub use shader::{MAX_SHADER_FILE_BYTES, ShaderDefinition};
 pub use smoothing::{
     DEFAULT_SMOOTHING_ANGLE_DEGREES, MAX_SUBDIVIDED_TRIANGLES, MAX_SUBDIVISION_LEVELS,
     MeshSmoothing, corner_normals, remap_subdivided_triangles, subdivide, vertex_normals,
@@ -3017,6 +3019,9 @@ pub struct MaterialProject {
     /// Lights added to the viewport environment, in views and renders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub light_rig: Option<LightRig>,
+    /// Viewport shader; `None` is the default metal/rough shading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader: Option<ShaderDefinition>,
 }
 
 impl MaterialProject {
@@ -3034,6 +3039,7 @@ impl MaterialProject {
             smart_masks: Vec::new(),
             cameras: Vec::new(),
             light_rig: None,
+            shader: None,
         }
     }
 
@@ -3118,6 +3124,13 @@ impl MaterialProject {
                 || !mesh.high_to_low.is_valid())
         {
             return Err(ProjectError::InvalidMeshSettings);
+        }
+        if self
+            .shader
+            .as_ref()
+            .is_some_and(|shader| !shader.is_valid())
+        {
+            return Err(ProjectError::InvalidShader);
         }
         if self.light_rig.as_ref().is_some_and(|rig| !rig.is_valid()) {
             return Err(ProjectError::InvalidLightRig);
@@ -3251,6 +3264,8 @@ pub enum ProjectError {
     InvalidMeshSettings,
     #[error("the light rig has too many lights or out-of-range values")]
     InvalidLightRig,
+    #[error("the viewport shader has out-of-range values")]
+    InvalidShader,
     #[error("pose id {0:?} is duplicated")]
     DuplicatePoseId(PoseId),
     #[error("pose name `{0}` is duplicated")]

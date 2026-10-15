@@ -29,8 +29,8 @@ use substancecraft_core::{
     MaterialTextures, MeshAsset, MeshGeometry, MeshId, MeshMapError, MeshMapKind, MeshMapSettings,
     MeshMaps, MeshSmoothing, MeshTopology, NamedPose, PaintStroke, PoseId, PreflightIssue,
     PreflightSeverity, PrimitivePreset, ProjectResource, ResourceId, ResourceImages, SelectionMode,
-    TexelRect, TextureImage, TextureResolution, TextureSet, TextureSetId, ViewportCamera,
-    ViewportLighting, remap_subdivided_triangles, stroke_texel_bounds,
+    ShaderDefinition, TexelRect, TextureImage, TextureResolution, TextureSet, TextureSetId,
+    ViewportCamera, ViewportLighting, remap_subdivided_triangles, stroke_texel_bounds,
 };
 use substancecraft_filament::{FilamentRuntime, MaterialMap};
 
@@ -176,6 +176,10 @@ struct SubstanceCraftApp {
     display_lut: Option<grading::DisplayLut>,
     /// Why the display LUT did not load, when it did not.
     grading_status: Option<String>,
+    /// Shader definitions from the user shader folder.
+    user_shaders: Vec<ShaderDefinition>,
+    /// Shader files skipped or not loaded, and why.
+    shader_status: Option<String>,
     /// Loads of custom environments so far.
     environment_revision: u64,
     /// Result of the last custom environment load.
@@ -821,6 +825,8 @@ impl Default for SubstanceCraftApp {
             custom_environment: None,
             display_lut: None,
             grading_status: None,
+            user_shaders: Vec::new(),
+            shader_status: None,
             environment_revision: 0,
             environment_status: None,
             filament_renderer: None,
@@ -1226,6 +1232,15 @@ impl SubstanceCraftApp {
         // The posed mesh, when the viewport shows a pose; bound otherwise.
         let pose = self.pose_key();
         let shown = self.display_mesh();
+        // Rig lights turn with the environment, including a turntable's turn.
+        let rig = self.rig_suns(
+            self.render_request
+                .as_ref()
+                .filter(|request| !request.issued)
+                .and_then(|request| request.lighting_rotation)
+                .unwrap_or(self.viewport_lighting.rotation),
+        );
+        let shader = self.viewport_shader();
         let Some(mesh) = self.mesh_geometry.as_deref() else {
             return;
         };
@@ -1300,10 +1315,8 @@ impl SubstanceCraftApp {
             self.filament_error = Some(error.to_string());
             return;
         }
-        let rig = self.rig_suns(lighting.rotation);
-        if let Some(renderer) = self.filament_renderer.as_mut() {
-            renderer.set_rig_lights(&rig);
-        }
+        renderer.set_rig_lights(&rig);
+        renderer.set_shader(&shader);
 
         let patch = self
             .baked_preview

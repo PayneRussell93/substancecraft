@@ -418,6 +418,7 @@ impl SubstanceCraftApp {
         self.preferences.path = Some(path);
         self.restore_custom_environment();
         self.restore_display_lut();
+        self.refresh_user_shaders();
     }
 
     /// Lights the viewport (and still renders) with `preset`, in place of

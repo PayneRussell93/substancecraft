@@ -85,6 +85,8 @@ struct ScRenderer {
     std::vector<MaterialInstance*> instances;
     std::vector<std::array<Texture*, MAP_COUNT>> maps;
     bool previewMode = false;
+    // Shader definition parameters, in ShaderDefinition::parameters order.
+    std::array<float, 9> shader{0.5f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.5f, 1.0f, 0.0f};
     Entity meshEntity;
     VertexBuffer* vertexBuffer = nullptr;
     IndexBuffer* indexBuffer = nullptr;
@@ -328,6 +330,18 @@ bool uploadMap(ScRenderer* r, uint32_t instance, uint32_t slot, uint32_t width, 
     return true;
 }
 
+// Sets the shader definition's parameters on one material instance.
+void applyShader(ScRenderer* r, MaterialInstance* instance) {
+    auto const& s = r->shader;
+    instance->setParameter("specularLevel", s[0]);
+    instance->setParameter("clearCoat", s[1]);
+    instance->setParameter("clearCoatRoughness", s[2]);
+    instance->setParameter("sheenColor", math::float3{s[3], s[4], s[5]});
+    instance->setParameter("sheenRoughness", s[6]);
+    instance->setParameter("emissiveScale", s[7]);
+    instance->setParameter("unlit", s[8]);
+}
+
 // Grows or shrinks the instance list to `count`. New instances start with neutral maps: grey
 // base colour, AO 1 / roughness 0.58 / metallic 0, a flat normal, and no emission.
 bool ensureInstances(ScRenderer* r, uint32_t count) {
@@ -341,6 +355,7 @@ bool ensureInstances(ScRenderer* r, uint32_t count) {
         }
         instance->setParameter("previewMode", r->previewMode ? 1.0f : 0.0f);
         instance->setParameter("emissiveStrength", EMISSIVE_NITS);
+        applyShader(r, instance);
         r->instances.push_back(instance);
         r->maps.push_back({});
         uint32_t const index = uint32_t(r->instances.size() - 1);
@@ -899,6 +914,20 @@ void sc_renderer_set_environment_transform(ScRenderer* r, float intensity, float
             auto& lights = r->engine->getLightManager();
             lights.setDirection(lights.getInstance(r->sunEntity),
                     turn * math::float3{sun_direction[0], sun_direction[1], sun_direction[2]});
+        }
+    } catch (...) {
+    }
+}
+
+// Sets the viewport shader: nine floats in ShaderDefinition::parameters order, applied to
+// every material slot.
+void sc_renderer_set_shader(ScRenderer* r, float const* parameters) {
+    try {
+        for (size_t index = 0; index < r->shader.size(); index++) {
+            r->shader[index] = parameters[index];
+        }
+        for (MaterialInstance* instance : r->instances) {
+            applyShader(r, instance);
         }
     } catch (...) {
     }

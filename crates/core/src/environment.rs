@@ -103,14 +103,13 @@ pub struct LightRig {
 impl LightRig {
     /// Starting points: classic studio arrangements.
     pub fn built_in() -> Vec<LightRig> {
-        let light = |elevation_degrees: f32, azimuth_degrees: f32, color: [f32; 3], lux: f32| {
-            RigLight {
+        let light =
+            |elevation_degrees: f32, azimuth_degrees: f32, color: [f32; 3], lux: f32| RigLight {
                 elevation_degrees,
                 azimuth_degrees,
                 color,
                 lux,
-            }
-        };
+            };
         let white = [1.0, 1.0, 1.0];
         vec![
             LightRig {
@@ -801,15 +800,30 @@ mod tests {
         };
         assert!((top.sun(0.0).direction - Vec3::NEG_Y).length() < 1e-5);
         let turned = front.sun(std::f32::consts::FRAC_PI_2);
-        assert!((turned.direction - rotate_about_up(Vec3::NEG_Z, std::f32::consts::FRAC_PI_2)).length() < 1e-5);
+        assert!(
+            (turned.direction - rotate_about_up(Vec3::NEG_Z, std::f32::consts::FRAC_PI_2)).length()
+                < 1e-5
+        );
 
         // Out-of-range lights and too many lights are refused.
         for bad in [
             RigLight { lux: -1.0, ..front },
-            RigLight { lux: MAX_RIG_LUX * 2.0, ..front },
-            RigLight { elevation_degrees: 91.0, ..front },
-            RigLight { color: [1.5, 0.0, 0.0], ..front },
-            RigLight { azimuth_degrees: f32::NAN, ..front },
+            RigLight {
+                lux: MAX_RIG_LUX * 2.0,
+                ..front
+            },
+            RigLight {
+                elevation_degrees: 91.0,
+                ..front
+            },
+            RigLight {
+                color: [1.5, 0.0, 0.0],
+                ..front
+            },
+            RigLight {
+                azimuth_degrees: f32::NAN,
+                ..front
+            },
         ] {
             assert!(!bad.is_valid(), "{bad:?}");
         }
@@ -822,7 +836,10 @@ mod tests {
             light_rig: Some(crowded),
             ..crate::MaterialProject::empty()
         };
-        assert_eq!(project.validate(), Err(crate::ProjectError::InvalidLightRig));
+        assert_eq!(
+            project.validate(),
+            Err(crate::ProjectError::InvalidLightRig)
+        );
         let saved = crate::MaterialProject {
             light_rig: Some(rigs[0].clone()),
             ..crate::MaterialProject::empty()

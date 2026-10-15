@@ -223,7 +223,10 @@ impl CubeLut {
                         .and_then(|word| word.parse::<usize>().ok())
                         .filter(|edge| (2..=MAX_CUBE_LUT_SIZE).contains(edge))
                         .ok_or_else(|| {
-                            format!("line {}: LUT_3D_SIZE must be 2 to {MAX_CUBE_LUT_SIZE}", number + 1)
+                            format!(
+                                "line {}: LUT_3D_SIZE must be 2 to {MAX_CUBE_LUT_SIZE}",
+                                number + 1
+                            )
                         })?;
                     size = Some(edge);
                     data.reserve(edge * edge * edge);
@@ -231,7 +234,10 @@ impl CubeLut {
                 "LUT_1D_SIZE" => return Err("1D LUTs are not supported; use a 3D LUT".to_owned()),
                 "DOMAIN_MIN" | "DOMAIN_MAX" => {
                     let expected = if keyword == "DOMAIN_MIN" { 0.0 } else { 1.0 };
-                    if numbers()?.iter().any(|value| (value - expected).abs() > 1e-6) {
+                    if numbers()?
+                        .iter()
+                        .any(|value| (value - expected).abs() > 1e-6)
+                    {
                         return Err(format!(
                             "line {}: only the 0..1 input domain is supported",
                             number + 1
@@ -244,13 +250,19 @@ impl CubeLut {
                         number + 1
                     ));
                 }
-                _ if keyword.starts_with(|first: char| first.is_ascii_digit() || first == '-' || first == '.') => {
+                _ if keyword.starts_with(|first: char| {
+                    first.is_ascii_digit() || first == '-' || first == '.'
+                }) =>
+                {
                     let values: Vec<f32> = std::iter::once(keyword)
                         .chain(words)
                         .map(|word| {
-                            word.parse::<f32>().ok().filter(|value| value.is_finite()).ok_or_else(
-                                || format!("line {}: `{word}` is not a number", number + 1),
-                            )
+                            word.parse::<f32>()
+                                .ok()
+                                .filter(|value| value.is_finite())
+                                .ok_or_else(|| {
+                                    format!("line {}: `{word}` is not a number", number + 1)
+                                })
                         })
                         .collect::<Result<_, _>>()?;
                     let [red, green, blue] = values[..] else {
@@ -295,6 +307,7 @@ impl CubeLut {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -372,7 +385,8 @@ mod tests {
     #[test]
     fn tc_0379_cube_luts_parse_and_interpolate_and_reject_what_they_cannot_hold() {
         // A 2³ table that swaps red and blue.
-        let mut text = String::from("# swap\nTITLE \"Swap R/B\"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\n");
+        let mut text =
+            String::from("# swap\nTITLE \"Swap R/B\"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\n");
         for b in 0..2 {
             for g in 0..2 {
                 for r in 0..2 {
@@ -387,14 +401,22 @@ mod tests {
             Vec3::new(0.1, 0.3, 0.8),
             1e-5
         ));
-        assert!(close(lut.apply(Vec3::splat(2.0)), Vec3::ONE, 1e-5), "clamped");
+        assert!(
+            close(lut.apply(Vec3::splat(2.0)), Vec3::ONE, 1e-5),
+            "clamped"
+        );
 
         // An identity table of edge 17 passes colours through.
         let mut identity = String::from("LUT_3D_SIZE 17\n");
         for b in 0..17 {
             for g in 0..17 {
                 for r in 0..17 {
-                    identity.push_str(&format!("{} {} {}\n", r as f32 / 16.0, g as f32 / 16.0, b as f32 / 16.0));
+                    identity.push_str(&format!(
+                        "{} {} {}\n",
+                        r as f32 / 16.0,
+                        g as f32 / 16.0,
+                        b as f32 / 16.0
+                    ));
                 }
             }
         }

@@ -39,6 +39,36 @@ material {
         {
             type : float,
             name : emissiveStrength
+        },
+        // Shader definition (see ShaderDefinition): dielectric reflectance, clear coat, sheen,
+        // emissive multiplier, and unlit (0 or 1).
+        {
+            type : float,
+            name : specularLevel
+        },
+        {
+            type : float,
+            name : clearCoat
+        },
+        {
+            type : float,
+            name : clearCoatRoughness
+        },
+        {
+            type : float3,
+            name : sheenColor
+        },
+        {
+            type : float,
+            name : sheenRoughness
+        },
+        {
+            type : float,
+            name : emissiveScale
+        },
+        {
+            type : float,
+            name : unlit
         }
     ]
 }
@@ -57,13 +87,36 @@ fragment {
             material.baseColor.a = 1.0;
             material.roughness = 0.58;
             material.metallic = 0.0;
+            // Using clear coat and sheen anywhere gives them non-zero defaults; preview keeps
+            // the plain dielectric.
+            material.reflectance = 0.5;
+            material.clearCoat = 0.0;
+            material.sheenColor = float3(0.0);
         } else {
             float3 orm = texture(materialParams_ormMap, uv).rgb;
             material.ambientOcclusion = orm.r;
             material.roughness = orm.g;
             material.metallic = orm.b;
             float3 emitted = texture(materialParams_emissiveMap, uv).rgb;
-            material.emissive = float4(emitted * materialParams.emissiveStrength, 0.0);
+            material.emissive = float4(
+                    emitted * materialParams.emissiveStrength * materialParams.emissiveScale, 0.0);
+            material.reflectance = materialParams.specularLevel;
+            material.clearCoat = materialParams.clearCoat;
+            material.clearCoatRoughness = materialParams.clearCoatRoughness;
+            material.sheenColor = materialParams.sheenColor;
+            material.sheenRoughness = materialParams.sheenRoughness;
+            if (materialParams.unlit > 0.5) {
+                // Lit model, no light: Base Color glows as painted.
+                material.emissive = float4(
+                        material.baseColor.rgb * materialParams.emissiveStrength, 0.0);
+                material.baseColor.rgb = float3(0.0);
+                material.metallic = 0.0;
+                material.roughness = 1.0;
+                material.reflectance = 0.0;
+                material.ambientOcclusion = 0.0;
+                material.clearCoat = 0.0;
+                material.sheenColor = float3(0.0);
+            }
         }
     }
 }

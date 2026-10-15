@@ -1748,6 +1748,9 @@ impl SubstanceCraftApp {
         if after != before {
             self.save_preferences();
         }
+        self.shader_section(ui);
+        self.light_rig_section(ui);
+        self.color_section(ui);
 
         widgets::caption(ui, "Render");
         let mut long_edge = None;
