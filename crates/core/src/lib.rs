@@ -42,7 +42,7 @@ pub use camera_paint::{MAX_STROKE_VIEWPORT, StrokeCamera, projected_stroke_texel
 pub use color::{ColorSpace, CubeLut, MAX_CUBE_LUT_SIZE, ViewTransform};
 pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
-    MaterialSample, MaterialTextures,
+    MaterialPlanes, MaterialSample, MaterialTextures,
 };
 pub use environment::{
     CUSTOM_ENVIRONMENT_LUX, EnvironmentImage, LightRig, LightingPreset, MAX_RIG_LIGHTS,
@@ -1261,6 +1261,16 @@ impl MaterialLayer {
     }
 
     /// How this layer blends `channel`: its channel mode, else its mode.
+    /// Channels the layer adds anything to: shown, enabled, and (for a
+    /// group) with a child that does.
+    pub fn composited_channels(&self) -> BTreeSet<MaterialChannel> {
+        self.channels
+            .iter()
+            .copied()
+            .filter(|channel| compositing::contributes(self, &[*channel]))
+            .collect()
+    }
+
     pub fn blend_mode_for(&self, channel: MaterialChannel) -> BlendMode {
         self.channel_blend_modes
             .get(&channel)
@@ -1786,6 +1796,68 @@ pub struct LayerSettings {
     pub uv_tiles: BTreeSet<UdimTile>,
 }
 
+impl LayerSettings {
+    /// Channels in which a layer with these settings composites differently
+    /// from one with `other`'s (its strokes alike). A name, material link,
+    /// or evolution control changes nothing composited; a fill value,
+    /// texture, or per-channel blend mode changes its own channel; any
+    /// other setting changes every channel either enables.
+    pub fn changed_channels(&self, other: &Self) -> BTreeSet<MaterialChannel> {
+        let enabled: BTreeSet<_> = self.channels.union(&other.channels).copied().collect();
+        // Everything that applies to all channels alike.
+        let shared = |settings: &Self| Self {
+            name: String::new(),
+            channels: BTreeSet::new(),
+            fill: settings.fill.map(|fill| LayerFill {
+                color: [0; 4],
+                roughness: 0.0,
+                metallic: 0.0,
+                height: 0.0,
+                emissive: [0; 3],
+                material_opacity: 0.0,
+                textures: FillTextures::default(),
+                user: UserValues::default(),
+                ..fill
+            }),
+            channel_blend_modes: BTreeMap::new(),
+            material_link: None,
+            evolutions: Vec::new(),
+            ..settings.clone()
+        };
+        if shared(self) != shared(other) {
+            return enabled;
+        }
+        let value = |settings: &Self, channel: MaterialChannel| {
+            let fill = settings.fill.as_ref();
+            (
+                settings.channels.contains(&channel),
+                settings.channel_blend_modes.get(&channel).copied(),
+                fill.and_then(|fill| fill.textures.for_channel(channel)),
+                fill.map(|fill| match channel {
+                    MaterialChannel::BaseColor => fill.color,
+                    MaterialChannel::Emissive => {
+                        let [r, g, b] = fill.emissive;
+                        [r, g, b, 0]
+                    }
+                    MaterialChannel::Roughness => fill.roughness.to_bits().to_le_bytes(),
+                    MaterialChannel::Metallic => fill.metallic.to_bits().to_le_bytes(),
+                    MaterialChannel::Height => fill.height.to_bits().to_le_bytes(),
+                    MaterialChannel::Opacity => fill.material_opacity.to_bits().to_le_bytes(),
+                    MaterialChannel::User(slot) => {
+                        let [r, g, b] = fill.user.get(slot.into());
+                        [r, g, b, 0]
+                    }
+                    _ => [0; 4],
+                }),
+            )
+        };
+        enabled
+            .into_iter()
+            .filter(|channel| value(self, *channel) != value(other, *channel))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PaintStroke {
     pub points: Vec<glam::Vec2>,
@@ -2285,6 +2357,18 @@ impl EditHistory {
 
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// The command the next [`Self::undo`] reverts: after a redo, the one
+    /// just redone.
+    pub fn last_done(&self) -> Option<&EditCommand> {
+        self.undo_stack.last()
+    }
+
+    /// The command the next [`Self::redo`] applies: after an undo, the one
+    /// just undone.
+    pub fn last_undone(&self) -> Option<&EditCommand> {
+        self.redo_stack.last()
     }
 
     pub fn undo(&mut self, project: &mut MaterialProject) -> bool {

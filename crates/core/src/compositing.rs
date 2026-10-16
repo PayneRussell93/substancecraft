@@ -157,6 +157,81 @@ impl FlattenedLayer {
     }
 }
 
+/// Which of a [`MaterialTextures`]' four textures to rebake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaterialPlanes {
+    pub base_color: bool,
+    pub orm: bool,
+    pub normal: bool,
+    pub emissive: bool,
+}
+
+impl MaterialPlanes {
+    pub const ALL: Self = Self {
+        base_color: true,
+        orm: true,
+        normal: true,
+        emissive: true,
+    };
+
+    /// The textures an edit of `channels` can change. ID layers clip other
+    /// layers' masks, so the ID channel can change all of them; ambient
+    /// occlusion and user channels reach none.
+    pub fn of_channels(channels: impl IntoIterator<Item = MaterialChannel>) -> Self {
+        channels
+            .into_iter()
+            .fold(Self::default(), |planes, channel| match channel {
+                MaterialChannel::Id => Self::ALL,
+                MaterialChannel::BaseColor | MaterialChannel::Opacity => Self {
+                    base_color: true,
+                    ..planes
+                },
+                MaterialChannel::Roughness | MaterialChannel::Metallic => Self {
+                    orm: true,
+                    ..planes
+                },
+                MaterialChannel::Normal | MaterialChannel::Height => Self {
+                    normal: true,
+                    ..planes
+                },
+                MaterialChannel::Emissive => Self {
+                    emissive: true,
+                    ..planes
+                },
+                MaterialChannel::AmbientOcclusion | MaterialChannel::User(_) => planes,
+            })
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            base_color: self.base_color || other.base_color,
+            orm: self.orm || other.orm,
+            normal: self.normal || other.normal,
+            emissive: self.emissive || other.emissive,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        !(self.base_color || self.orm || self.normal || self.emissive)
+    }
+
+    /// True when one of these textures shows `channel`.
+    pub const fn shows(self, channel: MaterialChannel) -> bool {
+        match channel {
+            MaterialChannel::BaseColor | MaterialChannel::Opacity => self.base_color,
+            MaterialChannel::Roughness | MaterialChannel::Metallic => self.orm,
+            MaterialChannel::Normal | MaterialChannel::Height => self.normal,
+            MaterialChannel::Emissive => self.emissive,
+            _ => false,
+        }
+    }
+
+    /// Base Color, ORM, Normal, Emissive, in [`MaterialTextures`] order.
+    pub const fn flags(self) -> [bool; 4] {
+        [self.base_color, self.orm, self.normal, self.emissive]
+    }
+}
+
 /// Viewport-ready textures for one texture set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterialTextures {
@@ -998,6 +1073,42 @@ impl TextureSet {
         filters.saturating_add(sources).saturating_mul(anchors + 1)
     }
 
+    /// Texels a change of `layer`'s settings can reach before the
+    /// [`Self::region_halo`] spreads it: the bounds of its paint strokes
+    /// (one more for the height-to-normal slope) when strokes are all it
+    /// has. `None` when it may reach any texel: groups, fills, and
+    /// strokes projected from a camera.
+    ///
+    /// A paint layer starts transparent and only its strokes give it
+    /// coverage; per-texel filters keep coverage, and the halo covers the
+    /// spatial ones, so its opacity, masks, blending, and filters change
+    /// nothing elsewhere.
+    pub fn layer_footprint(&self, layer: LayerId) -> Option<Vec<TexelRect>> {
+        let layer = self.layer(layer)?;
+        if layer.children.is_some() || layer.fill.is_some() {
+            return None;
+        }
+        let (width, height) = (self.resolution.width, self.resolution.height);
+        layer
+            .paint_strokes
+            .iter()
+            .filter_map(|stroke| {
+                if stroke.camera.is_some() {
+                    return Some(None);
+                }
+                brush::stroke_texel_bounds(
+                    &stroke.points,
+                    stroke.radius_pixels,
+                    stroke.tip,
+                    &stroke.frames,
+                    width,
+                    height,
+                )
+                .map(|bounds| Some(bounds.grow(1, width, height)))
+            })
+            .collect()
+    }
+
     /// Rebakes only `region` of `textures`, a [`Self::bake_material`]
     /// result for an earlier state of this set. When the two states differ
     /// only inside `edited`, rebaking `edited` grown by
@@ -1008,6 +1119,20 @@ impl TextureSet {
         context: BakeContext<'_>,
         textures: &mut MaterialTextures,
         region: TexelRect,
+    ) -> Result<(), BakeError> {
+        self.rebake_material_planes_region(context, textures, region, MaterialPlanes::ALL)
+    }
+
+    /// [`Self::rebake_material_region`] for only the textures in `planes`;
+    /// the others are left as they are. Exact when the two states differ
+    /// only in channels whose textures `planes` names (see
+    /// [`MaterialPlanes::of_channels`]).
+    pub fn rebake_material_planes_region(
+        &self,
+        context: BakeContext<'_>,
+        textures: &mut MaterialTextures,
+        region: TexelRect,
+        planes: MaterialPlanes,
     ) -> Result<(), BakeError> {
         let width = self.resolution.width;
         if ![
@@ -1021,21 +1146,24 @@ impl TextureSet {
         {
             return Err(BakeError::RegionMismatch);
         }
-        if region.is_empty() {
+        if region.is_empty() || planes.is_empty() {
             return Ok(());
         }
         let grown = self.composited_region(region);
-        let planes = self.material_rgba8(context, grown)?;
-        for (texture, rgba8) in [
+        let rebaked = self.material_rgba8(context, grown, planes)?;
+        for ((texture, rgba8), wanted) in [
             &mut textures.base_color,
             &mut textures.orm,
             &mut textures.normal,
             &mut textures.emissive,
         ]
         .into_iter()
-        .zip(&planes)
+        .zip(&rebaked)
+        .zip(planes.flags())
         {
-            patch_rgba8(&mut texture.rgba8, width, rgba8, grown, region);
+            if wanted {
+                patch_rgba8(&mut texture.rgba8, width, rgba8, grown, region);
+            }
         }
         Ok(())
     }
@@ -1250,8 +1378,9 @@ impl TextureSet {
         context: BakeContext<'_>,
         tiles: &[TexelRect],
     ) -> Result<MaterialTextures, BakeError> {
-        let [base_color, orm, normal, emissive] =
-            self.bake_in_tiles(tiles, |region| self.material_rgba8(context, region))?;
+        let [base_color, orm, normal, emissive] = self.bake_in_tiles(tiles, |region| {
+            self.material_rgba8(context, region, MaterialPlanes::ALL)
+        })?;
         Ok(MaterialTextures {
             base_color: self.texture(base_color),
             orm: self.texture(orm),
@@ -1261,37 +1390,39 @@ impl TextureSet {
     }
 
     /// [`Self::bake_material`]'s Base Color, ORM, Normal, and Emissive over
-    /// `region` only, each RGBA row-major within it.
+    /// `region` only, each RGBA row-major within it. Textures `planes`
+    /// leaves out come back empty.
     fn material_rgba8(
         &self,
         context: BakeContext<'_>,
         region: TexelRect,
+        planes: MaterialPlanes,
     ) -> Result<[Vec<u8>; 4], BakeError> {
         let id_map = self.validate_for_region(region)?;
         // Masks (generators especially) are the expensive part; build each once
         // and share them across all channels.
-        let masks = self.layer_masks_in(
-            &[
-                MaterialChannel::BaseColor,
-                MaterialChannel::Roughness,
-                MaterialChannel::Metallic,
-                MaterialChannel::Normal,
-                MaterialChannel::Height,
-                MaterialChannel::Emissive,
-                MaterialChannel::Opacity,
-            ],
-            context,
-            id_map.as_deref(),
-            region,
-        )?;
+        let channels = [
+            MaterialChannel::BaseColor,
+            MaterialChannel::Roughness,
+            MaterialChannel::Metallic,
+            MaterialChannel::Normal,
+            MaterialChannel::Height,
+            MaterialChannel::Emissive,
+            MaterialChannel::Opacity,
+        ]
+        .into_iter()
+        .filter(|channel| planes.shows(*channel))
+        .collect::<Vec<_>>();
+        let masks = self.layer_masks_in(&channels, context, id_map.as_deref(), region)?;
         let masks = &masks;
         let pixel_count = region.len();
         // Channels nothing paints stay at their defaults without compositing.
         let plane = |channel: MaterialChannel| -> Result<Option<Vec<Vec4>>, BakeError> {
-            if self
-                .layers
-                .iter()
-                .any(|layer| contributes(layer, &[channel]))
+            if planes.shows(channel)
+                && self
+                    .layers
+                    .iter()
+                    .any(|layer| contributes(layer, &[channel]))
             {
                 self.composite_region(channel, context, masks, None, region)
                     .map(Some)
@@ -1310,7 +1441,11 @@ impl TextureSet {
                     plane(MaterialChannel::Opacity)?,
                 ))
             });
-            let normal = self.normal_region(context, masks, region);
+            let normal = if planes.normal {
+                self.normal_region(context, masks, region)
+            } else {
+                Ok(Vec::new())
+            };
             let base = base.join().unwrap_or(Err(BakeError::AllocationFailed));
             let scalars = scalars.join().unwrap_or(Err(BakeError::AllocationFailed));
             (base, scalars, normal)
@@ -1322,7 +1457,9 @@ impl TextureSet {
             plane.as_ref().map_or(default, |plane| plane[index].x)
         };
         let mut occlusion = try_filled(pixel_count, 1.0_f32)?;
-        if let Some(maps) = context.mesh_maps {
+        if planes.orm
+            && let Some(maps) = context.mesh_maps
+        {
             parallel_fill_region(
                 &mut occlusion,
                 region,
@@ -1370,11 +1507,12 @@ impl TextureSet {
                 255,
             ]);
         }
+        let keep = |wanted: bool, rgba8: Vec<u8>| if wanted { rgba8 } else { Vec::new() };
         Ok([
-            base_color,
-            orm,
+            keep(planes.base_color, base_color),
+            keep(planes.orm, orm),
             plane_to_rgba8(&normal, PlaneData::Vector),
-            emission,
+            keep(planes.emissive, emission),
         ])
     }
 

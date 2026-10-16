@@ -89,9 +89,9 @@ use std::{
 };
 use substancecraft_core::{
     BakeContext, BakeError, BakedTexture, ExportPreset, ExportedTexture, MaterialChannel,
-    MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError, MeshMapSettings,
-    MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ProjectResource, ResourceId,
-    ResourceImages, TexelRect, TextureImage, TextureSet,
+    MaterialPlanes, MaterialProject, MaterialTextures, MeshError, MeshGeometry, MeshMapError,
+    MeshMapSettings, MeshMaps, MeshSmoothing, PreflightIssue, PrimitivePreset, ProjectResource,
+    ResourceId, ResourceImages, TexelRect, TextureImage, TextureSet,
 };
 use substancecraft_core::{ProjectTemplate, SmartMaterial};
 use thiserror::Error;
@@ -478,6 +478,28 @@ pub fn rebake_texture_set_material_regions(
     };
     for region in regions {
         texture_set.rebake_material_region(context, textures, *region)?;
+    }
+    Ok(())
+}
+
+/// [`rebake_texture_set_material_regions`] where each region rebakes only
+/// some of the textures: an edit of one channel leaves the textures that do
+/// not show it as they are.
+pub fn rebake_texture_set_material_plane_regions(
+    texture_set: &TextureSet,
+    mesh: Option<&MeshGeometry>,
+    mesh_maps: Option<&MeshMaps>,
+    resources: Option<&ResourceImages>,
+    textures: &mut MaterialTextures,
+    regions: &[(TexelRect, MaterialPlanes)],
+) -> Result<(), ApiError> {
+    let context = BakeContext {
+        mesh,
+        mesh_maps,
+        resources,
+    };
+    for (region, planes) in regions {
+        texture_set.rebake_material_planes_region(context, textures, *region, *planes)?;
     }
     Ok(())
 }

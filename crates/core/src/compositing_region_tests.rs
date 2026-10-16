@@ -798,3 +798,134 @@ fn tc_0254_region_rebake_refuses_bad_targets_and_measures_halos() {
     });
     assert_eq!(set.region_halo(), blur * 2);
 }
+
+/// Changes one layer setting at random (none that moves the halo).
+fn settings_edit(set: &mut TextureSet, rng: &mut Lcg) -> LayerId {
+    let blend = BlendMode::ALL[rng.below(BlendMode::ALL.len())];
+    let amount = rng.unit();
+    let byte = rng.byte();
+    let choice = rng.below(6);
+    let ids = [LayerId(1), PAINT, LayerId(3), MULTIPLY, MASKED];
+    let id = ids[rng.below(ids.len())];
+    let Some(layer) = set.layer_mut(id) else {
+        return id;
+    };
+    let channel = [
+        MaterialChannel::BaseColor,
+        MaterialChannel::Roughness,
+        MaterialChannel::Height,
+        MaterialChannel::Emissive,
+    ][choice % 4];
+    match (layer.fill.as_mut(), choice) {
+        (Some(fill), 0) => fill.roughness = amount,
+        (Some(fill), 1) => fill.color = [byte, 90, 200, 255],
+        (Some(fill), 2) => fill.height = amount,
+        (Some(fill), 3) => fill.emissive = [byte, 10, 0],
+        (_, 4) => {
+            if !layer.channels.remove(&channel) {
+                layer.channels.insert(channel);
+            }
+        }
+        (_, 5) => {
+            layer.channel_blend_modes.insert(channel, blend);
+        }
+        _ => match rng.below(5) {
+            0 => layer.opacity = amount,
+            1 => layer.visible = !layer.visible,
+            2 if !layer.is_group() => layer.blend_mode = blend,
+            3 => layer.invert_final_mask = !layer.invert_final_mask,
+            _ => layer.name = format!("Renamed {byte}"),
+        },
+    }
+    id
+}
+
+/// PERF-04 for edits other than strokes: rebaking the changed layer's
+/// [`TextureSet::layer_footprint`] (or the whole texture) in the textures
+/// its [`LayerSettings::changed_channels`] reach equals a full bake.
+fn check_settings_edits(mut set: TextureSet, seed: u64, rounds: usize) {
+    let mesh = PrimitivePreset::Cube.build_mesh();
+    let maps = bake_mesh_maps(
+        &mesh,
+        &MeshMapSettings {
+            resolution: 64,
+            ao_samples: 4,
+            ..MeshMapSettings::default()
+        },
+        None,
+    )
+    .unwrap();
+    let resources = ResourceImages::from([(ResourceId(1), Arc::new(checker_image(32)))]);
+    let context = BakeContext {
+        mesh: Some(&mesh),
+        mesh_maps: Some(&maps),
+        resources: Some(&resources),
+    };
+    let mut rng = Lcg(seed);
+    for _ in 0..40 {
+        edit(&mut set, &mut rng);
+    }
+    let (width, height) = (set.resolution.width, set.resolution.height);
+    let full = TexelRect::full(width, height);
+    let anchored = set
+        .walk_layers()
+        .iter()
+        .any(|layer| layer.mask_anchor.is_some());
+    let mut material = set.bake_material(context).unwrap();
+    let (mut bounded, mut limited) = (0, 0);
+    for round in 0..rounds {
+        let before = set.clone();
+        let id = settings_edit(&mut set, &mut rng);
+        if set.region_halo() != before.region_halo() {
+            set = before;
+            continue;
+        }
+        let channels = set
+            .layer(id)
+            .unwrap()
+            .settings()
+            .changed_channels(&before.layer(id).unwrap().settings());
+        let planes = if anchored || channels.contains(&MaterialChannel::Id) {
+            MaterialPlanes::ALL
+        } else {
+            MaterialPlanes::of_channels(channels.iter().copied())
+        };
+        let footprint = before
+            .layer(id)
+            .unwrap()
+            .fill
+            .is_none()
+            .then(|| set.layer_footprint(id))
+            .flatten();
+        let mut dirty = DirtyTexels::new(width, height);
+        for rect in footprint.as_deref().unwrap_or(&[full]) {
+            dirty.mark(rect.grow(set.region_halo(), width, height));
+        }
+        if !channels.is_empty() {
+            bounded += usize::from(footprint.is_some());
+            limited += usize::from(planes != MaterialPlanes::ALL);
+            for rect in dirty.rects() {
+                set.rebake_material_planes_region(context, &mut material, rect, planes)
+                    .unwrap();
+            }
+        }
+        assert!(
+            material == set.bake_material(context).unwrap(),
+            "material differs after round {round} ({id:?}, {channels:?})"
+        );
+    }
+    assert!(bounded > 0, "some edits must stay under strokes");
+    assert!(
+        anchored || limited > 0,
+        "some edits must rebake only some textures"
+    );
+}
+
+#[test]
+fn tc_0401_setting_edits_rebake_their_footprint_and_channels_exactly() {
+    check_settings_edits(stack(), 11, 40);
+    // Without the anchored layer, channels are told apart too.
+    let mut set = stack();
+    set.layers.retain(|layer| layer.id != LayerId(7));
+    check_settings_edits(set, 12, 40);
+}

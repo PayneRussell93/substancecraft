@@ -2201,7 +2201,7 @@ impl SubstanceCraftApp {
         if self.selected_layer == Some(layer_id) {
             self.layer_settled = Some((texture_set_id, layer_id, after));
         }
-        self.invalidate_preview();
+        self.invalidate_preview_layers();
     }
 
     fn properties_card(&mut self, ui: &mut Ui) {
