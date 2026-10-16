@@ -384,7 +384,9 @@ impl SubstanceCraftApp {
             .find(|set| set.id == set_id)
             .and_then(|set| set.layers.last())
             .map(|layer| layer.id);
-        self.invalidate_preview();
+        // The set itself is unchanged, so its cached material, if current,
+        // is shown without a rebake.
+        self.invalidate_view();
     }
 
     /// Shows the brand and tool pills and returns the y coordinate where

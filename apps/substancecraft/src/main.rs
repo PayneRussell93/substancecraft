@@ -324,6 +324,8 @@ struct SubstanceCraftApp {
     /// slots other than the selected one.
     set_materials: BTreeMap<TextureSetId, CachedMaterial>,
     set_bake_job: Option<SetBakeJob>,
+    /// What each set's entry in `set_materials` is missing.
+    set_dirty: BTreeMap<TextureSetId, SetDirty>,
     /// Set revisions whose background bake failed, so they are not retried.
     set_bake_failed: BTreeMap<TextureSetId, u64>,
     /// When true the viewport shows `active_channel` flat instead of the full
@@ -494,6 +496,20 @@ pub(crate) enum ViewMode {
 struct CachedMaterial {
     revision: u64,
     textures: Arc<MaterialTextures>,
+    /// Set when the textures were patched from the previous cache rather
+    /// than baked whole.
+    patched: bool,
+}
+
+/// What a texture set's cached material is missing (PERF-02): the strokes
+/// marked since it was baked, and the set's layer shape then. Kept for
+/// every set, so a background rebake, or selecting the set, patches the
+/// cache instead of baking the set whole.
+struct SetDirty {
+    dirty: incremental::PreviewDirty,
+    /// Whether the cache was baked with fresh mesh maps; a patch must read
+    /// the same maps as the texels around it.
+    maps_fresh: bool,
 }
 
 /// Background bake of a texture set that is not selected, so every material
@@ -501,7 +517,15 @@ struct CachedMaterial {
 struct SetBakeJob {
     set_id: TextureSetId,
     revision: u64,
-    receiver: Receiver<Result<MaterialTextures, String>>,
+    /// The cached material, and whether the job patched it.
+    receiver: Receiver<(Result<MaterialTextures, String>, bool)>,
+}
+
+/// True when a preview for `key` is the selected set's plain material, so
+/// it can stand in for the set's cached material (not tinted by a mask or
+/// quick mask, nor soloed).
+fn caches_material(key: &PreviewKey) -> bool {
+    key.target == PreviewTarget::Material && key.solo_layer.is_none()
 }
 
 /// What the viewport currently shows on the mesh.
@@ -594,16 +618,17 @@ impl PreviewPatch {
     }
 }
 
-/// Adds what `command` changes to `sets` and, for strokes of the selected
-/// set (`selected`, previewed `width` × `height` at `factor` times
-/// smaller), their texels to `strokes`. False when it changes more than
-/// texture sets' layers or a stroke's texels cannot be told (one painted
-/// through a camera): then every set needs a full rebake.
+/// Adds what `command` changes to `sets` and the texels of its strokes to
+/// `strokes`, by set, in each set's preview (`previews` holds each set's
+/// preview `width` × `height` and the `factor` it is downscaled by). False
+/// when it changes more than texture sets' layers or a stroke's texels
+/// cannot be told (one painted through a camera): then every set needs a
+/// full rebake.
 fn layer_edit_scope(
     command: &EditCommand,
-    selected: Option<(TextureSetId, u32, u32, u32)>,
+    previews: &BTreeMap<TextureSetId, (u32, u32, u32)>,
     sets: &mut BTreeSet<TextureSetId>,
-    strokes: &mut Vec<TexelRect>,
+    strokes: &mut BTreeMap<TextureSetId, Vec<TexelRect>>,
 ) -> bool {
     let mut stroke = |set: TextureSetId,
                       points: &[glam::Vec2],
@@ -611,8 +636,8 @@ fn layer_edit_scope(
                       tip: substancecraft_core::BrushTip,
                       frames: &[substancecraft_core::StampFrame]| {
         sets.insert(set);
-        if let Some((_, width, height, factor)) = selected.filter(|(id, ..)| *id == set) {
-            strokes.extend(stroke_texel_bounds(
+        if let Some(&(width, height, factor)) = previews.get(&set) {
+            strokes.entry(set).or_default().extend(stroke_texel_bounds(
                 points,
                 radius / factor as f32,
                 tip,
@@ -625,7 +650,7 @@ fn layer_edit_scope(
     match command {
         EditCommand::Batch(commands) => commands
             .iter()
-            .all(|command| layer_edit_scope(command, selected, sets, strokes)),
+            .all(|command| layer_edit_scope(command, previews, sets, strokes)),
         EditCommand::Paint {
             texture_set_id,
             stroke: painted,
@@ -732,7 +757,6 @@ fn keyboard_camera(camera: &mut ViewportCamera, input: &egui::InputState) -> boo
     delta != glam::Vec2::ZERO || zoom != 0.0
 }
 
-/// Shared inputs of a background texture-set bake.
 /// Preset the Export button starts with: the viewport's own metal/rough layout.
 const DEFAULT_EXPORT_PRESET: &str = "Metal/Rough (ORM)";
 
@@ -766,6 +790,7 @@ struct PresetDraft {
     preset: ExportPreset,
 }
 
+/// Shared inputs of a background texture-set bake.
 struct BakeInputs {
     mesh: Option<Arc<MeshGeometry>>,
     mesh_maps: Option<Arc<Vec<MeshMaps>>>,
@@ -819,6 +844,31 @@ impl BakeInputs {
         .map_err(|error| error.to_string())
     }
 
+    /// A copy of `base`, the material of an earlier state of `texture_set`,
+    /// rebaked over `patches` only, in the textures each one reaches.
+    fn patch_material(
+        &self,
+        texture_set: &TextureSet,
+        base: &MaterialTextures,
+        patches: &[incremental::Patch],
+    ) -> Result<MaterialTextures, String> {
+        let mut textures = base.clone();
+        let regions = patches
+            .iter()
+            .map(|patch| (patch.rect, patch.channels.planes()))
+            .collect::<Vec<_>>();
+        rebake_texture_set_material_plane_regions(
+            texture_set,
+            self.mesh.as_deref(),
+            self.maps(),
+            Some(&self.resources),
+            &mut textures,
+            &regions,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(textures)
+    }
+
     /// A copy of `base`, a preview of `target` for an earlier state of
     /// `texture_set`, rebaked over `regions` only.
     fn patch_preview(
@@ -830,23 +880,9 @@ impl BakeInputs {
     ) -> Result<PreviewTextures, String> {
         let (mesh, maps, resources) = (self.mesh.as_deref(), self.maps(), Some(&self.resources));
         match (base, target) {
-            (PreviewTextures::Material(base), PreviewTarget::Material) => {
-                let mut textures = MaterialTextures::clone(base);
-                let regions = patches
-                    .iter()
-                    .map(|patch| (patch.rect, patch.channels.planes()))
-                    .collect::<Vec<_>>();
-                rebake_texture_set_material_plane_regions(
-                    texture_set,
-                    mesh,
-                    maps,
-                    resources,
-                    &mut textures,
-                    &regions,
-                )
-                .map_err(|error| error.to_string())?;
-                Ok(PreviewTextures::Material(Arc::new(textures)))
-            }
+            (PreviewTextures::Material(base), PreviewTarget::Material) => self
+                .patch_material(texture_set, base, patches)
+                .map(|textures| PreviewTextures::Material(Arc::new(textures))),
             (PreviewTextures::Single(base), PreviewTarget::Channel(channel)) => {
                 let mut texture = BakedTexture::clone(base);
                 let regions = patches
@@ -886,6 +922,7 @@ impl BakeInputs {
     }
 }
 
+#[derive(Clone)]
 enum PreviewTextures {
     Material(Arc<MaterialTextures>),
     Single(Arc<BakedTexture>),
@@ -1091,6 +1128,7 @@ impl Default for SubstanceCraftApp {
             set_revisions: BTreeMap::new(),
             set_materials: BTreeMap::new(),
             set_bake_job: None,
+            set_dirty: BTreeMap::new(),
             set_bake_failed: BTreeMap::new(),
             channel_preview: false,
             mask_value: 0.0,
@@ -1177,12 +1215,19 @@ impl SubstanceCraftApp {
     /// background rebake replaces it. Edits made through the UI only touch
     /// the selected texture set.
     fn invalidate_preview(&mut self) {
+        self.invalidate_view();
+        if let Some(set_id) = self.selected_texture_set {
+            self.set_revisions.insert(set_id, self.preview_revision);
+            self.set_dirty.remove(&set_id);
+        }
+    }
+
+    /// Asks for a new preview without changing any set: the view changed
+    /// (another set selected), not what sets bake to.
+    fn invalidate_view(&mut self) {
         self.preview_revision = self.preview_revision.wrapping_add(1);
         self.preview_failed = false;
         self.preview_dirty = None;
-        if let Some(set_id) = self.selected_texture_set {
-            self.set_revisions.insert(set_id, self.preview_revision);
-        }
     }
 
     /// Like [`Self::invalidate_preview`] for a stroke edit that changed only
@@ -1190,15 +1235,25 @@ impl SubstanceCraftApp {
     /// can rebake just those.
     fn invalidate_preview_texels(&mut self, bounds: impl IntoIterator<Item = TexelRect>) {
         let dirty = self.preview_dirty.take();
+        let cached = self
+            .selected_texture_set
+            .and_then(|set_id| self.set_dirty.remove(&set_id));
         self.invalidate_preview();
+        let bounds: Vec<TexelRect> = bounds.into_iter().collect();
         self.preview_dirty = dirty
             .filter(|dirty| Some(dirty.set_id()) == self.selected_texture_set)
             .map(|mut dirty| {
-                for bounds in bounds {
-                    dirty.mark(bounds);
+                for bounds in &bounds {
+                    dirty.mark(*bounds);
                 }
                 dirty
             });
+        if let Some(mut cached) = cached {
+            for bounds in &bounds {
+                cached.dirty.mark(*bounds);
+            }
+            self.set_dirty.insert(cached.dirty.set_id(), cached);
+        }
     }
 
     /// Marks only `set_ids` out of date. When the selected set is not among
@@ -1216,23 +1271,44 @@ impl SubstanceCraftApp {
     }
 
     /// [`Self::invalidate_sets`]; with `strokes`, the edit changed only
-    /// layers, and of the selected set's strokes only those texels, so its
-    /// preview can be patched (see [`Self::invalidate_preview_layers`]).
+    /// layers, and of each set's strokes only those texels (in its preview),
+    /// so the selected preview and other sets' cached materials can be
+    /// patched (see [`Self::invalidate_preview_layers`]).
     fn invalidate_set_texels(
         &mut self,
         set_ids: &BTreeSet<TextureSetId>,
-        strokes: Option<Vec<TexelRect>>,
+        mut strokes: Option<BTreeMap<TextureSetId, Vec<TexelRect>>>,
     ) {
         if set_ids.is_empty() {
             return;
+        }
+        for set_id in set_ids
+            .iter()
+            .filter(|id| Some(**id) != self.selected_texture_set)
+        {
+            match &strokes {
+                Some(strokes) => {
+                    if let Some(cached) = self.set_dirty.get_mut(set_id) {
+                        for bounds in strokes.get(set_id).into_iter().flatten() {
+                            cached.dirty.mark(*bounds);
+                        }
+                    }
+                }
+                None => {
+                    self.set_dirty.remove(set_id);
+                }
+            }
         }
         let selected_affected = self
             .selected_texture_set
             .is_some_and(|id| set_ids.contains(&id));
         let previous = self.preview_key();
         if selected_affected {
-            match strokes {
-                Some(strokes) => self.invalidate_preview_texels(strokes),
+            let selected = self
+                .selected_texture_set
+                .and_then(|id| strokes.as_mut().map(|strokes| strokes.remove(&id)));
+            match selected {
+                Some(strokes) => self.invalidate_preview_texels(strokes.unwrap_or_default()),
                 None => self.invalidate_preview(),
             }
         } else {
@@ -1259,6 +1335,7 @@ impl SubstanceCraftApp {
     /// shared resources changed.
     fn invalidate_all_sets(&mut self) {
         self.invalidate_preview();
+        self.set_dirty.clear();
         let revision = self.preview_revision;
         for set in &self.project.texture_sets {
             self.set_revisions.insert(set.id, revision);
@@ -2623,7 +2700,9 @@ impl SubstanceCraftApp {
         };
         if applied {
             self.layer_settled = None;
-            self.invalidate_sets(&touched);
+            // Instances hold the master's values in their own fills, so the
+            // sets' snapshot diffs find what changed: no strokes did.
+            self.invalidate_set_texels(&touched, Some(BTreeMap::new()));
         }
         applied
     }
@@ -3981,18 +4060,25 @@ impl SubstanceCraftApp {
     /// redone. Edits of layers alone mark only their sets out of date, and
     /// the selected set's preview is patched.
     fn after_history_change(&mut self, command: Option<&EditCommand>) {
-        let selected = self.selected_texture_set_ref().map(|set| {
-            let factor = set.preview_factor(PREVIEW_MAX_EDGE);
-            (
-                set.id,
-                set.resolution.width.div_ceil(factor),
-                set.resolution.height.div_ceil(factor),
-                factor,
-            )
-        });
-        let (mut sets, mut strokes) = (BTreeSet::new(), Vec::new());
+        let previews = self
+            .project
+            .texture_sets
+            .iter()
+            .map(|set| {
+                let factor = set.preview_factor(PREVIEW_MAX_EDGE);
+                (
+                    set.id,
+                    (
+                        set.resolution.width.div_ceil(factor),
+                        set.resolution.height.div_ceil(factor),
+                        factor,
+                    ),
+                )
+            })
+            .collect();
+        let (mut sets, mut strokes) = (BTreeSet::new(), BTreeMap::new());
         let layers_only = command
-            .is_some_and(|command| layer_edit_scope(command, selected, &mut sets, &mut strokes));
+            .is_some_and(|command| layer_edit_scope(command, &previews, &mut sets, &mut strokes));
         if self.project.mesh != self.loaded_mesh {
             self.reload_project_mesh();
         }
@@ -4564,21 +4650,31 @@ impl SubstanceCraftApp {
         if self.udim_atlas.is_some() {
             return None;
         }
-        let preview = self.baked_preview.as_ref()?;
-        if preview.key.texture_set != key.texture_set
-            || preview.key.target != key.target
-            || preview.key.solo_layer != key.solo_layer
-        {
-            return None;
-        }
         let set = preview_copy(self.selected_texture_set_ref()?);
-        let dirty = self.preview_dirty.as_ref()?;
-        let patches = if key.solo_layer.is_some() {
-            dirty.stroke_regions(&set, preview.set_revision)?
-        } else {
-            dirty.regions(&set, preview.set_revision)?
+        let shown = self.baked_preview.as_ref().filter(|preview| {
+            preview.key.texture_set == key.texture_set
+                && preview.key.target == key.target
+                && preview.key.solo_layer == key.solo_layer
+        });
+        let (textures, patches) = match shown {
+            Some(preview) => {
+                let dirty = self.preview_dirty.as_ref()?;
+                let patches = if key.solo_layer.is_some() {
+                    dirty.stroke_regions(&set, preview.set_revision)?
+                } else {
+                    dirty.regions(&set, preview.set_revision)?
+                };
+                (preview.textures.clone(), patches)
+            }
+            // Another view was shown (another set was selected): start
+            // from this set's cached material.
+            None if caches_material(key) => {
+                let (textures, patches) = self.cached_material_patch(&set)?;
+                (PreviewTextures::Material(textures), patches)
+            }
+            None => return None,
         };
-        let (textures, patches) = match (&preview.textures, key.target) {
+        let (textures, patches) = match (&textures, key.target) {
             (PreviewTextures::Material(material), PreviewTarget::Material) => (
                 PreviewTextures::Material(Arc::clone(material)),
                 patches
@@ -4596,6 +4692,45 @@ impl SubstanceCraftApp {
             _ => return None,
         };
         Some((textures, patches))
+    }
+
+    /// The cached material of `set` (its preview copy) and the blocks to
+    /// rebake to bring it up to date, when the edits since it was baked
+    /// stay within some texels or channels; `None` means a full rebake.
+    fn cached_material_patch(
+        &self,
+        set: &TextureSet,
+    ) -> Option<(Arc<MaterialTextures>, Vec<incremental::Patch>)> {
+        // UDIM atlases rebake whole tiles, unchanged ones from the cache.
+        if self.udim_atlas.is_some() {
+            return None;
+        }
+        let cached = self.set_materials.get(&set.id)?;
+        let record = self
+            .set_dirty
+            .get(&set.id)
+            .filter(|record| record.maps_fresh == self.mesh_maps_fresh())?;
+        let patches = record
+            .dirty
+            .regions(set, cached.revision)?
+            .into_iter()
+            .filter(|patch| !patch.channels.planes().is_empty())
+            .collect();
+        Some((Arc::clone(&cached.textures), patches))
+    }
+
+    /// Starts tracking what `set` (its preview copy, at `revision`) changes
+    /// from here on, for the material about to be cached for it.
+    fn track_set_edits(&mut self, set: &TextureSet, revision: u64) {
+        if self.udim_atlas.is_some() {
+            self.set_dirty.remove(&set.id);
+            return;
+        }
+        let record = SetDirty {
+            dirty: incremental::PreviewDirty::new(set, revision),
+            maps_fresh: self.mesh_maps_fresh(),
+        };
+        self.set_dirty.insert(set.id, record);
     }
 
     /// Starts (at most one) background bake of the current preview. The last
@@ -4686,26 +4821,41 @@ impl SubstanceCraftApp {
                 .map(|set| incremental::PreviewDirty::new(&preview_copy(set), set_revision)),
             _ => None,
         };
-        if patch
-            .as_ref()
-            .is_some_and(|(_, regions)| regions.is_empty())
+        if caches_material(&key) {
+            self.track_set_edits(&texture_set, set_revision);
+        }
+        if let Some((textures, regions)) = &patch
+            && regions.is_empty()
         {
-            // Nothing the preview shows changed.
-            if let Some(preview) = &mut self.baked_preview {
-                preview.key = key;
-                preview.set_revision = set_revision;
-                if let (PreviewTextures::Material(material), Some(set_id)) =
-                    (&preview.textures, key.texture_set)
-                {
-                    self.set_materials.insert(
-                        set_id,
-                        CachedMaterial {
-                            revision: set_revision,
-                            textures: Arc::clone(material),
-                        },
-                    );
-                }
+            // Nothing the preview shows changed. The patch of the preview
+            // it came from, if that is the one shown, still applies.
+            let shown_patch = self
+                .baked_preview
+                .take()
+                .filter(|preview| {
+                    preview.key.texture_set == key.texture_set
+                        && preview.key.target == key.target
+                        && preview.key.solo_layer == key.solo_layer
+                })
+                .and_then(|preview| preview.patch);
+            if let (PreviewTextures::Material(material), Some(set_id), true) =
+                (textures, key.texture_set, caches_material(&key))
+            {
+                self.set_materials.insert(
+                    set_id,
+                    CachedMaterial {
+                        revision: set_revision,
+                        textures: Arc::clone(material),
+                        patched: false,
+                    },
+                );
             }
+            self.baked_preview = Some(BakedPreview {
+                key,
+                textures: textures.clone(),
+                set_revision,
+                patch: shown_patch,
+            });
             return;
         }
         let job_patch = patch
@@ -4847,14 +4997,17 @@ impl SubstanceCraftApp {
                         let patch = job_patch
                             .filter(|_| was_patched)
                             .map(|(base, patches)| PreviewPatch::new(&textures, base, &patches));
-                        if let (PreviewTextures::Material(material), Some(set_id)) =
-                            (&textures, key.texture_set)
+                        // Tinted, soloed, and single-channel previews are
+                        // not the set's material.
+                        if let (PreviewTextures::Material(material), Some(set_id), true) =
+                            (&textures, key.texture_set, caches_material(&key))
                         {
                             self.set_materials.insert(
                                 set_id,
                                 CachedMaterial {
                                     revision: set_revision,
                                     textures: Arc::clone(material),
+                                    patched: was_patched,
                                 },
                             );
                         }
@@ -4928,11 +5081,37 @@ impl SubstanceCraftApp {
             .unwrap_or(texture_set);
         let revision = self.set_revision(set_id);
         let inputs = self.bake_inputs(set_id);
+        // Only the texels and textures edited since the cached bake.
+        let patch = self.cached_material_patch(&texture_set);
+        self.track_set_edits(&texture_set, revision);
+        if let Some((textures, regions)) = &patch
+            && regions.is_empty()
+        {
+            // Nothing the material shows changed.
+            self.set_materials.insert(
+                set_id,
+                CachedMaterial {
+                    revision,
+                    textures: Arc::clone(textures),
+                    patched: false,
+                },
+            );
+            return;
+        }
         let (sender, receiver) = sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("set-bake".to_owned())
             .spawn(move || {
-                let _ = sender.send(inputs.bake_material(&texture_set));
+                let patched = patch.and_then(|(base, regions)| {
+                    inputs.patch_material(&texture_set, &base, &regions).ok()
+                });
+                let was_patched = patched.is_some();
+                // A patch that fails falls back to a full bake.
+                let result = match patched {
+                    Some(textures) => Ok(textures),
+                    None => inputs.bake_material(&texture_set),
+                };
+                let _ = sender.send((result, was_patched));
             });
         if spawned.is_ok() {
             self.set_bake_job = Some(SetBakeJob {
@@ -4948,7 +5127,7 @@ impl SubstanceCraftApp {
             return;
         };
         match job.receiver.try_recv() {
-            Ok(result) => {
+            Ok((result, patched)) => {
                 let (set_id, revision) = (job.set_id, job.revision);
                 self.set_bake_job = None;
                 match result {
@@ -4958,6 +5137,7 @@ impl SubstanceCraftApp {
                             CachedMaterial {
                                 revision,
                                 textures: Arc::new(textures),
+                                patched,
                             },
                         );
                     }
@@ -8070,6 +8250,150 @@ mod tests {
         );
         pump_until(&mut app, &context, settled);
         assert!(shown(&app) == full_bake(&app), "undo stroke");
+    }
+
+    #[test]
+    #[allow(clippy::unreachable)]
+    fn tc_0402_background_sets_patch_their_cached_material_and_selection_reuses_it() {
+        let context = egui::Context::default();
+        let folder = tempfile::tempdir().unwrap();
+        let path = write_two_material_gltf(folder.path());
+        let mut app = SubstanceCraftApp::default();
+        app.load_imported_mesh(&path);
+        small_sets(&mut app, 256);
+        let (body, trim) = (
+            app.project.texture_sets[0].id,
+            app.project.texture_sets[1].id,
+        );
+        // Trim: a fill linked to a project master, and a painted layer.
+        app.select_texture_set(trim);
+        app.add_fill_layer();
+        app.make_selected_layer_master();
+        let master = app.editing_material.unwrap();
+        app.add_paint_layer();
+        app.paint_mode = PaintMode::Paint;
+        for step in 0..3 {
+            app.append_stroke_point(glam::Vec2::new(0.3 + step as f32 * 0.05, 0.5));
+        }
+        app.finish_active_stroke();
+        app.select_texture_set(body);
+        let trim_set = |app: &SubstanceCraftApp| -> TextureSet {
+            app.project
+                .texture_sets
+                .iter()
+                .find(|set| set.id == trim)
+                .unwrap()
+                .clone()
+        };
+        let cached_current = |app: &SubstanceCraftApp| {
+            app.preview_job.is_none()
+                && app.set_bake_job.is_none()
+                && app
+                    .set_materials
+                    .get(&trim)
+                    .is_some_and(|cached| cached.revision == app.set_revision(trim))
+        };
+        pump_until(&mut app, &context, cached_current);
+        let cached = |app: &SubstanceCraftApp| {
+            let cached = &app.set_materials[&trim];
+            (cached.patched, MaterialTextures::clone(&cached.textures))
+        };
+        let full_bake = |app: &SubstanceCraftApp| {
+            let set = app
+                .project
+                .texture_sets
+                .iter()
+                .find(|set| set.id == trim)
+                .unwrap();
+            app.bake_inputs(trim).bake_material(set).unwrap()
+        };
+        assert!(cached(&app).1 == full_bake(&app));
+
+        // Undoing and redoing the Trim stroke while Body is selected patches
+        // Trim's cached material in the background.
+        for step in ["undo stroke", "redo stroke"] {
+            if step.starts_with("undo") {
+                app.undo();
+            } else {
+                app.redo();
+            }
+            assert_eq!(app.selected_texture_set, Some(body));
+            let set = preview_copy(&trim_set(&app)).into_owned();
+            let (_, patches) = app.cached_material_patch(&set).unwrap();
+            assert!(
+                !patches.is_empty() && patches.iter().all(|p| p.rect.len() < 256 * 256 / 2),
+                "{step}: only the stroke's texels"
+            );
+            pump_until(&mut app, &context, cached_current);
+            let (patched, textures) = cached(&app);
+            assert!(patched, "{step}");
+            assert!(
+                textures == full_bake(&app),
+                "{step} differs from a full bake"
+            );
+        }
+
+        // Editing the master updates its instance in Trim: only the
+        // textures the changed value reaches are rebaked.
+        let mut edited = app.project.material(master).unwrap().clone();
+        edited.fill.roughness = (edited.fill.roughness + 0.4) % 1.0;
+        app.edit_project_material(edited);
+        app.history.end_merge();
+        let set = preview_copy(&trim_set(&app)).into_owned();
+        let (_, patches) = app.cached_material_patch(&set).unwrap();
+        assert!(
+            patches
+                .iter()
+                .all(|patch| !patch.channels.planes().base_color),
+            "roughness reaches ORM alone: {patches:?}"
+        );
+        pump_until(&mut app, &context, cached_current);
+        let (patched, textures) = cached(&app);
+        assert!(patched && textures == full_bake(&app), "master edit");
+
+        // Selecting Trim shows its current cache: no bake at all.
+        let before = Arc::clone(&app.set_materials[&trim].textures);
+        app.select_texture_set(trim);
+        app.refresh_baked_preview();
+        assert!(app.preview_job.is_none(), "the cached material is current");
+        match &app.baked_preview.as_ref().unwrap().textures {
+            PreviewTextures::Material(shown) => assert!(Arc::ptr_eq(shown, &before)),
+            PreviewTextures::Single(_) => unreachable!("material preview expected"),
+        }
+        // ...and its edits from here patch that preview.
+        app.append_stroke_point(glam::Vec2::new(0.6, 0.6));
+        assert!(app.preview_patch(&app.preview_key()).is_some());
+        app.finish_active_stroke();
+
+        // Anything beyond layers (here every set at once) rebakes whole.
+        app.select_texture_set(body);
+        pump_until(&mut app, &context, cached_current);
+        app.invalidate_all_sets();
+        pump_until(&mut app, &context, cached_current);
+        let (patched, textures) = cached(&app);
+        assert!(!patched && textures == full_bake(&app));
+
+        // A mask overlay tints its preview, which never stands in for the
+        // set's material; leaving it shows the cached material, unbaked.
+        app.select_texture_set(trim);
+        app.refresh_baked_preview();
+        let material = Arc::clone(&app.set_materials[&trim].textures);
+        let layer = app.selected_layer.unwrap();
+        app.set_solo(Some(inspector::Solo::Overlay(layer)));
+        pump_until(&mut app, &context, |app| {
+            app.preview_job.is_none()
+                && app
+                    .baked_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.key == app.preview_key())
+        });
+        assert!(Arc::ptr_eq(&app.set_materials[&trim].textures, &material));
+        app.set_solo(None);
+        app.refresh_baked_preview();
+        assert!(
+            app.preview_job.is_none(),
+            "no bake after leaving the overlay"
+        );
     }
 
     #[test]

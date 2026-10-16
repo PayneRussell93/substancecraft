@@ -100,6 +100,7 @@ impl SubstanceCraftApp {
                 break;
             }
             self.set_materials.remove(&id);
+            self.set_dirty.remove(&id);
             self.cache.evicted.insert(id, revision);
             used -= bytes;
         }
@@ -110,6 +111,7 @@ impl SubstanceCraftApp {
     pub(super) fn clear_caches(&mut self) -> usize {
         let freed = self.cache_usage().total();
         self.set_materials.clear();
+        self.set_dirty.clear();
         self.cache.evicted.clear();
         self.set_bake_failed.clear();
         self.cancel_mesh_map_job();
@@ -138,6 +140,21 @@ impl SubstanceCraftApp {
             .size(11.5)
             .color(theme::TEXT_FAINT),
         );
+        let patched = self
+            .set_materials
+            .values()
+            .filter(|cached| cached.patched)
+            .count();
+        if patched > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{patched} of {} cached set(s) last updated by patching only edited texels",
+                    self.set_materials.len()
+                ))
+                .size(11.5)
+                .color(theme::TEXT_FAINT),
+            );
+        }
         let mut budget = self.preferences.values.cache_budget_mb;
         let response = widgets::property_row(ui, "Budget", |ui| {
             ui.add(
@@ -211,6 +228,7 @@ mod tests {
                 normal: texture(size),
                 emissive: texture(size),
             }),
+            patched: false,
         };
         app.set_materials.insert(TextureSetId(7), material(512));
         app.set_materials.insert(TextureSetId(8), material(64));

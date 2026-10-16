@@ -114,7 +114,9 @@ impl SubstanceCraftApp {
     pub(super) fn set_solo(&mut self, solo: Option<Solo>) {
         if self.inspect.solo != solo {
             self.inspect.solo = solo;
-            self.invalidate_preview();
+            // Solo changes the view only; leaving it shows the set's cached
+            // material again without a rebake.
+            self.invalidate_view();
         }
     }
 
