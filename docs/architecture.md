@@ -37,7 +37,8 @@ The product brief supplied for this project is the initial behavioral scope. Imp
 - `lib.rs`: project model, layers, compositing (`TextureSet::bake_channel`), and `EditHistory`.
 - `smoothing.rs`: auto-smoothed corner/vertex normals and crease-aware Loop subdivision. Both weld by position, so unshared per-corner FBX vertices smooth correctly.
 - `topology.rs`: per-triangle connected-element and UV-island membership for polygon selection.
-- `mesh_maps.rs`: multi-threaded, cancellable baking of world normal, position, curvature, AO, and thickness into UV space. A BVH serves the occlusion rays, and a spatial grid of sharp edges gives curvature bands.
+- `mesh_maps.rs`: multi-threaded, cancellable baking of world normal, position, curvature, AO, and thickness into UV space. Each batch of texel rows is evaluated in two stages: the surface (positions, normals, curvature, and the high-to-low projection ray) on the CPU, then one occlusion query per covered texel handed to an `OcclusionTracer` (`occlusion.rs`), which casts the AO and thickness rays through a BVH of the detailed surface. A spatial grid of sharp edges gives curvature bands.
+- `occlusion.rs`: the BVH, the shared sample directions, and `CpuTracer`. The `substancecraft-gpu` crate implements the same trait in a wgpu compute shader (`crates/gpu/src/occlusion.wgsl`, PERF-01); the desktop uses it through `FallbackTracer`, which drops to the CPU on any GPU failure. The command line stays on the CPU so its exports stay byte-identical.
 - `generators.rs` and `noise.rs`: Edge Wear, Dirt, Orientation, Gradient, Noise, and Thickness masks evaluated from mesh-map samples, with seeded object-space noise so breakup never seams, and the ID generator, which selects the set's ID map by colour.
 - `raster.rs`: shared UV triangle rasterisation.
 - `compositing.rs`, `export.rs`, and `filters.rs`: the layer compositor (including anchor masks and flattening), export presets and preflight, and layer filters.

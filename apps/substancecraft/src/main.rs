@@ -992,7 +992,8 @@ struct HighPolySource {
 }
 
 struct MeshMapJob {
-    receiver: Receiver<Result<Vec<MeshMaps>, MeshMapError>>,
+    /// The maps, and where their occlusion rays were traced.
+    receiver: Receiver<(Result<Vec<MeshMaps>, MeshMapError>, String)>,
     cancel: Arc<AtomicBool>,
     key: BakeKey,
     started: std::time::Instant,
@@ -4210,16 +4211,17 @@ impl SubstanceCraftApp {
     fn cancel_mesh_map_job(&mut self) {
         if let Some(job) = self.mesh_map_job.take() {
             job.cancel.store(true, Ordering::Relaxed);
-            self.log_bake(&job, bake_log::BakeOutcome::Cancelled);
+            self.log_bake(&job, bake_log::BakeOutcome::Cancelled, None);
         }
     }
 
-    fn log_bake(&mut self, job: &MeshMapJob, outcome: bake_log::BakeOutcome) {
+    fn log_bake(&mut self, job: &MeshMapJob, outcome: bake_log::BakeOutcome, rays: Option<String>) {
         self.bake_log.record(bake_log::BakeLogEntry {
             started: job.started_at,
             duration: job.started.elapsed(),
             settings: job.settings.clone(),
             outcome,
+            rays,
         });
     }
 
@@ -4252,6 +4254,7 @@ impl SubstanceCraftApp {
         };
         let cage = self.cage_mesh.as_ref().map(|(_, cage)| cage.clone());
         let smoothing = self.mesh_smoothing;
+        let gpu_baking = self.preferences.values.gpu_baking;
         let (sender, receiver) = sync_channel(1);
         let worker_cancel = Arc::clone(&cancel);
         let spawned = std::thread::Builder::new()
@@ -4265,14 +4268,22 @@ impl SubstanceCraftApp {
                     .skew_image(settings.resolution)
                     .map(Arc::new)
                     .or(skew_bitmap);
-                let _ = sender.send(bake_slot_mesh_maps(
+                // Occlusion rays on the GPU when asked for and available.
+                let tracer = if gpu_baking {
+                    substancecraft_gpu::FallbackTracer::shared()
+                } else {
+                    substancecraft_gpu::FallbackTracer::new(None)
+                };
+                let result = bake_slot_mesh_maps(
                     &mesh,
                     high.as_ref(),
                     &settings,
                     skew_map.as_deref(),
                     &plan,
+                    &tracer,
                     &worker_cancel,
-                ));
+                );
+                let _ = sender.send((result, rays_used(&tracer, gpu_baking)));
             });
         match spawned {
             Ok(_) => {
@@ -4304,7 +4315,7 @@ impl SubstanceCraftApp {
             return;
         };
         match job.receiver.try_recv() {
-            Ok(result) => {
+            Ok((result, rays)) => {
                 let key = job.key;
                 let Some(job) = self.mesh_map_job.take() else {
                     return;
@@ -4324,7 +4335,7 @@ impl SubstanceCraftApp {
                         bake_log::BakeOutcome::Failed(error.to_string())
                     }
                 };
-                self.log_bake(&job, outcome);
+                self.log_bake(&job, outcome, Some(rays));
             }
             Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(100)),
             Err(TryRecvError::Disconnected) => {
@@ -7243,6 +7254,18 @@ fn part_names(mesh: &MeshGeometry, low_name: &str) -> Vec<String> {
     }
 }
 
+/// Where `tracer` traced a bake's occlusion rays, for the bake log: the
+/// GPU, the CPU, or the CPU after the GPU failed (and why).
+fn rays_used(tracer: &substancecraft_gpu::FallbackTracer<'_>, gpu_wanted: bool) -> String {
+    let gpu = tracer.gpu().map(|gpu| gpu.adapter_name().to_owned());
+    match (tracer.traced_on_gpu(), tracer.fallback_reason(), gpu) {
+        (true, None, Some(gpu)) => gpu,
+        (true, Some(reason), Some(gpu)) => format!("{gpu}, then CPU ({reason})"),
+        (_, Some(reason), _) if gpu_wanted => format!("CPU ({reason})"),
+        _ => "CPU".to_owned(),
+    }
+}
+
 /// Bakes mesh maps for each material slot from that slot's triangles, so
 /// slots sharing UV space get their own maps. A single-slot mesh bakes
 /// whole; an empty slot falls back to the whole mesh. With a high mesh,
@@ -7253,6 +7276,7 @@ fn bake_slot_mesh_maps(
     settings: &MeshMapSettings,
     skew_map: Option<&substancecraft_core::TextureImage>,
     plan: &HighToLowPlan,
+    tracer: &dyn substancecraft_core::OcclusionTracer,
     cancel: &AtomicBool,
 ) -> Result<Vec<MeshMaps>, MeshMapError> {
     let names = part_names(mesh, &plan.low_name);
@@ -7269,12 +7293,13 @@ fn bake_slot_mesh_maps(
                 .clamp(0.0001, 0.5),
             ..*settings
         };
-        substancecraft_core::bake_mesh_maps_caged(
+        substancecraft_core::bake_mesh_maps_traced(
             low,
             matched.as_ref().or(high),
             &settings,
             skew_map,
             cage.filter(|_| high.is_some()),
+            tracer,
             Some(cancel),
         )
     };
@@ -7856,11 +7881,19 @@ mod tests {
                 low_name: "Crate".to_owned(),
                 cage: None,
             };
-            bake_slot_mesh_maps(&low, Some(&high), &settings, None, &plan, &cancel)
-                .unwrap()
-                .iter()
-                .map(MeshMaps::miss_fraction)
-                .collect::<Vec<_>>()
+            bake_slot_mesh_maps(
+                &low,
+                Some(&high),
+                &settings,
+                None,
+                &plan,
+                &substancecraft_core::CpuTracer,
+                &cancel,
+            )
+            .unwrap()
+            .iter()
+            .map(MeshMaps::miss_fraction)
+            .collect::<Vec<_>>()
         };
 
         // Without matching the lid catches the stray body piece.

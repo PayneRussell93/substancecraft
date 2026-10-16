@@ -257,6 +257,9 @@ pub struct Preferences {
     pub overlay_pattern: bool,
     /// Memory background texture-set bakes may use, in MiB.
     pub cache_budget_mb: u32,
+    /// Traces mesh-map occlusion and thickness rays on the GPU when there
+    /// is one (PERF-01).
+    pub gpu_baking: bool,
     /// Lighting-check environment of the viewport.
     pub lighting_preset: substancecraft_core::LightingPreset,
     /// HDR panorama lighting the viewport in place of the preset.
@@ -295,6 +298,7 @@ impl Default for Preferences {
             overlay_palette: substancecraft_core::OverlayPalette::Standard,
             overlay_pattern: false,
             cache_budget_mb: crate::cache::DEFAULT_CACHE_BUDGET_MB,
+            gpu_baking: true,
             lighting_preset: substancecraft_core::LightingPreset::default(),
             environment_file: None,
             picker_color_space: substancecraft_core::ColorSpace::Srgb,

@@ -38,6 +38,10 @@ pub struct BakeLogEntry {
     pub duration: Duration,
     pub settings: String,
     pub outcome: BakeOutcome,
+    /// Where the occlusion and thickness rays were traced: the GPU's name,
+    /// or the CPU and why. Absent from logs written before PERF-01.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rays: Option<String>,
 }
 
 impl BakeLogEntry {
@@ -52,8 +56,13 @@ impl BakeLogEntry {
             BakeOutcome::Cancelled => "cancelled".to_owned(),
             BakeOutcome::Failed(error) => format!("failed: {error}"),
         };
+        let rays = self
+            .rays
+            .as_ref()
+            .map(|rays| format!(" · rays on {rays}"))
+            .unwrap_or_default();
         format!(
-            "{} · {:.1} s · {} · {outcome}",
+            "{} · {:.1} s · {} · {outcome}{rays}",
             clock(self.started),
             self.duration.as_secs_f32(),
             self.settings
@@ -269,6 +278,56 @@ mod tests {
     }
 
     #[test]
+    fn tc_0405_the_bake_log_says_where_occlusion_rays_were_traced() {
+        let context = eframe::egui::Context::default();
+        let mut app = SubstanceCraftApp::default();
+        app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
+        app.mesh_map_settings.resolution = 32;
+        app.mesh_map_settings.ao_samples = 4;
+        let bake = |app: &mut SubstanceCraftApp, gpu: bool| {
+            app.preferences.values.gpu_baking = gpu;
+            app.start_mesh_map_bake();
+            crate::tests::pump_until(app, &context, |app| app.mesh_map_job.is_none());
+            let last = app.bake_log.entries().last().unwrap().clone();
+            assert!(
+                matches!(last.outcome, BakeOutcome::Finished { .. }),
+                "{last:?}"
+            );
+            (last.rays.unwrap(), app.mesh_maps.clone().unwrap())
+        };
+        let (rays, cpu) = bake(&mut app, false);
+        assert_eq!(rays, "CPU");
+        assert!(app.bake_log.to_text().contains("rays on CPU"));
+        // With a GPU, its name; without one, the CPU and why.
+        let (rays, traced) = bake(&mut app, true);
+        match substancecraft_gpu::GpuTracer::shared() {
+            Ok(gpu) => assert_eq!(rays, gpu.adapter_name()),
+            Err(error) => assert_eq!(rays, format!("CPU ({error})")),
+        }
+        // Either way the maps agree; the surface maps exactly.
+        for (cpu, traced) in cpu.iter().zip(traced.iter()) {
+            assert_eq!(
+                cpu.to_texture(substancecraft_core::MeshMapKind::Normal),
+                traced.to_texture(substancecraft_core::MeshMapKind::Normal)
+            );
+            let (cpu, traced) = (
+                cpu.to_texture(substancecraft_core::MeshMapKind::AmbientOcclusion),
+                traced.to_texture(substancecraft_core::MeshMapKind::AmbientOcclusion),
+            );
+            let differing = cpu
+                .rgba8
+                .iter()
+                .zip(&traced.rgba8)
+                .filter(|(a, b)| a.abs_diff(**b) > 64)
+                .count();
+            assert!(
+                differing * 100 < cpu.rgba8.len(),
+                "{differing} bytes differ"
+            );
+        }
+    }
+
+    #[test]
     fn tc_0371_bake_log_is_saved_with_the_project_and_restored_on_open() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("scene.sproject");
@@ -279,6 +338,7 @@ mod tests {
             duration: Duration::from_millis(1_500),
             settings: "32² · 2 AO samples · from mesh".to_owned(),
             outcome,
+            rays: None,
         };
         app.bake_log.record(entry(BakeOutcome::Finished {
             slots: 2,

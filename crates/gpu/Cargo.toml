@@ -1,0 +1,17 @@
+[package]
+name = "substancecraft-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPU compute paths for SubstanceCraft bakes (wgpu)"
+
+[dependencies]
+glam.workspace = true
+pollster.workspace = true
+substancecraft-core = { path = "../core" }
+thiserror.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

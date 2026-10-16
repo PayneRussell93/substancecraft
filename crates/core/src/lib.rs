@@ -22,6 +22,7 @@ mod instances;
 pub mod library;
 mod mesh_maps;
 pub mod noise;
+pub mod occlusion;
 pub mod painting;
 mod raster;
 mod region;
@@ -74,9 +75,10 @@ pub use library::{
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
     MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
-    bake_mesh_maps_caged, bake_mesh_maps_corrected, bake_mesh_maps_from, bake_name_key,
-    cage_ray_direction,
+    bake_mesh_maps_caged, bake_mesh_maps_corrected, bake_mesh_maps_from, bake_mesh_maps_traced,
+    bake_name_key, cage_ray_direction,
 };
+pub use occlusion::{CpuTracer, OcclusionParams, OcclusionQuery, OcclusionTracer};
 pub use painting::{
     LazyStabilizer, MAX_RADIAL_COPIES, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points,
 };

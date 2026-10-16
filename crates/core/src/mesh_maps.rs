@@ -10,14 +10,17 @@
 //! settings, and seed, runs on all available cores, and can be cancelled.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::noise::{lowbias32, unit_float};
+use crate::noise::lowbias32;
+use crate::occlusion::{
+    Bvh, CpuTracer, OcclusionParams, OcclusionQuery, OcclusionTracer, for_each_chunk,
+};
 use crate::resources::{TextureImage, luminance};
 use crate::smoothing::{vertex_normals, vertex_tangents};
 use crate::topology::{mesh_bounds, weld_positions};
@@ -230,6 +233,8 @@ pub enum MeshMapError {
     AllocationFailed,
     #[error("the cage mesh does not match the low mesh's vertices and triangles")]
     CageMismatch,
+    #[error("occlusion tracing failed: {0}")]
+    Tracer(String),
 }
 
 /// The part of a mesh name that high-to-low name matching compares:
@@ -535,6 +540,25 @@ pub fn bake_mesh_maps_caged(
     cage_mesh: Option<&MeshGeometry>,
     cancel: Option<&AtomicBool>,
 ) -> Result<MeshMaps, MeshMapError> {
+    bake_mesh_maps_traced(low, high, settings, skew_map, cage_mesh, &CpuTracer, cancel)
+}
+
+/// Texels whose surfaces are evaluated before their occlusion rays are
+/// traced together, bounding the queries held at once.
+const OCCLUSION_BATCH_TEXELS: usize = 1 << 18;
+
+/// [`bake_mesh_maps_caged`] with ambient-occlusion and thickness rays
+/// traced by `tracer` (a GPU tracer, say) instead of on the CPU. Every
+/// other map is evaluated on the CPU as before.
+pub fn bake_mesh_maps_traced(
+    low: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    skew_map: Option<&TextureImage>,
+    cage_mesh: Option<&MeshGeometry>,
+    tracer: &dyn OcclusionTracer,
+    cancel: Option<&AtomicBool>,
+) -> Result<MeshMaps, MeshMapError> {
     settings.validate()?;
     low.validate()?;
     if let Some(high) = high {
@@ -610,8 +634,6 @@ pub fn bake_mesh_maps_caged(
         mesh: low,
         settings,
         geometry: &low_geometry,
-        bvh: &bvh,
-        diagonal,
     };
     let high_context = high
         .zip(high_geometry.as_ref())
@@ -619,8 +641,6 @@ pub fn bake_mesh_maps_caged(
             mesh,
             settings,
             geometry,
-            bvh: &bvh,
-            diagonal,
         });
     let cage = settings.cage_distance * diagonal;
     let frame = LowFrame {
@@ -629,94 +649,95 @@ pub fn bake_mesh_maps_caged(
         tangents: &low_tangents,
     };
     let misses = AtomicUsize::new(0);
+    let params = OcclusionParams::new(settings, diagonal);
 
-    let rows_per_chunk = 4_usize;
-    let chunk_len = rows_per_chunk * width as usize;
-    let work = Mutex::new(texels.chunks_mut(chunk_len).enumerate());
-    let threads = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .clamp(1, 32);
-    let cancelled = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    if is_cancelled() {
-                        cancelled.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    let next = match work.lock() {
-                        Ok(mut chunks) => chunks.next(),
-                        Err(_) => return,
-                    };
-                    let Some((chunk_index, chunk)) = next else {
-                        return;
-                    };
-                    let start = chunk_index * chunk_len;
-                    for (offset, texel) in chunk.iter_mut().enumerate() {
-                        let index = start + offset;
-                        let triangle = owner[index];
-                        if triangle == u32::MAX {
-                            continue;
-                        }
-                        let basis = frame.at(triangle, weights[index]);
-                        let map_weight = skew_map.map_or(1.0, |map| {
-                            let (x, y) = (index as u32 % width, index as u32 / width);
-                            luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
-                        });
-                        let (mut direction, applied_skew) = cage_ray_direction(
-                            basis.normal,
-                            low_geometry.face_normals[triangle as usize],
-                            settings.skew * map_weight,
-                            settings.skew_edge_degrees,
-                        );
-                        let mut reach = cage;
-                        // An explicit cage sets each ray's start and length.
-                        if let Some(cage_mesh) = cage_mesh {
-                            let corners = low.triangles[triangle as usize];
-                            let weight = weights[index];
-                            let point = corners
-                                .iter()
-                                .zip([weight.x, weight.y, weight.z])
-                                .map(|(corner, weight)| {
-                                    cage_mesh.vertices[*corner as usize].position * weight
-                                })
-                                .sum::<Vec3>();
-                            let offset = point - basis.position;
-                            if let Some(outward) = offset.try_normalize() {
-                                direction = outward;
-                                reach = offset.length();
-                            }
-                        }
-                        let projected = high_context.as_ref().and_then(|context| {
-                            let origin = basis.position + direction * reach;
-                            context
-                                .bvh
-                                .closest_hit(origin, -direction, 0.0, reach * 2.0)
-                                .map(|hit| {
-                                    context.evaluate(hit.triangle, hit.weights, index as u32)
-                                })
-                        });
-                        if high_context.is_some() && projected.is_none() {
-                            misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let mut value = projected.unwrap_or_else(|| {
-                            low_context.evaluate(triangle, weights[index], index as u32)
-                        });
-                        value.tangent_normal = basis.to_tangent(value.normal);
-                        value.skew = if high_context.is_some() && cage_mesh.is_none() {
-                            applied_skew
-                        } else {
-                            0.0
-                        };
-                        *texel = value;
+    // Whole rows at a time: every texel's surface on the CPU, then the
+    // batch's occlusion rays through `tracer`.
+    let row = width as usize;
+    let batch_len = OCCLUSION_BATCH_TEXELS.div_ceil(row).max(1) * row;
+    let mut queries: Vec<Option<OcclusionQuery>> = Vec::new();
+    for (batch_index, batch) in texels.chunks_mut(batch_len).enumerate() {
+        let batch_start = batch_index * batch_len;
+        queries.clear();
+        queries.resize(batch.len(), None);
+        let mut slots = batch.iter_mut().zip(queries.iter_mut()).collect::<Vec<_>>();
+        for_each_chunk(&mut slots, 4 * row, cancel, |start, chunk| {
+            for (offset, (texel, query)) in chunk.iter_mut().enumerate() {
+                let index = batch_start + start + offset;
+                let triangle = owner[index];
+                if triangle == u32::MAX {
+                    continue;
+                }
+                let basis = frame.at(triangle, weights[index]);
+                let map_weight = skew_map.map_or(1.0, |map| {
+                    let (x, y) = (index as u32 % width, index as u32 / width);
+                    luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
+                });
+                let (mut direction, applied_skew) = cage_ray_direction(
+                    basis.normal,
+                    low_geometry.face_normals[triangle as usize],
+                    settings.skew * map_weight,
+                    settings.skew_edge_degrees,
+                );
+                let mut reach = cage;
+                // An explicit cage sets each ray's start and length.
+                if let Some(cage_mesh) = cage_mesh {
+                    let corners = low.triangles[triangle as usize];
+                    let weight = weights[index];
+                    let point = corners
+                        .iter()
+                        .zip([weight.x, weight.y, weight.z])
+                        .map(|(corner, weight)| {
+                            cage_mesh.vertices[*corner as usize].position * weight
+                        })
+                        .sum::<Vec3>();
+                    let offset = point - basis.position;
+                    if let Some(outward) = offset.try_normalize() {
+                        direction = outward;
+                        reach = offset.length();
                     }
                 }
-            });
+                let projected = high_context.as_ref().and_then(|context| {
+                    let origin = basis.position + direction * reach;
+                    bvh.closest_hit(origin, -direction, 0.0, reach * 2.0)
+                        .map(|hit| context.evaluate(hit.triangle, hit.weights, index as u32))
+                });
+                if high_context.is_some() && projected.is_none() {
+                    misses.fetch_add(1, Ordering::Relaxed);
+                }
+                let (mut value, traced) = projected.unwrap_or_else(|| {
+                    low_context.evaluate(triangle, weights[index], index as u32)
+                });
+                value.tangent_normal = basis.to_tangent(value.normal);
+                value.skew = if high_context.is_some() && cage_mesh.is_none() {
+                    applied_skew
+                } else {
+                    0.0
+                };
+                **texel = value;
+                **query = Some(traced);
+            }
+        })?;
+        drop(slots);
+        let (indices, traced): (Vec<usize>, Vec<OcclusionQuery>) = queries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, query)| query.map(|query| (index, query)))
+            .unzip();
+        let results = tracer.trace(&bvh, &params, &traced, cancel)?;
+        if results.len() != traced.len() {
+            return Err(MeshMapError::Tracer(format!(
+                "{} results for {} queries",
+                results.len(),
+                traced.len()
+            )));
         }
-    });
-    if cancelled.load(Ordering::Relaxed) || is_cancelled() {
+        for (index, [ambient_occlusion, thickness]) in indices.into_iter().zip(results) {
+            batch[index].ambient_occlusion = ambient_occlusion;
+            batch[index].thickness = thickness;
+        }
+    }
+    if is_cancelled() {
         return Err(MeshMapError::Cancelled);
     }
 
@@ -1108,12 +1129,12 @@ struct TexelContext<'a> {
     mesh: &'a MeshGeometry,
     settings: &'a MeshMapSettings,
     geometry: &'a SurfaceGeometry,
-    bvh: &'a Bvh,
-    diagonal: f32,
 }
 
 impl TexelContext<'_> {
-    fn evaluate(&self, triangle: u32, weights: Vec3, texel_index: u32) -> Texel {
+    /// The surface at `weights` in `triangle`, and the occlusion rays texel
+    /// `texel_index` casts from it.
+    fn evaluate(&self, triangle: u32, weights: Vec3, texel_index: u32) -> (Texel, OcclusionQuery) {
         let triangle_index = triangle as usize;
         let corners = self.mesh.triangles[triangle_index];
         let position = |corner: usize| self.mesh.vertices[corners[corner] as usize].position;
@@ -1130,291 +1151,26 @@ impl TexelContext<'_> {
             + corner_curvature[2] * weights.z;
         let edge = self.geometry.edge_curvature(point, face_normal);
         let curvature = 0.5 + 0.5 * (edge + smooth).clamp(-1.0, 1.0);
-
-        let bias = self.diagonal * 1e-4;
         let seed = lowbias32(texel_index ^ self.settings.seed.wrapping_mul(0x9e37_79b9));
-        let ao_distance = self.settings.ao_distance * self.diagonal;
-        let ao_samples = self.settings.ao_samples;
-        let origin = point + face_normal * bias;
-        let mut occluded = 0_u32;
-        for sample in 0..ao_samples {
-            let direction = cosine_direction(normal, face_normal, sample, ao_samples, seed);
-            if self.bvh.any_hit(origin, direction, bias, ao_distance) {
-                occluded += 1;
-            }
-        }
-        let ambient_occlusion = 1.0 - occluded as f32 / ao_samples as f32;
-
-        let thickness_samples = (ao_samples / 2).max(4);
-        let thickness_distance = self.diagonal * 0.5;
-        let inside = point - face_normal * bias;
-        let mut total = 0.0;
-        for sample in 0..thickness_samples {
-            let direction = cosine_direction(
-                -normal,
-                -face_normal,
-                sample,
-                thickness_samples,
-                lowbias32(seed ^ 0x5bd1_e995),
-            );
-            total += self
-                .bvh
-                .closest_hit(inside, direction, bias, thickness_distance)
-                .map_or(thickness_distance, |hit| hit.distance);
-        }
-        let thickness = (total / thickness_samples as f32 / thickness_distance).clamp(0.0, 1.0);
-
-        Texel {
+        let texel = Texel {
             position: point,
             normal,
             // Set by the caller once the low-mesh tangent frame is known.
             tangent_normal: Vec3::Z,
             curvature,
-            ambient_occlusion,
-            thickness,
+            // Set once the query is traced.
+            ambient_occlusion: 1.0,
+            thickness: 1.0,
             skew: 0.0,
-        }
+        };
+        let query = OcclusionQuery {
+            point,
+            normal,
+            face_normal,
+            seed,
+        };
+        (texel, query)
     }
-}
-
-/// Cosine-weighted hemisphere direction around `normal` from a rotated
-/// Hammersley sequence, reflected above the geometric face plane.
-fn cosine_direction(normal: Vec3, face_normal: Vec3, index: u32, count: u32, seed: u32) -> Vec3 {
-    let jitter = Vec2::new(unit_float(seed), unit_float(lowbias32(seed)));
-    let u = ((index as f32 + 0.5) / count as f32 + jitter.x).fract();
-    let v = (radical_inverse(index) + jitter.y).fract();
-    let radius = u.sqrt();
-    let angle = std::f32::consts::TAU * v;
-    let (tangent, bitangent) = normal.any_orthonormal_pair();
-    let direction = (tangent * (radius * angle.cos())
-        + bitangent * (radius * angle.sin())
-        + normal * (1.0 - u).max(0.0).sqrt())
-    .normalize_or(normal);
-    let below = direction.dot(face_normal);
-    if below < 0.0 {
-        (direction - face_normal * (2.0 * below)).normalize_or(normal)
-    } else {
-        direction
-    }
-}
-
-fn radical_inverse(mut bits: u32) -> f32 {
-    bits = bits.reverse_bits();
-    bits as f32 * (1.0 / 4_294_967_296.0)
-}
-
-#[derive(Clone, Copy)]
-struct BvhNode {
-    min: Vec3,
-    max: Vec3,
-    /// Leaf: first index into `order`. Interior: index of the left child; the
-    /// right child follows it.
-    first: u32,
-    /// Triangle count for leaves, zero for interior nodes.
-    count: u32,
-}
-
-/// Bounding-volume hierarchy over mesh triangles for occlusion rays.
-struct Bvh {
-    nodes: Vec<BvhNode>,
-    order: Vec<u32>,
-    triangles: Vec<[Vec3; 3]>,
-}
-
-const BVH_LEAF_SIZE: usize = 4;
-
-impl Bvh {
-    fn build(mesh: &MeshGeometry) -> Self {
-        let triangles = mesh
-            .triangles
-            .iter()
-            .map(|triangle| triangle.map(|index| mesh.vertices[index as usize].position))
-            .collect::<Vec<_>>();
-        let centroids = triangles
-            .iter()
-            .map(|[a, b, c]| (*a + *b + *c) / 3.0)
-            .collect::<Vec<_>>();
-        let mut order = (0..triangles.len() as u32).collect::<Vec<_>>();
-        let mut nodes = vec![BvhNode {
-            min: Vec3::ZERO,
-            max: Vec3::ZERO,
-            first: 0,
-            count: 0,
-        }];
-        let mut stack = vec![(0_usize, 0_usize, order.len())];
-        while let Some((node_index, start, end)) = stack.pop() {
-            let mut minimum = Vec3::splat(f32::INFINITY);
-            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
-            let mut centroid_min = Vec3::splat(f32::INFINITY);
-            let mut centroid_max = Vec3::splat(f32::NEG_INFINITY);
-            for triangle in &order[start..end] {
-                for corner in triangles[*triangle as usize] {
-                    minimum = minimum.min(corner);
-                    maximum = maximum.max(corner);
-                }
-                let centroid = centroids[*triangle as usize];
-                centroid_min = centroid_min.min(centroid);
-                centroid_max = centroid_max.max(centroid);
-            }
-            let count = end - start;
-            let spread = centroid_max - centroid_min;
-            if count <= BVH_LEAF_SIZE || spread.max_element() <= f32::EPSILON {
-                nodes[node_index] = BvhNode {
-                    min: minimum,
-                    max: maximum,
-                    first: start as u32,
-                    count: count as u32,
-                };
-                continue;
-            }
-            let axis = if spread.x >= spread.y && spread.x >= spread.z {
-                0
-            } else if spread.y >= spread.z {
-                1
-            } else {
-                2
-            };
-            let middle = (centroid_min[axis] + centroid_max[axis]) * 0.5;
-            let slice = &mut order[start..end];
-            let mut split = 0;
-            for index in 0..slice.len() {
-                if centroids[slice[index] as usize][axis] < middle {
-                    slice.swap(index, split);
-                    split += 1;
-                }
-            }
-            if split == 0 || split == slice.len() {
-                split = slice.len() / 2;
-                slice.select_nth_unstable_by(split, |left, right| {
-                    centroids[*left as usize][axis].total_cmp(&centroids[*right as usize][axis])
-                });
-            }
-            let left = nodes.len();
-            nodes.push(nodes[node_index]);
-            nodes.push(nodes[node_index]);
-            nodes[node_index] = BvhNode {
-                min: minimum,
-                max: maximum,
-                first: left as u32,
-                count: 0,
-            };
-            stack.push((left, start, start + split));
-            stack.push((left + 1, start + split, end));
-        }
-        Self {
-            nodes,
-            order,
-            triangles,
-        }
-    }
-
-    fn any_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> bool {
-        self.traverse(origin, direction, t_min, t_max, true)
-            .is_some()
-    }
-
-    fn closest_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> Option<RayHit> {
-        self.traverse(origin, direction, t_min, t_max, false)
-    }
-
-    fn traverse(
-        &self,
-        origin: Vec3,
-        direction: Vec3,
-        t_min: f32,
-        mut t_max: f32,
-        any: bool,
-    ) -> Option<RayHit> {
-        if self.order.is_empty() {
-            return None;
-        }
-        let inverse = direction.recip();
-        let mut closest = None;
-        let mut stack = [0_u32; 128];
-        let mut depth = 1;
-        while depth > 0 {
-            depth -= 1;
-            let node = self.nodes[stack[depth] as usize];
-            if !ray_hits_box(origin, inverse, node.min, node.max, t_min, t_max) {
-                continue;
-            }
-            if node.count > 0 {
-                let first = node.first as usize;
-                for triangle in &self.order[first..first + node.count as usize] {
-                    let [a, b, c] = self.triangles[*triangle as usize];
-                    if let Some((distance, u, v)) = ray_triangle(origin, direction, a, b, c)
-                        && distance > t_min
-                        && distance < t_max
-                    {
-                        let hit = RayHit {
-                            distance,
-                            triangle: *triangle,
-                            weights: Vec3::new(1.0 - u - v, u, v),
-                        };
-                        if any {
-                            return Some(hit);
-                        }
-                        t_max = distance;
-                        closest = Some(hit);
-                    }
-                }
-            } else if depth + 2 <= stack.len() {
-                stack[depth] = node.first;
-                stack[depth + 1] = node.first + 1;
-                depth += 2;
-            }
-        }
-        closest
-    }
-}
-
-fn ray_hits_box(origin: Vec3, inverse: Vec3, min: Vec3, max: Vec3, t_min: f32, t_max: f32) -> bool {
-    let first = (min - origin) * inverse;
-    let second = (max - origin) * inverse;
-    // `max_element`/`min_element` skip NaN lanes produced by a zero direction
-    // component lying exactly on a slab boundary.
-    let near = first.min(second).max_element().max(t_min);
-    let far = first.max(second).min_element().min(t_max);
-    near <= far
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RayHit {
-    distance: f32,
-    triangle: u32,
-    /// Barycentric weights of the triangle corners at the hit.
-    weights: Vec3,
-}
-
-/// Two-sided Möller–Trumbore intersection returning the hit distance and
-/// the barycentric `u`, `v` of corners `b` and `c`.
-fn ray_triangle(
-    origin: Vec3,
-    direction: Vec3,
-    a: Vec3,
-    b: Vec3,
-    c: Vec3,
-) -> Option<(f32, f32, f32)> {
-    let edge_ab = b - a;
-    let edge_ac = c - a;
-    let p = direction.cross(edge_ac);
-    let determinant = edge_ab.dot(p);
-    if determinant.abs() < 1e-12 {
-        return None;
-    }
-    let inverse = 1.0 / determinant;
-    let offset = origin - a;
-    let u = offset.dot(p) * inverse;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-    let q = offset.cross(edge_ab);
-    let v = direction.dot(q) * inverse;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-    let distance = edge_ac.dot(q) * inverse;
-    distance.is_finite().then_some((distance, u, v))
 }
 
 #[cfg(test)]

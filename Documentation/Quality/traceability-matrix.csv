@@ -83,3 +83,4 @@ REQ-0081,Save and apply panel layouts,docs/feature-map.md,docs/architecture.md,,
 REQ-0082,Hide and isolate selected geometry in the viewport,docs/feature-map.md,docs/architecture.md,,TC-0397,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0083,Import glTF materials as fill layers,docs/feature-map.md,docs/architecture.md,,TC-0398,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0084,Import BMP TIFF WebP OpenEXR and HDR bitmaps with 16-bit precision,docs/feature-map.md,docs/architecture.md,,TC-0399;TC-0400,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0085,Trace mesh-map occlusion and thickness rays on the GPU with a CPU fallback within a tested tolerance,docs/feature-map.md,docs/architecture.md,,TC-0403;TC-0404;TC-0405,Documentation/Quality/TestPlan-short.md,Project owner,Verified

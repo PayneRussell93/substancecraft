@@ -3377,6 +3377,7 @@ dependencies = [
  "substancecraft-api",
  "substancecraft-core",
  "substancecraft-filament",
+ "substancecraft-gpu",
  "tempfile",
 ]
 
@@ -3429,6 +3430,17 @@ dependencies = [
  "glam",
  "substancecraft-core",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "substancecraft-gpu"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "pollster 0.4.0",
+ "substancecraft-core",
+ "thiserror 2.0.21",
+ "wgpu",
 ]
 
 [[package]]
