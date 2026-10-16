@@ -105,6 +105,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("SubstanceCraft")
             .with_app_id("com.substancecraft.desktop")
+            .with_icon(app_icon())
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
@@ -137,6 +138,63 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn app_icon() -> egui::IconData {
+    let size = 64_usize;
+    let mut rgba = vec![0_u8; size * size * 4];
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&[18, 27, 31, 255]);
+    }
+
+    fill_icon_polygon(
+        &mut rgba,
+        size,
+        &[(32, 8), (54, 20), (32, 32), (10, 20)],
+        [103, 220, 190, 255],
+    );
+    fill_icon_polygon(
+        &mut rgba,
+        size,
+        &[(10, 20), (32, 32), (32, 56), (10, 44)],
+        [39, 145, 136, 255],
+    );
+    fill_icon_polygon(
+        &mut rgba,
+        size,
+        &[(54, 20), (32, 32), (32, 56), (54, 44)],
+        [27, 92, 112, 255],
+    );
+
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
+
+fn fill_icon_polygon(rgba: &mut [u8], size: usize, points: &[(i32, i32)], color: [u8; 4]) {
+    let min_y = points.iter().map(|point| point.1).min().unwrap_or(0);
+    let max_y = points.iter().map(|point| point.1).max().unwrap_or(0);
+
+    for y in min_y..max_y {
+        let mut intersections = Vec::new();
+        for index in 0..points.len() {
+            let (x1, y1) = points[index];
+            let (x2, y2) = points[(index + 1) % points.len()];
+            if (y1 <= y && y < y2) || (y2 <= y && y < y1) {
+                intersections.push(x1 + (y - y1) * (x2 - x1) / (y2 - y1));
+            }
+        }
+        intersections.sort_unstable();
+
+        for pair in intersections.as_chunks::<2>().0 {
+            for x in pair[0]..pair[1] {
+                let offset = (y as usize * size + x as usize) * 4;
+                rgba[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
 }
 
 struct SubstanceCraftApp {
