@@ -246,6 +246,7 @@ impl SubstanceCraftApp {
             clear = self.display_lut.is_some()
                 && widgets::pill_button(ui, Some(Icon::Close), "Remove", false, false).clicked();
         });
+        self.ocio_section(ui);
         if let Some(status) = &self.grading_status {
             hint(ui, status);
         }

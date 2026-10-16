@@ -61,7 +61,11 @@ impl Node {
 
     /// A scalar as a number.
     pub fn number(&self) -> Option<f64> {
-        self.str()?.trim().parse().ok().filter(|value: &f64| value.is_finite())
+        self.str()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|value: &f64| value.is_finite())
     }
 
     /// A sequence of numbers, or one number.
@@ -200,7 +204,12 @@ fn logical_lines(text: &str) -> Result<Vec<Line>, String> {
                     break;
                 }
                 let block_indent = *block_indent.get_or_insert(candidate_indent);
-                gathered.push(candidate.get(block_indent..).unwrap_or(candidate.trim()).to_owned());
+                gathered.push(
+                    candidate
+                        .get(block_indent..)
+                        .unwrap_or(candidate.trim())
+                        .to_owned(),
+                );
                 index += 1;
             }
             while gathered.last().is_some_and(String::is_empty) {
@@ -237,9 +246,7 @@ fn split_key(text: &str) -> Option<(String, &str)> {
                 '"' | '\'' if index == 0 => quote = Some(c),
                 '[' | '{' => depth += 1,
                 ']' | '}' => depth -= 1,
-                ':' if depth == 0
-                    && bytes.get(index + 1).is_none_or(|next| *next == b' ') =>
-                {
+                ':' if depth == 0 && bytes.get(index + 1).is_none_or(|next| *next == b' ') => {
                     let key = unquote(text[..index].trim());
                     return Some((key, text[index + 1..].trim()));
                 }
@@ -330,7 +337,9 @@ impl Parser {
                 self.block(indent)?
             }
             // A sequence may sit at its key's own indentation.
-            Some(next) if next.indent == parent && (next.text == "-" || next.text.starts_with("- ")) => {
+            Some(next)
+                if next.indent == parent && (next.text == "-" || next.text.starts_with("- ")) =>
+            {
                 self.sequence(parent)?
             }
             _ => Node::plain(if tag.is_some() {
@@ -661,11 +670,20 @@ list:
         let group = spaces[0].get("to_reference").unwrap();
         assert_eq!(group.tag.as_deref(), Some("GroupTransform"));
         let children = group.get("children").unwrap().seq();
-        assert_eq!(children[0].get("matrix").unwrap().numbers().unwrap().len(), 16);
+        assert_eq!(
+            children[0].get("matrix").unwrap().numbers().unwrap().len(),
+            16
+        );
         assert_eq!(children[1].get_str("src"), Some("a.spi1d"));
         let exponent = spaces[1].get("from_reference").unwrap();
         assert_eq!(exponent.get("value").unwrap().numbers(), Some(vec![2.2]));
-        let list: Vec<&str> = root.get("list").unwrap().seq().iter().filter_map(Node::str).collect();
+        let list: Vec<&str> = root
+            .get("list")
+            .unwrap()
+            .seq()
+            .iter()
+            .filter_map(Node::str)
+            .collect();
         assert_eq!(list, ["a", "b"]);
 
         assert!(parse("a: [1, 2").is_err());

@@ -976,15 +976,14 @@ impl FilterPreset {
 
     /// Original filter stacks for common adjustments.
     pub fn built_in() -> Vec<Self> {
-        let preset = |name: &str, description: &str, filters: Vec<LayerFilter>, tags: &[&str]| {
-            Self {
+        let preset =
+            |name: &str, description: &str, filters: Vec<LayerFilter>, tags: &[&str]| Self {
                 name: name.to_owned(),
                 description: description.to_owned(),
                 filters,
                 provenance: built_in_provenance(),
                 tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
-            }
-        };
+            };
         vec![
             preset(
                 "Soften",
@@ -1768,8 +1767,14 @@ mod tests {
                 .map(|asset| asset.name)
                 .collect()
         };
-        assert_eq!(names(&project, "threshold", AssetKind::Filter), ["Hard edge"]);
-        assert_eq!(names(&project, "chips", AssetKind::Generator), ["Fine chips"]);
+        assert_eq!(
+            names(&project, "threshold", AssetKind::Filter),
+            ["Hard edge"]
+        );
+        assert_eq!(
+            names(&project, "chips", AssetKind::Generator),
+            ["Fine chips"]
+        );
 
         // Filter stacks append to content or mask filters, within limits.
         let mut layer = MaterialLayer::new_paint(LayerId(1), "Paint");
@@ -1797,7 +1802,9 @@ mod tests {
         assert_eq!(target.mask_filters, [LayerFilter::Invert]);
         let recaptured = GeneratorPreset::from_layer(&target, "Mine").unwrap();
         assert_eq!(recaptured.generator, grime.generator);
-        assert!(GeneratorPreset::from_layer(&MaterialLayer::new_paint(LayerId(3), "x"), "x").is_none());
+        assert!(
+            GeneratorPreset::from_layer(&MaterialLayer::new_paint(LayerId(3), "x"), "x").is_none()
+        );
 
         // Environments keep their file, rotation, and strength.
         let mut sky = EnvironmentResource::new("Studio sky", "sky.hdr");
@@ -1810,7 +1817,10 @@ mod tests {
         project.generator_presets.push(recaptured.clone());
         project.environments.push(sky.clone());
         project.validate().unwrap();
-        assert_eq!(names(&project, "project", AssetKind::Environment), ["Studio sky"]);
+        assert_eq!(
+            names(&project, "project", AssetKind::Environment),
+            ["Studio sky"]
+        );
         let json = serde_json::to_string(&project).unwrap();
         let back: MaterialProject = serde_json::from_str(&json).unwrap();
         assert_eq!(back.environments, project.environments);
@@ -1826,9 +1836,9 @@ mod tests {
         broken.generator_presets.push(recaptured.clone());
         assert_eq!(
             broken.validate(),
-            Err(crate::ProjectError::InvalidLibraryEntry(LibraryError::DuplicateName(
-                "Mine".to_owned()
-            )))
+            Err(crate::ProjectError::InvalidLibraryEntry(
+                LibraryError::DuplicateName("Mine".to_owned())
+            ))
         );
 
         // Saving them is undoable.

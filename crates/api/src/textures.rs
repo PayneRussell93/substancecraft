@@ -1,5 +1,5 @@
-//! Bitmap import (PNG, JPEG, TGA) and baked-texture export (PNG, TGA, and
-//! OpenEXR).
+//! Bitmap import (PNG, JPEG, TGA, BMP, TIFF, WebP, OpenEXR, Radiance HDR)
+//! and baked-texture export (PNG, TGA, and OpenEXR).
 
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -9,7 +9,8 @@ use image::{
 };
 use substancecraft_core::color::srgb_to_linear;
 use substancecraft_core::{
-    BakedTexture, BitDepth, ExportedTexture, MAX_RESOURCE_DIMENSION, OutputLayout, TextureImage,
+    BakedTexture, BitDepth, ColorSpace, ExportedTexture, MAX_RESOURCE_DIMENSION, OutputLayout,
+    TextureImage,
 };
 use thiserror::Error;
 
@@ -32,7 +33,30 @@ pub enum TextureIoError {
     UnsupportedFormat(String),
 }
 
-/// Decodes PNG, JPEG, or TGA bytes into straight-alpha RGBA8. TGA has no
+/// Raster file extensions imported as bitmap resources (besides SVG and
+/// `.sctext`, which are rasterized).
+pub const BITMAP_EXTENSIONS: [&str; 10] = [
+    "png", "jpg", "jpeg", "tga", "bmp", "tif", "tiff", "webp", "exr", "hdr",
+];
+
+/// The colour space a file's pixels are encoded in when nothing says
+/// otherwise: linear for floating-point formats (OpenEXR, Radiance HDR),
+/// sRGB for the rest.
+pub fn source_color_space(path: impl AsRef<Path>) -> ColorSpace {
+    let extension = path
+        .as_ref()
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("exr" | "hdr") => ColorSpace::LinearSrgb,
+        _ => ColorSpace::Srgb,
+    }
+}
+
+/// Decodes PNG, JPEG, TGA, BMP, TIFF, WebP, OpenEXR, or Radiance HDR bytes
+/// into straight-alpha RGBA8. Sources with more than 8 bits per channel
+/// also keep a 16-bit copy ([`TextureImage::rgba16`]); floating-point ones
+/// are clamped to `0..=1` and tagged linear. TGA has no
 /// signature, so bytes no other format claims are tried as TGA.
 pub fn decode_texture_image(bytes: &[u8]) -> Result<TextureImage, TextureIoError> {
     decode_with_hint(bytes, None)
@@ -54,14 +78,51 @@ fn decode_with_hint(
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_RESOURCE_DIMENSION);
     limits.max_image_height = Some(MAX_RESOURCE_DIMENSION);
+    // Room for the largest image as RGBA 32-bit float.
+    limits.max_alloc = Some(u64::from(MAX_RESOURCE_DIMENSION).pow(2) * 16);
     reader.limits(limits);
     let image = reader
         .decode()
-        .map_err(|error| TextureIoError::Decode(error.to_string()))?
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    TextureImage::new(width, height, image.into_raw())
-        .ok_or(TextureIoError::InvalidDimensions { width, height })
+        .map_err(|error| TextureIoError::Decode(error.to_string()))?;
+    let (width, height) = (image.width(), image.height());
+    let invalid = TextureIoError::InvalidDimensions { width, height };
+    match image {
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => {
+            // Alpha is read as straight, as SubstanceCraft writes it, so
+            // exported EXRs import back unchanged.
+            let mut rgba = image.into_rgba32f().into_raw();
+            for value in &mut rgba {
+                *value = if value.is_finite() {
+                    value.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+            }
+            let rgba8 = rgba
+                .iter()
+                .map(|value| (value * 255.0).round() as u8)
+                .collect();
+            let rgba16 = rgba
+                .iter()
+                .map(|value| (value * 65535.0).round() as u16)
+                .collect();
+            let mut texture = TextureImage::new(width, height, rgba8)
+                .and_then(|texture| texture.with_rgba16(rgba16))
+                .ok_or(invalid)?;
+            texture.color_space = ColorSpace::LinearSrgb;
+            Ok(texture)
+        }
+        DynamicImage::ImageLuma16(_)
+        | DynamicImage::ImageLumaA16(_)
+        | DynamicImage::ImageRgb16(_)
+        | DynamicImage::ImageRgba16(_) => {
+            let rgba16 = image.to_rgba16().into_raw();
+            TextureImage::new(width, height, image.into_rgba8().into_raw())
+                .and_then(|texture| texture.with_rgba16(rgba16))
+                .ok_or(invalid)
+        }
+        _ => TextureImage::new(width, height, image.into_rgba8().into_raw()).ok_or(invalid),
+    }
 }
 
 /// Reads and decodes a bitmap file.
@@ -551,5 +612,83 @@ mod tests {
             let rgba = load_texture_image(&written[2]).unwrap();
             assert_eq!(rgba.rgba8, texture().rgba8);
         }
+    }
+
+    #[test]
+    fn tc_0399_bmp_tiff_webp_exr_and_hdr_import_with_deep_formats_kept_at_16_bits() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = |name: &str| folder.path().join(name);
+        let pixels = vec![10, 20, 30, 255, 200, 150, 100, 128];
+        let rgba = RgbaImage::from_raw(2, 1, pixels.clone()).unwrap();
+
+        // 8-bit formats decode exactly, with no 16-bit copy, tagged sRGB.
+        for name in ["plain.bmp", "plain.tif", "plain.tiff", "plain.webp"] {
+            rgba.save(path(name)).unwrap();
+            let image = load_texture_image(path(name)).unwrap();
+            assert_eq!(image.rgba8, pixels, "{name}");
+            assert!(image.rgba16.is_none(), "{name}");
+            assert_eq!(image.color_space, ColorSpace::Srgb, "{name}");
+        }
+
+        // 16-bit PNG and TIFF keep every word; the 8-bit copy rounds them.
+        let words = vec![1000_u16, 30_000, 65_535, 65_535, 50_001, 2, 7, 32_768];
+        let deep = ImageBuffer::<image::Rgba<u16>, _>::from_raw(2, 1, words.clone()).unwrap();
+        for name in ["deep.png", "deep.tif"] {
+            deep.save(path(name)).unwrap();
+            let image = load_texture_image(path(name)).unwrap();
+            assert_eq!(image.rgba16.as_ref(), Some(&words), "{name}");
+            assert_eq!(image.rgba8, [4, 117, 255, 255, 195, 0, 0, 128], "{name}");
+            assert_eq!(image.color_space, ColorSpace::Srgb, "{name}");
+        }
+
+        // OpenEXR: linear floats clamped to 0..=1 (non-finite to 0), alpha
+        // straight, tagged linear.
+        let floats = vec![0.25_f32, 2.0, -1.0, 0.5, f32::NAN, 0.75, 1.0, 1.0];
+        ImageBuffer::<image::Rgba<f32>, _>::from_raw(2, 1, floats)
+            .unwrap()
+            .save(path("linear.exr"))
+            .unwrap();
+        let exr = load_texture_image(path("linear.exr")).unwrap();
+        assert_eq!(exr.color_space, ColorSpace::LinearSrgb);
+        assert_eq!(
+            exr.rgba16.as_deref(),
+            Some(&[16_384, 65_535, 0, 32_768, 0, 49_151, 65_535, 65_535][..])
+        );
+        assert_eq!(exr.rgba8, [64, 255, 0, 128, 0, 191, 255, 255]);
+
+        // Radiance HDR (RGBE, no alpha) is opaque and linear.
+        ImageBuffer::<image::Rgb<f32>, _>::from_raw(2, 1, vec![0.5, 0.25, 0.125, 4.0, 1.0, 0.0])
+            .unwrap()
+            .save(path("sky.hdr"))
+            .unwrap();
+        let hdr = load_texture_image(path("sky.hdr")).unwrap();
+        assert_eq!(hdr.color_space, ColorSpace::LinearSrgb);
+        let hdr16 = hdr.rgba16.unwrap();
+        assert!((f32::from(hdr16[0]) / 65_535.0 - 0.5).abs() < 0.01);
+        assert!((f32::from(hdr16[2]) / 65_535.0 - 0.125).abs() < 0.01);
+        assert_eq!(hdr16[3], 65_535);
+        assert_eq!(hdr16[4], 65_535, "values above 1 clamp");
+
+        // A SubstanceCraft EXR export imports back as written.
+        let written = write_exported_textures(
+            folder.path(),
+            &[ExportedTexture {
+                format: Some("exr".to_owned()),
+                rgba16: Some(words.clone()),
+                ..exported("Body_Mask", OutputLayout::Rgba)
+            }],
+            TextureFormat::Png,
+        )
+        .unwrap();
+        let round = load_texture_image(&written[0]).unwrap().rgba16.unwrap();
+        for (read, wrote) in round.iter().zip(&words) {
+            // Half floats hold about 11 significant bits.
+            assert!(read.abs_diff(*wrote) <= 32, "{read} vs {wrote}");
+        }
+
+        // The tag a file starts with follows its extension.
+        assert_eq!(source_color_space("a/b.EXR"), ColorSpace::LinearSrgb);
+        assert_eq!(source_color_space("sky.hdr"), ColorSpace::LinearSrgb);
+        assert_eq!(source_color_space("wall.tiff"), ColorSpace::Srgb);
     }
 }

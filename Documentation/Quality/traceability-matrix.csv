@@ -74,3 +74,12 @@ REQ-0072,Clone and smudge the layer stack and limit strokes to a quick mask,docs
 REQ-0073,Define paint and export user channels per texture set,docs/feature-map.md,docs/architecture.md,,TC-0358;TC-0359;TC-0360;TC-0361;TC-0362,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0074,Anchor masks to individual effects within a layer,docs/feature-map.md,docs/architecture.md,,TC-0363,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0075,Give fills procedural content from material graphs and procedural material resources,docs/feature-map.md,docs/architecture.md,,TC-0364;TC-0365;TC-0366;TC-0367;TC-0368,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0076,Read OpenColorIO configs for viewport views and pipeline colour spaces,docs/feature-map.md,docs/compatibility.md,,TC-0390;TC-0391;TC-0392;TC-0393,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0077,Keep a shared asset library outside projects,docs/feature-map.md,docs/architecture.md,,TC-0386;TC-0388,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0078,Offer filters generators and environments as library resources,docs/feature-map.md,docs/architecture.md,,TC-0387;TC-0388,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0079,Import numbered image sequences as frame-stepped resources,docs/feature-map.md,docs/architecture.md,,TC-0389,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0080,Publish and enforce release-compatibility targets,docs/compatibility.md,docs/compatibility.md,,TC-0394;TC-0395,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0081,Save and apply panel layouts,docs/feature-map.md,docs/architecture.md,,TC-0396,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0082,Hide and isolate selected geometry in the viewport,docs/feature-map.md,docs/architecture.md,,TC-0397,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0083,Import glTF materials as fill layers,docs/feature-map.md,docs/architecture.md,,TC-0398,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0084,Import BMP TIFF WebP OpenEXR and HDR bitmaps with 16-bit precision,docs/feature-map.md,docs/architecture.md,,TC-0399;TC-0400,Documentation/Quality/TestPlan-short.md,Project owner,Verified

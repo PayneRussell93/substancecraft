@@ -435,7 +435,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -588,6 +588,124 @@ mod tests {
         std::fs::write(&file, "empty.sproject --out a\nempty.sproject --out c\n").unwrap();
         assert_eq!(run_batch(&file, 2), 0);
         assert_eq!(run_batch(&folder.path().join("none.txt"), 1), 2);
+    }
+
+    #[test]
+    fn tc_0392_cli_lists_and_bakes_ocio_views_and_exports_into_config_colour_spaces() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = folder.path().join("config.ocio");
+        let text = [
+            "ocio_profile_version: 2",
+            "roles:",
+            "  scene_linear: Linear Rec.709",
+            "displays:",
+            "  sRGB:",
+            "    - !<View> {name: Standard, colorspace: sRGB}",
+            "colorspaces:",
+            "  - !<ColorSpace>",
+            "    name: Linear Rec.709",
+            "  - !<ColorSpace>",
+            "    name: sRGB",
+            "    from_scene_reference: !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}",
+            "  - !<ColorSpace>",
+            "    name: ACEScg",
+            "    from_scene_reference: !<BuiltinTransform> {style: ACES-AP1_to_LINEAR-REC709_BFD, direction: inverse}",
+        ]
+        .join("\n");
+        std::fs::write(&config, text).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(&ocio_summary(&config).unwrap()).unwrap();
+        assert_eq!(summary["displays"][0]["views"][0], "Standard");
+        assert_eq!(summary["linear_rec709"], "Linear Rec.709");
+
+        let out = folder.path().join("view.cube");
+        let command = parse(&args(&format!(
+            "ocio-bake {} --display sRGB --view Standard --size 9 --out {}",
+            config.display(),
+            out.display()
+        )))
+        .unwrap();
+        let Command::OcioBake(bake) = command else {
+            panic!("expected ocio-bake");
+        };
+        ocio_bake(&bake).unwrap();
+        let lut =
+            substancecraft_core::CubeLut::parse(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(lut.size, 9);
+        for bad in [
+            "ocio",
+            "ocio a b",
+            "ocio-bake a --display x --view y",
+            "ocio-bake a --display x --view y --out z --size 1",
+            "export a --out b --ocio c",
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad}");
+        }
+
+        // Exports convert colour outputs into the config's ACEScg: pure
+        // sRGB red becomes mostly-red AP1 weights, and data stays raw.
+        let mut project = substancecraft_core::MaterialProject::empty();
+        let mut set = substancecraft_core::TextureSet {
+            user_channels: Default::default(),
+            stencils: Default::default(),
+            id: substancecraft_core::TextureSetId(1),
+            name: "Body".to_owned(),
+            material_slot: "Body".to_owned(),
+            resolution: substancecraft_core::TextureResolution::new(4, 4).unwrap(),
+            channels: [
+                substancecraft_core::MaterialChannel::BaseColor,
+                substancecraft_core::MaterialChannel::Roughness,
+            ]
+            .into(),
+            layers: Vec::new(),
+            height_strength: 1.0,
+            export: None,
+        };
+        let fill = substancecraft_core::LayerFill {
+            color: [255, 0, 0, 255],
+            roughness: 0.5,
+            ..Default::default()
+        };
+        set.layers = vec![substancecraft_core::MaterialLayer {
+            channels: [
+                substancecraft_core::MaterialChannel::BaseColor,
+                substancecraft_core::MaterialChannel::Roughness,
+            ]
+            .into(),
+            ..substancecraft_core::MaterialLayer::new_fill(
+                substancecraft_core::LayerId(1),
+                "Red",
+                fill,
+            )
+        }];
+        project.texture_sets.push(set);
+        let scene = folder.path().join("scene.sproject");
+        substancecraft_api::save_project_file(&scene, &project).unwrap();
+        let command = parse(&args(&format!(
+            "export {} --out {} --ocio {} --colorspace ACEScg",
+            scene.display(),
+            folder.path().join("out").display(),
+            config.display()
+        )))
+        .unwrap();
+        let job = export_job(command).unwrap();
+        let files = run_export_job(&job).unwrap();
+        let base = files
+            .iter()
+            .find(|file| file.to_string_lossy().contains("BaseColor"))
+            .unwrap();
+        let image = substancecraft_api::load_texture_image(base).unwrap();
+        let [r, g, b, _] = image.rgba8[..4] else {
+            panic!("no texels");
+        };
+        assert!((i32::from(r) - 156).abs() <= 2, "{r}");
+        assert!(g > 10 && g < 25 && b < 10, "{g} {b}");
+        let mut bad = job.clone();
+        bad.ocio = Some(OcioExport {
+            config: config.clone(),
+            colorspace: "Nope".to_owned(),
+        });
+        assert!(run_export_job(&bad).is_err());
     }
 
     fn export_job(command: Command) -> Option<ExportJob> {

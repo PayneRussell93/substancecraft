@@ -1830,4 +1830,78 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn tc_0400_sixteen_bit_bitmaps_keep_precision_through_bakes_and_exports() {
+        use crate::{FillTextures, ResourceId, ResourceImages, TextureImage};
+        use std::sync::Arc;
+
+        // 1000 / 65535 sits between the 8-bit steps 3 and 4.
+        let word = 1000_u16;
+        let image = TextureImage::new(4, 4, [4, 4, 4, 255].repeat(16))
+            .unwrap()
+            .with_rgba16([word, word, word, u16::MAX].repeat(16))
+            .unwrap();
+        assert!(
+            TextureImage::new(4, 4, vec![0; 64])
+                .unwrap()
+                .with_rgba16(vec![0; 63])
+                .is_none(),
+            "the 16-bit copy must match the dimensions"
+        );
+        let expected = f32::from(word) / 65535.0;
+        assert!((image.pixel(5).x - expected).abs() < 1e-6);
+        assert!((image.sample(glam::Vec2::splat(0.3), true).y - expected).abs() < 1e-6);
+
+        let resources = ResourceImages::from([(ResourceId(3), Arc::new(image))]);
+        let context = BakeContext {
+            resources: Some(&resources),
+            ..BakeContext::default()
+        };
+        let preset = ExportPreset {
+            name: "Deep".to_owned(),
+            outputs: vec![ExportOutput {
+                bit_depth: BitDepth::Sixteen,
+                ..ExportOutput::new(
+                    "Rough",
+                    OutputLayout::Gray,
+                    [
+                        ChannelSlot::channel(MaterialChannel::Roughness, SourceComponent::Red),
+                        ChannelSlot::ZERO,
+                        ChannelSlot::ZERO,
+                        ChannelSlot::ONE,
+                    ],
+                )
+            }],
+            max_resolution: None,
+        };
+        // Same size as the set (texels copied) and resampled.
+        for size in [4, 8] {
+            let mut layer = MaterialLayer::new_fill(
+                LayerId(1),
+                "Rough",
+                LayerFill {
+                    textures: FillTextures {
+                        roughness: Some(ResourceId(3)),
+                        ..FillTextures::default()
+                    },
+                    ..LayerFill::default()
+                },
+            );
+            layer.channels = BTreeSet::from([MaterialChannel::Roughness]);
+            let mut set = set_with(size, layer);
+            set.channels = BTreeSet::from([MaterialChannel::Roughness]);
+            let files = set.bake_export(&preset, context).unwrap();
+            let words = files[0].rgba16.as_ref().unwrap();
+            assert!(
+                words
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|texel| texel[0].abs_diff(word) <= 1),
+                "{size}: {:?}",
+                &words[..4]
+            );
+        }
+    }
 }

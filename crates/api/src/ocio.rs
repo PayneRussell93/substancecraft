@@ -267,11 +267,15 @@ impl Op {
                 if !*inverse {
                     match linear_segment {
                         Some((lin_break, _, slope, offset)) if x <= lin_break => x * slope + offset,
-                        _ => log_slope[i] * log_of(lin_slope[i] * x + lin_offset[i]) + log_offset[i],
+                        _ => {
+                            log_slope[i] * log_of(lin_slope[i] * x + lin_offset[i]) + log_offset[i]
+                        }
                     }
                 } else {
                     match linear_segment {
-                        Some((_, log_break, slope, offset)) if x <= log_break => (x - offset) / slope,
+                        Some((_, log_break, slope, offset)) if x <= log_break => {
+                            (x - offset) / slope
+                        }
                         _ => {
                             (base.powf((x - log_offset[i]) / log_slope[i]) - lin_offset[i])
                                 / lin_slope[i]
@@ -548,7 +552,10 @@ impl OcioConfig {
             .map_err(|error| OcioError::Io(format!("{}: {error}", path.display())))?
             .len();
         if size > MAX_OCIO_CONFIG_BYTES {
-            return Err(OcioError::Io(format!("{}: the file is too large", path.display())));
+            return Err(OcioError::Io(format!(
+                "{}: the file is too large",
+                path.display()
+            )));
         }
         let text = std::fs::read_to_string(path)
             .map_err(|error| OcioError::Io(format!("{}: {error}", path.display())))?;
@@ -625,8 +632,9 @@ impl OcioConfig {
                     if item.tag.as_deref() == Some("Views") {
                         // References to shared views.
                         for reference in item.seq().iter().filter_map(Node::str) {
-                            if let Some(view) =
-                                shared_views.iter().find(|view| names_match(&view.name, reference))
+                            if let Some(view) = shared_views
+                                .iter()
+                                .find(|view| names_match(&view.name, reference))
                             {
                                 views.push(view.clone());
                             }
@@ -643,9 +651,12 @@ impl OcioConfig {
         }
         let list = |key: &str| -> Vec<String> {
             match root.get(key) {
-                Some(node) if !node.seq().is_empty() => {
-                    node.seq().iter().filter_map(Node::str).map(str::to_owned).collect()
-                }
+                Some(node) if !node.seq().is_empty() => node
+                    .seq()
+                    .iter()
+                    .filter_map(Node::str)
+                    .map(str::to_owned)
+                    .collect(),
                 Some(node) => node
                     .str()
                     .unwrap_or_default()
@@ -689,7 +700,10 @@ impl OcioConfig {
                     aliases,
                     is_data: node.get("isdata").and_then(Node::boolean).unwrap_or(false),
                     display_referred,
-                    to_reference: node.get(to_key).or_else(|| node.get("to_reference")).cloned(),
+                    to_reference: node
+                        .get(to_key)
+                        .or_else(|| node.get("to_reference"))
+                        .cloned(),
                     from_reference: node
                         .get(from_key)
                         .or_else(|| node.get("from_reference"))
@@ -705,8 +719,14 @@ impl OcioConfig {
             .filter_map(|node| {
                 Some(ViewTransformDef {
                     name: node.get_str("name")?.to_owned(),
-                    from_scene: node.get("from_scene_reference").or_else(|| node.get("from_reference")).cloned(),
-                    to_scene: node.get("to_scene_reference").or_else(|| node.get("to_reference")).cloned(),
+                    from_scene: node
+                        .get("from_scene_reference")
+                        .or_else(|| node.get("from_reference"))
+                        .cloned(),
+                    to_scene: node
+                        .get("to_scene_reference")
+                        .or_else(|| node.get("to_reference"))
+                        .cloned(),
                 })
             })
             .collect();
@@ -768,7 +788,11 @@ impl OcioConfig {
         let active: Vec<&OcioDisplay> = self
             .active_displays
             .iter()
-            .filter_map(|name| self.displays.iter().find(|display| names_match(&display.name, name)))
+            .filter_map(|name| {
+                self.displays
+                    .iter()
+                    .find(|display| names_match(&display.name, name))
+            })
             .collect();
         if active.is_empty() {
             self.displays.iter().collect()
@@ -788,7 +812,12 @@ impl OcioConfig {
         let active: Vec<&OcioView> = self
             .active_views
             .iter()
-            .filter_map(|name| display.views.iter().find(|view| names_match(&view.name, name)))
+            .filter_map(|name| {
+                display
+                    .views
+                    .iter()
+                    .find(|view| names_match(&view.name, name))
+            })
             .collect();
         if active.is_empty() {
             display.views.iter().collect()
@@ -798,12 +827,17 @@ impl OcioConfig {
     }
 
     fn display(&self, name: &str) -> Option<&OcioDisplay> {
-        self.displays.iter().find(|display| names_match(&display.name, name))
+        self.displays
+            .iter()
+            .find(|display| names_match(&display.name, name))
     }
 
     /// Names of every colour space (scene- and display-referred).
     pub fn colorspace_names(&self) -> Vec<&str> {
-        self.colorspaces.iter().map(|space| space.name.as_str()).collect()
+        self.colorspaces
+            .iter()
+            .map(|space| space.name.as_str())
+            .collect()
     }
 
     fn colorspace(&self, name: &str) -> Option<&ColorSpaceDef> {
@@ -812,7 +846,8 @@ impl OcioConfig {
             .get(&name.trim().to_lowercase())
             .map_or(name, String::as_str);
         self.colorspaces.iter().find(|space| {
-            names_match(&space.name, name) || space.aliases.iter().any(|alias| names_match(alias, name))
+            names_match(&space.name, name)
+                || space.aliases.iter().any(|alias| names_match(alias, name))
         })
     }
 
@@ -850,7 +885,11 @@ impl OcioConfig {
 
     // -- compiling ----------------------------------------------------------
 
-    fn to_reference(&self, space: &ColorSpaceDef, depth: usize) -> Result<Vec<Op>, OcioError> {
+    fn space_to_reference(
+        &self,
+        space: &ColorSpaceDef,
+        depth: usize,
+    ) -> Result<Vec<Op>, OcioError> {
         if space.is_data {
             return Ok(Vec::new());
         }
@@ -861,7 +900,11 @@ impl OcioConfig {
         }
     }
 
-    fn from_reference(&self, space: &ColorSpaceDef, depth: usize) -> Result<Vec<Op>, OcioError> {
+    fn reference_to_space(
+        &self,
+        space: &ColorSpaceDef,
+        depth: usize,
+    ) -> Result<Vec<Op>, OcioError> {
         if space.is_data {
             return Ok(Vec::new());
         }
@@ -879,7 +922,11 @@ impl OcioConfig {
             .default_view_transform
             .as_deref()
             .and_then(|name| self.view_transform(name))
-            .or_else(|| self.view_transforms.iter().find(|vt| vt.from_scene.is_some() || vt.to_scene.is_some()));
+            .or_else(|| {
+                self.view_transforms
+                    .iter()
+                    .find(|vt| vt.from_scene.is_some() || vt.to_scene.is_some())
+            });
         match transform {
             Some(transform) => self.view_transform_ops(transform, depth),
             None => Ok(Vec::new()),
@@ -887,10 +934,16 @@ impl OcioConfig {
     }
 
     fn view_transform(&self, name: &str) -> Option<&ViewTransformDef> {
-        self.view_transforms.iter().find(|vt| names_match(&vt.name, name))
+        self.view_transforms
+            .iter()
+            .find(|vt| names_match(&vt.name, name))
     }
 
-    fn view_transform_ops(&self, transform: &ViewTransformDef, depth: usize) -> Result<Vec<Op>, OcioError> {
+    fn view_transform_ops(
+        &self,
+        transform: &ViewTransformDef,
+        depth: usize,
+    ) -> Result<Vec<Op>, OcioError> {
         match (&transform.from_scene, &transform.to_scene) {
             (Some(node), _) => self.compile(node, false, depth + 1),
             (None, Some(node)) => self.compile(node, true, depth + 1),
@@ -915,21 +968,30 @@ impl OcioConfig {
         if source.is_data || target.is_data || source.name == target.name {
             return Ok(Vec::new());
         }
-        let mut ops = self.to_reference(source, depth)?;
+        let mut ops = self.space_to_reference(source, depth)?;
         match (source.display_referred, target.display_referred) {
             (false, true) => ops.extend(self.scene_to_display(depth)?),
             (true, false) => ops.extend(invert_ops(self.scene_to_display(depth)?)?),
             _ => {}
         }
-        ops.extend(self.from_reference(target, depth)?);
+        ops.extend(self.reference_to_space(target, depth)?);
         Ok(ops)
     }
 
     /// Looks named in `looks` (`+a, -b` or `a, b`), applied in the
     /// reference space they are inserted into.
-    fn look_ops(&self, looks: &str, display_referred: bool, depth: usize) -> Result<Vec<Op>, OcioError> {
+    fn look_ops(
+        &self,
+        looks: &str,
+        display_referred: bool,
+        depth: usize,
+    ) -> Result<Vec<Op>, OcioError> {
         let mut ops = Vec::new();
-        for entry in looks.split([',', ':']).map(str::trim).filter(|entry| !entry.is_empty()) {
+        for entry in looks
+            .split([',', ':'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
             let (inverse, name) = match entry.strip_prefix('-') {
                 Some(name) => (true, name.trim()),
                 None => (false, entry.trim_start_matches('+').trim()),
@@ -942,12 +1004,16 @@ impl OcioConfig {
             let space = self
                 .colorspace(&look.process_space)
                 .ok_or_else(|| OcioError::UnknownColorSpace(look.process_space.clone()))?;
-            let mut into = self.from_reference(space, depth)?;
-            let mut back = self.to_reference(space, depth)?;
+            let mut into = self.reference_to_space(space, depth)?;
+            let mut back = self.space_to_reference(space, depth)?;
             if space.display_referred != display_referred {
                 return Err(OcioError::Unsupported(format!(
                     "look `{name}` in a {} process space here",
-                    if space.display_referred { "display-referred" } else { "scene-referred" }
+                    if space.display_referred {
+                        "display-referred"
+                    } else {
+                        "scene-referred"
+                    }
                 )));
             }
             let body = match (inverse, &look.transform, &look.inverse_transform) {
@@ -973,13 +1039,24 @@ impl OcioConfig {
 
     /// The processor showing colour space `input` through `display`'s
     /// `view`.
-    pub fn view_processor(&self, input: &str, display: &str, view: &str) -> Result<OcioProcessor, OcioError> {
+    pub fn view_processor(
+        &self,
+        input: &str,
+        display: &str,
+        view: &str,
+    ) -> Result<OcioProcessor, OcioError> {
         Ok(OcioProcessor {
             ops: self.view_ops(input, display, view, 0)?,
         })
     }
 
-    fn view_ops(&self, input: &str, display: &str, view: &str, depth: usize) -> Result<Vec<Op>, OcioError> {
+    fn view_ops(
+        &self,
+        input: &str,
+        display: &str,
+        view: &str,
+        depth: usize,
+    ) -> Result<Vec<Op>, OcioError> {
         if depth > MAX_DEPTH {
             return Err(OcioError::TooDeep);
         }
@@ -1024,7 +1101,11 @@ impl OcioConfig {
                     "viewing a display-referred colour space through a view transform".into(),
                 ));
             }
-            let mut ops = if source.is_data { Vec::new() } else { self.to_reference(source, depth)? };
+            let mut ops = if source.is_data {
+                Vec::new()
+            } else {
+                self.space_to_reference(source, depth)?
+            };
             if source.is_data {
                 return Ok(ops);
             }
@@ -1032,7 +1113,7 @@ impl OcioConfig {
                 ops.extend(self.look_ops(looks, false, depth)?);
             }
             ops.extend(self.view_transform_ops(transform, depth)?);
-            ops.extend(self.from_reference(target, depth)?);
+            ops.extend(self.reference_to_space(target, depth)?);
             Ok(ops)
         } else {
             let target_name = resolve_display_name(
@@ -1047,7 +1128,7 @@ impl OcioConfig {
             if source.is_data || target.is_data {
                 return Ok(Vec::new());
             }
-            let mut ops = self.to_reference(source, depth)?;
+            let mut ops = self.space_to_reference(source, depth)?;
             match (source.display_referred, target.display_referred) {
                 (false, true) => {
                     if let Some(looks) = &view_def.looks {
@@ -1062,7 +1143,7 @@ impl OcioConfig {
                     }
                 }
             }
-            ops.extend(self.from_reference(target, depth)?);
+            ops.extend(self.reference_to_space(target, depth)?);
             Ok(ops)
         }
     }
@@ -1092,7 +1173,9 @@ impl OcioConfig {
             }
             "MatrixTransform" => {
                 let matrix = numbers("matrix").unwrap_or_else(|| {
-                    vec![1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]
+                    vec![
+                        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                    ]
                 });
                 let offset = numbers("offset").unwrap_or_else(|| vec![0.0; 4]);
                 if matrix.len() != 16 || offset.len() < 3 {
@@ -1108,7 +1191,10 @@ impl OcioConfig {
                 }]
             }
             "ExponentTransform" => {
-                let style = node.get_str("style").unwrap_or("basicFwd").to_ascii_lowercase();
+                let style = node
+                    .get_str("style")
+                    .unwrap_or("basicFwd")
+                    .to_ascii_lowercase();
                 vec![Op::Power {
                     gamma: rgb("value", 1.0)?,
                     mirror: style.contains("mirror") || style.contains("pass"),
@@ -1144,7 +1230,9 @@ impl OcioConfig {
                     None
                 };
                 let linear_slope = match numbers("linear_slope") {
-                    Some(values) => Some(rgb3(&values).ok_or_else(|| parse_error("bad linear_slope"))?),
+                    Some(values) => {
+                        Some(rgb3(&values).ok_or_else(|| parse_error("bad linear_slope"))?)
+                    }
                     None => None,
                 };
                 vec![Op::Log {
@@ -1171,8 +1259,12 @@ impl OcioConfig {
             }
             "RangeTransform" => {
                 let get = |key: &str| node.get(key).and_then(Node::number);
-                let (min_in, max_in, min_out, max_out) =
-                    (get("min_in_value"), get("max_in_value"), get("min_out_value"), get("max_out_value"));
+                let (min_in, max_in, min_out, max_out) = (
+                    get("min_in_value"),
+                    get("max_in_value"),
+                    get("min_out_value"),
+                    get("max_out_value"),
+                );
                 let clamp = !node
                     .get_str("style")
                     .is_some_and(|style| style.to_ascii_lowercase().contains("noclamp"));
@@ -1200,9 +1292,15 @@ impl OcioConfig {
                 ops
             }
             "AllocationTransform" => {
-                let allocation = node.get_str("allocation").unwrap_or("uniform").to_ascii_lowercase();
+                let allocation = node
+                    .get_str("allocation")
+                    .unwrap_or("uniform")
+                    .to_ascii_lowercase();
                 let vars = numbers("vars").unwrap_or_else(|| vec![0.0, 1.0]);
-                let (min, max) = (vars.first().copied().unwrap_or(0.0), vars.get(1).copied().unwrap_or(1.0));
+                let (min, max) = (
+                    vars.first().copied().unwrap_or(0.0),
+                    vars.get(1).copied().unwrap_or(1.0),
+                );
                 let mut ops = Vec::new();
                 if allocation == "lg2" {
                     let offset = vars.get(2).copied().unwrap_or(0.0);
@@ -1232,14 +1330,18 @@ impl OcioConfig {
                 let src = node
                     .get_str("src")
                     .ok_or_else(|| parse_error("FileTransform needs src"))?;
-                let path = self
-                    .file_path(src)
-                    .ok_or_else(|| OcioError::Io(format!("LUT file {src} was not found on the search path")))?;
+                let path = self.file_path(src).ok_or_else(|| {
+                    OcioError::Io(format!("LUT file {src} was not found on the search path"))
+                })?;
                 luts::read(&path)?
             }
             "ColorSpaceTransform" => {
-                let src = node.get_str("src").ok_or_else(|| parse_error("ColorSpaceTransform needs src"))?;
-                let dst = node.get_str("dst").ok_or_else(|| parse_error("ColorSpaceTransform needs dst"))?;
+                let src = node
+                    .get_str("src")
+                    .ok_or_else(|| parse_error("ColorSpaceTransform needs src"))?;
+                let dst = node
+                    .get_str("dst")
+                    .ok_or_else(|| parse_error("ColorSpaceTransform needs dst"))?;
                 self.colorspace_ops(src, dst, depth + 1)?
             }
             "DisplayViewTransform" => {
@@ -1250,17 +1352,23 @@ impl OcioConfig {
                 self.view_ops(get("src")?, get("display")?, get("view")?, depth + 1)?
             }
             "LookTransform" => {
-                let src = node.get_str("src").ok_or_else(|| parse_error("LookTransform needs src"))?;
+                let src = node
+                    .get_str("src")
+                    .ok_or_else(|| parse_error("LookTransform needs src"))?;
                 let dst = node.get_str("dst").unwrap_or(src);
                 let source = self
                     .colorspace(src)
                     .ok_or_else(|| OcioError::UnknownColorSpace(src.to_owned()))?;
-                let mut ops = self.to_reference(source, depth)?;
-                ops.extend(self.look_ops(node.get_str("looks").unwrap_or_default(), source.display_referred, depth)?);
+                let mut ops = self.space_to_reference(source, depth)?;
+                ops.extend(self.look_ops(
+                    node.get_str("looks").unwrap_or_default(),
+                    source.display_referred,
+                    depth,
+                )?);
                 let target = self
                     .colorspace(dst)
                     .ok_or_else(|| OcioError::UnknownColorSpace(dst.to_owned()))?;
-                ops.extend(self.from_reference(target, depth)?);
+                ops.extend(self.reference_to_space(target, depth)?);
                 ops
             }
             "BuiltinTransform" => {
@@ -1279,7 +1387,13 @@ impl OcioConfig {
     /// is the display-encoded sRGB image of linear Rec.709 light exposed
     /// [`OCIO_HEADROOM_STOPS`] darker and clipped at white (the renderer's
     /// Linear view), read as colour space `input`.
-    pub fn bake_view(&self, input: &str, display: &str, view: &str, size: usize) -> Result<CubeLut, OcioError> {
+    pub fn bake_view(
+        &self,
+        input: &str,
+        display: &str,
+        view: &str,
+        size: usize,
+    ) -> Result<CubeLut, OcioError> {
         let processor = self.view_processor(input, display, view)?;
         let size = size.clamp(2, MAX_CUBE_LUT_SIZE);
         let headroom = f64::from(2.0_f32.powf(OCIO_HEADROOM_STOPS));
@@ -1291,9 +1405,9 @@ impl OcioConfig {
                     let encoded = [r, g, b].map(|i| srgb_to_linear(i as f32 / last));
                     let scene = encoded.map(|value| f64::from(value) * headroom);
                     let out = processor.apply(scene);
-                    data.push(Vec3::from_array(out.map(|value| {
-                        if value.is_finite() { value as f32 } else { 0.0 }
-                    })));
+                    data.push(Vec3::from_array(
+                        out.map(|value| if value.is_finite() { value as f32 } else { 0.0 }),
+                    ));
                 }
             }
         }
@@ -1316,9 +1430,13 @@ mod luts {
             .map_err(|error| OcioError::Io(format!("{}: {error}", path.display())))?
             .len();
         if size > MAX_OCIO_LUT_BYTES {
-            return Err(OcioError::Io(format!("{}: the LUT is too large", path.display())));
+            return Err(OcioError::Io(format!(
+                "{}: the LUT is too large",
+                path.display()
+            )));
         }
-        std::fs::read_to_string(path).map_err(|error| OcioError::Io(format!("{}: {error}", path.display())))
+        std::fs::read_to_string(path)
+            .map_err(|error| OcioError::Io(format!("{}: {error}", path.display())))
     }
 
     fn numbers_of(line: &str, path: &Path) -> Result<Vec<f64>, OcioError> {
@@ -1327,7 +1445,9 @@ mod luts {
                 word.parse::<f64>()
                     .ok()
                     .filter(|value| value.is_finite())
-                    .ok_or_else(|| parse_error(format!("{}: `{word}` is not a number", path.display())))
+                    .ok_or_else(|| {
+                        parse_error(format!("{}: `{word}` is not a number", path.display()))
+                    })
             })
             .collect()
     }
@@ -1344,7 +1464,10 @@ mod luts {
             "spi1d" => spi1d(&text, path),
             "spi3d" => spi3d(&text, path),
             "spimtx" => spimtx(&text, path),
-            other => Err(OcioError::Unsupported(format!("the .{other} LUT format ({})", path.display()))),
+            other => Err(OcioError::Unsupported(format!(
+                "the .{other} LUT format ({})",
+                path.display()
+            ))),
         }
     }
 
@@ -1370,15 +1493,25 @@ mod luts {
                 "TITLE" => {}
                 "LUT_1D_SIZE" => size_1d = rest()?.first().map(|v| *v as usize),
                 "LUT_3D_SIZE" => size_3d = rest()?.first().map(|v| *v as usize),
-                "DOMAIN_MIN" => domain_min = rgb3(&rest()?).ok_or_else(|| parse_error("bad DOMAIN_MIN"))?,
-                "DOMAIN_MAX" => domain_max = rgb3(&rest()?).ok_or_else(|| parse_error("bad DOMAIN_MAX"))?,
+                "DOMAIN_MIN" => {
+                    domain_min = rgb3(&rest()?).ok_or_else(|| parse_error("bad DOMAIN_MIN"))?
+                }
+                "DOMAIN_MAX" => {
+                    domain_max = rgb3(&rest()?).ok_or_else(|| parse_error("bad DOMAIN_MAX"))?
+                }
                 "LUT_1D_INPUT_RANGE" => {
                     let values = rest()?;
-                    range_1d = (values.first().copied().unwrap_or(0.0), values.get(1).copied().unwrap_or(1.0));
+                    range_1d = (
+                        values.first().copied().unwrap_or(0.0),
+                        values.get(1).copied().unwrap_or(1.0),
+                    );
                 }
                 "LUT_3D_INPUT_RANGE" => {
                     let values = rest()?;
-                    range_3d = Some((values.first().copied().unwrap_or(0.0), values.get(1).copied().unwrap_or(1.0)));
+                    range_3d = Some((
+                        values.first().copied().unwrap_or(0.0),
+                        values.get(1).copied().unwrap_or(1.0),
+                    ));
                 }
                 _ if keyword.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.') => {
                     let values = numbers_of(line, path)?;
@@ -1394,7 +1527,10 @@ mod luts {
         let mut rows = rows.as_slice();
         if let Some(size) = size_1d {
             if size < 2 || rows.len() < size {
-                return Err(parse_error(format!("{}: too few 1D entries", path.display())));
+                return Err(parse_error(format!(
+                    "{}: too few 1D entries",
+                    path.display()
+                )));
             }
             let domain = if size_3d.is_some() {
                 range_1d
@@ -1410,7 +1546,11 @@ mod luts {
         }
         if let Some(size) = size_3d {
             if size < 2 || rows.len() != size * size * size {
-                return Err(parse_error(format!("{}: expected {} 3D entries", path.display(), size * size * size)));
+                return Err(parse_error(format!(
+                    "{}: expected {} 3D entries",
+                    path.display(),
+                    size * size * size
+                )));
             }
             let (min, max) = match (range_3d, size_1d) {
                 (Some((low, high)), _) => ([low; 3], [high; 3]),
@@ -1459,16 +1599,24 @@ mod luts {
             match words.next().unwrap_or_default() {
                 "From" => {
                     let values = numbers_of(&line[4..], path)?;
-                    domain = (values.first().copied().unwrap_or(0.0), values.get(1).copied().unwrap_or(1.0));
+                    domain = (
+                        values.first().copied().unwrap_or(0.0),
+                        values.get(1).copied().unwrap_or(1.0),
+                    );
                 }
-                "Components" => components = words.next().and_then(|word| word.parse().ok()).unwrap_or(1),
+                "Components" => {
+                    components = words.next().and_then(|word| word.parse().ok()).unwrap_or(1)
+                }
                 "Length" => length = words.next().and_then(|word| word.parse::<usize>().ok()),
                 "{" => in_values = true,
                 _ => {}
             }
         }
         if rows.len() < 2 || length.is_some_and(|length| length != rows.len()) {
-            return Err(parse_error(format!("{}: the table length does not match", path.display())));
+            return Err(parse_error(format!(
+                "{}: the table length does not match",
+                path.display()
+            )));
         }
         Ok(vec![Op::Lut1d {
             table: Arc::new(rows),
@@ -1488,27 +1636,45 @@ mod luts {
         let sizes = numbers_of(lines.next().unwrap_or_default(), path)?;
         let size = match sizes.as_slice() {
             [a, b, c] if a == b && b == c && *a >= 2.0 => *a as usize,
-            _ => return Err(OcioError::Unsupported(format!("non-cubic .spi3d ({})", path.display()))),
+            _ => {
+                return Err(OcioError::Unsupported(format!(
+                    "non-cubic .spi3d ({})",
+                    path.display()
+                )));
+            }
         };
         if size > MAX_CUBE_LUT_SIZE {
-            return Err(parse_error(format!("{}: the LUT is too large", path.display())));
+            return Err(parse_error(format!(
+                "{}: the LUT is too large",
+                path.display()
+            )));
         }
         let mut data = vec![[0.0; 3]; size * size * size];
         let mut filled = 0;
         for line in lines {
             let values = numbers_of(line, path)?;
             let [r, g, b, red, green, blue] = values[..] else {
-                return Err(parse_error(format!("{}: expected six values per row", path.display())));
+                return Err(parse_error(format!(
+                    "{}: expected six values per row",
+                    path.display()
+                )));
             };
             let (r, g, b) = (r as usize, g as usize, b as usize);
             if r >= size || g >= size || b >= size {
-                return Err(parse_error(format!("{}: an index is out of range", path.display())));
+                return Err(parse_error(format!(
+                    "{}: an index is out of range",
+                    path.display()
+                )));
             }
             data[r + size * (g + size * b)] = [red, green, blue];
             filled += 1;
         }
         if filled != size * size * size {
-            return Err(parse_error(format!("{}: expected {} entries", path.display(), size * size * size)));
+            return Err(parse_error(format!(
+                "{}: expected {} entries",
+                path.display(),
+                size * size * size
+            )));
         }
         Ok(vec![Op::Lut3d {
             size,
@@ -1523,7 +1689,10 @@ mod luts {
     pub fn spimtx(text: &str, path: &Path) -> Result<Vec<Op>, OcioError> {
         let values = numbers_of(&text.split_whitespace().collect::<Vec<_>>().join(" "), path)?;
         if values.len() != 12 {
-            return Err(parse_error(format!("{}: expected 12 values", path.display())));
+            return Err(parse_error(format!(
+                "{}: expected 12 values",
+                path.display()
+            )));
         }
         Ok(vec![Op::Matrix {
             m: [
@@ -1531,7 +1700,11 @@ mod luts {
                 [values[4], values[5], values[6]],
                 [values[8], values[9], values[10]],
             ],
-            offset: [values[3] / 65535.0, values[7] / 65535.0, values[11] / 65535.0],
+            offset: [
+                values[3] / 65535.0,
+                values[7] / 65535.0,
+                values[11] / 65535.0,
+            ],
         }])
     }
 }
@@ -1586,11 +1759,17 @@ pub(crate) mod builtin {
     ];
 
     fn matrix(m: [[f64; 3]; 3]) -> Op {
-        Op::Matrix { m, offset: [0.0; 3] }
+        Op::Matrix {
+            m,
+            offset: [0.0; 3],
+        }
     }
 
     fn ap0_to_ap1() -> [[f64; 3]; 3] {
-        mat_product(&super::mat_inverse(&AP1_TO_XYZ).unwrap_or(IDENTITY), &AP0_TO_XYZ)
+        mat_product(
+            &super::mat_inverse(&AP1_TO_XYZ).unwrap_or(IDENTITY),
+            &AP0_TO_XYZ,
+        )
     }
 
     /// ACEScct (log) to linear AP1.
@@ -1646,7 +1825,9 @@ pub(crate) mod builtin {
         let xyz_d65_from_ap1 = mat_product(&D60_TO_D65, &AP1_TO_XYZ);
         Ok(match key {
             "IDENTITY" => Vec::new(),
-            "ACESCG_TO_ACES2065-1" => vec![matrix(super::mat_inverse(&ap0_to_ap1()).unwrap_or(IDENTITY))],
+            "ACESCG_TO_ACES2065-1" => vec![matrix(
+                super::mat_inverse(&ap0_to_ap1()).unwrap_or(IDENTITY),
+            )],
             "ACESCCT_TO_ACES2065-1" => vec![
                 acescct_to_lin(),
                 matrix(super::mat_inverse(&ap0_to_ap1()).unwrap_or(IDENTITY)),
@@ -1660,25 +1841,47 @@ pub(crate) mod builtin {
             "ACES-AP1_TO_LINEAR-REC709_BFD" => {
                 vec![matrix(mat_product(&XYZ_TO_REC709, &xyz_d65_from_ap1))]
             }
-            "DISPLAY - CIE-XYZ-D65_TO_SRGB" => vec![matrix(XYZ_TO_REC709), Op::Clamp { min: Some(0.0), max: None }, srgb_encode()],
+            "DISPLAY - CIE-XYZ-D65_TO_SRGB" => vec![
+                matrix(XYZ_TO_REC709),
+                Op::Clamp {
+                    min: Some(0.0),
+                    max: None,
+                },
+                srgb_encode(),
+            ],
             "DISPLAY - CIE-XYZ-D65_TO_REC.1886-REC.709" => {
                 vec![matrix(XYZ_TO_REC709), gamma_encode(2.4)]
             }
             "DISPLAY - CIE-XYZ-D65_TO_REC.1886-REC.2020" => {
                 vec![matrix(XYZ_TO_REC2020), gamma_encode(2.4)]
             }
-            "DISPLAY - CIE-XYZ-D65_TO_G2.2-REC.709" => vec![matrix(XYZ_TO_REC709), gamma_encode(2.2)],
-            "DISPLAY - CIE-XYZ-D65_TO_DISPLAYP3" => {
-                vec![matrix(XYZ_TO_P3_D65), Op::Clamp { min: Some(0.0), max: None }, srgb_encode()]
+            "DISPLAY - CIE-XYZ-D65_TO_G2.2-REC.709" => {
+                vec![matrix(XYZ_TO_REC709), gamma_encode(2.2)]
             }
-            "DISPLAY - CIE-XYZ-D65_TO_G2.6-P3-D65" => vec![matrix(XYZ_TO_P3_D65), gamma_encode(2.6)],
+            "DISPLAY - CIE-XYZ-D65_TO_DISPLAYP3" => {
+                vec![
+                    matrix(XYZ_TO_P3_D65),
+                    Op::Clamp {
+                        min: Some(0.0),
+                        max: None,
+                    },
+                    srgb_encode(),
+                ]
+            }
+            "DISPLAY - CIE-XYZ-D65_TO_G2.6-P3-D65" => {
+                vec![matrix(XYZ_TO_P3_D65), gamma_encode(2.6)]
+            }
             "ACES-OUTPUT - ACES2065-1_TO_CIE-XYZ-D65 - SDR-VIDEO_1.0" => {
                 vec![Op::AcesOutput(AcesOutput::Video)]
             }
             "ACES-OUTPUT - ACES2065-1_TO_CIE-XYZ-D65 - SDR-CINEMA_1.0" => {
                 vec![Op::AcesOutput(AcesOutput::Cinema)]
             }
-            _ => return Err(OcioError::Unsupported(format!("the built-in transform `{style}`"))),
+            _ => {
+                return Err(OcioError::Unsupported(format!(
+                    "the built-in transform `{style}`"
+                )));
+            }
         })
     }
 
@@ -1694,15 +1897,45 @@ pub(crate) mod builtin {
     // Segmented spline coefficients of the ACES 1.0 reference rendering
     // transform (C5) and 48-nit output tone scale (C9), from the ACES
     // reference implementation.
-    const C5_LOW: [f64; 6] = [-4.0, -4.0, -3.157_376_577_3, -0.485_249_995_8, 1.847_732_470_6, 1.847_732_470_6];
-    const C5_HIGH: [f64; 6] = [-0.718_548_242_5, 2.081_030_717_2, 3.668_124_123_7, 4.0, 4.0, 4.0];
+    const C5_LOW: [f64; 6] = [
+        -4.0,
+        -4.0,
+        -3.157_376_577_3,
+        -0.485_249_995_8,
+        1.847_732_470_6,
+        1.847_732_470_6,
+    ];
+    const C5_HIGH: [f64; 6] = [
+        -0.718_548_242_5,
+        2.081_030_717_2,
+        3.668_124_123_7,
+        4.0,
+        4.0,
+        4.0,
+    ];
     const C9_LOW: [f64; 10] = [
-        -1.698_970_004_3, -1.698_970_004_3, -1.477_9, -1.229_1, -0.864_8, -0.448, 0.005_18,
-        0.451_108_033_4, 0.911_374_441_4, 0.911_374_441_4,
+        -1.698_970_004_3,
+        -1.698_970_004_3,
+        -1.477_9,
+        -1.229_1,
+        -0.864_8,
+        -0.448,
+        0.005_18,
+        0.451_108_033_4,
+        0.911_374_441_4,
+        0.911_374_441_4,
     ];
     const C9_HIGH: [f64; 10] = [
-        0.515_438_696_5, 0.847_043_778_3, 1.135_8, 1.380_2, 1.519_7, 1.598_5, 1.646_7,
-        1.674_609_135_7, 1.687_873_339, 1.687_873_339,
+        0.515_438_696_5,
+        0.847_043_778_3,
+        1.135_8,
+        1.380_2,
+        1.519_7,
+        1.598_5,
+        1.646_7,
+        1.674_609_135_7,
+        1.687_873_339,
+        1.687_873_339,
     ];
     const M: [[f64; 3]; 3] = [[0.5, -1.0, 0.5], [-1.0, 1.0, 0.5], [0.5, 0.0, 0.0]];
 
@@ -1902,7 +2135,10 @@ pub(crate) mod builtin {
                 } else {
                     [0.0, luma, 0.0]
                 };
-                linear = mat_mul(&super::mat_inverse(&AP1_TO_XYZ).unwrap_or(IDENTITY), adjusted);
+                linear = mat_mul(
+                    &super::mat_inverse(&AP1_TO_XYZ).unwrap_or(IDENTITY),
+                    adjusted,
+                );
                 linear = mat_mul(&saturation_matrix(0.93, luminance), linear);
             }
             mat_mul(&mat_product(&D60_TO_D65, &AP1_TO_XYZ), linear)
@@ -1990,35 +2226,53 @@ display_colorspaces:
         let config = OcioConfig::load(write_config(folder.path())).unwrap();
         let displays: Vec<&str> = config.displays().iter().map(|d| d.name.as_str()).collect();
         assert_eq!(displays, ["sRGB", "Rec.1886"]);
-        let views: Vec<&str> = config.views("sRGB").iter().map(|v| v.name.as_str()).collect();
+        let views: Vec<&str> = config
+            .views("sRGB")
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
         assert_eq!(views, ["Standard", "Graded", "Film", "Raw"]);
         assert_eq!(config.linear_rec709_space(), Some("Linear Rec.709"));
 
         // sRGB view: linear 0.18 encodes to the sRGB curve's 0.4613.
-        let srgb = config.view_processor("lin_rec709", "sRGB", "Standard").unwrap();
+        let srgb = config
+            .view_processor("lin_rec709", "sRGB", "Standard")
+            .unwrap();
         let grey = srgb.apply([0.18; 3]);
         assert!(close(grey, [0.461_356; 3], 1e-4), "{grey:?}");
         assert!(close(srgb.apply([0.002; 3]), [0.002 * 12.92; 3], 1e-4));
         // Roles resolve too.
-        assert!(config.view_processor("scene_linear", "sRGB", "Standard").is_ok());
+        assert!(
+            config
+                .view_processor("scene_linear", "sRGB", "Standard")
+                .is_ok()
+        );
 
         // A look applies in its process space before the display.
-        let graded = config.view_processor("Linear Rec.709", "sRGB", "Graded").unwrap();
+        let graded = config
+            .view_processor("Linear Rec.709", "sRGB", "Graded")
+            .unwrap();
         let warm = graded.apply([0.18; 3]);
         assert!(warm[0] > grey[0] && warm[2] < grey[2]);
 
         // A log curve followed by a LUT file found on the search path.
-        let film = config.view_processor("Linear Rec.709", "sRGB", "Film").unwrap();
+        let film = config
+            .view_processor("Linear Rec.709", "sRGB", "Film")
+            .unwrap();
         let expected = (0.1 * 0.18_f64.log2() + 0.6) * 0.5;
         assert!(close(film.apply([0.18; 3]), [expected; 3], 1e-6));
 
         // Data passes through untouched.
-        let raw = config.view_processor("Linear Rec.709", "sRGB", "Raw").unwrap();
+        let raw = config
+            .view_processor("Linear Rec.709", "sRGB", "Raw")
+            .unwrap();
         assert!(raw.is_identity());
 
         // A v2 view transform with a display colour space, from ACEScg:
         // white stays white.
-        let video = config.view_processor("ACEScg", "Rec.1886", "Standard").unwrap();
+        let video = config
+            .view_processor("ACEScg", "Rec.1886", "Standard")
+            .unwrap();
         let white = video.apply([1.0; 3]);
         assert!(close(white, [1.0; 3], 2e-3), "{white:?}");
 
@@ -2031,7 +2285,10 @@ display_colorspaces:
             config.view_processor("ACEScg", "sRGB", "Nope"),
             Err(OcioError::UnknownView { .. })
         ));
-        let odd = CONFIG.replace("!<CDLTransform> {slope: [1.2, 1, 0.8]}", "!<GradingToneTransform> {}");
+        let odd = CONFIG.replace(
+            "!<CDLTransform> {slope: [1.2, 1, 0.8]}",
+            "!<GradingToneTransform> {}",
+        );
         let odd = OcioConfig::parse(&odd, &folder.path().join("config.ocio")).unwrap();
         assert!(matches!(
             odd.view_processor("Linear Rec.709", "sRGB", "Graded"),
@@ -2041,7 +2298,9 @@ display_colorspaces:
 
         // Baked views follow the renderer's input: encoded sRGB of light
         // exposed down by the headroom.
-        let lut = config.bake_view("Linear Rec.709", "sRGB", "Standard", 33).unwrap();
+        let lut = config
+            .bake_view("Linear Rec.709", "sRGB", "Standard", 33)
+            .unwrap();
         assert_eq!(lut.size, 33);
         let headroom = 2f32.powf(OCIO_HEADROOM_STOPS);
         let input = substancecraft_core::color::linear_to_srgb(0.18 / headroom);
@@ -2128,12 +2387,20 @@ display_colorspaces:
         let ops = luts::cube(shaper, path).unwrap();
         assert_eq!(ops.len(), 2);
         let processor = OcioProcessor { ops };
-        assert!(close(processor.apply([1.0, 0.5, 0.0]), [0.5, 0.25, 0.0], 1e-9));
+        assert!(close(
+            processor.apply([1.0, 0.5, 0.0]),
+            [0.5, 0.25, 0.0],
+            1e-9
+        ));
         assert!(luts::cube("LUT_3D_SIZE 2\n0 0 0\n", path).is_err());
         let spi3d = "SPILUT 1.0\n3 3\n2 2 2\n0 0 0 0 0 0\n1 0 0 1 0 0\n0 1 0 0 1 0\n1 1 0 1 1 0\n\
                      0 0 1 0 0 1\n1 0 1 1 0 1\n0 1 1 0 1 1\n1 1 1 1 1 1\n";
         let ops = luts::spi3d(spi3d, Path::new("t.spi3d")).unwrap();
-        assert!(close(ops[0].apply([0.25, 0.5, 0.75]), [0.25, 0.5, 0.75], 1e-9));
+        assert!(close(
+            ops[0].apply([0.25, 0.5, 0.75]),
+            [0.25, 0.5, 0.75],
+            1e-9
+        ));
         let ops = luts::spimtx("2 0 0 0\n0 2 0 0\n0 0 2 65535\n", Path::new("m.spimtx")).unwrap();
         assert!(close(ops[0].apply([0.5; 3]), [1.0, 1.0, 2.0], 1e-9));
     }

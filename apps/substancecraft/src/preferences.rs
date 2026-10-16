@@ -277,6 +277,12 @@ pub struct Preferences {
     pub display_lut: Option<PathBuf>,
     /// Folder of the shared asset library; `None` uses the default.
     pub shared_library: Option<PathBuf>,
+    /// OpenColorIO config, display, and view grading the viewport.
+    pub ocio: Option<crate::ocio_view::OcioChoice>,
+    /// Panel layouts saved by name.
+    pub layouts: Vec<crate::layouts::PanelLayout>,
+    /// The panel arrangement in use, restored next session.
+    pub window_layout: Option<crate::layouts::PanelLayout>,
 }
 
 impl Default for Preferences {
@@ -299,6 +305,9 @@ impl Default for Preferences {
             exposure: 0.0,
             display_lut: None,
             shared_library: None,
+            ocio: None,
+            layouts: Vec::new(),
+            window_layout: None,
         }
     }
 }
@@ -421,6 +430,8 @@ impl SubstanceCraftApp {
         self.preferences.path = Some(path);
         self.restore_custom_environment();
         self.restore_display_lut();
+        self.restore_ocio_view();
+        self.restore_layout();
         self.refresh_user_shaders();
     }
 
@@ -736,6 +747,7 @@ impl SubstanceCraftApp {
 
     /// The Preferences drawer: UI scale and key bindings.
     pub(super) fn preferences_drawer(&mut self, ui: &mut Ui) {
+        self.layouts_section(ui);
         widgets::caption(ui, "Interface scale");
         let mut scale = self.preferences.values.ui_scale;
         widgets::property_row(ui, "Scale", |ui| {

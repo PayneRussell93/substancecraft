@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{
     AssetEntry, AssetKind, AssetOrigin, ColorSpace, EnvironmentResource, ExportPreset,
-    FilterPreset, GeneratorPreset, MaterialProject, MaterialResource, ProjectResource,
-    ResourceId, ResourceProvenance, SmartMask, SmartMaterial,
+    FilterPreset, GeneratorPreset, MaterialProject, MaterialResource, ProjectResource, ResourceId,
+    ResourceProvenance, SmartMask, SmartMaterial,
 };
 use thiserror::Error;
 
@@ -75,8 +75,8 @@ fn first_resource() -> ResourceId {
 #[serde(tag = "kind", content = "asset", rename_all = "snake_case")]
 pub enum LibraryAsset {
     Bitmap(SharedBitmap),
-    Material(MaterialResource),
-    SmartMaterial(SmartMaterial),
+    Material(Box<MaterialResource>),
+    SmartMaterial(Box<SmartMaterial>),
     SmartMask(SmartMask),
     Filter(FilterPreset),
     Generator(GeneratorPreset),
@@ -149,7 +149,9 @@ impl LibraryAsset {
                 resources.dedup();
                 resources
             }
-            Self::SmartMaterial(material) => material.requirements().resources.into_iter().collect(),
+            Self::SmartMaterial(material) => {
+                material.requirements().resources.into_iter().collect()
+            }
             Self::SmartMask(mask) => mask.requirements().resources.into_iter().collect(),
             _ => Vec::new(),
         }
@@ -174,7 +176,8 @@ impl LibraryAsset {
     }
 
     pub fn validate(&self) -> Result<(), SharedLibraryError> {
-        let invalid = |error: &dyn std::fmt::Display| SharedLibraryError::Invalid(error.to_string());
+        let invalid =
+            |error: &dyn std::fmt::Display| SharedLibraryError::Invalid(error.to_string());
         match self {
             Self::Bitmap(bitmap) => {
                 if bitmap.name.trim().is_empty() || bitmap.file.trim().is_empty() {
@@ -238,8 +241,11 @@ pub struct SharedLibrary {
 /// `~/.local/share/substancecraft/library`) elsewhere.
 pub fn default_shared_library_root() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(|appdata| PathBuf::from(appdata).join("SubstanceCraft").join("Library"))
+        std::env::var_os("APPDATA").map(|appdata| {
+            PathBuf::from(appdata)
+                .join("SubstanceCraft")
+                .join("Library")
+        })
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -288,7 +294,8 @@ fn same_name(a: &str, b: &str) -> bool {
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SharedLibraryError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| io(parent, error))?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| io(parent, error))?;
     temporary
         .write_all(bytes)
         .and_then(|()| temporary.as_file().sync_all())
@@ -412,7 +419,10 @@ impl SharedLibrary {
 
     /// Index entries of every library asset, for search.
     pub fn asset_entries(&self) -> Vec<AssetEntry> {
-        self.entries.iter().map(|entry| entry.asset.entry()).collect()
+        self.entries
+            .iter()
+            .map(|entry| entry.asset.entry())
+            .collect()
     }
 
     /// The asset of `kind` named `name` (ignoring case).
@@ -445,7 +455,8 @@ impl SharedLibrary {
         if !target.exists() {
             let folder = self.root.join(FILES_DIR);
             std::fs::create_dir_all(&folder).map_err(|error| io(&folder, error))?;
-            let temporary = tempfile::NamedTempFile::new_in(&folder).map_err(|error| io(&folder, error))?;
+            let temporary =
+                tempfile::NamedTempFile::new_in(&folder).map_err(|error| io(&folder, error))?;
             std::fs::copy(source, temporary.path()).map_err(|error| io(source, error))?;
             temporary
                 .persist(&target)
@@ -584,7 +595,10 @@ impl SharedLibrary {
         match &mut asset {
             LibraryAsset::Bitmap(bitmap) => resources.push(new_resource(bitmap)),
             LibraryAsset::Environment(environment) => {
-                environment.source = self.resolve(&environment.source).to_string_lossy().into_owned();
+                environment.source = self
+                    .resolve(&environment.source)
+                    .to_string_lossy()
+                    .into_owned();
             }
             _ => {
                 let mut ids = BTreeMap::new();
@@ -601,7 +615,11 @@ impl SharedLibrary {
 }
 
 fn stored_files(entry: &SharedEntry) -> Vec<String> {
-    let mut files: Vec<String> = entry.bitmaps.iter().map(|bitmap| bitmap.file.clone()).collect();
+    let mut files: Vec<String> = entry
+        .bitmaps
+        .iter()
+        .map(|bitmap| bitmap.file.clone())
+        .collect();
     match &entry.asset {
         LibraryAsset::Bitmap(bitmap) => files.push(bitmap.file.clone()),
         LibraryAsset::Environment(environment) => files.push(environment.source.clone()),
@@ -638,13 +656,13 @@ pub fn add_imported_asset(project: &mut MaterialProject, asset: LibraryAsset) ->
                     + 1,
             );
             let name = material.name.clone();
-            project.materials.push(material);
+            project.materials.push(*material);
             Some(name)
         }
         LibraryAsset::SmartMaterial(mut material) => {
             material.name = unique(&project.smart_materials, &material.name, |m| &m.name);
             let name = material.name.clone();
-            project.smart_materials.push(material);
+            project.smart_materials.push(*material);
             Some(name)
         }
         LibraryAsset::SmartMask(mut mask) => {
@@ -688,7 +706,11 @@ pub fn add_imported_asset(project: &mut MaterialProject, asset: LibraryAsset) ->
 
 /// The project asset of `kind` named `name` as a library asset, ready for
 /// [`SharedLibrary::save`]. Built-in assets are offered by name too.
-pub fn project_asset(project: &MaterialProject, kind: AssetKind, name: &str) -> Option<LibraryAsset> {
+pub fn project_asset(
+    project: &MaterialProject,
+    kind: AssetKind,
+    name: &str,
+) -> Option<LibraryAsset> {
     let pick = |candidates: Vec<LibraryAsset>| {
         candidates
             .into_iter()
@@ -717,7 +739,7 @@ pub fn project_asset(project: &MaterialProject, kind: AssetKind, name: &str) -> 
                 .chain(MaterialResource::built_in())
                 .map(|mut material| {
                     material.id = substancecraft_core::MaterialId::UNASSIGNED;
-                    LibraryAsset::Material(material)
+                    LibraryAsset::Material(Box::new(material))
                 })
                 .collect(),
         ),
@@ -727,7 +749,7 @@ pub fn project_asset(project: &MaterialProject, kind: AssetKind, name: &str) -> 
                 .iter()
                 .cloned()
                 .chain(SmartMaterial::built_in())
-                .map(LibraryAsset::SmartMaterial)
+                .map(|material| LibraryAsset::SmartMaterial(Box::new(material)))
                 .collect(),
         ),
         AssetKind::SmartMask => pick(
@@ -830,10 +852,18 @@ mod tests {
         let mut library = SharedLibrary::open(&root);
         assert!(library.entries().is_empty(), "a missing folder is empty");
         library
-            .save(LibraryAsset::SmartMask(mask.clone()), &project, Some(&project_dir))
+            .save(
+                LibraryAsset::SmartMask(mask.clone()),
+                &project,
+                Some(&project_dir),
+            )
             .unwrap();
         library
-            .save(LibraryAsset::Material(material), &project, Some(&project_dir))
+            .save(
+                LibraryAsset::Material(Box::new(material)),
+                &project,
+                Some(&project_dir),
+            )
             .unwrap();
         library
             .save(
@@ -947,7 +977,7 @@ mod tests {
         let mut dangling = MaterialResource::built_in().remove(0);
         dangling.fill.textures.base_color = Some(ResourceId(40));
         assert!(matches!(
-            library.save(LibraryAsset::Material(dangling), &project, None),
+            library.save(LibraryAsset::Material(Box::new(dangling)), &project, None),
             Err(SharedLibraryError::MissingResource(ResourceId(40)))
         ));
     }

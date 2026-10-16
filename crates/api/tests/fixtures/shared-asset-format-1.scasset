@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "kind": "filter",
+  "asset": {
+    "name": "Release 1 soften",
+    "description": "A blur saved by the first release of the shared library format.",
+    "filters": [{ "Blur": { "radius": 2.0 } }],
+    "provenance": { "author": "SubstanceCraft", "license": "CC0-1.0", "origin": "Fixture" },
+    "tags": ["blur"]
+  }
+}

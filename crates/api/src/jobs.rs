@@ -378,7 +378,11 @@ fn convert_colour_output(
         };
         let out = processor.apply(encoded.map(decode));
         for (c, value) in out.into_iter().enumerate() {
-            let value = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
+            let value = if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             file.texture.rgba8[texel * 4 + c] = (value * 255.0).round() as u8;
             if let Some(samples) = &mut file.rgba16 {
                 samples[texel * 4 + c] = (value * 65535.0).round() as u16;

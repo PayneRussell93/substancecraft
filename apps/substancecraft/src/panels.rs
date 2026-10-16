@@ -30,7 +30,6 @@ use crate::theme;
 use crate::widgets;
 
 const DRAWER_WIDTH: f32 = 284.0;
-const INSPECTOR_WIDTH: f32 = 296.0;
 /// Vertical space kept free above the bottom edge for the status pill.
 const STATUS_RESERVE: f32 = 56.0;
 const MODES: [(PaintMode, &str); 6] = [
@@ -49,7 +48,7 @@ const VIEW_MODES: [(ViewMode, &str); 3] = [
 const MESH_MAP_RESOLUTIONS: [u32; 4] = [256, 512, 1024, 2048];
 pub(super) const WARNING: Color32 = Color32::from_rgb(240, 180, 80);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Drawer {
     Scene,
     Brush,
@@ -118,6 +117,10 @@ impl Drawer {
 pub struct OverlayLayout {
     toolbar_width: f32,
     dock_width: f32,
+    /// Share of the central area the 3D view takes in Split view.
+    pub split: f32,
+    /// Width of the inspector column, in points.
+    pub inspector_width: f32,
 }
 
 impl Default for OverlayLayout {
@@ -125,6 +128,8 @@ impl Default for OverlayLayout {
         Self {
             toolbar_width: 520.0,
             dock_width: 66.0,
+            split: 0.5,
+            inspector_width: crate::layouts::DEFAULT_INSPECTOR_WIDTH,
         }
     }
 }
@@ -394,7 +399,7 @@ impl SubstanceCraftApp {
 
         let left = brand.right() + theme::GAP;
         let inspector = if self.show_inspector {
-            INSPECTOR_WIDTH + theme::GAP
+            self.layout.inspector_width + theme::GAP
         } else {
             0.0
         };
@@ -1317,6 +1322,41 @@ impl SubstanceCraftApp {
             "Click adds to the selected layer's polygon mask, Shift-click removes. Drag to \
              orbit.",
         );
+        widgets::caption(ui, "Visibility");
+        let hidden = self.hidden_triangles().len();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            if widgets::chip(ui, "Hide", false)
+                .on_hover_text("Hide the selected faces in the viewport")
+                .clicked()
+            {
+                self.hide_selection();
+            }
+            if widgets::chip(ui, "Isolate", false)
+                .on_hover_text("Hide every face but the selected ones")
+                .clicked()
+            {
+                self.isolate_selection();
+            }
+            if widgets::chip(ui, "Invert", false)
+                .on_hover_text("Swap hidden and shown faces")
+                .clicked()
+            {
+                self.invert_hidden_geometry();
+            }
+            if widgets::chip(ui, "Show all", hidden == 0).clicked() {
+                self.show_all_geometry();
+            }
+        });
+        if hidden > 0 {
+            hint(
+                ui,
+                &format!(
+                    "{hidden} faces hidden. Clicks and strokes pass through them; bakes and \
+                     exports are unchanged."
+                ),
+            );
+        }
         if self.selected_layer.is_none() {
             ui.add_space(4.0);
             ui.label(
@@ -1847,7 +1887,7 @@ impl SubstanceCraftApp {
                 screen.top() + theme::EDGE,
             ))
             .show(context, |ui| {
-                ui.set_width(INSPECTOR_WIDTH);
+                ui.set_width(self.layout.inspector_width);
                 // An Area offers last frame's rect as available space, so the scroll
                 // height must come from the window, not from `ui`; otherwise the column
                 // stays clipped at a stale height after its content grows.
@@ -1857,7 +1897,7 @@ impl SubstanceCraftApp {
                     .min_scrolled_height(max_height)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.set_max_width(INSPECTOR_WIDTH);
+                        ui.set_max_width(self.layout.inspector_width);
                         ui.spacing_mut().item_spacing.y = theme::GAP;
                         self.texture_sets_card(ui);
                         self.layers_card(ui);
@@ -1965,6 +2005,15 @@ impl SubstanceCraftApp {
                         .clicked()
                     {
                         self.import_openpbr();
+                    }
+                    if widgets::chip(ui, "glTF…", false)
+                        .on_hover_text(
+                            "Fill layers from a glTF 2.0 file's materials: factors become \
+                             fill values, external textures bitmaps",
+                        )
+                        .clicked()
+                    {
+                        self.import_gltf_materials();
                     }
                     if widgets::chip(ui, "Edge Wear", false)
                         .on_hover_text("Bare metal on convex edges, driven by curvature")

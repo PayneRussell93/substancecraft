@@ -1,0 +1,164 @@
+{
+  "active_texture_set": 1,
+  "materials": [
+    {
+      "channels": ["BaseColor", "Roughness", "Metallic"],
+      "fill": {
+        "color": [196, 199, 199, 255],
+        "emissive": [0, 0, 0],
+        "height": 0.5,
+        "material_opacity": 1.0,
+        "metallic": 1.0,
+        "projection": {
+          "axis": "Y",
+          "blend_sharpness": 4.0,
+          "decal": {
+            "center": [0.0, 0.0, 0.0],
+            "depth": 0.1,
+            "normal": [0.0, 0.0, 1.0],
+            "region_max": [1.0, 1.0],
+            "region_min": [0.0, 0.0],
+            "size": [0.25, 0.25],
+            "up": [0.0, 1.0, 0.0]
+          },
+          "mode": "Uv",
+          "offset": [0.0, 0.0],
+          "rotation_degrees": 0.0,
+          "scale": 1.0,
+          "tile_size": null
+        },
+        "roughness": 0.35,
+        "textures": {
+          "base_color": null,
+          "emissive": null,
+          "height": null,
+          "metallic": null,
+          "normal": null,
+          "opacity": null,
+          "roughness": null
+        }
+      },
+      "id": 1,
+      "name": "Red paint",
+      "provenance": {
+        "author": "SubstanceCraft",
+        "license": "MIT OR Apache-2.0",
+        "origin": "Built-in"
+      },
+      "tags": ["metal"]
+    }
+  ],
+  "mesh": null,
+  "saved_poses": [],
+  "schema_version": 3,
+  "texture_sets": [
+    {
+      "channels": ["BaseColor", "Roughness"],
+      "height_strength": 1.0,
+      "id": 1,
+      "layers": [
+        {
+          "channels": ["BaseColor", "Roughness"],
+          "fill": {
+            "color": [180, 40, 30, 255],
+            "emissive": [0, 0, 0],
+            "height": 0.5,
+            "material_opacity": 1.0,
+            "metallic": 0.0,
+            "projection": {
+              "axis": "Y",
+              "blend_sharpness": 4.0,
+              "decal": {
+                "center": [0.0, 0.0, 0.0],
+                "depth": 0.1,
+                "normal": [0.0, 0.0, 1.0],
+                "region_max": [1.0, 1.0],
+                "region_min": [0.0, 0.0],
+                "size": [0.25, 0.25],
+                "up": [0.0, 1.0, 0.0]
+              },
+              "mode": "Uv",
+              "offset": [0.0, 0.0],
+              "rotation_degrees": 0.0,
+              "scale": 1.0,
+              "tile_size": null
+            },
+            "roughness": 0.6,
+            "textures": {
+              "base_color": null,
+              "emissive": null,
+              "height": null,
+              "metallic": null,
+              "normal": null,
+              "opacity": null,
+              "roughness": null
+            }
+          },
+          "id": 1,
+          "id_mask_color": null,
+          "id_strokes": [],
+          "invert_final_mask": false,
+          "mask_bitmap": null,
+          "mask_generator": null,
+          "mask_strokes": [],
+          "name": "Paint",
+          "opacity": 1.0,
+          "paint_strokes": [],
+          "polygon_mask": null,
+          "visible": true
+        },
+        {
+          "channels": ["BaseColor", "Id", "Roughness", "Metallic"],
+          "fill": null,
+          "id": 2,
+          "id_mask_color": null,
+          "id_strokes": [],
+          "invert_final_mask": false,
+          "mask_bitmap": null,
+          "mask_generator": null,
+          "mask_strokes": [],
+          "name": "Scratches",
+          "opacity": 1.0,
+          "paint_strokes": [
+            {
+              "color": [230, 230, 230, 255],
+              "emissive": [0, 0, 0],
+              "erase": false,
+              "height": 0.5,
+              "material_opacity": 1.0,
+              "metallic": 0.0,
+              "opacity": 1.0,
+              "points": [
+                [0.25, 0.5],
+                [0.75, 0.5]
+              ],
+              "radius_pixels": 3.0,
+              "roughness": 0.5,
+              "tip": {
+                "angle_degrees": 0.0,
+                "angle_jitter": 0.0,
+                "follow_path": false,
+                "hardness": 0.0,
+                "pressure_opacity": false,
+                "pressure_size": true,
+                "scatter": 0.0,
+                "seed": 0,
+                "shape": "Round",
+                "size_jitter": 0.0,
+                "spacing": 0.1
+              }
+            }
+          ],
+          "polygon_mask": null,
+          "visible": true
+        }
+      ],
+      "material_slot": "Body",
+      "name": "Body",
+      "resolution": {
+        "height": 16,
+        "width": 16
+      }
+    }
+  ]
+}

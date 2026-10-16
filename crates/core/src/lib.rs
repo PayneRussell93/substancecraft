@@ -66,10 +66,10 @@ pub use graph::{
 pub use inspect::{MASK_SHOWN, OverlayPalette, TexelContribution, mask_drivers, mask_overlay};
 pub use instances::{InstanceField, MaterialLink};
 pub use library::{
-    AssetEntry, AssetKind, BUILT_IN_LICENSE, ExposedParameter, ExposedProperty, LibraryError,
-    MapRequirements, MaterialResource, ParameterValue, SmartMask, SmartMaterial,
-    AssetOrigin, EnvironmentResource, FilterPreset, GeneratorPreset, MAX_ENVIRONMENT_STRENGTH,
-    MIN_ENVIRONMENT_STRENGTH,
+    AssetEntry, AssetKind, AssetOrigin, BUILT_IN_LICENSE, EnvironmentResource, ExposedParameter,
+    ExposedProperty, FilterPreset, GeneratorPreset, LibraryError, MAX_ENVIRONMENT_STRENGTH,
+    MIN_ENVIRONMENT_STRENGTH, MapRequirements, MaterialResource, ParameterValue, SmartMask,
+    SmartMaterial,
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
@@ -82,11 +82,11 @@ pub use painting::{
 };
 pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{
-    BitmapMask, ContentHash, ContentHasher, DecalPlacement, ImageSequence, MAX_SEQUENCE_FPS,
-    MAX_SEQUENCE_FRAMES, MIN_SEQUENCE_FPS, sequence_frame_path, split_frame_number, MAX_DECAL_SIZE, MAX_PROJECTION_SCALE,
-    MAX_RESOURCE_DIMENSION, MAX_TILE_SIZE, MIN_DECAL_SIZE, MIN_PROJECTION_SCALE, MIN_TILE_SIZE,
+    BitmapMask, ContentHash, ContentHasher, DecalPlacement, ImageSequence, MAX_DECAL_SIZE,
+    MAX_PROJECTION_SCALE, MAX_RESOURCE_DIMENSION, MAX_SEQUENCE_FPS, MAX_SEQUENCE_FRAMES,
+    MAX_TILE_SIZE, MIN_DECAL_SIZE, MIN_PROJECTION_SCALE, MIN_SEQUENCE_FPS, MIN_TILE_SIZE,
     ProjectResource, ProjectionMode, ResourceImages, ResourceProvenance, TextureImage,
-    TextureProjection,
+    TextureProjection, sequence_frame_path, split_frame_number,
 };
 pub use rig::{
     AnimationClip, ClipSample, Influence, Joint, JointAnimation, MAX_INFLUENCES, Rig, RigError,
@@ -1067,6 +1067,7 @@ impl HighToLowOptions {
             width: baked.width,
             height: baked.height,
             rgba8: baked.rgba8,
+            rgba16: None,
             color_space: ColorSpace::Raw,
         })
     }
@@ -1538,10 +1539,9 @@ impl FillTextures {
         ]
         .into_iter()
         .chain(self.user.iter_mut())
+        .flatten()
         {
-            if let Some(id) = slot {
-                *id = map(*id);
-            }
+            *slot = map(*slot);
         }
     }
 

@@ -632,19 +632,12 @@ impl Compositor<'_> {
         {
             // Same grid as the bake: copy texels instead of resampling, so
             // exact-size bitmaps (and flattened layers) stay sharp.
-            let pixels = image.rgba8.as_chunks::<4>().0;
             let row = self.width() as usize;
             let span = self.region.width as usize;
             for (local_row, texels) in local.chunks_mut(span).enumerate() {
                 let start = (self.region.y as usize + local_row) * row + self.region.x as usize;
-                for (texel, pixel) in texels.iter_mut().zip(&pixels[start..start + span]) {
-                    let sample = Vec4::new(
-                        f32::from(pixel[0]),
-                        f32::from(pixel[1]),
-                        f32::from(pixel[2]),
-                        f32::from(pixel[3]),
-                    ) / 255.0;
-                    *texel = texture_texel(sample, data, image.color_space);
+                for (offset, texel) in texels.iter_mut().enumerate() {
+                    *texel = texture_texel(image.pixel(start + offset), data, image.color_space);
                 }
             }
             return Ok(());

@@ -43,23 +43,24 @@ pub use history_file::{
     HISTORY_EXTENSION, MAX_HISTORY_BYTES, history_path, load_project_history, save_project_history,
 };
 pub use interchange::{
-    GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS, OpenPbrMaterial, materialx_color_space,
-    openpbr_fill, openpbr_preset, openpbr_texture_color_space, read_openpbr_materialx, write_gltf,
+    GLTF_FILL_INPUTS, GltfMaterial, GltfMaterialFiles, InterchangeError, OPENPBR_INPUTS,
+    OpenPbrMaterial, gltf_fill, materialx_color_space, openpbr_fill, openpbr_preset,
+    openpbr_texture_color_space, read_gltf_materials, read_openpbr_materialx, write_gltf,
     write_openpbr_materialx,
 };
 pub use jobs::{
     DEFAULT_EXPORT_PRESET_NAME, ExportJob, JobError, OcioExport, load_mesh_file, load_project_mesh,
     run_export_job, run_export_jobs,
 };
+pub use ocio::{
+    MAX_OCIO_CONFIG_BYTES, OCIO_BAKE_SIZE, OCIO_HEADROOM_STOPS, OcioConfig, OcioDisplay, OcioError,
+    OcioProcessor, OcioView,
+};
 pub use project_format::{MigrationReport, decode_project_json_with_report};
 pub use recovery::{RecoveryCandidate, RecoveryStore};
 pub use relink::{
     MAX_RELINK_DEPTH, MAX_RELINK_SCAN, MissingFiles, file_content_hash, find_relink_candidates,
     find_relink_candidates_by_content, missing_project_files,
-};
-pub use ocio::{
-    MAX_OCIO_CONFIG_BYTES, OCIO_BAKE_SIZE, OCIO_HEADROOM_STOPS, OcioConfig, OcioDisplay, OcioError,
-    OcioProcessor, OcioView,
 };
 pub use shared_library::{
     LibraryAsset, MAX_SHARED_ASSET_BYTES, MAX_SHARED_ASSETS, SHARED_ASSET_EXTENSION,
@@ -71,9 +72,9 @@ pub use step::{
     import_step, import_step_file, import_step_with_report,
 };
 pub use textures::{
-    MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
-    encode_exported_texture, encode_texture, load_texture_image, write_exported_textures,
-    write_texture,
+    BITMAP_EXTENSIONS, MAX_TEXTURE_FILE_BYTES, TextureFormat, TextureIoError, decode_texture_image,
+    encode_exported_texture, encode_texture, load_texture_image, source_color_space,
+    write_exported_textures, write_texture,
 };
 pub use vector::{
     DEFAULT_SVG_EDGE, TEXT_RESOURCE_EXTENSION, TextSpec, load_text_resource, rasterize_svg,

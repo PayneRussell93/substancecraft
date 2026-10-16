@@ -248,6 +248,11 @@ pub struct TextureImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
+    /// The same pixels at 16 bits per channel, kept when the source file
+    /// holds more than 8 (16-bit PNG/TIFF, OpenEXR, Radiance HDR), so
+    /// bakes sample a height map or linear colour without 8-bit banding.
+    /// `rgba8` stays the display copy.
+    pub rgba16: Option<Vec<u16>>,
     /// Encoding of the pixels, from the resource tag.
     pub color_space: ColorSpace,
 }
@@ -266,8 +271,46 @@ impl TextureImage {
             width,
             height,
             rgba8,
+            rgba16: None,
             color_space: ColorSpace::Srgb,
         })
+    }
+
+    /// Attaches a 16-bit copy of the pixels; `None` unless it matches the
+    /// dimensions.
+    pub fn with_rgba16(mut self, rgba16: Vec<u16>) -> Option<Self> {
+        (rgba16.len() == self.rgba8.len()).then(|| {
+            self.rgba16 = Some(rgba16);
+            self
+        })
+    }
+
+    /// Texel `index` (row-major) in `0..=1`, from the 16-bit copy when there
+    /// is one.
+    pub fn pixel(&self, index: usize) -> Vec4 {
+        let start = index * 4;
+        if let Some(pixel) = self
+            .rgba16
+            .as_ref()
+            .and_then(|rgba16| rgba16.get(start..start + 4))
+        {
+            return Vec4::new(
+                f32::from(pixel[0]),
+                f32::from(pixel[1]),
+                f32::from(pixel[2]),
+                f32::from(pixel[3]),
+            ) / 65535.0;
+        }
+        self.rgba8
+            .get(start..start + 4)
+            .map_or(Vec4::ZERO, |pixel| {
+                Vec4::new(
+                    f32::from(pixel[0]),
+                    f32::from(pixel[1]),
+                    f32::from(pixel[2]),
+                    f32::from(pixel[3]),
+                ) / 255.0
+            })
     }
 
     fn texel(&self, x: i64, y: i64, wrap: bool) -> Vec4 {
@@ -277,17 +320,7 @@ impl TextureImage {
         } else {
             (x.clamp(0, width - 1), y.clamp(0, height - 1))
         };
-        let index = (y as usize * self.width as usize + x as usize) * 4;
-        self.rgba8
-            .get(index..index + 4)
-            .map_or(Vec4::ZERO, |pixel| {
-                Vec4::new(
-                    f32::from(pixel[0]),
-                    f32::from(pixel[1]),
-                    f32::from(pixel[2]),
-                    f32::from(pixel[3]),
-                ) / 255.0
-            })
+        self.pixel(y as usize * self.width as usize + x as usize)
     }
 
     /// Bilinear sample with `+V` up (row 0 is `v = 1`); channels in `0..=1`.

@@ -81,9 +81,17 @@ impl SubstanceCraftApp {
 
     /// Copies the project (or built-in) asset of `kind` named `name` into
     /// the shared library.
-    pub(super) fn save_asset_to_library(&mut self, kind: AssetKind, name: &str) -> Result<(), String> {
-        let asset = project_asset(&self.project, kind, name)
-            .ok_or_else(|| format!("The project has no {} named {name}.", kind.name().to_lowercase()))?;
+    pub(super) fn save_asset_to_library(
+        &mut self,
+        kind: AssetKind,
+        name: &str,
+    ) -> Result<(), String> {
+        let asset = project_asset(&self.project, kind, name).ok_or_else(|| {
+            format!(
+                "The project has no {} named {name}.",
+                kind.name().to_lowercase()
+            )
+        })?;
         let base = self.project_folder();
         self.shared_library();
         let library = self
@@ -99,7 +107,11 @@ impl SubstanceCraftApp {
     }
 
     /// Removes the library asset of `kind` named `name`.
-    pub(super) fn remove_library_asset(&mut self, kind: AssetKind, name: &str) -> Result<(), String> {
+    pub(super) fn remove_library_asset(
+        &mut self,
+        kind: AssetKind,
+        name: &str,
+    ) -> Result<(), String> {
         self.shared_library();
         let library = self
             .library
@@ -143,7 +155,10 @@ impl SubstanceCraftApp {
             self.resource_images.insert(id, Arc::new(image));
             self.resource_watcher.remember(id, &path);
         }
-        let first_resource = import.resources.first().map(|resource| resource.name.clone());
+        let first_resource = import
+            .resources
+            .first()
+            .map(|resource| resource.name.clone());
         self.project.resources.extend(import.resources);
 
         let mut after = self.project.clone();
@@ -188,7 +203,10 @@ impl SubstanceCraftApp {
 
     /// Lights the viewport with `environment`'s panorama at its rotation
     /// and strength.
-    pub(super) fn use_environment(&mut self, environment: &EnvironmentResource) -> Result<(), String> {
+    pub(super) fn use_environment(
+        &mut self,
+        environment: &EnvironmentResource,
+    ) -> Result<(), String> {
         self.load_custom_environment(PathBuf::from(&environment.source))?;
         self.viewport_lighting.rotation = environment.rotation_degrees.to_radians();
         self.viewport_lighting.ambient_fill = environment.strength * DEFAULT_AMBIENT_FILL;
@@ -199,7 +217,12 @@ impl SubstanceCraftApp {
     /// as a project environment.
     pub(super) fn save_lighting_as_environment(&mut self) -> Option<String> {
         let custom = self.custom_environment.as_ref()?;
-        let taken: Vec<String> = self.project.environments.iter().map(|e| e.name.clone()).collect();
+        let taken: Vec<String> = self
+            .project
+            .environments
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
         let stem = custom
             .path
             .file_stem()
@@ -207,15 +230,27 @@ impl SubstanceCraftApp {
             .unwrap_or_else(|| "Environment".to_owned());
         let name = Self::unique_name(&stem, &taken);
         let mut environment = EnvironmentResource::new(&name, custom.path.to_string_lossy());
-        let degrees = self.viewport_lighting.rotation.to_degrees().rem_euclid(360.0);
-        environment.rotation_degrees = if degrees > 180.0 { degrees - 360.0 } else { degrees };
-        environment.strength = (self.viewport_lighting.ambient_fill / DEFAULT_AMBIENT_FILL)
-            .clamp(substancecraft_core::MIN_ENVIRONMENT_STRENGTH, substancecraft_core::MAX_ENVIRONMENT_STRENGTH);
+        let degrees = self
+            .viewport_lighting
+            .rotation
+            .to_degrees()
+            .rem_euclid(360.0);
+        environment.rotation_degrees = if degrees > 180.0 {
+            degrees - 360.0
+        } else {
+            degrees
+        };
+        environment.strength = (self.viewport_lighting.ambient_fill / DEFAULT_AMBIENT_FILL).clamp(
+            substancecraft_core::MIN_ENVIRONMENT_STRENGTH,
+            substancecraft_core::MAX_ENVIRONMENT_STRENGTH,
+        );
         let before = self.project.environments.clone();
         let mut after = before.clone();
         after.push(environment);
-        self.history
-            .apply(&mut self.project, EditCommand::Environments { before, after });
+        self.history.apply(
+            &mut self.project,
+            EditCommand::Environments { before, after },
+        );
         Some(name)
     }
 
@@ -223,13 +258,21 @@ impl SubstanceCraftApp {
     /// filter preset.
     pub(super) fn save_layer_filters(&mut self, mask: bool) -> Option<String> {
         let layer = self.selected_layer()?;
-        let filters = if mask { &layer.mask_filters } else { &layer.filters };
+        let filters = if mask {
+            &layer.mask_filters
+        } else {
+            &layer.filters
+        };
         let taken: Vec<String> = self
             .project
             .filter_presets
             .iter()
             .map(|preset| preset.name.clone())
-            .chain(FilterPreset::built_in().into_iter().map(|preset| preset.name))
+            .chain(
+                FilterPreset::built_in()
+                    .into_iter()
+                    .map(|preset| preset.name),
+            )
             .collect();
         let suffix = if mask { "mask filters" } else { "filters" };
         let name = Self::unique_name(&format!("{} {suffix}", layer.name), &taken);
@@ -237,8 +280,10 @@ impl SubstanceCraftApp {
         let before = self.project.filter_presets.clone();
         let mut after = before.clone();
         after.push(preset);
-        self.history
-            .apply(&mut self.project, EditCommand::FilterPresets { before, after });
+        self.history.apply(
+            &mut self.project,
+            EditCommand::FilterPresets { before, after },
+        );
         Some(name)
     }
 
@@ -250,15 +295,21 @@ impl SubstanceCraftApp {
             .generator_presets
             .iter()
             .map(|preset| preset.name.clone())
-            .chain(GeneratorPreset::built_in().into_iter().map(|preset| preset.name))
+            .chain(
+                GeneratorPreset::built_in()
+                    .into_iter()
+                    .map(|preset| preset.name),
+            )
             .collect();
         let name = Self::unique_name(&format!("{} generator", layer.name), &taken);
         let preset = GeneratorPreset::from_layer(layer, &name)?;
         let before = self.project.generator_presets.clone();
         let mut after = before.clone();
         after.push(preset);
-        self.history
-            .apply(&mut self.project, EditCommand::GeneratorPresets { before, after });
+        self.history.apply(
+            &mut self.project,
+            EditCommand::GeneratorPresets { before, after },
+        );
         Some(name)
     }
 
@@ -303,7 +354,11 @@ impl SubstanceCraftApp {
             .iter()
             .enumerate()
             .map(|(index, preset)| (Some(index), preset.clone()))
-            .chain(FilterPreset::built_in().into_iter().map(|preset| (None, preset)));
+            .chain(
+                FilterPreset::built_in()
+                    .into_iter()
+                    .map(|preset| (None, preset)),
+            );
         for (index, preset) in rows {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&preset.name).size(12.0).color(theme::TEXT))
@@ -350,11 +405,19 @@ impl SubstanceCraftApp {
             .iter()
             .enumerate()
             .map(|(index, preset)| (Some(index), preset.clone()))
-            .chain(GeneratorPreset::built_in().into_iter().map(|preset| (None, preset)));
+            .chain(
+                GeneratorPreset::built_in()
+                    .into_iter()
+                    .map(|preset| (None, preset)),
+            );
         for (index, preset) in rows {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&preset.name).size(12.0).color(theme::TEXT))
-                    .on_hover_text(format!("{} ({})", preset.description, preset.generator.name()));
+                    .on_hover_text(format!(
+                        "{} ({})",
+                        preset.description,
+                        preset.generator.name()
+                    ));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(index) = index
                         && widgets::chip(ui, "Delete", false).clicked()
@@ -381,11 +444,15 @@ impl SubstanceCraftApp {
         widgets::caption(ui, "Environments");
         for (index, environment) in self.project.environments.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&environment.name).size(12.0).color(theme::TEXT))
-                    .on_hover_text(format!(
-                        "{} · {:.0}° · {:.2}×",
-                        environment.source, environment.rotation_degrees, environment.strength
-                    ));
+                ui.label(
+                    RichText::new(&environment.name)
+                        .size(12.0)
+                        .color(theme::TEXT),
+                )
+                .on_hover_text(format!(
+                    "{} · {:.0}° · {:.2}×",
+                    environment.source, environment.rotation_degrees, environment.strength
+                ));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::chip(ui, "Delete", false).clicked() {
                         action = Some(LibraryAction::DeleteEnvironment(index));
@@ -408,7 +475,10 @@ impl SubstanceCraftApp {
             }
         });
         if self.project.environments.is_empty() && self.custom_environment.is_none() {
-            hint(ui, "Load an HDRI in the Light drawer to save it as an environment.");
+            hint(
+                ui,
+                "Load an HDRI in the Light drawer to save it as an environment.",
+            );
         }
         if let Some(action) = action {
             self.run_library_action(action);
@@ -432,10 +502,10 @@ impl SubstanceCraftApp {
             .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(root.as_deref().map_or_else(
-                    || "No folder".to_owned(),
-                    |root| root.display().to_string(),
-                ))
+                RichText::new(
+                    root.as_deref()
+                        .map_or_else(|| "No folder".to_owned(), |root| root.display().to_string()),
+                )
                 .size(10.5)
                 .color(theme::TEXT_FAINT),
             );
@@ -467,7 +537,11 @@ impl SubstanceCraftApp {
             if of_kind.is_empty() {
                 continue;
             }
-            ui.label(RichText::new(kind.name()).size(11.0).color(theme::TEXT_WEAK));
+            ui.label(
+                RichText::new(kind.name())
+                    .size(11.0)
+                    .color(theme::TEXT_WEAK),
+            );
             for entry in of_kind.iter().take(LISTED_PER_KIND) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&entry.name).size(12.0).color(theme::TEXT));
@@ -476,7 +550,8 @@ impl SubstanceCraftApp {
                             .on_hover_text("Delete from the shared library")
                             .clicked()
                         {
-                            action = Some(LibraryAction::RemoveFromLibrary(kind, entry.name.clone()));
+                            action =
+                                Some(LibraryAction::RemoveFromLibrary(kind, entry.name.clone()));
                         }
                         if widgets::chip(ui, "Add", false)
                             .on_hover_text("Add to this project")
@@ -490,12 +565,19 @@ impl SubstanceCraftApp {
             if of_kind.len() > LISTED_PER_KIND {
                 hint(
                     ui,
-                    &format!("…and {} more; search to find them", of_kind.len() - LISTED_PER_KIND),
+                    &format!(
+                        "…and {} more; search to find them",
+                        of_kind.len() - LISTED_PER_KIND
+                    ),
                 );
             }
         }
         for problem in problems.iter().take(4) {
-            ui.label(RichText::new(problem).size(10.5).color(crate::panels::WARNING));
+            ui.label(
+                RichText::new(problem)
+                    .size(10.5)
+                    .color(crate::panels::WARNING),
+            );
         }
         if let Some(status) = &self.library.status {
             hint(ui, status);
@@ -676,9 +758,12 @@ mod tests {
 
         // Project assets go to the shared library and come back into
         // another project with fresh names.
-        app.save_asset_to_library(AssetKind::Filter, &filters).unwrap();
-        app.save_asset_to_library(AssetKind::Generator, &generator).unwrap();
-        app.save_asset_to_library(AssetKind::Filter, "Soften").unwrap();
+        app.save_asset_to_library(AssetKind::Filter, &filters)
+            .unwrap();
+        app.save_asset_to_library(AssetKind::Generator, &generator)
+            .unwrap();
+        app.save_asset_to_library(AssetKind::Filter, "Soften")
+            .unwrap();
         let found = app.search_all_assets("library soften");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].origin, AssetOrigin::Shared);
@@ -699,7 +784,9 @@ mod tests {
         assert_eq!(other.project.filter_presets.len(), 1);
 
         // Removing from the library hides it from every project's search.
-        other.remove_library_asset(AssetKind::Filter, "Soften").unwrap();
+        other
+            .remove_library_asset(AssetKind::Filter, "Soften")
+            .unwrap();
         other.library.shared = None;
         assert!(other.search_all_assets("soften library").is_empty());
 

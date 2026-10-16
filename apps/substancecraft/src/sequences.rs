@@ -13,7 +13,7 @@ use substancecraft_core::{MAX_SEQUENCE_FPS, MIN_SEQUENCE_FPS, ProjectResource, R
 
 use crate::animation::PoseSource;
 use crate::panels::hint;
-use crate::{IMAGE_EXTENSIONS, SubstanceCraftApp, widgets};
+use crate::{SubstanceCraftApp, widgets};
 
 impl SubstanceCraftApp {
     /// Adds the numbered sequence `path` belongs to as one resource showing
@@ -25,17 +25,12 @@ impl SubstanceCraftApp {
                 crate::path_label(path)
             )
         })?;
-        let first = substancecraft_core::sequence_frame_path(
-            &path.to_string_lossy(),
-            sequence.first,
-        )
-        .ok_or("The file name has no frame number.")?;
-        let mut resource = ProjectResource::new(
-            ResourceId(0),
-            sequence_name(path),
-            first,
-        );
+        let first =
+            substancecraft_core::sequence_frame_path(&path.to_string_lossy(), sequence.first)
+                .ok_or("The file name has no frame number.")?;
+        let mut resource = ProjectResource::new(ResourceId(0), sequence_name(path), first);
         resource.sequence = Some(sequence);
+        resource.color_space = substancecraft_api::source_color_space(path);
         let image = load_resource_image(&resource).map_err(|error| error.to_string())?;
         let id = ResourceId(
             self.project
@@ -47,7 +42,8 @@ impl SubstanceCraftApp {
                 .saturating_add(1),
         );
         resource.id = id;
-        resource.content_hash = substancecraft_api::file_content_hash(Path::new(&resource.source)).ok();
+        resource.content_hash =
+            substancecraft_api::file_content_hash(Path::new(&resource.source)).ok();
         self.resource_watcher
             .remember(id, Path::new(&resource.active_source()));
         self.project.resources.push(resource);
@@ -58,7 +54,10 @@ impl SubstanceCraftApp {
     /// Asks for one frame of a sequence and imports the whole sequence.
     pub(super) fn pick_image_sequence(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Numbered images (PNG, JPEG, TGA)", &IMAGE_EXTENSIONS[..3])
+            .add_filter(
+                "Numbered images (PNG, JPEG, TGA, BMP, TIFF, WebP, EXR, HDR)",
+                &substancecraft_api::BITMAP_EXTENSIONS,
+            )
             .pick_file()
             && let Err(error) = self.import_image_sequence(&path)
         {
@@ -231,10 +230,16 @@ mod tests {
             .unwrap();
         let resource = app.project.resources.last().unwrap().clone();
         assert_eq!(resource.name, "wave");
-        assert!(resource.source.ends_with("wave_0001.png"), "source is the first frame");
+        assert!(
+            resource.source.ends_with("wave_0001.png"),
+            "source is the first frame"
+        );
         assert!(resource.active_source().ends_with("wave_0002.png"));
         assert_eq!(app.resource_images[&id].rgba8[0], 120);
-        assert!(app.import_image_sequence(&folder.path().join("single.png")).is_err());
+        assert!(
+            app.import_image_sequence(&folder.path().join("single.png"))
+                .is_err()
+        );
 
         // A fill showing the sequence bakes the current frame.
         app.add_paint_layer();

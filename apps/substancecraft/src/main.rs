@@ -42,12 +42,16 @@ mod cameras;
 mod diagnostics;
 mod edges;
 mod environments;
+mod geometry_visibility;
+mod gltf_material;
 mod grading;
 mod graph_editor;
 mod icons;
 mod incremental;
 mod inspector;
+mod layouts;
 mod library_panel;
+mod ocio_view;
 mod panels;
 mod preferences;
 mod relink;
@@ -85,7 +89,9 @@ const BAKEABLE_CHANNELS: [MaterialChannel; 8] = [
 /// Mesh formats the importer reads.
 const MESH_EXTENSIONS: [&str; 5] = ["fbx", "gltf", "glb", "step", "stp"];
 /// Bitmap formats the resource importer reads.
-const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "tga", "svg", "sctext"];
+const IMAGE_EXTENSIONS: [&str; 12] = [
+    "png", "jpg", "jpeg", "tga", "bmp", "tif", "tiff", "webp", "exr", "hdr", "svg", "sctext",
+];
 const POSE_TRANSITION_SECONDS: f64 = 0.35;
 const MAX_SAVED_POSES: usize = 256;
 /// Edge of smart-material thumbnails in the browser, in pixels.
@@ -169,6 +175,10 @@ struct SubstanceCraftApp {
     mesh_error: Option<String>,
     mesh_revision: u64,
     filament_mesh_revision: Option<u64>,
+    /// Hidden-face revision the renderer last drew.
+    filament_hidden_revision: Option<u64>,
+    /// Faces hidden from the viewport (a view setting, never saved).
+    hidden_geometry: geometry_visibility::HiddenGeometry,
     /// Environment the renderer was last given, and the lux and rotation it
     /// was applied at.
     filament_environment: Option<(environments::EnvironmentSource, f32, f32)>,
@@ -176,6 +186,8 @@ struct SubstanceCraftApp {
     custom_environment: Option<environments::CustomEnvironment>,
     /// Display LUT applied after the view transform.
     display_lut: Option<grading::DisplayLut>,
+    /// OpenColorIO view grading the viewport, in place of the display LUT.
+    ocio: Option<ocio_view::OcioState>,
     /// Why the display LUT did not load, when it did not.
     grading_status: Option<String>,
     /// Shader definitions from the user shader folder.
@@ -335,6 +347,8 @@ struct SubstanceCraftApp {
     drawer: Option<panels::Drawer>,
     last_drawer: panels::Drawer,
     show_inspector: bool,
+    /// Name typed for saving the current panel layout.
+    layout_name: String,
     layout: panels::OverlayLayout,
     autosave: autosave::Autosave,
     preferences: preferences::PreferenceState,
@@ -411,8 +425,8 @@ impl PaintMode {
 }
 
 /// Which viewports share the central area.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ViewMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ViewMode {
     Model,
     Split,
     Uv,
@@ -824,9 +838,12 @@ impl Default for SubstanceCraftApp {
             mesh_error: None,
             mesh_revision: 1,
             filament_mesh_revision: None,
+            filament_hidden_revision: None,
+            hidden_geometry: geometry_visibility::HiddenGeometry::default(),
             filament_environment: None,
             custom_environment: None,
             display_lut: None,
+            ocio: None,
             grading_status: None,
             user_shaders: Vec::new(),
             shader_status: None,
@@ -941,6 +958,7 @@ impl Default for SubstanceCraftApp {
             drawer: Some(panels::Drawer::Scene),
             last_drawer: panels::Drawer::Scene,
             show_inspector: true,
+            layout_name: String::new(),
             layout: panels::OverlayLayout::default(),
             autosave: autosave::Autosave::default(),
             preferences: preferences::PreferenceState::default(),
@@ -1245,6 +1263,7 @@ impl SubstanceCraftApp {
                 .unwrap_or(self.viewport_lighting.rotation),
         );
         let shader = self.viewport_shader();
+        let (transform, exposure, lut) = self.grading();
         let Some(mesh) = self.mesh_geometry.as_deref() else {
             return;
         };
@@ -1262,10 +1281,23 @@ impl SubstanceCraftApp {
         }
         let atlas = self.udim_atlas.as_ref();
         let atlas_mesh = |mesh| in_atlas(atlas, mesh);
-        if self.filament_mesh_revision != Some(self.mesh_revision) {
-            match renderer.set_mesh(&atlas_mesh(mesh), self.mesh_smoothing.angle_degrees) {
+        let hidden_revision = (self.hidden_geometry.mesh_revision == self.mesh_revision)
+            .then_some(self.hidden_geometry.revision);
+        if self.filament_mesh_revision != Some(self.mesh_revision)
+            || self.filament_hidden_revision != hidden_revision
+        {
+            let hidden = match hidden_revision {
+                Some(_) => &self.hidden_geometry.triangles,
+                None => &BTreeSet::new(),
+            };
+            let visible = geometry_visibility::visible_mesh(mesh, hidden);
+            match renderer.set_mesh(
+                &in_atlas(atlas, &visible),
+                self.mesh_smoothing.angle_degrees,
+            ) {
                 Ok(()) => {
                     self.filament_mesh_revision = Some(self.mesh_revision);
+                    self.filament_hidden_revision = hidden_revision;
                     self.filament_pose = Some(None);
                 }
                 Err(error) => {
@@ -1311,11 +1343,7 @@ impl SubstanceCraftApp {
                 .then_some(preferences.background_blur),
         );
         renderer.set_global_illumination(preferences.global_illumination);
-        if let Err(error) = renderer.set_color_grading(
-            preferences.view_transform,
-            preferences.exposure,
-            self.display_lut.as_ref().map(|lut| lut.lut.as_ref()),
-        ) {
+        if let Err(error) = renderer.set_color_grading(transform, exposure, lut.as_deref()) {
             self.filament_error = Some(error.to_string());
             return;
         }
@@ -3284,7 +3312,8 @@ impl SubstanceCraftApp {
         shift: bool,
     ) {
         let pick = |app: &Self, at: egui::Pos2| {
-            pick_triangle(mesh, points, at).filter(|hit| app.triangle_in_selected_set(hit.triangle))
+            pick_triangle(mesh, points, at, Some(app.hidden_triangles()))
+                .filter(|hit| app.triangle_in_selected_set(hit.triangle))
         };
         let Some(pointer) = pointer else {
             return;
@@ -5510,7 +5539,7 @@ impl SubstanceCraftApp {
     fn import_resources(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter(
-                "Bitmap, SVG, or text (PNG, JPEG, TGA, SVG, SCTEXT)",
+                "Bitmap, SVG, or text (PNG, JPEG, TGA, BMP, TIFF, WebP, EXR, HDR, SVG, SCTEXT)",
                 &IMAGE_EXTENSIONS,
             )
             .pick_files()
@@ -5687,6 +5716,7 @@ impl SubstanceCraftApp {
             .unwrap_or_else(|| format!("Bitmap {}", id.0));
         self.project.resources.push(ProjectResource {
             content_hash: substancecraft_api::file_content_hash(path).ok(),
+            color_space: image.color_space,
             ..ProjectResource::new(id, name, path.to_string_lossy())
         });
         self.resource_images.insert(id, Arc::new(image));
@@ -5998,13 +6028,29 @@ impl SubstanceCraftApp {
                     ViewMode::Model => (Some(area), None),
                     ViewMode::Uv => (None, Some(area)),
                     ViewMode::Split => {
-                        let middle = area.center().x;
+                        let middle = area.left() + area.width() * self.layout.split;
                         (
                             Some(area.with_max_x(middle - 1.0)),
                             Some(area.with_min_x(middle + 1.0)),
                         )
                     }
                 };
+                // The split divider drags; layouts save where it sits.
+                let divider = model
+                    .filter(|_| uv.is_some())
+                    .map(|model| model.right() + 1.0);
+                if let Some(x) = divider {
+                    let handle = egui::Rect::from_x_y_ranges(x - 4.0..=x + 4.0, area.y_range());
+                    let response = ui
+                        .interact(handle, egui::Id::new("split_divider"), egui::Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                    if response.dragged()
+                        && let Some(pointer) = response.interact_pointer_pos()
+                    {
+                        self.layout.split =
+                            layouts::clamp_split((pointer.x - area.left()) / area.width());
+                    }
+                }
                 // Runs during strokes too: previews bake in the background, so the
                 // stroke in progress shows up live.
                 self.refresh_baked_preview();
@@ -6014,9 +6060,9 @@ impl SubstanceCraftApp {
                 if let Some(rect) = uv {
                     self.uv_viewport(ui, rect);
                 }
-                if model.is_some() && uv.is_some() {
+                if let Some(x) = divider {
                     ui.painter().vline(
-                        area.center().x,
+                        x,
                         area.y_range(),
                         egui::Stroke::new(2.0, theme::VIEWPORT_BG.gamma_multiply(0.5)),
                     );
@@ -6199,7 +6245,7 @@ impl SubstanceCraftApp {
         if selecting {
             let hit = match (&projected, hover_position, &self.mesh_geometry) {
                 (Some(points), Some(pointer), Some(mesh)) if response.hovered() => {
-                    pick_triangle(mesh, points, pointer)
+                    pick_triangle(mesh, points, pointer, Some(self.hidden_triangles()))
                 }
                 _ => None,
             };
@@ -6326,7 +6372,7 @@ impl SubstanceCraftApp {
         let (Some(points), Some(set)) = (points, self.selected_texture_set_ref()) else {
             return Vec::new();
         };
-        let Some(hit) = pick_triangle(mesh, points, pointer) else {
+        let Some(hit) = pick_triangle(mesh, points, pointer, Some(self.hidden_triangles())) else {
             return Vec::new();
         };
         let uv_radius = glam::Vec2::new(
@@ -6484,9 +6530,13 @@ fn pick_triangle(
     mesh: &MeshGeometry,
     points: &[ProjectedVertex],
     pointer: egui::Pos2,
+    hidden: Option<&BTreeSet<u32>>,
 ) -> Option<TriangleHit> {
     let mut best: Option<(f32, TriangleHit)> = None;
     for (index, triangle) in mesh.triangles.iter().enumerate() {
+        if hidden.is_some_and(|hidden| hidden.contains(&(index as u32))) {
+            continue;
+        }
         let [a, b, c] = triangle.map(|vertex| points.get(vertex as usize));
         let (Some(a), Some(b), Some(c)) = (a, b, c) else {
             continue;
@@ -6850,6 +6900,9 @@ impl eframe::App for SubstanceCraftApp {
         self.update_pose_transition(ui.ctx());
         self.advance_animation(ui.ctx());
         self.follow_animation_with_sequences();
+        if !ui.ctx().input(|input| input.pointer.any_down()) {
+            self.remember_layout();
+        }
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
         self.sync_layer_history(ui.ctx());
@@ -7177,11 +7230,11 @@ mod tests {
 
         // Looking down -Z, the screen centre covers the +Z face (triangles 0
         // and 1) in front of the -Z face (triangles 2 and 3).
-        let hit = pick_triangle(&cube, &points, egui::pos2(110.0, 90.0)).unwrap();
+        let hit = pick_triangle(&cube, &points, egui::pos2(110.0, 90.0), None).unwrap();
         assert!(hit.triangle < 2, "picked {}", hit.triangle);
         assert!(hit.uv.is_some());
         assert_eq!(
-            pick_triangle(&cube, &points, egui::pos2(400.0, 400.0)),
+            pick_triangle(&cube, &points, egui::pos2(400.0, 400.0), None),
             None
         );
 
@@ -8213,7 +8266,7 @@ mod tests {
         };
         let projected = projection.project_mesh(&mesh);
         let first = app.stabilized_cursor(egui::pos2(100.0, 100.0)).unwrap();
-        let first_hit = pick_triangle(&mesh, &projected, first).unwrap();
+        let first_hit = pick_triangle(&mesh, &projected, first, None).unwrap();
         app.paint_hit(first_hit);
 
         assert_eq!(
@@ -8223,15 +8276,15 @@ mod tests {
         );
         let trailing = app.stabilized_cursor(egui::pos2(130.0, 100.0)).unwrap();
         assert_eq!(trailing, egui::pos2(120.0, 100.0));
-        app.paint_hit(pick_triangle(&mesh, &projected, trailing).unwrap());
+        app.paint_hit(pick_triangle(&mesh, &projected, trailing, None).unwrap());
         app.finish_active_stroke();
 
         let recorded = &app.selected_layer().unwrap().paint_strokes[0].points;
-        let expected = pick_triangle(&mesh, &projected, trailing)
+        let expected = pick_triangle(&mesh, &projected, trailing, None)
             .unwrap()
             .uv
             .unwrap();
-        let raw = pick_triangle(&mesh, &projected, egui::pos2(130.0, 100.0))
+        let raw = pick_triangle(&mesh, &projected, egui::pos2(130.0, 100.0), None)
             .unwrap()
             .uv
             .unwrap();
@@ -9650,7 +9703,7 @@ Connections:  {
             (points[0].screen.to_vec2() + points[1].screen.to_vec2() + points[2].screen.to_vec2())
                 / 3.0;
         let bind_mesh = app.mesh_geometry.clone().unwrap();
-        let hit = pick_triangle(&bind_mesh, &points, centroid.to_pos2()).unwrap();
+        let hit = pick_triangle(&bind_mesh, &points, centroid.to_pos2(), None).unwrap();
         let expected = (bind_mesh.vertices[0].position
             + bind_mesh.vertices[1].position
             + bind_mesh.vertices[2].position)
@@ -9897,7 +9950,7 @@ Connections:  {
         ));
         let radial = footprints(&app);
         assert_eq!(radial.len(), 4);
-        let hit = pick_triangle(&cube, &points, pointer).unwrap();
+        let hit = pick_triangle(&cube, &points, pointer, None).unwrap();
         assert_eq!(app.symmetry_copies(&hit, hit.uv.unwrap()).len(), 3);
 
         // Off the mesh there is no footprint.

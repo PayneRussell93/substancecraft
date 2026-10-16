@@ -776,3 +776,278 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// glTF 2.0 material import
+
+/// A glTF 2.0 metallic-roughness material: its factors (colours in linear
+/// light) and the external texture files (relative to the glTF) feeding it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GltfMaterial {
+    pub name: String,
+    pub base_color_factor: [f32; 4],
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub emissive_factor: [f32; 3],
+    pub base_color_texture: Option<String>,
+    /// Roughness in G, metallic in B.
+    pub metallic_roughness_texture: Option<String>,
+    pub normal_texture: Option<String>,
+    pub emissive_texture: Option<String>,
+    /// `alphaMode` is BLEND or MASK, so base colour alpha is opacity.
+    pub uses_alpha: bool,
+    /// Textures embedded in the file (data URIs or buffer views), which
+    /// are not imported.
+    pub embedded_textures: usize,
+}
+
+/// The JSON of a `.gltf` file, or of the JSON chunk of a `.glb`.
+fn gltf_json(path: &Path) -> Result<serde_json::Value, InterchangeError> {
+    let bytes = std::fs::read(path).map_err(io)?;
+    let json = if bytes.starts_with(b"glTF") {
+        if bytes.len() < 20 {
+            return Err(InterchangeError::Invalid("truncated GLB".to_owned()));
+        }
+        let length = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        if &bytes[16..20] != b"JSON" || bytes.len() < 20 + length {
+            return Err(InterchangeError::Invalid(
+                "GLB has no JSON chunk".to_owned(),
+            ));
+        }
+        bytes[20..20 + length].to_vec()
+    } else {
+        bytes
+    };
+    serde_json::from_slice(&json).map_err(|error| InterchangeError::Invalid(error.to_string()))
+}
+
+/// Reads every material of a glTF 2.0 file (`.gltf` or `.glb`).
+pub fn read_gltf_materials(path: &Path) -> Result<Vec<GltfMaterial>, InterchangeError> {
+    let document = gltf_json(path)?;
+    let empty = Vec::new();
+    let array = |key: &str| {
+        document
+            .get(key)
+            .and_then(|value| value.as_array())
+            .unwrap_or(&empty)
+    };
+    let (textures, images) = (array("textures"), array("images"));
+    let numbers = |value: Option<&serde_json::Value>, default: &[f32]| -> Vec<f32> {
+        value
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_f64().unwrap_or(0.0) as f32)
+                    .collect()
+            })
+            .filter(|items: &Vec<f32>| {
+                items.len() == default.len() && items.iter().all(|value| value.is_finite())
+            })
+            .unwrap_or_else(|| default.to_vec())
+    };
+    let scalar = |value: Option<&serde_json::Value>, default: f32| {
+        value
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+    };
+    let mut materials = Vec::new();
+    for (index, material) in array("materials").iter().enumerate() {
+        let mut embedded = 0;
+        let mut texture = |info: Option<&serde_json::Value>| -> Option<String> {
+            let texture_index = info?.get("index")?.as_u64()? as usize;
+            let image_index = textures.get(texture_index)?.get("source")?.as_u64()? as usize;
+            let image = images.get(image_index)?;
+            match image.get("uri").and_then(|uri| uri.as_str()) {
+                Some(uri) if !uri.starts_with("data:") => Some(percent_decode(uri)),
+                _ => {
+                    embedded += 1;
+                    None
+                }
+            }
+        };
+        let pbr = material.get("pbrMetallicRoughness");
+        let pbr_field = |key: &str| pbr.and_then(|pbr| pbr.get(key));
+        let base = numbers(pbr_field("baseColorFactor"), &[1.0, 1.0, 1.0, 1.0]);
+        let emissive = numbers(material.get("emissiveFactor"), &[0.0, 0.0, 0.0]);
+        let alpha_mode = material
+            .get("alphaMode")
+            .and_then(|mode| mode.as_str())
+            .unwrap_or("OPAQUE");
+        let base_color_texture = texture(pbr_field("baseColorTexture"));
+        let metallic_roughness_texture = texture(pbr_field("metallicRoughnessTexture"));
+        let normal_texture = texture(material.get("normalTexture"));
+        let emissive_texture = texture(material.get("emissiveTexture"));
+        materials.push(GltfMaterial {
+            name: material
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map_or_else(|| format!("Material {}", index + 1), str::to_owned),
+            base_color_factor: [base[0], base[1], base[2], base[3]],
+            metallic_factor: scalar(pbr_field("metallicFactor"), 1.0).clamp(0.0, 1.0),
+            roughness_factor: scalar(pbr_field("roughnessFactor"), 1.0).clamp(0.0, 1.0),
+            emissive_factor: [emissive[0], emissive[1], emissive[2]],
+            base_color_texture,
+            metallic_roughness_texture,
+            normal_texture,
+            emissive_texture,
+            uses_alpha: matches!(alpha_mode, "BLEND" | "MASK"),
+            embedded_textures: embedded,
+        });
+    }
+    if materials.is_empty() {
+        return Err(InterchangeError::Invalid(
+            "the file has no materials".to_owned(),
+        ));
+    }
+    Ok(materials)
+}
+
+/// Decodes `%XX` escapes in a glTF URI.
+fn percent_decode(uri: &str) -> String {
+    let bytes = uri.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(value) = u8::from_str_radix(&uri[index + 1..index + 3], 16)
+        {
+            out.push(value);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Keys of the resources [`gltf_fill`] binds, with the channel each feeds.
+pub const GLTF_FILL_INPUTS: [(&str, MaterialChannel); 5] = [
+    ("base_color", MaterialChannel::BaseColor),
+    ("roughness", MaterialChannel::Roughness),
+    ("metallic", MaterialChannel::Metallic),
+    ("normal", MaterialChannel::Normal),
+    ("emissive", MaterialChannel::Emissive),
+];
+
+/// The fill layer a glTF material describes, and the channels it writes.
+/// Factors become fill values (colours converted from linear light to
+/// sRGB); a texture replaces its factor. Emission is written when given a
+/// texture or a non-black factor, normals when given a texture, and opacity
+/// when the material blends or masks.
+pub fn gltf_fill(
+    material: &GltfMaterial,
+    resources: &BTreeMap<String, ResourceId>,
+) -> (LayerFill, BTreeSet<MaterialChannel>) {
+    let to_srgb8 = |rgb: [f32; 3]| {
+        ColorSpace::LinearSrgb
+            .to_srgb(glam::Vec3::from(rgb).max(glam::Vec3::ZERO))
+            .to_array()
+            .map(|component| (component.clamp(0.0, 1.0) * 255.0).round() as u8)
+    };
+    let [r, g, b, a] = material.base_color_factor;
+    let mut fill = LayerFill::default();
+    let [cr, cg, cb] = to_srgb8([r, g, b]);
+    fill.color = [cr, cg, cb, 255];
+    fill.roughness = material.roughness_factor;
+    fill.metallic = material.metallic_factor;
+    fill.emissive = to_srgb8(material.emissive_factor);
+    let mut channels = BTreeSet::from([
+        MaterialChannel::BaseColor,
+        MaterialChannel::Roughness,
+        MaterialChannel::Metallic,
+    ]);
+    if resources.contains_key("emissive") || fill.emissive != [0, 0, 0] {
+        channels.insert(MaterialChannel::Emissive);
+    }
+    if resources.contains_key("normal") {
+        channels.insert(MaterialChannel::Normal);
+    }
+    if material.uses_alpha {
+        fill.material_opacity = a.clamp(0.0, 1.0);
+        channels.insert(MaterialChannel::Opacity);
+    }
+    for (input, channel) in GLTF_FILL_INPUTS {
+        if let (Some(resource), Some(slot)) =
+            (resources.get(input), fill.textures.slot_mut(channel))
+        {
+            *slot = Some(*resource);
+        }
+    }
+    (fill, channels)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod gltf_material_tests {
+    use super::*;
+
+    #[test]
+    fn gltf_materials_read_factors_and_external_textures() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("crate.gltf");
+        let document = json!({
+            "asset": {"version": "2.0"},
+            "images": [{"uri": "crate%20base.png"}, {"uri": "data:image/png;base64,AAAA"}, {"uri": "mr.png"}],
+            "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+            "materials": [
+                {"name": "Crate", "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.2159, 0.2159, 0.2159, 0.5],
+                    "baseColorTexture": {"index": 0},
+                    "metallicRoughnessTexture": {"index": 2},
+                    "roughnessFactor": 0.4},
+                 "normalTexture": {"index": 1},
+                 "emissiveFactor": [1.0, 0.0, 0.0],
+                 "alphaMode": "BLEND"},
+                {}
+            ]
+        });
+        std::fs::write(&path, document.to_string()).unwrap();
+        let materials = read_gltf_materials(&path).unwrap();
+        assert_eq!(materials.len(), 2);
+        let crate_material = &materials[0];
+        assert_eq!(
+            crate_material.base_color_texture.as_deref(),
+            Some("crate base.png")
+        );
+        assert_eq!(
+            crate_material.metallic_roughness_texture.as_deref(),
+            Some("mr.png")
+        );
+        assert_eq!(crate_material.normal_texture, None);
+        assert_eq!(crate_material.embedded_textures, 1);
+        assert!(crate_material.uses_alpha);
+        assert_eq!(materials[1].name, "Material 2");
+        assert_eq!(materials[1].metallic_factor, 1.0);
+
+        let resources = BTreeMap::from([("base_color".to_owned(), ResourceId(4))]);
+        let (fill, channels) = gltf_fill(crate_material, &resources);
+        assert_eq!(fill.color, [128, 128, 128, 255]);
+        assert_eq!(fill.textures.base_color, Some(ResourceId(4)));
+        assert!((fill.roughness - 0.4).abs() < 1e-6);
+        assert_eq!(fill.emissive, [255, 0, 0]);
+        assert_eq!(fill.material_opacity, 0.5);
+        assert!(channels.contains(&MaterialChannel::Emissive));
+        assert!(channels.contains(&MaterialChannel::Opacity));
+        assert!(!channels.contains(&MaterialChannel::Normal));
+
+        // The JSON chunk of a GLB reads the same.
+        let json_bytes = document.to_string().into_bytes();
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(((20 + json_bytes.len()) as u32).to_le_bytes());
+        glb.extend((json_bytes.len() as u32).to_le_bytes());
+        glb.extend(b"JSON");
+        glb.extend(&json_bytes);
+        let glb_path = folder.path().join("crate.glb");
+        std::fs::write(&glb_path, glb).unwrap();
+        assert_eq!(read_gltf_materials(&glb_path).unwrap(), materials);
+
+        std::fs::write(&path, r#"{"asset": {"version": "2.0"}}"#).unwrap();
+        assert!(read_gltf_materials(&path).is_err());
+    }
+}
