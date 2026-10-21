@@ -29,6 +29,6 @@ Double-click `scripts/launch-substancecraft.cmd` to build and run the desktop ap
 
 ## Direction
 
-The architecture and initial vertical slice are tracked in [the roadmap](ROADMAP.md), [the 50-area feature map](docs/feature-map.md), and [the architecture notes](docs/architecture.md). The API and MCP starter are described in [the API guide](docs/api-and-mcp.md). Quality records are in [Documentation/Quality](Documentation/Quality/mini-QualityPlan.md).
+The architecture and initial vertical slice are tracked in [the roadmap](ROADMAP.md), [the 50-area feature map](docs/feature-map.md), and [the architecture notes](docs/architecture.md). The API and MCP starter are described in [the API guide](docs/api-and-mcp.md), and plugins in [Writing plugins](docs/plugins.md). Quality records are in [Documentation/Quality](Documentation/Quality/mini-QualityPlan.md).
 
 SubstanceCraft is an independent project. PhotoCraft, LightCraft, and VectorCraft inform architectural choices only; no source code, assets, proprietary formats, or product UI assets are copied from them or from Adobe products.

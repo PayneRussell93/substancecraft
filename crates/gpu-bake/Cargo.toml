@@ -8,6 +8,8 @@ description = "GPU compute ray tracing for SubstanceCraft mesh-map bakes"
 
 [dependencies]
 glam.workspace = true
+thiserror.workspace = true
+bytemuck = "1"
 pollster = "0.4"
 substancecraft-core = { path = "../core" }
 wgpu = "30"

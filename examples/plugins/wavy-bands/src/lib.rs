@@ -70,7 +70,7 @@ pub extern "C" fn sc_generate(
     let parameters = floats(parameters, 8);
     let samples = floats(samples, count * SAMPLE_FLOATS);
     let out = floats(out, count);
-    for (value, sample) in out.iter_mut().zip(samples.chunks_exact(SAMPLE_FLOATS)) {
+    for (value, sample) in out.iter_mut().zip(samples.as_chunks::<SAMPLE_FLOATS>().0) {
         *value = wavy(parameters, sample);
     }
     0
@@ -80,7 +80,13 @@ pub extern "C" fn sc_generate(
 const COLOR: i32 = 0;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sc_filter(filter: i32, parameters: i32, texels: i32, count: i32, kind: i32) -> i32 {
+pub extern "C" fn sc_filter(
+    filter: i32,
+    parameters: i32,
+    texels: i32,
+    count: i32,
+    kind: i32,
+) -> i32 {
     if filter != 0 {
         return 1;
     }
@@ -88,7 +94,10 @@ pub extern "C" fn sc_filter(filter: i32, parameters: i32, texels: i32, count: i3
         return 0;
     }
     let amount = floats(parameters, 8)[0].clamp(0.0, 1.0);
-    for texel in floats(texels, count.max(0) as usize * 4).chunks_exact_mut(4) {
+    for texel in floats(texels, count.max(0) as usize * 4)
+        .as_chunks_mut::<4>()
+        .0
+    {
         let (r, g, b) = (texel[0], texel[1], texel[2]);
         let sepia = [
             r * 0.393 + g * 0.769 + b * 0.189,

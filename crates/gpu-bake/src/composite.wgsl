@@ -20,7 +20,8 @@ struct Globals {
     maps_width: u32,
     maps_height: u32,
     has_maps: u32,
-    _pad0: u32,
+    // Where mask slots start in `planes`, four masks per vec4.
+    mask_base: u32,
     bounds_min: vec4<f32>,
     bounds_max: vec4<f32>,
     diagonal: f32,
@@ -879,10 +880,8 @@ fn math_apply(op: u32, a: f32, b: f32) -> f32 {
         default: {
             let base = max(a, 0.0);
             if base == 0.0 {
+                // 0 to a negative power is infinite, which the CPU drops to 0.
                 value = select(0.0, 1.0, b == 0.0);
-                if b < 0.0 {
-                    value = 3.5e38;
-                }
             } else {
                 value = pow(base, b);
             }
@@ -1037,7 +1036,12 @@ fn mask_value(r: u32, i: u32, uv: vec2<f32>, s: Sample) -> f32 {
         return 1.0;
     }
     if kind == 2u {
-        return upload[g.count + i].x;
+        // CPU masks upload as plain floats after the content plane.
+        return upload[g.count + i / 4u][i % 4u];
+    }
+    if kind == 3u {
+        let slot = word(r + 3u, 3u);
+        return planes[g.mask_base + (slot / 4u) * g.count + i][slot % 4u];
     }
     var value = 1.0;
     let generator = word(r + 3u, 3u);
@@ -1068,6 +1072,23 @@ fn mask_value(r: u32, i: u32, uv: vec2<f32>, s: Sample) -> f32 {
 
 fn plane_at(level: u32, i: u32) -> u32 {
     return level * g.count + i;
+}
+
+/// A layer's mask, computed once for every channel into slot
+/// `dispatch.level`.
+@compute @workgroup_size(256)
+fn make_mask(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if i >= g.count {
+        return;
+    }
+    let r = record(dispatch.record);
+    let uv = pixel_uv(i % g.width, i / g.width);
+    let slot = dispatch.level;
+    let at = g.mask_base + (slot / 4u) * g.count + i;
+    var masks = planes[at];
+    masks[slot % 4u] = mask_value(r, i, uv, maps_sample(uv));
+    planes[at] = masks;
 }
 
 // ---- Entry points ------------------------------------------------------------

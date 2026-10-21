@@ -91,6 +91,9 @@ pub enum PlanContent {
 }
 
 /// A layer's mask.
+// A plan holds a handful of these, built once per bake; boxing the large
+// variant would only add indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanMask {
     Open,
@@ -111,8 +114,10 @@ pub enum PlanMask {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanStep {
     /// Lays a layer over the current plane: its content through `filters`
-    /// (per-texel), `mask`, and `opacity`, blended by `blend`.
+    /// (per-texel), `mask`, and `opacity`, blended by `blend`. A layer's
+    /// mask is the same in every channel.
     Layer {
+        layer: LayerId,
         content: PlanContent,
         filters: Vec<LayerFilter>,
         mask: PlanMask,
@@ -126,6 +131,7 @@ pub enum PlanStep {
     /// it over the plane beneath like a layer, or for a pass-through group
     /// fades it in by `opacity` and `mask`.
     EndGroup {
+        layer: LayerId,
         filters: Vec<LayerFilter>,
         mask: PlanMask,
         opacity: f32,
@@ -192,11 +198,12 @@ impl<'a> CompositePlan<'a> {
             return Err(PlanError::Unsupported("the set bakes in tiles"));
         }
         let id_map = set.validate_for_region(region)?;
-        if set
-            .walk_layers()
-            .iter()
-            .any(|layer| layer.paint_strokes.iter().any(|stroke| stroke.source.is_some()))
-        {
+        if set.walk_layers().iter().any(|layer| {
+            layer
+                .paint_strokes
+                .iter()
+                .any(|stroke| stroke.source.is_some())
+        }) {
             return Err(PlanError::Unsupported(
                 "clone and smudge strokes read the stack",
             ));
@@ -213,7 +220,10 @@ impl<'a> CompositePlan<'a> {
         for channel in PLAN_CHANNELS {
             // Normal always composites: it starts from the baked normals.
             if channel != MaterialChannel::Normal
-                && !set.layers.iter().any(|layer| contributes(layer, &[channel]))
+                && !set
+                    .layers
+                    .iter()
+                    .any(|layer| contributes(layer, &[channel]))
             {
                 continue;
             }
@@ -262,15 +272,25 @@ impl<'a> CompositePlan<'a> {
 
     /// A [`PlanContent::Cpu`] layer's content for `channel` over the whole
     /// set, after its filters, as straight-alpha texels in row order.
-    pub fn content(&self, layer: LayerId, channel: MaterialChannel) -> Result<Vec<Vec4>, BakeError> {
-        let layer = self.set.layer(layer).ok_or(BakeError::InvalidLayerSettings)?;
+    pub fn content(
+        &self,
+        layer: LayerId,
+        channel: MaterialChannel,
+    ) -> Result<Vec<Vec4>, BakeError> {
+        let layer = self
+            .set
+            .layer(layer)
+            .ok_or(BakeError::InvalidLayerSettings)?;
         self.set
             .layer_local_plane(layer, channel, self.context, self.id_map.as_deref())
     }
 
     /// A [`PlanMask::Cpu`] layer's mask over the whole set, in row order.
     pub fn mask(&self, layer: LayerId) -> Result<Vec<f32>, BakeError> {
-        let layer = self.set.layer(layer).ok_or(BakeError::InvalidLayerSettings)?;
+        let layer = self
+            .set
+            .layer(layer)
+            .ok_or(BakeError::InvalidLayerSettings)?;
         let region = self.set.texel_rect();
         Ok(self
             .set
@@ -319,6 +339,7 @@ impl<'a> CompositePlan<'a> {
                     steps.push(PlanStep::BeginGroup { pass_through: true });
                     self.walk(children, channel, steps, depth, level + 1)?;
                     steps.push(PlanStep::EndGroup {
+                        layer: layer.id,
                         filters,
                         mask,
                         opacity,
@@ -335,6 +356,7 @@ impl<'a> CompositePlan<'a> {
                     });
                     self.walk(children, channel, steps, depth, level + 1)?;
                     steps.push(PlanStep::EndGroup {
+                        layer: layer.id,
                         filters,
                         mask,
                         opacity,
@@ -343,6 +365,7 @@ impl<'a> CompositePlan<'a> {
                     });
                 }
                 Some(_) => steps.push(PlanStep::Layer {
+                    layer: layer.id,
                     content: PlanContent::Cpu(layer.id),
                     filters: Vec::new(),
                     mask,
@@ -354,6 +377,7 @@ impl<'a> CompositePlan<'a> {
                         Some(content) if gpu_filters => content,
                         _ => {
                             steps.push(PlanStep::Layer {
+                                layer: layer.id,
                                 content: PlanContent::Cpu(layer.id),
                                 filters: Vec::new(),
                                 mask,
@@ -364,6 +388,7 @@ impl<'a> CompositePlan<'a> {
                         }
                     };
                     steps.push(PlanStep::Layer {
+                        layer: layer.id,
                         content,
                         filters,
                         mask,
@@ -398,7 +423,11 @@ impl<'a> CompositePlan<'a> {
             if graph.needs_mesh_maps() && self.context.mesh_maps.is_none() {
                 return Err(BakeError::MissingMeshMaps);
             }
-            let index = match self.graphs.iter().position(|known| std::ptr::eq(*known, graph)) {
+            let index = match self
+                .graphs
+                .iter()
+                .position(|known| std::ptr::eq(*known, graph))
+            {
                 Some(index) => index,
                 None => {
                     self.graphs.push(graph);

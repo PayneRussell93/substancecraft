@@ -823,6 +823,8 @@ struct BakeInputs {
     /// Set for meshes with UDIM tiles beyond 1001: previews bake every
     /// tile into an atlas.
     udim: Option<udim_view::UdimInputs>,
+    /// Composite full material previews on the GPU when it can (PERF-06).
+    gpu_compositing: bool,
 }
 
 impl BakeInputs {
@@ -857,6 +859,20 @@ impl BakeInputs {
     fn bake_material(&self, texture_set: &TextureSet) -> Result<MaterialTextures, String> {
         if let Some(udim) = &self.udim {
             return udim.bake_material(self, texture_set);
+        }
+        // The GPU composites what its plan covers; anything it declines, or
+        // fails at, bakes on the CPU below. Exports never come through here.
+        if self.gpu_compositing
+            && let Some(compositor) = substancecraft_gpu_bake::GpuCompositor::shared()
+        {
+            let context = substancecraft_core::BakeContext {
+                mesh: self.mesh.as_deref(),
+                mesh_maps: self.maps(),
+                resources: Some(&self.resources),
+            };
+            if let Ok(textures) = compositor.bake_material(texture_set, context) {
+                return Ok(textures);
+            }
         }
         bake_texture_set_material(
             texture_set,
@@ -5036,6 +5052,7 @@ impl SubstanceCraftApp {
                 settings: self.effective_mesh_map_settings(),
                 gpu: self.preferences.values.gpu_baking,
             }),
+            gpu_compositing: self.preferences.values.gpu_compositing,
         }
     }
 
@@ -9756,6 +9773,45 @@ mod tests {
     }
 
     #[test]
+    fn tc_0413_previews_composite_on_the_gpu_and_match_cpu_bakes() {
+        let Some(compositor) = substancecraft_gpu_bake::GpuCompositor::shared() else {
+            eprintln!("TC-0413 skipped: no GPU");
+            return;
+        };
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        app.add_paint_layer();
+        let set = app.selected_texture_set_ref().unwrap().clone();
+        let mut inputs = app.bake_inputs(set.id);
+        let cpu = inputs.bake_material(&set).unwrap();
+        inputs.gpu_compositing = true;
+        let gpu = inputs.bake_material(&set).unwrap();
+        for (a, b) in [
+            (&gpu.base_color, &cpu.base_color),
+            (&gpu.orm, &cpu.orm),
+            (&gpu.normal, &cpu.normal),
+            (&gpu.emissive, &cpu.emissive),
+        ] {
+            let (mean, far) = substancecraft_gpu_bake::texture_differences(a, b, 2);
+            assert!(
+                mean < 0.5 && far <= 0.01,
+                "{} {mean} {far}",
+                compositor.name()
+            );
+        }
+        // The preference is remembered, and off means the CPU.
+        assert!(
+            !app.preferences.values.gpu_compositing,
+            "tests default to the CPU"
+        );
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("preferences.json");
+        app.preferences.values.gpu_compositing = true;
+        app.preferences.values.save(&path).unwrap();
+        assert!(preferences::Preferences::load(&path).gpu_compositing);
+    }
+
+    #[test]
     fn tc_0411_plugin_presets_are_offered_and_adopted_when_a_set_keeps_one() {
         struct Presets;
         impl substancecraft_core::PluginHost for Presets {
@@ -9789,7 +9845,11 @@ mod tests {
         let mut app = SubstanceCraftApp::default();
         app.add_fill_layer();
         let name = "App plugin preset".to_owned();
-        assert!(app.export_presets().iter().any(|preset| preset.name == name));
+        assert!(
+            app.export_presets()
+                .iter()
+                .any(|preset| preset.name == name)
+        );
 
         // Chosen app-wide, it stays the plugin's.
         app.set_preset_choice(name.clone());
@@ -9799,12 +9859,20 @@ mod tests {
         // on its own; undo takes both back.
         app.remember_export_for_selected(true);
         assert!(app.is_custom_preset(&name));
-        let saved = app.selected_texture_set_ref().unwrap().export.clone().unwrap();
+        let saved = app
+            .selected_texture_set_ref()
+            .unwrap()
+            .export
+            .clone()
+            .unwrap();
         assert_eq!(saved.preset, name);
         substancecraft_core::extensions::unregister_plugin("test.app");
         app.project.validate().unwrap();
         assert_eq!(
-            app.export_presets().iter().filter(|preset| preset.name == name).count(),
+            app.export_presets()
+                .iter()
+                .filter(|preset| preset.name == name)
+                .count(),
             1
         );
         app.undo();

@@ -1605,6 +1605,20 @@ impl SubstanceCraftApp {
             self.preferences.values.gpu_baking = gpu;
             self.save_preferences();
         }
+        let mut compositing = self.preferences.values.gpu_compositing;
+        let toggled = widgets::property_row(ui, "GPU layers", |ui| {
+            widgets::toggle(ui, &mut compositing)
+        })
+        .on_hover_text(
+            "Composite the viewport's material on the GPU; strokes and blurs still render on \
+             the CPU, and exports always bake there",
+        )
+        .changed();
+        if toggled {
+            self.preferences.values.gpu_compositing = compositing;
+            self.save_preferences();
+            self.invalidate_preview();
+        }
         hint(ui, "Setting changes apply on the next bake.");
 
         widgets::caption(ui, "Preview on mesh");

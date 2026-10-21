@@ -23,6 +23,6 @@
 7. **Automation foundation:** the Rust API facade, a versioned automation API (layer structure, masks and generators, bitmap, polygon, and anchor masks, filters, strokes, materials, smart materials and smart masks, texture-set and mesh properties), headless CLI exports and edits, and MCP project tools are implemented. Complete.
 8. **Full product capability map:** track all 50 capability areas and acceptance targets in [the feature map](docs/feature-map.md).
 
-UDIM, saved smart-material presets, and plugin support remain later targets. Each milestone must preserve a usable, testable workspace; no Adobe project-format compatibility is planned.
+UDIM and saved smart-material presets remain later targets; plugin support (generators, filters, and export presets as sandboxed WebAssembly plugins) is in place, see [Writing plugins](docs/plugins.md). Each milestone must preserve a usable, testable workspace; no Adobe project-format compatibility is planned.
 
 The feature map is intentionally comprehensive, but this repository does not yet implement most Painter-class capabilities. Continue milestone-by-milestone and do not label planned areas complete without behavior tests.

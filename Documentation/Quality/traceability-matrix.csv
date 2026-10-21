@@ -83,3 +83,7 @@ REQ-0081,Save and apply panel layouts,docs/feature-map.md,docs/architecture.md,,
 REQ-0082,Hide and isolate selected geometry in the viewport,docs/feature-map.md,docs/architecture.md,,TC-0397,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0083,Import glTF materials as fill layers,docs/feature-map.md,docs/architecture.md,,TC-0398,Documentation/Quality/TestPlan-short.md,Project owner,Verified
 REQ-0084,Import BMP TIFF WebP OpenEXR and HDR bitmaps with 16-bit precision,docs/feature-map.md,docs/architecture.md,,TC-0399;TC-0400,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0085,Bind actions to keys mouse side buttons and gamepad buttons,docs/feature-map.md,docs/architecture.md,,TC-0407,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0086,Export byte-identical textures on every supported OS and CPU,docs/feature-map.md,docs/compatibility.md,,TC-0408,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0087,Extend generators filters and export presets with sandboxed plugins,docs/plugins.md,docs/architecture.md,,TC-0409;TC-0410;TC-0411,Documentation/Quality/TestPlan-short.md,Project owner,Verified
+REQ-0088,Composite viewport previews on the GPU within a tested tolerance of the CPU,docs/feature-map.md,docs/architecture.md,,TC-0412;TC-0413,Documentation/Quality/TestPlan-short.md,Project owner,Verified

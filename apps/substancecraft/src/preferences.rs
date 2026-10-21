@@ -342,6 +342,8 @@ pub struct Preferences {
     pub disk_cache_budget_mb: u32,
     /// Trace mesh-map rays on the GPU when one is available.
     pub gpu_baking: bool,
+    /// Composite material previews on the GPU when one is available.
+    pub gpu_compositing: bool,
     /// Lighting-check environment of the viewport.
     pub lighting_preset: substancecraft_core::LightingPreset,
     /// HDR panorama lighting the viewport in place of the preset.
@@ -384,6 +386,9 @@ impl Default for Preferences {
             disk_cache_folder: None,
             disk_cache_budget_mb: crate::disk_cache::DEFAULT_DISK_BUDGET_MB,
             gpu_baking: true,
+            // Unit tests compare previews with CPU bakes byte for byte; the
+            // GPU path has its own tolerance tests.
+            gpu_compositing: !cfg!(test),
             lighting_preset: substancecraft_core::LightingPreset::default(),
             environment_file: None,
             picker_color_space: substancecraft_core::ColorSpace::Srgb,

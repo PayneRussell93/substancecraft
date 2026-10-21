@@ -19,7 +19,7 @@ use substancecraft_core::{
 
 mod composite;
 
-pub use composite::{CompositeError, GpuCompositor};
+pub use composite::{CompositeError, GpuCompositor, texture_differences};
 
 const SHADER: &str = include_str!("trace.wgsl");
 const WORKGROUP: u32 = 64;
@@ -300,7 +300,7 @@ fn bvh_depth(nodes: &[substancecraft_core::BvhNode]) -> Result<usize, String> {
     Ok(deepest)
 }
 
-fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
