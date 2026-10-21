@@ -23,6 +23,10 @@ powershell -ExecutionPolicy Bypass -File scripts/build-filament.ps1
 
 The core, API, CLI, and MCP crates build and test without Filament (`cargo test -p substancecraft-core -p substancecraft-api -p substancecraft-cli -p substancecraft-mcp`).
 
+## Launch on Windows
+
+Double-click `scripts/launch-substancecraft.cmd` to build and run the desktop app. The app uses a custom material-cube icon in its window and taskbar; while it is running, right-click its taskbar icon and choose **Pin to taskbar**.
+
 ## Direction
 
 The architecture and initial vertical slice are tracked in [the roadmap](ROADMAP.md), [the 50-area feature map](docs/feature-map.md), and [the architecture notes](docs/architecture.md). The API and MCP starter are described in [the API guide](docs/api-and-mcp.md). Quality records are in [Documentation/Quality](Documentation/Quality/mini-QualityPlan.md).
