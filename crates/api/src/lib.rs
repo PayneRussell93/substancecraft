@@ -16,6 +16,7 @@ mod project_format;
 mod recovery;
 mod relink;
 mod shared_library;
+mod stable_writer;
 mod step;
 mod step_face;
 mod step_geom;
@@ -84,7 +85,7 @@ pub use vector::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{Read, Write},
     path::Path,
 };
 use substancecraft_core::{
@@ -102,7 +103,16 @@ pub fn encode_project_json(project: &MaterialProject) -> Result<Vec<u8>, Project
     project
         .validate()
         .map_err(|error| ProjectFileError::InvalidProject(error.to_string()))?;
+    stable_writer::to_stable_json(project)
+}
 
+/// [`encode_project_json`] through a `serde_json::Value` tree, as saves
+/// were written before PERF-05; the reference the streaming writer must
+/// match byte for byte.
+#[cfg(test)]
+pub(crate) fn encode_project_json_tree(
+    project: &MaterialProject,
+) -> Result<Vec<u8>, ProjectFileError> {
     let mut writer = BoundedJsonWriter {
         bytes: Vec::new(),
         limit_exceeded: false,
@@ -161,24 +171,26 @@ pub fn load_project_file_with_report(
     decode_project_json_with_report(&bytes)
 }
 
+#[cfg(test)]
 struct BoundedJsonWriter {
     bytes: Vec<u8>,
     limit_exceeded: bool,
 }
 
+#[cfg(test)]
 impl Write for BoundedJsonWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let Some(new_len) = self.bytes.len().checked_add(buffer.len()) else {
             self.limit_exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
                 "project JSON size overflow",
             ));
         };
         if new_len > MAX_PROJECT_JSON_BYTES {
             self.limit_exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
                 "project JSON exceeds size limit",
             ));
         }
@@ -186,7 +198,7 @@ impl Write for BoundedJsonWriter {
         Ok(buffer.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -644,14 +656,40 @@ pub fn detect_image_sequence(path: &Path) -> Option<substancecraft_core::ImageSe
 pub fn load_project_resources(
     project: &MaterialProject,
 ) -> (ResourceImages, Vec<(ResourceId, TextureIoError)>) {
+    // Decoded in parallel (PERF-05); results keep the project's order.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 16);
+    let chunk = project.resources.len().div_ceil(threads).max(1);
+    let decoded: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = project
+            .resources
+            .chunks(chunk)
+            .map(|resources| {
+                let decode = move || {
+                    resources
+                        .iter()
+                        .map(|resource| (resource.id, load_resource_image(resource)))
+                        .collect::<Vec<_>>()
+                };
+                (decode, scope.spawn(decode))
+            })
+            .collect();
+        // A worker that panicked has its share decoded again here, so no
+        // bitmap goes missing unreported.
+        workers
+            .into_iter()
+            .flat_map(|(decode, worker)| worker.join().unwrap_or_else(|_| decode()))
+            .collect()
+    });
     let mut images = ResourceImages::new();
     let mut failures = Vec::new();
-    for resource in &project.resources {
-        match load_resource_image(resource) {
+    for (id, result) in decoded {
+        match result {
             Ok(image) => {
-                images.insert(resource.id, std::sync::Arc::new(image));
+                images.insert(id, std::sync::Arc::new(image));
             }
-            Err(error) => failures.push((resource.id, error)),
+            Err(error) => failures.push((id, error)),
         }
     }
     (images, failures)

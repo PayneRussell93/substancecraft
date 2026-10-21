@@ -12,15 +12,15 @@ use std::time::Duration;
 use eframe::egui;
 #[cfg(test)]
 use substancecraft_api::load_project_file;
+use substancecraft_api::load_project_history;
 use substancecraft_api::load_resource_image;
 use substancecraft_api::{
     ImportedMesh, MAX_FBX_BYTES, TextureFormat, bake_texture_set_channel, bake_texture_set_export,
     bake_texture_set_material, existing_export_files, export_preflight, import_fbx_meshes,
     import_gltf_file, load_project_file_with_report, load_project_resources, load_texture_image,
     rebake_texture_set_channel_regions, rebake_texture_set_material_plane_regions,
-    save_project_file, write_exported_textures, write_texture,
+    write_exported_textures, write_texture,
 };
-use substancecraft_api::{load_project_history, save_project_history};
 use substancecraft_core::{
     BakedTexture, BoneId, BoneTransform, BrushTip, DEFAULT_EMISSIVE, DEFAULT_HEIGHT,
     DEFAULT_HEIGHT_STRENGTH, DEFAULT_OPACITY, Dirt, EdgeWear, EditCommand, EditHistory,
@@ -40,6 +40,7 @@ mod bake_log;
 mod cache;
 mod cameras;
 mod diagnostics;
+mod disk_cache;
 mod edges;
 mod environments;
 mod geometry_visibility;
@@ -56,7 +57,10 @@ mod panels;
 mod preferences;
 mod relink;
 mod resource_watch;
+mod saving;
 mod sequences;
+#[cfg(test)]
+mod stress;
 mod stroke_tools;
 mod theme;
 mod turntable;
@@ -132,7 +136,7 @@ fn main() -> eframe::Result {
             }
             // `substancecraft path/to/scene.sproject` opens that project.
             if let Some(path) = std::env::args_os().nth(1) {
-                app.open_project_path(path.into());
+                app.open_project_in_background(path.into());
             }
             Ok(Box::new(app))
         }),
@@ -358,6 +362,10 @@ struct SubstanceCraftApp {
     loaded_resource_sources: Vec<(ResourceId, String)>,
     bake_log: bake_log::BakeLog,
     cache: cache::CacheState,
+    /// Saves and autosaves being written in the background.
+    saving: saving::Saving,
+    /// A project being read in the background, and where from.
+    opening: Option<(std::path::PathBuf, Receiver<Result<LoadedProject, String>>)>,
     library: library_panel::LibraryState,
 }
 
@@ -432,10 +440,45 @@ pub(crate) enum ViewMode {
     Uv,
 }
 
+/// A project's decoded bitmaps and the ones that failed to load.
+type ResourceFailure = (
+    substancecraft_core::ResourceId,
+    substancecraft_api::TextureIoError,
+);
+type LoadedResources = (ResourceImages, Vec<ResourceFailure>);
+
+/// A project file read, upgraded, relinked, and with its bitmaps decoded:
+/// everything opening it does that needs no app state (PERF-05).
+struct LoadedProject {
+    project: MaterialProject,
+    report: substancecraft_api::MigrationReport,
+    /// Mesh files found again after a move.
+    relinked: Vec<String>,
+    resources: LoadedResources,
+}
+
+/// Reads the project at `path` for opening; safe on any thread.
+fn load_for_opening(path: &std::path::Path) -> Result<LoadedProject, String> {
+    let (mut project, report) =
+        load_project_file_with_report(path).map_err(|error| error.to_string())?;
+    // Moved mesh files are found by name near the project.
+    let relinked = relink::relink_mesh_sources(&mut project, &relink::search_roots(Some(path)));
+    let resources = load_project_resources(&project);
+    Ok(LoadedProject {
+        project,
+        report,
+        relinked,
+        resources,
+    })
+}
+
 /// A texture set's last full-material bake.
 struct CachedMaterial {
     revision: u64,
     textures: Arc<MaterialTextures>,
+    /// What changed in the set since `revision`, so the next background
+    /// bake can patch these textures (PERF-02); `None` means a full rebake.
+    dirty: Option<incremental::PreviewDirty>,
 }
 
 /// Background bake of a texture set that is not selected, so every material
@@ -444,6 +487,8 @@ struct SetBakeJob {
     set_id: TextureSetId,
     revision: u64,
     receiver: Receiver<Result<MaterialTextures, String>>,
+    /// Edits of the set since the bake started.
+    dirty: Option<incremental::PreviewDirty>,
 }
 
 /// What the viewport currently shows on the mesh.
@@ -543,9 +588,9 @@ impl PreviewPatch {
 /// through a camera): then every set needs a full rebake.
 fn layer_edit_scope(
     command: &EditCommand,
-    selected: Option<(TextureSetId, u32, u32, u32)>,
+    previews: &BTreeMap<TextureSetId, (u32, u32, u32)>,
     sets: &mut BTreeSet<TextureSetId>,
-    strokes: &mut Vec<TexelRect>,
+    strokes: &mut BTreeMap<TextureSetId, Vec<TexelRect>>,
 ) -> bool {
     let mut stroke = |set: TextureSetId,
                       points: &[glam::Vec2],
@@ -553,8 +598,8 @@ fn layer_edit_scope(
                       tip: substancecraft_core::BrushTip,
                       frames: &[substancecraft_core::StampFrame]| {
         sets.insert(set);
-        if let Some((_, width, height, factor)) = selected.filter(|(id, ..)| *id == set) {
-            strokes.extend(stroke_texel_bounds(
+        if let Some(&(width, height, factor)) = previews.get(&set) {
+            strokes.entry(set).or_default().extend(stroke_texel_bounds(
                 points,
                 radius / factor as f32,
                 tip,
@@ -567,7 +612,7 @@ fn layer_edit_scope(
     match command {
         EditCommand::Batch(commands) => commands
             .iter()
-            .all(|command| layer_edit_scope(command, selected, sets, strokes)),
+            .all(|command| layer_edit_scope(command, previews, sets, strokes)),
         EditCommand::Paint {
             texture_set_id,
             stroke: painted,
@@ -828,6 +873,7 @@ impl BakeInputs {
     }
 }
 
+#[derive(Clone)]
 enum PreviewTextures {
     Material(Arc<MaterialTextures>),
     Single(Arc<BakedTexture>),
@@ -897,7 +943,8 @@ struct HighPolySource {
 }
 
 struct MeshMapJob {
-    receiver: Receiver<Result<Vec<MeshMaps>, MeshMapError>>,
+    /// The maps, and whether they came from the disk cache.
+    receiver: Receiver<(Result<Vec<MeshMaps>, MeshMapError>, bool)>,
     cancel: Arc<AtomicBool>,
     key: BakeKey,
     started: std::time::Instant,
@@ -1092,6 +1139,8 @@ impl Default for SubstanceCraftApp {
             loaded_resource_sources: Vec::new(),
             bake_log: bake_log::BakeLog::default(),
             cache: cache::CacheState::default(),
+            saving: saving::Saving::default(),
+            opening: None,
             library: library_panel::LibraryState::default(),
         };
         app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
@@ -1119,11 +1168,10 @@ impl SubstanceCraftApp {
     /// background rebake replaces it. Edits made through the UI only touch
     /// the selected texture set.
     fn invalidate_preview(&mut self) {
-        self.preview_revision = self.preview_revision.wrapping_add(1);
-        self.preview_failed = false;
+        self.bump_selected_revision();
         self.preview_dirty = None;
         if let Some(set_id) = self.selected_texture_set {
-            self.set_revisions.insert(set_id, self.preview_revision);
+            self.mark_set_bakes(set_id, None);
         }
     }
 
@@ -1131,16 +1179,61 @@ impl SubstanceCraftApp {
     /// the texels in `bounds` (none at all when empty), so the next preview
     /// can rebake just those.
     fn invalidate_preview_texels(&mut self, bounds: impl IntoIterator<Item = TexelRect>) {
-        let dirty = self.preview_dirty.take();
-        self.invalidate_preview();
-        self.preview_dirty = dirty
-            .filter(|dirty| Some(dirty.set_id()) == self.selected_texture_set)
-            .map(|mut dirty| {
-                for bounds in bounds {
-                    dirty.mark(bounds);
+        self.bump_selected_revision();
+        let selected = self.selected_texture_set;
+        if self
+            .preview_dirty
+            .as_ref()
+            .is_some_and(|dirty| Some(dirty.set_id()) != selected)
+        {
+            self.preview_dirty = None;
+        }
+        let bounds = bounds.into_iter().collect::<Vec<_>>();
+        if let Some(dirty) = &mut self.preview_dirty {
+            for rect in &bounds {
+                dirty.mark(*rect);
+            }
+        }
+        if let Some(set_id) = selected {
+            self.mark_set_bakes(set_id, Some(&bounds));
+        }
+    }
+
+    /// Moves the selected set to a new revision, leaving dirty records be.
+    fn bump_selected_revision(&mut self) {
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        self.preview_failed = false;
+        if let Some(set_id) = self.selected_texture_set {
+            self.set_revisions.insert(set_id, self.preview_revision);
+        }
+    }
+
+    /// Records an edit of texture set `set_id` in the dirty records of its
+    /// cached and in-flight background bakes (PERF-02): strokes over the
+    /// texels in `strokes` (layer edits are found by the snapshot diff), or
+    /// with `None` an edit the records cannot follow, which drops them.
+    fn mark_set_bakes(&mut self, set_id: TextureSetId, strokes: Option<&[TexelRect]>) {
+        let cached = self
+            .set_materials
+            .get_mut(&set_id)
+            .map(|cached| &mut cached.dirty);
+        let job = self
+            .set_bake_job
+            .as_mut()
+            .filter(|job| job.set_id == set_id)
+            .map(|job| &mut job.dirty);
+        for dirty in cached.into_iter().chain(job) {
+            match strokes {
+                Some(strokes) => {
+                    if let Some(dirty) = dirty {
+                        for bounds in strokes {
+                            dirty.mark(*bounds);
+                        }
+                    }
                 }
-                dirty
-            });
+                None => *dirty = None,
+            }
+        }
     }
 
     /// Marks only `set_ids` out of date. When the selected set is not among
@@ -1158,12 +1251,13 @@ impl SubstanceCraftApp {
     }
 
     /// [`Self::invalidate_sets`]; with `strokes`, the edit changed only
-    /// layers, and of the selected set's strokes only those texels, so its
-    /// preview can be patched (see [`Self::invalidate_preview_layers`]).
+    /// layers, and of each set's strokes only the texels listed for it (in
+    /// its preview resolution), so its preview and cached bake can be
+    /// patched (see [`Self::invalidate_preview_layers`]).
     fn invalidate_set_texels(
         &mut self,
         set_ids: &BTreeSet<TextureSetId>,
-        strokes: Option<Vec<TexelRect>>,
+        mut strokes: Option<BTreeMap<TextureSetId, Vec<TexelRect>>>,
     ) {
         if set_ids.is_empty() {
             return;
@@ -1173,9 +1267,11 @@ impl SubstanceCraftApp {
             .is_some_and(|id| set_ids.contains(&id));
         let previous = self.preview_key();
         if selected_affected {
-            match strokes {
-                Some(strokes) => self.invalidate_preview_texels(strokes),
-                None => self.invalidate_preview(),
+            match (&mut strokes, self.selected_texture_set) {
+                (Some(strokes), Some(set_id)) => {
+                    self.invalidate_preview_texels(strokes.remove(&set_id).unwrap_or_default());
+                }
+                _ => self.invalidate_preview(),
             }
         } else {
             self.preview_revision = self.preview_revision.wrapping_add(1);
@@ -1194,6 +1290,12 @@ impl SubstanceCraftApp {
         let revision = self.preview_revision;
         for id in set_ids {
             self.set_revisions.insert(*id, revision);
+            if Some(*id) != self.selected_texture_set {
+                let texels = strokes
+                    .as_ref()
+                    .map(|strokes| strokes.get(id).map_or(&[][..], Vec::as_slice));
+                self.mark_set_bakes(*id, texels);
+            }
         }
     }
 
@@ -1202,8 +1304,15 @@ impl SubstanceCraftApp {
     fn invalidate_all_sets(&mut self) {
         self.invalidate_preview();
         let revision = self.preview_revision;
-        for set in &self.project.texture_sets {
-            self.set_revisions.insert(set.id, revision);
+        let ids = self
+            .project
+            .texture_sets
+            .iter()
+            .map(|set| set.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.set_revisions.insert(id, revision);
+            self.mark_set_bakes(id, None);
         }
     }
 
@@ -1740,23 +1849,7 @@ impl SubstanceCraftApp {
             return;
         };
 
-        match save_project_file(&path, &self.project) {
-            Ok(()) => {
-                self.project_error = save_project_history(&path, &self.history)
-                    .err()
-                    .map(|error| format!("Saved, but the undo history was not: {error}"))
-                    .or_else(|| {
-                        self.bake_log
-                            .save(&path)
-                            .err()
-                            .map(|error| format!("Saved, but the bake log was not: {error}"))
-                    });
-                self.project_path = Some(path);
-                self.mark_project_settled();
-                self.discard_autosave();
-            }
-            Err(error) => self.project_error = Some(error.to_string()),
-        }
+        self.start_save(path);
     }
 
     fn open_project(&mut self) {
@@ -1764,23 +1857,70 @@ impl SubstanceCraftApp {
             .add_filter("SubstanceCraft Project", &["sproject"])
             .pick_file()
         {
-            self.open_project_path(path);
+            self.open_project_in_background(path);
         }
     }
 
-    /// Loads a project file, reporting failures in the status bar.
+    /// Loads a project file now, reporting failures in the status bar.
     fn open_project_path(&mut self, path: std::path::PathBuf) {
-        let (mut project, report) = match load_project_file_with_report(&path) {
+        let loaded = load_for_opening(&path);
+        self.finish_opening(path, loaded);
+    }
+
+    /// Reads and decodes a project file on a background thread; the
+    /// project replaces the open one when it is ready ([`Self::poll_opening`]).
+    fn open_project_in_background(&mut self, path: std::path::PathBuf) {
+        let (sender, receiver) = sync_channel(1);
+        let source = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("project-open".to_owned())
+            .spawn(move || {
+                let _ = sender.send(load_for_opening(&source));
+            });
+        match spawned {
+            Ok(_) => {
+                self.project_error = Some(format!("Opening {}…", path_label(&path)));
+                self.opening = Some((path, receiver));
+            }
+            Err(_) => self.open_project_path(path),
+        }
+    }
+
+    /// Takes in a project opened in the background.
+    fn poll_opening(&mut self, context: &egui::Context) {
+        let Some((_, receiver)) = &self.opening else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(loaded) => {
+                if let Some((path, _)) = self.opening.take() {
+                    self.finish_opening(path, loaded);
+                }
+                context.request_repaint();
+            }
+            Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(50)),
+            Err(TryRecvError::Disconnected) => {
+                self.opening = None;
+                self.project_error = Some("Opening the project stopped unexpectedly".to_owned());
+            }
+        }
+    }
+
+    /// Makes a loaded project the open one.
+    fn finish_opening(&mut self, path: std::path::PathBuf, loaded: Result<LoadedProject, String>) {
+        let LoadedProject {
+            project,
+            report,
+            mut relinked,
+            resources,
+        } = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
-                self.project_error = Some(error.to_string());
+                self.project_error = Some(error);
                 return;
             }
         };
-        // Moved mesh files are found by name near the project.
-        let mut relinked =
-            relink::relink_mesh_sources(&mut project, &relink::search_roots(Some(&path)));
-        if let Err(error) = self.adopt_project(project, Some(path.clone())) {
+        if let Err(error) = self.adopt_project_with(project, Some(path.clone()), Some(resources)) {
             self.project_error = Some(error);
             return;
         }
@@ -1809,7 +1949,20 @@ impl SubstanceCraftApp {
         project: MaterialProject,
         path: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        self.adopt_project_with(project, path, None)
+    }
+
+    /// [`Self::adopt_project`] with its bitmaps already decoded, or decoded
+    /// here when `resources` is `None`.
+    fn adopt_project_with(
+        &mut self,
+        project: MaterialProject,
+        path: Option<std::path::PathBuf>,
+        resources: Option<LoadedResources>,
+    ) -> Result<(), String> {
         let scene = Self::restore_project_mesh(&project)?;
+        // Writes still running belong to the project being replaced.
+        self.saving.generation += 1;
         self.project = project;
         self.project_path = path.clone();
         self.bake_log = path
@@ -1825,7 +1978,10 @@ impl SubstanceCraftApp {
         self.restore_high_poly();
         self.loaded_mesh = self.project.mesh.clone();
         self.project_error = None;
-        self.reload_resources();
+        match resources {
+            Some((images, failures)) => self.install_resources(images, failures),
+            None => self.reload_resources(),
+        }
         self.selected_texture_set = self.project.active_texture_set;
         self.selected_layer = self
             .project
@@ -3923,18 +4079,26 @@ impl SubstanceCraftApp {
     /// redone. Edits of layers alone mark only their sets out of date, and
     /// the selected set's preview is patched.
     fn after_history_change(&mut self, command: Option<&EditCommand>) {
-        let selected = self.selected_texture_set_ref().map(|set| {
-            let factor = set.preview_factor(PREVIEW_MAX_EDGE);
-            (
-                set.id,
-                set.resolution.width.div_ceil(factor),
-                set.resolution.height.div_ceil(factor),
-                factor,
-            )
-        });
-        let (mut sets, mut strokes) = (BTreeSet::new(), Vec::new());
+        // Each set's preview size: its strokes are marked in those texels.
+        let previews = self
+            .project
+            .texture_sets
+            .iter()
+            .map(|set| {
+                let factor = set.preview_factor(PREVIEW_MAX_EDGE);
+                (
+                    set.id,
+                    (
+                        set.resolution.width.div_ceil(factor),
+                        set.resolution.height.div_ceil(factor),
+                        factor,
+                    ),
+                )
+            })
+            .collect();
+        let (mut sets, mut strokes) = (BTreeSet::new(), BTreeMap::new());
         let layers_only = command
-            .is_some_and(|command| layer_edit_scope(command, selected, &mut sets, &mut strokes));
+            .is_some_and(|command| layer_edit_scope(command, &previews, &mut sets, &mut strokes));
         if self.project.mesh != self.loaded_mesh {
             self.reload_project_mesh();
         }
@@ -4066,16 +4230,22 @@ impl SubstanceCraftApp {
     fn cancel_mesh_map_job(&mut self) {
         if let Some(job) = self.mesh_map_job.take() {
             job.cancel.store(true, Ordering::Relaxed);
-            self.log_bake(&job, bake_log::BakeOutcome::Cancelled);
+            self.log_bake(&job, bake_log::BakeOutcome::Cancelled, None);
         }
     }
 
-    fn log_bake(&mut self, job: &MeshMapJob, outcome: bake_log::BakeOutcome) {
+    fn log_bake(
+        &mut self,
+        job: &MeshMapJob,
+        outcome: bake_log::BakeOutcome,
+        device: Option<String>,
+    ) {
         self.bake_log.record(bake_log::BakeLogEntry {
             started: job.started_at,
             duration: job.started.elapsed(),
             settings: job.settings.clone(),
             outcome,
+            device,
         });
     }
 
@@ -4108,6 +4278,10 @@ impl SubstanceCraftApp {
         };
         let cage = self.cage_mesh.as_ref().map(|(_, cage)| cage.clone());
         let smoothing = self.mesh_smoothing;
+        let disk = self
+            .disk_cache_dir()
+            .map(|folder| (folder, self.disk_cache_budget_bytes()));
+        let gpu = self.preferences.values.gpu_baking;
         let (sender, receiver) = sync_channel(1);
         let worker_cancel = Arc::clone(&cancel);
         let spawned = std::thread::Builder::new()
@@ -4121,14 +4295,47 @@ impl SubstanceCraftApp {
                     .skew_image(settings.resolution)
                     .map(Arc::new)
                     .or(skew_bitmap);
-                let _ = sender.send(bake_slot_mesh_maps(
+                let disk = disk.map(|(folder, budget)| {
+                    // The cage and skew map count by content, not source.
+                    let options = substancecraft_core::HighToLowOptions {
+                        cage_source: None,
+                        skew_strokes: Vec::new(),
+                        ..plan.options.clone()
+                    };
+                    let key = disk_cache::mesh_map_key(&disk_cache::MeshMapInputs {
+                        mesh: &mesh,
+                        high: high.as_ref(),
+                        parts: &plan.parts,
+                        options: format!("{options:?}"),
+                        low_name: &plan.low_name,
+                        cage: plan.cage.as_ref(),
+                        settings: &settings,
+                        skew_map: skew_map.as_deref(),
+                    });
+                    (folder, budget, key)
+                });
+                if let Some(maps) = disk
+                    .as_ref()
+                    .and_then(|(folder, _, key)| disk_cache::load_mesh_maps(folder, key))
+                {
+                    let _ = sender.send((Ok(maps), true));
+                    return;
+                }
+                let tracer = gpu_tracer(gpu);
+                let result = bake_slot_mesh_maps(
                     &mesh,
                     high.as_ref(),
                     &settings,
                     skew_map.as_deref(),
                     &plan,
+                    tracer,
                     &worker_cancel,
-                ));
+                );
+                if let (Ok(maps), Some((folder, budget, key))) = (&result, &disk) {
+                    // A cache that cannot be written only costs a rebake.
+                    let _ = disk_cache::store_mesh_maps(folder, key, maps, *budget);
+                }
+                let _ = sender.send((result, false));
             });
         match spawned {
             Ok(_) => {
@@ -4160,14 +4367,25 @@ impl SubstanceCraftApp {
             return;
         };
         match job.receiver.try_recv() {
-            Ok(result) => {
+            Ok((result, from_disk)) => {
                 let key = job.key;
                 let Some(job) = self.mesh_map_job.take() else {
                     return;
                 };
+                self.cache.disk_usage = None;
+                let device = result
+                    .as_ref()
+                    .ok()
+                    .filter(|_| !from_disk)
+                    .and_then(|maps| maps.first())
+                    .map(|maps| bake_log::device_label(maps.trace_device()));
                 let outcome = match result {
                     Ok(maps) if key == self.bake_key() => {
-                        let outcome = bake_log::finished(&maps);
+                        let outcome = if from_disk {
+                            bake_log::BakeOutcome::Loaded { slots: maps.len() }
+                        } else {
+                            bake_log::finished(&maps)
+                        };
                         self.mesh_maps = Some(Arc::new(maps));
                         self.mesh_maps_key = Some(key);
                         self.invalidate_all_sets();
@@ -4180,7 +4398,7 @@ impl SubstanceCraftApp {
                         bake_log::BakeOutcome::Failed(error.to_string())
                     }
                 };
-                self.log_bake(&job, outcome);
+                self.log_bake(&job, outcome, device);
             }
             Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(100)),
             Err(TryRecvError::Disconnected) => {
@@ -4636,17 +4854,8 @@ impl SubstanceCraftApp {
             if let Some(preview) = &mut self.baked_preview {
                 preview.key = key;
                 preview.set_revision = set_revision;
-                if let (PreviewTextures::Material(material), Some(set_id)) =
-                    (&preview.textures, key.texture_set)
-                {
-                    self.set_materials.insert(
-                        set_id,
-                        CachedMaterial {
-                            revision: set_revision,
-                            textures: Arc::clone(material),
-                        },
-                    );
-                }
+                let textures = preview.textures.clone();
+                self.cache_set_material(key, set_revision, &textures);
             }
             return;
         }
@@ -4764,6 +4973,7 @@ impl SubstanceCraftApp {
                 maps_key: udim_view::key_hash(&self.bake_key()),
                 mesh_revision: self.mesh_revision,
                 settings: self.effective_mesh_map_settings(),
+                gpu: self.preferences.values.gpu_baking,
             }),
         }
     }
@@ -4789,17 +4999,7 @@ impl SubstanceCraftApp {
                         let patch = job_patch
                             .filter(|_| was_patched)
                             .map(|(base, patches)| PreviewPatch::new(&textures, base, &patches));
-                        if let (PreviewTextures::Material(material), Some(set_id)) =
-                            (&textures, key.texture_set)
-                        {
-                            self.set_materials.insert(
-                                set_id,
-                                CachedMaterial {
-                                    revision: set_revision,
-                                    textures: Arc::clone(material),
-                                },
-                            );
-                        }
+                        self.cache_set_material(key, set_revision, &textures);
                         self.baked_preview = Some(BakedPreview {
                             key,
                             textures,
@@ -4824,9 +5024,40 @@ impl SubstanceCraftApp {
         }
     }
 
+    /// Keeps a finished material preview of `key` as its set's cached bake,
+    /// with the preview's dirty record so later background bakes of the
+    /// set can patch it. Solo and overlay previews are not the set's
+    /// material and are not kept.
+    fn cache_set_material(
+        &mut self,
+        key: PreviewKey,
+        set_revision: u64,
+        textures: &PreviewTextures,
+    ) {
+        let (PreviewTextures::Material(material), Some(set_id), PreviewTarget::Material, None) =
+            (textures, key.texture_set, key.target, key.solo_layer)
+        else {
+            return;
+        };
+        let dirty = self
+            .preview_dirty
+            .as_ref()
+            .filter(|dirty| dirty.set_id() == set_id && dirty.base_revision() == set_revision)
+            .cloned();
+        self.set_materials.insert(
+            set_id,
+            CachedMaterial {
+                revision: set_revision,
+                textures: Arc::clone(material),
+                dirty,
+            },
+        );
+    }
+
     /// On multi-material meshes, rebakes (one at a time, after the selected
     /// preview) texture sets whose cached material is out of date, so every
-    /// slot shows its own textures.
+    /// slot shows its own textures. A cached bake whose set changed only in
+    /// some texels or channels is patched there instead (PERF-02).
     fn refresh_set_caches(&mut self) {
         if self.set_bake_job.is_some() || self.preview_job.is_some() {
             return;
@@ -4869,20 +5100,75 @@ impl SubstanceCraftApp {
             .downscaled(self.preview_edge())
             .unwrap_or(texture_set);
         let revision = self.set_revision(set_id);
+        // UDIM atlases bake per tile; their bakes are not patched.
+        let dirty = self
+            .udim_atlas
+            .is_none()
+            .then(|| incremental::PreviewDirty::new(&texture_set, revision));
+        let patch = self.set_bake_patch(&texture_set);
+        if patch
+            .as_ref()
+            .is_some_and(|(_, patches)| patches.is_empty())
+        {
+            // Nothing the bake shows changed.
+            if let Some(cached) = self.set_materials.get_mut(&set_id) {
+                cached.revision = revision;
+                cached.dirty = dirty;
+            }
+            return;
+        }
         let inputs = self.bake_inputs(set_id);
         let (sender, receiver) = sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("set-bake".to_owned())
             .spawn(move || {
-                let _ = sender.send(inputs.bake_material(&texture_set));
+                let patched = patch.and_then(|(base, patches)| {
+                    inputs
+                        .patch_preview(
+                            &texture_set,
+                            PreviewTarget::Material,
+                            &PreviewTextures::Material(base),
+                            &patches,
+                        )
+                        .ok()
+                });
+                let result = match patched {
+                    Some(PreviewTextures::Material(textures)) => {
+                        Ok(Arc::try_unwrap(textures).unwrap_or_else(|shared| (*shared).clone()))
+                    }
+                    // A patch that fails falls back to a full bake.
+                    _ => inputs.bake_material(&texture_set),
+                };
+                let _ = sender.send(result);
             });
         if spawned.is_ok() {
             self.set_bake_job = Some(SetBakeJob {
                 set_id,
                 revision,
                 receiver,
+                dirty,
             });
         }
+    }
+
+    /// The cached bake of `texture_set` (as the viewport bakes it) and the
+    /// blocks to rebake to bring it up to date, or `None` for a full bake.
+    fn set_bake_patch(
+        &self,
+        texture_set: &TextureSet,
+    ) -> Option<(Arc<MaterialTextures>, Vec<incremental::Patch>)> {
+        if self.udim_atlas.is_some() {
+            return None;
+        }
+        let cached = self.set_materials.get(&texture_set.id)?;
+        let patches = cached
+            .dirty
+            .as_ref()?
+            .regions(texture_set, cached.revision)?
+            .into_iter()
+            .filter(|patch| !patch.channels.planes().is_empty())
+            .collect();
+        Some((Arc::clone(&cached.textures), patches))
     }
 
     fn poll_set_bake_job(&mut self, context: &egui::Context) {
@@ -4891,8 +5177,10 @@ impl SubstanceCraftApp {
         };
         match job.receiver.try_recv() {
             Ok(result) => {
+                let Some(job) = self.set_bake_job.take() else {
+                    return;
+                };
                 let (set_id, revision) = (job.set_id, job.revision);
-                self.set_bake_job = None;
                 match result {
                     Ok(textures) => {
                         self.set_materials.insert(
@@ -4900,6 +5188,7 @@ impl SubstanceCraftApp {
                             CachedMaterial {
                                 revision,
                                 textures: Arc::new(textures),
+                                dirty: job.dirty,
                             },
                         );
                     }
@@ -5687,6 +5976,11 @@ impl SubstanceCraftApp {
     /// Loads the pixels of every project resource, reporting unreadable files.
     fn reload_resources(&mut self) {
         let (images, failures) = load_project_resources(&self.project);
+        self.install_resources(images, failures);
+    }
+
+    /// Makes `images` the project's decoded bitmaps, reporting `failures`.
+    fn install_resources(&mut self, images: ResourceImages, failures: Vec<ResourceFailure>) {
         self.loaded_resource_sources = self
             .project
             .resources
@@ -7009,12 +7303,22 @@ fn part_names(mesh: &MeshGeometry, low_name: &str) -> Vec<String> {
 /// slots sharing UV space get their own maps. A single-slot mesh bakes
 /// whole; an empty slot falls back to the whole mesh. With a high mesh,
 /// `plan` picks each part's high parts, cage scale, and cage.
+/// The GPU ray tracer for mesh-map bakes, when `wanted` and a GPU is
+/// available (PERF-01); bakes run on the CPU otherwise.
+fn gpu_tracer(wanted: bool) -> Option<&'static dyn substancecraft_core::RayTracer> {
+    wanted
+        .then(substancecraft_gpu_bake::GpuTracer::shared)
+        .flatten()
+        .map(|tracer| tracer as &dyn substancecraft_core::RayTracer)
+}
+
 fn bake_slot_mesh_maps(
     mesh: &MeshGeometry,
     high: Option<&MeshGeometry>,
     settings: &MeshMapSettings,
     skew_map: Option<&substancecraft_core::TextureImage>,
     plan: &HighToLowPlan,
+    tracer: Option<&dyn substancecraft_core::RayTracer>,
     cancel: &AtomicBool,
 ) -> Result<Vec<MeshMaps>, MeshMapError> {
     let names = part_names(mesh, &plan.low_name);
@@ -7031,12 +7335,13 @@ fn bake_slot_mesh_maps(
                 .clamp(0.0001, 0.5),
             ..*settings
         };
-        substancecraft_core::bake_mesh_maps_caged(
+        substancecraft_core::bake_mesh_maps_traced(
             low,
             matched.as_ref().or(high),
             &settings,
             skew_map,
             cage.filter(|_| high.is_some()),
+            tracer,
             Some(cancel),
         )
     };
@@ -7087,11 +7392,16 @@ impl eframe::App for SubstanceCraftApp {
         self.update_viewport(ui);
         self.update_overlay(ui.ctx());
         self.sync_layer_history(ui.ctx());
+        self.poll_saves(ui.ctx());
+        self.poll_opening(ui.ctx());
         self.autosave_tick(std::time::Instant::now());
+        self.finish_saves();
         ui.ctx().request_repaint_after(autosave::AUTOSAVE_INTERVAL);
     }
 
     fn on_exit(&mut self) {
+        // A save in progress must reach the disk before the process ends.
+        self.finish_saves();
         self.end_recovery_session();
     }
 }
@@ -7209,7 +7519,7 @@ fn suggest_import_channel(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use substancecraft_api::write_texture;
+    use substancecraft_api::{save_project_file, write_texture};
     use substancecraft_core::LightingPreset;
 
     #[test]
@@ -7538,6 +7848,7 @@ mod tests {
         let project = folder.path().join("scene.sproject");
         app.project_path = Some(project.clone());
         app.save_project();
+        app.finish_saves();
         assert_eq!(app.project_error, None);
         assert!(substancecraft_api::history_path(&project).exists());
         let mut reopened = SubstanceCraftApp::default();
@@ -7618,7 +7929,7 @@ mod tests {
                 low_name: "Crate".to_owned(),
                 cage: None,
             };
-            bake_slot_mesh_maps(&low, Some(&high), &settings, None, &plan, &cancel)
+            bake_slot_mesh_maps(&low, Some(&high), &settings, None, &plan, None, &cancel)
                 .unwrap()
                 .iter()
                 .map(MeshMaps::miss_fraction)
@@ -8012,6 +8323,115 @@ mod tests {
         );
         pump_until(&mut app, &context, settled);
         assert!(shown(&app) == full_bake(&app), "undo stroke");
+    }
+
+    #[test]
+    #[allow(clippy::unreachable)]
+    fn tc_0402_background_set_bakes_patch_what_undo_and_redo_changed() {
+        let context = egui::Context::default();
+        let folder = tempfile::tempdir().unwrap();
+        let path = write_two_material_gltf(folder.path());
+        let mut app = SubstanceCraftApp::default();
+        app.load_imported_mesh(&path);
+        let (body, trim) = (
+            app.project.texture_sets[0].id,
+            app.project.texture_sets[1].id,
+        );
+        small_sets(&mut app, 256);
+
+        // Trim gets a fill, a roughness edit, and a stroke while selected.
+        app.select_texture_set(trim);
+        app.add_fill_layer();
+        let fill = app.selected_layer.unwrap();
+        app.add_paint_layer();
+        let paint = app.selected_layer.unwrap();
+        app.selected_layer = Some(fill);
+        app.layer_settled = None;
+        app.sync_layer_history(&context);
+        let roughness = app.selected_layer().unwrap().fill.unwrap().roughness;
+        app.selected_layer_mut()
+            .unwrap()
+            .fill
+            .as_mut()
+            .unwrap()
+            .roughness = (roughness + 0.3) % 1.0;
+        app.sync_layer_history(&context);
+        app.selected_layer = Some(paint);
+        app.paint_mode = PaintMode::Paint;
+        app.append_stroke_point(glam::Vec2::new(0.3, 0.4));
+        app.append_stroke_point(glam::Vec2::new(0.35, 0.4));
+        app.finish_active_stroke();
+
+        // Then Body is selected and Trim bakes in the background.
+        app.select_texture_set(body);
+        let settled = |app: &SubstanceCraftApp| {
+            app.preview_job.is_none()
+                && app.set_bake_job.is_none()
+                && app
+                    .baked_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.key == app.preview_key())
+                && app
+                    .set_materials
+                    .get(&trim)
+                    .is_some_and(|cached| cached.revision == app.set_revision(trim))
+        };
+        pump_until(&mut app, &context, settled);
+        let trim_set = |app: &SubstanceCraftApp| {
+            app.project
+                .texture_sets
+                .iter()
+                .find(|set| set.id == trim)
+                .unwrap()
+                .clone()
+        };
+        let cached =
+            |app: &SubstanceCraftApp| MaterialTextures::clone(&app.set_materials[&trim].textures);
+        let full_bake =
+            |app: &SubstanceCraftApp| app.bake_inputs(trim).bake_material(&trim_set(app)).unwrap();
+        assert!(cached(&app) == full_bake(&app));
+
+        // Undo the stroke, then the roughness edit, and redo both: each
+        // touches Trim alone and patches its cached bake.
+        for step in [
+            "undo stroke",
+            "undo roughness",
+            "redo roughness",
+            "redo stroke",
+        ] {
+            let body_revision = app.set_revision(body);
+            if step.starts_with("undo") {
+                app.undo();
+            } else {
+                app.redo();
+            }
+            assert_eq!(app.set_revision(body), body_revision, "{step}");
+            let Some((_, patches)) = app.set_bake_patch(&trim_set(&app)) else {
+                unreachable!("{step} rebakes Trim whole");
+            };
+            assert!(!patches.is_empty(), "{step}");
+            if step.ends_with("stroke") {
+                assert!(
+                    patches.iter().all(|patch| patch.rect.len() < 256 * 256 / 2),
+                    "{step} patches its texels: {patches:?}"
+                );
+            } else {
+                assert!(
+                    patches
+                        .iter()
+                        .all(|patch| !patch.channels.planes().base_color),
+                    "{step} leaves Base Color alone: {patches:?}"
+                );
+            }
+            pump_until(&mut app, &context, settled);
+            assert!(cached(&app) == full_bake(&app), "{step} differs");
+        }
+
+        // An edit the records cannot follow rebakes whole.
+        app.invalidate_all_sets();
+        assert!(app.set_bake_patch(&trim_set(&app)).is_none());
+        pump_until(&mut app, &context, settled);
+        assert!(cached(&app) == full_bake(&app));
     }
 
     #[test]

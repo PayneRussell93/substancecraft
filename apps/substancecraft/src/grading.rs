@@ -462,6 +462,7 @@ mod tests {
         let project_path = folder.path().join("lit.sproject");
         app.project_path = Some(project_path.clone());
         app.save_project();
+        app.finish_saves();
         let mut reopened = SubstanceCraftApp::default();
         reopened.open_project_path(project_path);
         assert_eq!(reopened.project.light_rig, Some(rig));
@@ -519,6 +520,7 @@ mod tests {
         ));
         app.project_path = Some(project.clone());
         app.save_project();
+        app.finish_saves();
         let mut reopened = SubstanceCraftApp::default();
         reopened.open_project_path(project);
         assert_eq!(reopened.viewport_shader(), wet);

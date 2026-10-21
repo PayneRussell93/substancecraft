@@ -63,6 +63,8 @@ pub(super) struct UdimInputs {
     pub(super) maps_key: u64,
     pub(super) mesh_revision: u64,
     pub(super) settings: MeshMapSettings,
+    /// Trace tile bakes on the GPU when one is available.
+    pub(super) gpu: bool,
 }
 
 /// Hash of a value's debug form, for keys whose fields do not implement
@@ -121,8 +123,16 @@ impl UdimInputs {
             return Ok(None);
         };
         let maps = Arc::new(
-            substancecraft_core::bake_mesh_maps(mesh, &self.settings, None)
-                .map_err(|error| error.to_string())?,
+            substancecraft_core::bake_mesh_maps_traced(
+                mesh,
+                None,
+                &self.settings,
+                None,
+                None,
+                super::gpu_tracer(self.gpu),
+                None,
+            )
+            .map_err(|error| error.to_string())?,
         );
         let mut cache = self.lock();
         if cache.maps_key == Some(self.maps_key) {

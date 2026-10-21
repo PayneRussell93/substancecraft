@@ -23,8 +23,8 @@ pub struct Autosave {
     pub prompt: Option<RecoveryCandidate>,
     last_check: Option<Instant>,
     /// The project as last autosaved, saved, or opened; unchanged projects
-    /// are not written again.
-    snapshot: Option<MaterialProject>,
+    /// are not written again. Shared with the write that produced it.
+    pub(super) snapshot: Option<std::sync::Arc<MaterialProject>>,
 }
 
 impl SubstanceCraftApp {
@@ -35,13 +35,13 @@ impl SubstanceCraftApp {
             Err(error) => self.project_error = Some(format!("Autosave unavailable: {error}")),
         }
         self.autosave.store = Some(store);
-        self.autosave.snapshot = Some(self.project.clone());
+        self.autosave.snapshot = Some(std::sync::Arc::new(self.project.clone()));
     }
 
     /// Records that `project` matches what is on disk (opened or saved), so
     /// it is not autosaved until it changes.
     pub(super) fn mark_project_settled(&mut self) {
-        self.autosave.snapshot = Some(self.project.clone());
+        self.autosave.snapshot = Some(std::sync::Arc::new(self.project.clone()));
     }
 
     /// After an explicit save the snapshot is older than the save, so it is
@@ -62,10 +62,10 @@ impl SubstanceCraftApp {
     /// changed. Paused while a recovery offer is open, so the old snapshot
     /// is not replaced before the user decides.
     pub(super) fn autosave_tick(&mut self, now: Instant) {
-        let Some(store) = &self.autosave.store else {
+        let Some(store) = self.autosave.store.clone() else {
             return;
         };
-        if self.autosave.prompt.is_some() || self.active_stroke.is_some() {
+        if self.autosave.prompt.is_some() || self.active_stroke.is_some() || self.saving.busy() {
             return;
         }
         let last = *self.autosave.last_check.get_or_insert(now);
@@ -73,13 +73,10 @@ impl SubstanceCraftApp {
             return;
         }
         self.autosave.last_check = Some(now);
-        if self.autosave.snapshot.as_ref() == Some(&self.project) {
+        if self.autosave.snapshot.as_deref() == Some(&self.project) {
             return;
         }
-        match store.write_autosave(&self.project, self.project_path.as_deref()) {
-            Ok(()) => self.autosave.snapshot = Some(self.project.clone()),
-            Err(error) => self.project_error = Some(format!("Autosave failed: {error}")),
-        }
+        self.start_autosave(store);
     }
 
     /// Answers the recovery offer: `restore` loads the snapshot (keeping the
@@ -187,17 +184,22 @@ mod tests {
         app.add_texture_set();
         app.project_path = Some(saved.clone());
         app.save_project();
+        app.finish_saves();
         let start = Instant::now();
         app.autosave_tick(start);
+        app.finish_saves();
         // Unchanged projects are not written.
         app.autosave_tick(start + AUTOSAVE_INTERVAL);
+        app.finish_saves();
         assert!(!store.dir().join("autosave.sproject").exists());
 
         app.add_paint_layer();
         let layers = app.project.texture_sets[0].layers.len();
         app.autosave_tick(start + AUTOSAVE_INTERVAL);
+        app.finish_saves();
         assert!(!store.dir().join("autosave.sproject").exists(), "too soon");
         app.autosave_tick(start + AUTOSAVE_INTERVAL * 2);
+        app.finish_saves();
         assert!(store.dir().join("autosave.sproject").exists());
         // The app "crashes": no end_recovery_session.
         drop(app);

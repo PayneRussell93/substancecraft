@@ -15,6 +15,7 @@ serde_json.workspace = true
 substancecraft-filament = { path = "../../crates/filament" }
 substancecraft-api = { path = "../../crates/api" }
 substancecraft-core = { path = "../../crates/core" }
+substancecraft-gpu-bake = { path = "../../crates/gpu-bake" }
 
 [lints]
 workspace = true

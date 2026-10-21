@@ -142,6 +142,7 @@ mod tests {
         let path = folder.path().join("views.sproject");
         app.project_path = Some(path.clone());
         app.save_project();
+        app.finish_saves();
         let loaded = substancecraft_api::load_project_file(&path).unwrap();
         assert_eq!(loaded.cameras, app.project.cameras);
 

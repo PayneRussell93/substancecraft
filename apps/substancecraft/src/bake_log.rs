@@ -25,6 +25,10 @@ pub enum BakeOutcome {
         /// high-to-low bakes.
         miss_percent: Option<f32>,
     },
+    /// Read back from the on-disk bake cache instead of baking.
+    Loaded {
+        slots: usize,
+    },
     /// Finished, but the mesh or settings changed meanwhile; not used.
     Discarded,
     Cancelled,
@@ -38,6 +42,9 @@ pub struct BakeLogEntry {
     pub duration: Duration,
     pub settings: String,
     pub outcome: BakeOutcome,
+    /// The device that traced the bake's rays, when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 impl BakeLogEntry {
@@ -48,12 +55,17 @@ impl BakeLogEntry {
                 miss_percent: Some(misses),
             } => format!("finished, {slots} slot(s), {misses:.1}% ray misses"),
             BakeOutcome::Finished { slots, .. } => format!("finished, {slots} slot(s)"),
+            BakeOutcome::Loaded { slots } => format!("loaded {slots} slot(s) from disk cache"),
             BakeOutcome::Discarded => "finished but outdated, discarded".to_owned(),
             BakeOutcome::Cancelled => "cancelled".to_owned(),
             BakeOutcome::Failed(error) => format!("failed: {error}"),
         };
+        let device = self
+            .device
+            .as_ref()
+            .map_or(String::new(), |device| format!(" · {device}"));
         format!(
-            "{} · {:.1} s · {} · {outcome}",
+            "{} · {:.1} s · {}{device} · {outcome}",
             clock(self.started),
             self.duration.as_secs_f32(),
             self.settings
@@ -183,6 +195,17 @@ pub fn log_path(project: &Path) -> PathBuf {
 }
 
 /// Outcome of a finished high-to-low or plain bake.
+/// The device that traced a bake, for the log.
+pub fn device_label(device: &substancecraft_core::TraceDevice) -> String {
+    match device {
+        substancecraft_core::TraceDevice::Cpu => "CPU".to_owned(),
+        substancecraft_core::TraceDevice::Tracer(name) => format!("GPU {name}"),
+        substancecraft_core::TraceDevice::Fallback { tracer, error } => {
+            format!("CPU (GPU {tracer} failed: {error})")
+        }
+    }
+}
+
 pub fn finished(maps: &[MeshMaps]) -> BakeOutcome {
     let high: Vec<&MeshMaps> = maps.iter().filter(|maps| maps.from_high_poly()).collect();
     BakeOutcome::Finished {
@@ -279,6 +302,7 @@ mod tests {
             duration: Duration::from_millis(1_500),
             settings: "32² · 2 AO samples · from mesh".to_owned(),
             outcome,
+            device: None,
         };
         app.bake_log.record(entry(BakeOutcome::Finished {
             slots: 2,
@@ -288,6 +312,7 @@ mod tests {
             .record(entry(BakeOutcome::Failed("no mesh".to_owned())));
         app.project_path = Some(path.clone());
         app.save_project();
+        app.finish_saves();
         assert!(log_path(&path).exists());
 
         let mut reopened = SubstanceCraftApp::default();
@@ -298,6 +323,7 @@ mod tests {
         // A cleared log removes the sidecar; a damaged one reads as empty.
         reopened.bake_log.clear();
         reopened.save_project();
+        reopened.finish_saves();
         assert!(!log_path(&path).exists());
         std::fs::write(log_path(&path), b"{not json").unwrap();
         assert_eq!(BakeLog::load(&path).len(), 0);

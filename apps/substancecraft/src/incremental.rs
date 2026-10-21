@@ -124,7 +124,9 @@ impl SetShape {
 }
 
 /// Texels of one texture set that strokes changed since `base_revision`,
-/// and the set's shape then.
+/// and the set's shape then. The selected set's preview keeps one, and so
+/// does every cached bake of a texture set (PERF-02).
+#[derive(Clone)]
 pub(super) struct PreviewDirty {
     set_id: TextureSetId,
     base_revision: u64,
@@ -145,6 +147,10 @@ impl PreviewDirty {
 
     pub(super) fn set_id(&self) -> TextureSetId {
         self.set_id
+    }
+
+    pub(super) fn base_revision(&self) -> u64 {
+        self.base_revision
     }
 
     /// Records a stroke edit of the texels in `bounds`.

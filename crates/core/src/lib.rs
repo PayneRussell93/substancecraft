@@ -24,6 +24,7 @@ mod mesh_maps;
 pub mod noise;
 pub mod painting;
 mod raster;
+mod ray_trace;
 mod region;
 mod resources;
 pub mod rig;
@@ -73,12 +74,16 @@ pub use library::{
 };
 pub use mesh_maps::{
     MAX_MESH_MAP_PADDING, MAX_MESH_MAP_RESOLUTION, MAX_MESH_MAP_SAMPLES, MIN_MESH_MAP_RESOLUTION,
-    MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps, bake_mesh_maps,
-    bake_mesh_maps_caged, bake_mesh_maps_corrected, bake_mesh_maps_from, bake_name_key,
-    cage_ray_direction,
+    MeshMapDecodeError, MeshMapError, MeshMapKind, MeshMapSample, MeshMapSettings, MeshMaps,
+    bake_mesh_maps, bake_mesh_maps_caged, bake_mesh_maps_corrected, bake_mesh_maps_from,
+    bake_mesh_maps_traced, bake_name_key, cage_ray_direction, decode_mesh_maps, encode_mesh_maps,
 };
 pub use painting::{
     LazyStabilizer, MAX_RADIAL_COPIES, PathSpec, SurfaceHit, Symmetry, crosses_uv_seam, line_points,
+};
+pub use ray_trace::{
+    BvhNode, CageHit, CageRay, Occlusion, OcclusionParams, OcclusionQuery, PreparedScene,
+    RayTracer, TRACE_STACK_DEPTH, TraceDevice, TraceScene,
 };
 pub use region::{DIRTY_TILE_SIZE, DirtyTexels, TexelRect};
 pub use resources::{

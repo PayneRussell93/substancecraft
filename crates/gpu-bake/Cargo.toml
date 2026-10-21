@@ -1,0 +1,16 @@
+[package]
+name = "substancecraft-gpu-bake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPU compute ray tracing for SubstanceCraft mesh-map bakes"
+
+[dependencies]
+glam.workspace = true
+pollster = "0.4"
+substancecraft-core = { path = "../core" }
+wgpu = "30"
+
+[lints]
+workspace = true

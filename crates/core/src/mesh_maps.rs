@@ -10,7 +10,7 @@
 //! settings, and seed, runs on all available cores, and can be cancelled.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use glam::{Vec2, Vec3};
@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::noise::{lowbias32, unit_float};
+use crate::ray_trace::{
+    BvhNode, CageHit, CageRay, Occlusion, OcclusionParams, OcclusionQuery, PreparedScene,
+    RayTracer, TRACE_STACK_DEPTH, TraceDevice, TraceScene,
+};
 use crate::resources::{TextureImage, luminance};
 use crate::smoothing::{vertex_normals, vertex_tangents};
 use crate::topology::{mesh_bounds, weld_positions};
@@ -322,9 +326,28 @@ pub struct MeshMaps {
     /// Covered texels whose cage ray found no high-poly surface.
     misses: usize,
     blocks: BlockCache,
+    /// Which device traced the bake's rays; not part of the maps' value.
+    device: DeviceNote,
+}
+
+/// [`TraceDevice`] of a bake. Maps from different devices still compare
+/// by their texels alone.
+#[derive(Clone, Debug, Default)]
+struct DeviceNote(TraceDevice);
+
+impl PartialEq for DeviceNote {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl MeshMaps {
+    /// Which device traced this bake's rays. Maps read back from a cache
+    /// report the CPU.
+    pub fn trace_device(&self) -> &TraceDevice {
+        &self.device.0
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -535,6 +558,27 @@ pub fn bake_mesh_maps_caged(
     cage_mesh: Option<&MeshGeometry>,
     cancel: Option<&AtomicBool>,
 ) -> Result<MeshMaps, MeshMapError> {
+    bake_mesh_maps_traced(low, high, settings, skew_map, cage_mesh, None, cancel)
+}
+
+/// Texels whose ray queries go to the tracer in one batch; cancellation is
+/// checked between batches.
+const TRACE_BATCH: usize = 1 << 16;
+
+/// [`bake_mesh_maps_caged`] with its ray queries (cage rays, ambient
+/// occlusion, and thickness) answered by `tracer`, such as a GPU. Any batch
+/// the tracer fails on, and every later one, runs on the CPU instead; the
+/// result reports which ran ([`MeshMaps::trace_device`]). Without a tracer
+/// the CPU traces every ray.
+pub fn bake_mesh_maps_traced(
+    low: &MeshGeometry,
+    high: Option<&MeshGeometry>,
+    settings: &MeshMapSettings,
+    skew_map: Option<&TextureImage>,
+    cage_mesh: Option<&MeshGeometry>,
+    tracer: Option<&dyn RayTracer>,
+    cancel: Option<&AtomicBool>,
+) -> Result<MeshMaps, MeshMapError> {
     settings.validate()?;
     low.validate()?;
     if let Some(high) = high {
@@ -608,115 +652,219 @@ pub fn bake_mesh_maps_caged(
     let mut texels = try_filled_vec(pixel_count, Texel::default())?;
     let low_context = TexelContext {
         mesh: low,
-        settings,
         geometry: &low_geometry,
-        bvh: &bvh,
-        diagonal,
     };
     let high_context = high
         .zip(high_geometry.as_ref())
-        .map(|(mesh, geometry)| TexelContext {
-            mesh,
-            settings,
-            geometry,
-            bvh: &bvh,
-            diagonal,
-        });
+        .map(|(mesh, geometry)| TexelContext { mesh, geometry });
     let cage = settings.cage_distance * diagonal;
     let frame = LowFrame {
         mesh: low,
         normals: &low_normals,
         tangents: &low_tangents,
     };
-    let misses = AtomicUsize::new(0);
-
-    let rows_per_chunk = 4_usize;
-    let chunk_len = rows_per_chunk * width as usize;
-    let work = Mutex::new(texels.chunks_mut(chunk_len).enumerate());
+    let params = OcclusionParams {
+        seed: settings.seed,
+        ao_samples: settings.ao_samples,
+        ao_distance: settings.ao_distance * diagonal,
+        thickness_samples: (settings.ao_samples / 2).max(4),
+        thickness_distance: diagonal * 0.5,
+        bias: diagonal * 1e-4,
+    };
+    let mut misses = 0_usize;
     let threads = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
         .clamp(1, 32);
-    let cancelled = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    if is_cancelled() {
-                        cancelled.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    let next = match work.lock() {
-                        Ok(mut chunks) => chunks.next(),
-                        Err(_) => return,
-                    };
-                    let Some((chunk_index, chunk)) = next else {
-                        return;
-                    };
-                    let start = chunk_index * chunk_len;
-                    for (offset, texel) in chunk.iter_mut().enumerate() {
-                        let index = start + offset;
-                        let triangle = owner[index];
-                        if triangle == u32::MAX {
-                            continue;
-                        }
-                        let basis = frame.at(triangle, weights[index]);
-                        let map_weight = skew_map.map_or(1.0, |map| {
-                            let (x, y) = (index as u32 % width, index as u32 / width);
-                            luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
-                        });
-                        let (mut direction, applied_skew) = cage_ray_direction(
-                            basis.normal,
-                            low_geometry.face_normals[triangle as usize],
-                            settings.skew * map_weight,
-                            settings.skew_edge_degrees,
-                        );
-                        let mut reach = cage;
-                        // An explicit cage sets each ray's start and length.
-                        if let Some(cage_mesh) = cage_mesh {
-                            let corners = low.triangles[triangle as usize];
-                            let weight = weights[index];
-                            let point = corners
-                                .iter()
-                                .zip([weight.x, weight.y, weight.z])
-                                .map(|(corner, weight)| {
-                                    cage_mesh.vertices[*corner as usize].position * weight
-                                })
-                                .sum::<Vec3>();
-                            let offset = point - basis.position;
-                            if let Some(outward) = offset.try_normalize() {
-                                direction = outward;
-                                reach = offset.length();
-                            }
-                        }
-                        let projected = high_context.as_ref().and_then(|context| {
-                            let origin = basis.position + direction * reach;
-                            context
-                                .bvh
-                                .closest_hit(origin, -direction, 0.0, reach * 2.0)
-                                .map(|hit| {
-                                    context.evaluate(hit.triangle, hit.weights, index as u32)
-                                })
-                        });
-                        if high_context.is_some() && projected.is_none() {
-                            misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let mut value = projected.unwrap_or_else(|| {
-                            low_context.evaluate(triangle, weights[index], index as u32)
-                        });
-                        value.tangent_normal = basis.to_tangent(value.normal);
-                        value.skew = if high_context.is_some() && cage_mesh.is_none() {
-                            applied_skew
-                        } else {
-                            0.0
-                        };
-                        *texel = value;
-                    }
+
+    let mut device = TraceDevice::Cpu;
+    let mut traced: Option<Box<dyn PreparedScene + '_>> = None;
+    if let Some(tracer) = tracer {
+        match tracer.prepare(&bvh.scene()) {
+            Ok(scene) => {
+                traced = Some(scene);
+                device = TraceDevice::Tracer(tracer.name());
+            }
+            Err(error) => {
+                device = TraceDevice::Fallback {
+                    tracer: tracer.name(),
+                    error,
                 }
-            });
+            }
         }
-    });
-    if cancelled.load(Ordering::Relaxed) || is_cancelled() {
+    }
+    // Hands the rest of the bake to the CPU after a tracer error.
+    let mut give_up = |traced: &mut Option<Box<dyn PreparedScene + '_>>, error: String| {
+        *traced = None;
+        if let TraceDevice::Tracer(name) = &device {
+            device = TraceDevice::Fallback {
+                tracer: name.clone(),
+                error,
+            };
+        }
+    };
+
+    for (batch_index, batch) in texels.chunks_mut(TRACE_BATCH).enumerate() {
+        if is_cancelled() {
+            return Err(MeshMapError::Cancelled);
+        }
+        let start = batch_index * TRACE_BATCH;
+        // The low surface under each covered texel, and its cage ray.
+        let mut rays: Vec<Option<(TangentBasis, f32, CageRay)>> = vec![None; batch.len()];
+        parallel_fill(&mut rays, threads, |offset, slot| {
+            let index = start + offset;
+            let triangle = owner[index];
+            if triangle == u32::MAX {
+                return;
+            }
+            let basis = frame.at(triangle, weights[index]);
+            let map_weight = skew_map.map_or(1.0, |map| {
+                let (x, y) = (index as u32 % width, index as u32 / width);
+                luminance(map.sample(raster::pixel_to_uv(x, y, width, height), false))
+            });
+            let (mut direction, applied_skew) = cage_ray_direction(
+                basis.normal,
+                low_geometry.face_normals[triangle as usize],
+                settings.skew * map_weight,
+                settings.skew_edge_degrees,
+            );
+            let mut reach = cage;
+            // An explicit cage sets each ray's start and length.
+            if let Some(cage_mesh) = cage_mesh {
+                let corners = low.triangles[triangle as usize];
+                let weight = weights[index];
+                let point = corners
+                    .iter()
+                    .zip([weight.x, weight.y, weight.z])
+                    .map(|(corner, weight)| cage_mesh.vertices[*corner as usize].position * weight)
+                    .sum::<Vec3>();
+                let offset = point - basis.position;
+                if let Some(outward) = offset.try_normalize() {
+                    direction = outward;
+                    reach = offset.length();
+                }
+            }
+            let ray = CageRay {
+                origin: basis.position + direction * reach,
+                direction: -direction,
+                t_max: reach * 2.0,
+            };
+            *slot = Some((basis, applied_skew, ray));
+        });
+
+        // Where cage rays meet the high mesh.
+        let mut hits: Vec<Option<CageHit>> = vec![None; batch.len()];
+        if high_context.is_some() {
+            let wanted = rays
+                .iter()
+                .flatten()
+                .map(|(.., ray)| *ray)
+                .collect::<Vec<_>>();
+            let answered = match traced.as_mut().map(|scene| scene.cage_hits(&wanted)) {
+                Some(Ok(answered)) if answered.len() == wanted.len() => Some(answered),
+                Some(Ok(_)) => {
+                    give_up(&mut traced, "cage hits: wrong answer count".to_owned());
+                    None
+                }
+                Some(Err(error)) => {
+                    give_up(&mut traced, error);
+                    None
+                }
+                None => None,
+            };
+            let answered = answered.unwrap_or_else(|| {
+                let mut answered = vec![None; wanted.len()];
+                parallel_fill(&mut answered, threads, |offset, hit| {
+                    let ray = wanted[offset];
+                    *hit = bvh
+                        .closest_hit(ray.origin, ray.direction, 0.0, ray.t_max)
+                        .map(|hit| CageHit {
+                            triangle: hit.triangle,
+                            weights: hit.weights,
+                        });
+                });
+                answered
+            });
+            let mut answers = answered.into_iter();
+            for (slot, ray) in hits.iter_mut().zip(&rays) {
+                if ray.is_some() {
+                    *slot = answers.next().flatten();
+                    misses += usize::from(slot.is_none());
+                }
+            }
+        }
+
+        // The surface each texel shows, and where its occlusion is wanted.
+        let mut queries: Vec<Option<OcclusionQuery>> = vec![None; batch.len()];
+        let surface = |offset: usize| -> Option<(Texel, OcclusionQuery)> {
+            let index = start + offset;
+            let (basis, applied_skew, _) = rays[offset].as_ref()?;
+            let projected = high_context
+                .as_ref()
+                .zip(hits[offset])
+                .map(|(context, hit)| context.surface(hit.triangle, hit.weights));
+            let (mut value, face_normal) =
+                projected.unwrap_or_else(|| low_context.surface(owner[index], weights[index]));
+            value.tangent_normal = basis.to_tangent(value.normal);
+            value.skew = if high_context.is_some() && cage_mesh.is_none() {
+                *applied_skew
+            } else {
+                0.0
+            };
+            let query = OcclusionQuery {
+                point: value.position,
+                normal: value.normal,
+                face_normal,
+                texel: index as u32,
+            };
+            Some((value, query))
+        };
+        {
+            let mut pairs: Vec<Option<(Texel, OcclusionQuery)>> = vec![None; batch.len()];
+            parallel_fill(&mut pairs, threads, |offset, pair| *pair = surface(offset));
+            for ((texel, query), pair) in batch.iter_mut().zip(&mut queries).zip(pairs) {
+                if let Some((value, wanted)) = pair {
+                    *texel = value;
+                    *query = Some(wanted);
+                }
+            }
+        }
+
+        // Ambient occlusion and thickness.
+        let wanted = queries.iter().flatten().copied().collect::<Vec<_>>();
+        let answered = match traced
+            .as_mut()
+            .map(|scene| scene.occlusion(&wanted, &params))
+        {
+            Some(Ok(answered)) if answered.len() == wanted.len() => Some(answered),
+            Some(Ok(_)) => {
+                give_up(&mut traced, "occlusion: wrong answer count".to_owned());
+                None
+            }
+            Some(Err(error)) => {
+                give_up(&mut traced, error);
+                None
+            }
+            None => None,
+        };
+        let answered = answered.unwrap_or_else(|| {
+            let mut answered = vec![Occlusion::default(); wanted.len()];
+            parallel_fill(&mut answered, threads, |offset, value| {
+                *value = cpu_occlusion(&bvh, &wanted[offset], &params);
+            });
+            answered
+        });
+        let mut answers = answered.into_iter();
+        for (texel, query) in batch.iter_mut().zip(&queries) {
+            if query.is_some()
+                && let Some(occlusion) = answers.next()
+            {
+                texel.ambient_occlusion = occlusion.ambient_occlusion;
+                texel.thickness = occlusion.thickness;
+            }
+        }
+    }
+    if is_cancelled() {
         return Err(MeshMapError::Cancelled);
     }
 
@@ -731,9 +879,220 @@ pub fn bake_mesh_maps_caged(
         covered,
         filled,
         from_high_poly: high.is_some(),
-        misses: misses.into_inner(),
+        misses,
         blocks: BlockCache::default(),
+        device: DeviceNote(device),
     })
+}
+
+/// Runs `fill` for every element of `out`, by index, over `threads`
+/// threads.
+fn parallel_fill<T: Send>(out: &mut [T], threads: usize, fill: impl Fn(usize, &mut T) + Sync) {
+    const PIECE: usize = 512;
+    if out.len() <= PIECE || threads == 1 {
+        for (index, value) in out.iter_mut().enumerate() {
+            fill(index, value);
+        }
+        return;
+    }
+    let work = Mutex::new(out.chunks_mut(PIECE).enumerate());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let next = match work.lock() {
+                        Ok(mut pieces) => pieces.next(),
+                        Err(_) => return,
+                    };
+                    let Some((piece_index, piece)) = next else {
+                        return;
+                    };
+                    for (offset, value) in piece.iter_mut().enumerate() {
+                        fill(piece_index * PIECE + offset, value);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Leading bytes of encoded mesh maps ([`encode_mesh_maps`]).
+const MESH_MAPS_MAGIC: &[u8; 4] = b"SCMM";
+/// Version of the encoding; older or newer data is refused.
+const MESH_MAPS_FORMAT: u32 = 1;
+/// Floats stored per texel.
+const TEXEL_FLOATS: usize = 13;
+
+/// Why encoded mesh maps could not be read back.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MeshMapDecodeError {
+    #[error("not encoded mesh maps")]
+    NotMeshMaps,
+    #[error("mesh map encoding version {0} is not supported")]
+    UnsupportedVersion(u32),
+    #[error("encoded mesh maps are truncated or inconsistent")]
+    Corrupt,
+}
+
+/// Mesh maps (one per material slot) as bytes, for an on-disk bake cache.
+/// [`decode_mesh_maps`] reads them back unchanged.
+pub fn encode_mesh_maps(maps: &[MeshMaps]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MESH_MAPS_MAGIC);
+    out.extend_from_slice(&MESH_MAPS_FORMAT.to_le_bytes());
+    out.extend_from_slice(&(maps.len() as u32).to_le_bytes());
+    for map in maps {
+        map.encode(&mut out);
+    }
+    out
+}
+
+/// Reads mesh maps written by [`encode_mesh_maps`].
+pub fn decode_mesh_maps(bytes: &[u8]) -> Result<Vec<MeshMaps>, MeshMapDecodeError> {
+    let mut reader = Reader(bytes);
+    if reader.take(4)? != MESH_MAPS_MAGIC {
+        return Err(MeshMapDecodeError::NotMeshMaps);
+    }
+    let version = reader.u32()?;
+    if version != MESH_MAPS_FORMAT {
+        return Err(MeshMapDecodeError::UnsupportedVersion(version));
+    }
+    let count = reader.u32()?;
+    let maps = (0..count)
+        .map(|_| MeshMaps::decode(&mut reader))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !reader.0.is_empty() {
+        return Err(MeshMapDecodeError::Corrupt);
+    }
+    Ok(maps)
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], MeshMapDecodeError> {
+        if self.0.len() < count {
+            return Err(MeshMapDecodeError::Corrupt);
+        }
+        let (head, rest) = self.0.split_at(count);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u32(&mut self) -> Result<u32, MeshMapDecodeError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, MeshMapDecodeError> {
+        Ok(u64::from(self.u32()?) | (u64::from(self.u32()?) << 32))
+    }
+
+    fn f32(&mut self) -> Result<f32, MeshMapDecodeError> {
+        self.u32().map(f32::from_bits)
+    }
+
+    fn vec3(&mut self) -> Result<Vec3, MeshMapDecodeError> {
+        Ok(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
+    }
+
+    fn flags(&mut self, count: usize) -> Result<Vec<bool>, MeshMapDecodeError> {
+        self.take(count)?
+            .iter()
+            .map(|byte| match byte {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(MeshMapDecodeError::Corrupt),
+            })
+            .collect()
+    }
+}
+
+impl MeshMaps {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let settings = serde_json::to_vec(&self.settings).unwrap_or_default();
+        out.extend_from_slice(&(settings.len() as u32).to_le_bytes());
+        out.extend_from_slice(&settings);
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        let floats = |out: &mut Vec<u8>, values: &[f32]| {
+            for value in values {
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        };
+        floats(out, &self.bounds_min.to_array());
+        floats(out, &self.bounds_max.to_array());
+        out.push(u8::from(self.from_high_poly));
+        out.extend_from_slice(&(self.misses as u64).to_le_bytes());
+        out.reserve(self.texels.len() * (TEXEL_FLOATS * 4 + 2));
+        for texel in &self.texels {
+            floats(out, &texel.position.to_array());
+            floats(out, &texel.normal.to_array());
+            floats(out, &texel.tangent_normal.to_array());
+            floats(
+                out,
+                &[
+                    texel.curvature,
+                    texel.ambient_occlusion,
+                    texel.thickness,
+                    texel.skew,
+                ],
+            );
+        }
+        out.extend(self.covered.iter().map(|value| u8::from(*value)));
+        out.extend(self.filled.iter().map(|value| u8::from(*value)));
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, MeshMapDecodeError> {
+        let settings_len = reader.u32()? as usize;
+        let settings: MeshMapSettings = serde_json::from_slice(reader.take(settings_len)?)
+            .map_err(|_| MeshMapDecodeError::Corrupt)?;
+        let (width, height) = (reader.u32()?, reader.u32()?);
+        let count = (width as usize)
+            .checked_mul(height as usize)
+            .filter(|count| *count > 0 && *count <= MAX_BAKE_PIXELS)
+            .ok_or(MeshMapDecodeError::Corrupt)?;
+        let (bounds_min, bounds_max) = (reader.vec3()?, reader.vec3()?);
+        let from_high_poly = match reader.take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(MeshMapDecodeError::Corrupt),
+        };
+        let misses = usize::try_from(reader.u64()?).map_err(|_| MeshMapDecodeError::Corrupt)?;
+        // Checked before allocating, so a corrupt size cannot exhaust memory.
+        if reader.0.len() < count * (TEXEL_FLOATS * 4 + 2) {
+            return Err(MeshMapDecodeError::Corrupt);
+        }
+        let texels = (0..count)
+            .map(|_| {
+                Ok(Texel {
+                    position: reader.vec3()?,
+                    normal: reader.vec3()?,
+                    tangent_normal: reader.vec3()?,
+                    curvature: reader.f32()?,
+                    ambient_occlusion: reader.f32()?,
+                    thickness: reader.f32()?,
+                    skew: reader.f32()?,
+                })
+            })
+            .collect::<Result<Vec<_>, MeshMapDecodeError>>()?;
+        let covered = reader.flags(count)?;
+        let filled = reader.flags(count)?;
+        Ok(Self {
+            width,
+            height,
+            settings,
+            bounds_min,
+            bounds_max,
+            texels,
+            covered,
+            filled,
+            from_high_poly,
+            misses,
+            blocks: BlockCache::default(),
+            device: DeviceNote::default(),
+        })
+    }
 }
 
 /// Per-vertex normal/tangent frame of the low mesh, interpolated exactly as
@@ -744,6 +1103,7 @@ struct LowFrame<'a> {
     tangents: &'a [glam::Vec4],
 }
 
+#[derive(Clone, Copy)]
 struct TangentBasis {
     position: Vec3,
     normal: Vec3,
@@ -775,7 +1135,7 @@ impl LowFrame<'_> {
 }
 
 impl TangentBasis {
-    fn to_tangent(&self, world: Vec3) -> Vec3 {
+    fn to_tangent(self, world: Vec3) -> Vec3 {
         Vec3::new(
             world.dot(self.tangent),
             world.dot(self.bitangent),
@@ -1106,14 +1466,13 @@ fn distance_to_segment(point: Vec3, start: Vec3, end: Vec3) -> f32 {
 
 struct TexelContext<'a> {
     mesh: &'a MeshGeometry,
-    settings: &'a MeshMapSettings,
     geometry: &'a SurfaceGeometry,
-    bvh: &'a Bvh,
-    diagonal: f32,
 }
 
 impl TexelContext<'_> {
-    fn evaluate(&self, triangle: u32, weights: Vec3, texel_index: u32) -> Texel {
+    /// The surface at `weights` within `triangle`, without occlusion, and
+    /// the triangle's face normal.
+    fn surface(&self, triangle: u32, weights: Vec3) -> (Texel, Vec3) {
         let triangle_index = triangle as usize;
         let corners = self.mesh.triangles[triangle_index];
         let position = |corner: usize| self.mesh.vertices[corners[corner] as usize].position;
@@ -1130,50 +1489,62 @@ impl TexelContext<'_> {
             + corner_curvature[2] * weights.z;
         let edge = self.geometry.edge_curvature(point, face_normal);
         let curvature = 0.5 + 0.5 * (edge + smooth).clamp(-1.0, 1.0);
-
-        let bias = self.diagonal * 1e-4;
-        let seed = lowbias32(texel_index ^ self.settings.seed.wrapping_mul(0x9e37_79b9));
-        let ao_distance = self.settings.ao_distance * self.diagonal;
-        let ao_samples = self.settings.ao_samples;
-        let origin = point + face_normal * bias;
-        let mut occluded = 0_u32;
-        for sample in 0..ao_samples {
-            let direction = cosine_direction(normal, face_normal, sample, ao_samples, seed);
-            if self.bvh.any_hit(origin, direction, bias, ao_distance) {
-                occluded += 1;
-            }
-        }
-        let ambient_occlusion = 1.0 - occluded as f32 / ao_samples as f32;
-
-        let thickness_samples = (ao_samples / 2).max(4);
-        let thickness_distance = self.diagonal * 0.5;
-        let inside = point - face_normal * bias;
-        let mut total = 0.0;
-        for sample in 0..thickness_samples {
-            let direction = cosine_direction(
-                -normal,
-                -face_normal,
-                sample,
-                thickness_samples,
-                lowbias32(seed ^ 0x5bd1_e995),
-            );
-            total += self
-                .bvh
-                .closest_hit(inside, direction, bias, thickness_distance)
-                .map_or(thickness_distance, |hit| hit.distance);
-        }
-        let thickness = (total / thickness_samples as f32 / thickness_distance).clamp(0.0, 1.0);
-
-        Texel {
+        let texel = Texel {
             position: point,
             normal,
             // Set by the caller once the low-mesh tangent frame is known.
             tangent_normal: Vec3::Z,
             curvature,
-            ambient_occlusion,
-            thickness,
+            ambient_occlusion: 1.0,
+            thickness: 0.0,
             skew: 0.0,
+        };
+        (texel, face_normal)
+    }
+}
+
+/// Ambient occlusion and thickness at `query`, traced on the CPU. GPU
+/// tracers mirror this sampling.
+fn cpu_occlusion(bvh: &Bvh, query: &OcclusionQuery, params: &OcclusionParams) -> Occlusion {
+    let OcclusionQuery {
+        point,
+        normal,
+        face_normal,
+        texel,
+    } = *query;
+    let bias = params.bias;
+    let seed = lowbias32(texel ^ params.seed.wrapping_mul(0x9e37_79b9));
+    let ao_samples = params.ao_samples;
+    let origin = point + face_normal * bias;
+    let mut occluded = 0_u32;
+    for sample in 0..ao_samples {
+        let direction = cosine_direction(normal, face_normal, sample, ao_samples, seed);
+        if bvh.any_hit(origin, direction, bias, params.ao_distance) {
+            occluded += 1;
         }
+    }
+    let ambient_occlusion = 1.0 - occluded as f32 / ao_samples as f32;
+
+    let thickness_samples = params.thickness_samples;
+    let thickness_distance = params.thickness_distance;
+    let inside = point - face_normal * bias;
+    let mut total = 0.0;
+    for sample in 0..thickness_samples {
+        let direction = cosine_direction(
+            -normal,
+            -face_normal,
+            sample,
+            thickness_samples,
+            lowbias32(seed ^ 0x5bd1_e995),
+        );
+        total += bvh
+            .closest_hit(inside, direction, bias, thickness_distance)
+            .map_or(thickness_distance, |hit| hit.distance);
+    }
+    let thickness = (total / thickness_samples as f32 / thickness_distance).clamp(0.0, 1.0);
+    Occlusion {
+        ambient_occlusion,
+        thickness,
     }
 }
 
@@ -1201,17 +1572,6 @@ fn cosine_direction(normal: Vec3, face_normal: Vec3, index: u32, count: u32, see
 fn radical_inverse(mut bits: u32) -> f32 {
     bits = bits.reverse_bits();
     bits as f32 * (1.0 / 4_294_967_296.0)
-}
-
-#[derive(Clone, Copy)]
-struct BvhNode {
-    min: Vec3,
-    max: Vec3,
-    /// Leaf: first index into `order`. Interior: index of the left child; the
-    /// right child follows it.
-    first: u32,
-    /// Triangle count for leaves, zero for interior nodes.
-    count: u32,
 }
 
 /// Bounding-volume hierarchy over mesh triangles for occlusion rays.
@@ -1308,6 +1668,14 @@ impl Bvh {
         }
     }
 
+    fn scene(&self) -> TraceScene<'_> {
+        TraceScene {
+            nodes: &self.nodes,
+            order: &self.order,
+            triangles: &self.triangles,
+        }
+    }
+
     fn any_hit(&self, origin: Vec3, direction: Vec3, t_min: f32, t_max: f32) -> bool {
         self.traverse(origin, direction, t_min, t_max, true)
             .is_some()
@@ -1330,7 +1698,7 @@ impl Bvh {
         }
         let inverse = direction.recip();
         let mut closest = None;
-        let mut stack = [0_u32; 128];
+        let mut stack = [0_u32; TRACE_STACK_DEPTH];
         let mut depth = 1;
         while depth > 0 {
             depth -= 1;
@@ -1421,7 +1789,137 @@ fn ray_triangle(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_maps_encode_and_decode_unchanged() {
+        let mesh = crate::PrimitivePreset::Cube.build_mesh();
+        let settings = MeshMapSettings {
+            resolution: 32,
+            ao_samples: 2,
+            ..MeshMapSettings::default()
+        };
+        let maps = bake_mesh_maps(&mesh, &settings, None).unwrap();
+        let bytes = encode_mesh_maps(std::slice::from_ref(&maps));
+        assert_eq!(decode_mesh_maps(&bytes), Ok(vec![maps.clone()]));
+        assert_eq!(
+            decode_mesh_maps(&bytes[..bytes.len() - 1]),
+            Err(MeshMapDecodeError::Corrupt)
+        );
+        assert_eq!(
+            decode_mesh_maps(b"PNG!rest"),
+            Err(MeshMapDecodeError::NotMeshMaps)
+        );
+        let mut newer = bytes.clone();
+        newer[4] = 9;
+        assert_eq!(
+            decode_mesh_maps(&newer),
+            Err(MeshMapDecodeError::UnsupportedVersion(9))
+        );
+    }
     use crate::{MeshVertex, PrimitivePreset};
+
+    /// Fails at `prepare`, or on every query after it.
+    struct FailingTracer {
+        at_prepare: bool,
+        wrong_count: bool,
+    }
+
+    struct FailingScene {
+        wrong_count: bool,
+    }
+
+    impl RayTracer for FailingTracer {
+        fn name(&self) -> String {
+            "failing".to_owned()
+        }
+
+        fn prepare(&self, _: &TraceScene<'_>) -> Result<Box<dyn PreparedScene + '_>, String> {
+            if self.at_prepare {
+                return Err("no device".to_owned());
+            }
+            Ok(Box::new(FailingScene {
+                wrong_count: self.wrong_count,
+            }))
+        }
+    }
+
+    impl PreparedScene for FailingScene {
+        fn cage_hits(&mut self, _: &[CageRay]) -> Result<Vec<Option<CageHit>>, String> {
+            if self.wrong_count {
+                return Ok(Vec::new());
+            }
+            Err("device lost".to_owned())
+        }
+
+        fn occlusion(
+            &mut self,
+            _: &[OcclusionQuery],
+            _: &OcclusionParams,
+        ) -> Result<Vec<Occlusion>, String> {
+            if self.wrong_count {
+                return Ok(Vec::new());
+            }
+            Err("device lost".to_owned())
+        }
+    }
+
+    #[test]
+    fn tc_0404_failing_tracers_fall_back_to_the_cpu_bake() {
+        let sphere = crate::PrimitivePreset::Sphere.build_mesh();
+        let mut high = sphere.clone();
+        for vertex in &mut high.vertices {
+            vertex.position *= 1.02;
+        }
+        let settings = fast_settings(48);
+        let cpu = bake_mesh_maps_from(&sphere, Some(&high), &settings, None).unwrap();
+        assert_eq!(cpu.trace_device(), &TraceDevice::Cpu);
+        for (tracer, error) in [
+            (
+                FailingTracer {
+                    at_prepare: true,
+                    wrong_count: false,
+                },
+                "no device",
+            ),
+            (
+                FailingTracer {
+                    at_prepare: false,
+                    wrong_count: false,
+                },
+                "device lost",
+            ),
+            (
+                FailingTracer {
+                    at_prepare: false,
+                    wrong_count: true,
+                },
+                "cage hits: wrong answer count",
+            ),
+        ] {
+            let maps = bake_mesh_maps_traced(
+                &sphere,
+                Some(&high),
+                &settings,
+                None,
+                None,
+                Some(&tracer),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                maps.trace_device(),
+                &TraceDevice::Fallback {
+                    tracer: "failing".to_owned(),
+                    error: error.to_owned()
+                }
+            );
+            // Byte for byte the CPU bake, not merely close.
+            assert_eq!(
+                encode_mesh_maps(&[maps]),
+                encode_mesh_maps(std::slice::from_ref(&cpu))
+            );
+        }
+    }
 
     fn fast_settings(resolution: u32) -> MeshMapSettings {
         MeshMapSettings {

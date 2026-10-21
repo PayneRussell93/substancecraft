@@ -100,6 +100,21 @@ pub fn decode_project_json_with_report(
     if bytes.len() > MAX_PROJECT_JSON_BYTES {
         return Err(ProjectFileError::TooLarge(bytes.len()));
     }
+    // A current file that reads back to exactly these bytes needed no
+    // upgrade, defaulted nothing, and held nothing unknown: decode it
+    // straight into the project, without the trees the report compares
+    // (PERF-05). Anything else takes the full path below.
+    if let Ok(project) = serde_json::from_slice::<MaterialProject>(bytes)
+        && project.schema_version == PROJECT_SCHEMA_VERSION
+        && project.validate().is_ok()
+        && crate::stable_writer::to_stable_json(&project).is_ok_and(|encoded| encoded == bytes)
+    {
+        let report = MigrationReport {
+            from_version: PROJECT_SCHEMA_VERSION,
+            ..MigrationReport::default()
+        };
+        return Ok((project, report));
+    }
     let mut value: Value = serde_json::from_slice(bytes)
         .map_err(|error| ProjectFileError::Decode(error.to_string()))?;
     let Value::Object(object) = &mut value else {
@@ -197,6 +212,7 @@ fn is_default_like(key: &str, value: &Value) -> bool {
 }
 
 /// Re-lays out compact JSON in the stable, diff-friendly format.
+#[cfg(test)]
 pub(crate) fn stable_json(compact: &[u8]) -> Result<Vec<u8>, ProjectFileError> {
     // `Value` objects are `BTreeMap`s, so keys come out sorted.
     let value: Value = serde_json::from_slice(compact)
@@ -210,6 +226,7 @@ pub(crate) fn stable_json(compact: &[u8]) -> Result<Vec<u8>, ProjectFileError> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn write_value(value: &Value, depth: usize, out: &mut Vec<u8>) -> Result<(), ProjectFileError> {
     match value {
         Value::Object(fields) if !fields.is_empty() => {
@@ -258,16 +275,19 @@ fn write_value(value: &Value, depth: usize, out: &mut Vec<u8>) -> Result<(), Pro
     Ok(())
 }
 
+#[cfg(test)]
 fn is_scalar(value: &Value) -> bool {
     !matches!(value, Value::Array(_) | Value::Object(_))
         || matches!(value, Value::Array(items) if items.is_empty())
         || matches!(value, Value::Object(fields) if fields.is_empty())
 }
 
+#[cfg(test)]
 fn write_scalar(value: &Value, out: &mut Vec<u8>) -> Result<(), ProjectFileError> {
     serde_json::to_writer(out, value).map_err(|error| ProjectFileError::Encode(error.to_string()))
 }
 
+#[cfg(test)]
 fn indent(depth: usize, out: &mut Vec<u8>) {
     out.extend(std::iter::repeat_n(b' ', depth * 2));
 }
@@ -276,6 +296,125 @@ fn indent(depth: usize, out: &mut Vec<u8>) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The streaming writer must lay projects out byte for byte as the
+    /// tree-based writer did (PERF-05).
+    #[test]
+    fn tc_0405_streaming_writer_matches_the_tree_layout() {
+        use substancecraft_core::{
+            EnvironmentResource, ExportPreset, FilterPreset, GeneratorPreset, MaterialResource,
+            ProjectTemplate, SmartMask, SmartMaterial,
+        };
+        let mut projects = vec![sample_project()];
+        for template in ProjectTemplate::built_in() {
+            let mut project = template.instantiate(&["Body".to_owned(), "Trim".to_owned()]);
+            project.materials = MaterialResource::built_in();
+            for (index, material) in project.materials.iter_mut().enumerate() {
+                material.id = substancecraft_core::MaterialId(index as u64 + 1);
+            }
+            project.smart_masks = SmartMask::built_in();
+            project.filter_presets = FilterPreset::built_in();
+            project.generator_presets = GeneratorPreset::built_in();
+            project.smart_materials = SmartMaterial::built_in();
+            project.environments = vec![EnvironmentResource::new("Studio", "studio.hdr")];
+            project.export_presets = ExportPreset::built_in();
+            for preset in &mut project.export_presets {
+                preset.name = format!("Custom {}", preset.name);
+            }
+            projects.push(project);
+        }
+        // Floats whose f32 and f64 shortest forms are worth checking.
+        let mut awkward = sample_project();
+        let values = [
+            0.1_f32,
+            1.0 / 3.0,
+            -0.0,
+            1e-7,
+            3.4e38,
+            1.175_494_4e-38,
+            16_777_217.0,
+            0.3,
+            2.5e-5,
+            123_456.79,
+            f32::MIN_POSITIVE,
+            7.0e-45,
+        ];
+        awkward.texture_sets[0].layers[0].paint_strokes[0].points = values
+            .chunks(2)
+            .map(|pair| glam::Vec2::new(pair[0], pair[1]))
+            .collect();
+        projects.push(awkward);
+        for (index, project) in projects.iter().enumerate() {
+            let tree = crate::encode_project_json_tree(project).unwrap();
+            let streamed = crate::stable_writer::to_stable_json(project).unwrap();
+            assert!(
+                tree == streamed,
+                "project {index} differs:
+{}",
+                first_difference(&tree, &streamed)
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_writer_lays_out_mixed_and_empty_shapes_like_the_tree() {
+        let value = serde_json::json!({
+            "z": [1, 2, {"b": [], "a": {}}, "three", [4.5, [], {}]],
+            "a": [[], {}, []],
+            "m": [{"k": null}, [[1], [2, [3]]]],
+            "e": {"": "", "10": 1, "9": 2},
+            "s": [r#"quote " and \ and é"#, "tab\there", true, false, null, -0.0, 1e300],
+        });
+        let compact = serde_json::to_vec(&value).unwrap();
+        let tree = stable_json(&compact).unwrap();
+        let streamed = crate::stable_writer::to_stable_json(&value).unwrap();
+        assert!(tree == streamed, "{}", first_difference(&tree, &streamed));
+    }
+
+    /// Inside the writer's direct band an f32's text is the text of the
+    /// f64 it parses to, so it needs no reparse.
+    fn check_direct_f32_band(step: usize) {
+        for bits in (0..=u32::MAX).step_by(step) {
+            let value = f32::from_bits(bits);
+            if !crate::stable_writer::writes_f32_directly(value) {
+                continue;
+            }
+            let text = serde_json::to_string(&value).unwrap();
+            let reparsed = serde_json::to_string(&text.parse::<f64>().unwrap()).unwrap();
+            assert_eq!(text, reparsed, "{bits:#x}");
+        }
+    }
+
+    #[test]
+    fn f32_text_matches_its_f64_reparse_in_the_direct_band() {
+        check_direct_f32_band(9_973);
+    }
+
+    #[test]
+    #[ignore = "dense check"]
+    fn f32_text_matches_its_f64_reparse_in_the_direct_band_densely() {
+        check_direct_f32_band(13);
+    }
+
+    fn first_difference(a: &[u8], b: &[u8]) -> String {
+        let at = a
+            .iter()
+            .zip(b)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()));
+        let window = |bytes: &[u8]| {
+            String::from_utf8_lossy(&bytes[at.saturating_sub(80)..(at + 80).min(bytes.len())])
+                .into_owned()
+        };
+        format!(
+            "tree:
+{}
+streamed:
+{}",
+            window(a),
+            window(b)
+        )
+    }
     use crate::{decode_project_json, encode_project_json};
     use substancecraft_core::{
         LayerId, MaterialChannel, MaterialLayer, TextureResolution, TextureSet, TextureSetId,

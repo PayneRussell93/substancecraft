@@ -257,6 +257,14 @@ pub struct Preferences {
     pub overlay_pattern: bool,
     /// Memory background texture-set bakes may use, in MiB.
     pub cache_budget_mb: u32,
+    /// Keep mesh-map bakes on disk between sessions.
+    pub disk_cache: bool,
+    /// Folder of the disk cache; `None` uses `Cache` beside the preferences.
+    pub disk_cache_folder: Option<PathBuf>,
+    /// Disk space the cache may use, in MiB.
+    pub disk_cache_budget_mb: u32,
+    /// Trace mesh-map rays on the GPU when one is available.
+    pub gpu_baking: bool,
     /// Lighting-check environment of the viewport.
     pub lighting_preset: substancecraft_core::LightingPreset,
     /// HDR panorama lighting the viewport in place of the preset.
@@ -295,6 +303,10 @@ impl Default for Preferences {
             overlay_palette: substancecraft_core::OverlayPalette::Standard,
             overlay_pattern: false,
             cache_budget_mb: crate::cache::DEFAULT_CACHE_BUDGET_MB,
+            disk_cache: true,
+            disk_cache_folder: None,
+            disk_cache_budget_mb: crate::disk_cache::DEFAULT_DISK_BUDGET_MB,
+            gpu_baking: true,
             lighting_preset: substancecraft_core::LightingPreset::default(),
             environment_file: None,
             picker_color_space: substancecraft_core::ColorSpace::Srgb,
@@ -375,6 +387,10 @@ impl Preferences {
         self.cache_budget_mb = self.cache_budget_mb.clamp(
             crate::cache::MIN_CACHE_BUDGET_MB,
             crate::cache::MAX_CACHE_BUDGET_MB,
+        );
+        self.disk_cache_budget_mb = self.disk_cache_budget_mb.clamp(
+            crate::disk_cache::MIN_DISK_BUDGET_MB,
+            crate::disk_cache::MAX_DISK_BUDGET_MB,
         );
         self.recent.truncate(MAX_RECENT);
     }

@@ -1594,6 +1594,17 @@ impl SubstanceCraftApp {
         if slider_row(ui, "Padding", &mut padding, 0.0..=16.0, false, 0) {
             self.mesh_map_settings.padding = padding.round() as u32;
         }
+        let mut gpu = self.preferences.values.gpu_baking;
+        let toggled = widgets::property_row(ui, "GPU baking", |ui| widgets::toggle(ui, &mut gpu))
+            .on_hover_text(
+                "Trace occlusion, thickness, and cage rays on the GPU; the CPU takes over \
+                 when no GPU is available or it fails",
+            )
+            .changed();
+        if toggled {
+            self.preferences.values.gpu_baking = gpu;
+            self.save_preferences();
+        }
         hint(ui, "Setting changes apply on the next bake.");
 
         widgets::caption(ui, "Preview on mesh");
