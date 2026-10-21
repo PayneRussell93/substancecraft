@@ -12,6 +12,8 @@ mod interchange;
 mod jobs;
 mod ocio;
 mod ocio_yaml;
+mod paths;
+mod plugins;
 mod project_format;
 mod recovery;
 mod relink;
@@ -56,6 +58,12 @@ pub use jobs::{
 pub use ocio::{
     MAX_OCIO_CONFIG_BYTES, OCIO_BAKE_SIZE, OCIO_HEADROOM_STOPS, OcioConfig, OcioDisplay, OcioError,
     OcioProcessor, OcioView,
+};
+pub use paths::{resolve_stored_path, stored_path};
+pub use plugins::{
+    LoadedPlugin, PLUGIN_ABI, PLUGIN_FORMAT, PLUGIN_MANIFEST, PluginError, PluginItem,
+    PluginManifest, PluginParameter, SAMPLE_FLOATS, default_plugin_folders, install_plugins,
+    installed_plugins, load_plugin, load_plugins,
 };
 pub use project_format::{MigrationReport, decode_project_json_with_report};
 pub use recovery::{RecoveryCandidate, RecoveryStore};
@@ -538,9 +546,10 @@ pub fn rebake_texture_set_channel_regions(
     Ok(())
 }
 
-/// The built-in export presets, as serializable output descriptions.
+/// The built-in export presets and those of installed plugins, as
+/// serializable output descriptions.
 pub fn list_export_presets() -> Vec<ExportPreset> {
-    ExportPreset::built_in()
+    substancecraft_core::available_export_presets()
 }
 
 /// Bakes the files an export preset describes for one texture set. Takes the

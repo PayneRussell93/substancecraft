@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
+use substancecraft_core::math;
 
 use glam::{DAffine3, DVec2, DVec3, Vec3};
 use serde::{Deserialize, Serialize};
@@ -639,7 +640,7 @@ impl<'a> Reader<'a> {
                 Surface::Cone {
                     frame: self.frame(record.reference(1)?)?,
                     radius: record.number(2)?,
-                    tan: angle.tan(),
+                    tan: math::tan(angle),
                 }
             }
             "SPHERICAL_SURFACE" => Surface::Sphere {
@@ -1868,7 +1869,7 @@ mod tests {
             assert_watertight(geometry);
             for vertex in &geometry.vertices {
                 let p = vertex.position.as_dvec3();
-                assert!(p.x.hypot(p.y) <= 0.005 + 1e-7);
+                assert!(math::hypot(p.x, p.y) <= 0.005 + 1e-7);
             }
         }
     }
@@ -1887,7 +1888,7 @@ mod tests {
         let body = writer.add(format!("MANIFOLD_SOLID_BREP('ball',#{shell})"));
         writer.representation(body, context);
         let (mesh, _) = import(&writer.finish());
-        let expected = 4.0 / 3.0 * PI * 0.03_f64.powi(3);
+        let expected = 4.0 / 3.0 * PI * math::powi(0.03_f64, 3);
         assert!((volume(&mesh.geometry) - expected).abs() < expected * 0.01);
         for vertex in &mesh.geometry.vertices {
             assert!((vertex.position.as_dvec3().length() - 0.03).abs() < 1e-6);

@@ -1,0 +1,17 @@
+# PROD-08 export digests (FNV-1a 64) of tests/determinism.rs.
+# Regenerate with SUBSTANCECRAFT_BLESS=1 after an intentional change.
+Sphere Probe_BaseColor.png 223a68d4608bbd2e
+Sphere Probe_ORM.png 7ddf5e749d96523a
+Sphere Probe_Normal.png 0ef9391c0eb51917
+corner.gltf Probe_BaseColor.png 81f90fcf2768785d
+corner.gltf Probe_ORM.png 25f903e95f156a10
+corner.gltf Probe_Normal.png 131c59dc70cf82db
+corner.gltf Probe_BaseColor.exr 5651fe63c5e4bf05
+corner.gltf Probe_Roughness.exr 087c2f2fb1a0f1c3
+corner.gltf Probe_Metallic.exr dea612763fe83ce8
+corner.gltf Probe_Normal.exr 9d3e9edff8b27f4d
+corner.gltf Probe_Height.exr 7a7b869e1acf4f8b
+corner.gltf Probe_AmbientOcclusion.exr cd6a2c5c2902f0a3
+corner.gltf Probe_Opacity.exr 265f7a377abebb68
+Sphere mesh-maps.f32 ce7544fa0e51455d
+corner.gltf mesh-maps.f32 c82deab9a5754631

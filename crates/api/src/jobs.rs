@@ -61,11 +61,7 @@ pub fn load_mesh_file(path: &Path) -> Result<Vec<ImportedMesh>, String> {
 }
 
 fn resolve(source: &str, base: Option<&Path>) -> PathBuf {
-    let path = PathBuf::from(source);
-    match base {
-        Some(base) if path.is_relative() => base.join(path),
-        _ => path,
-    }
+    crate::resolve_stored_path(source, base)
 }
 
 fn scaled(mut mesh: MeshGeometry, scale: f32) -> MeshGeometry {
@@ -241,7 +237,8 @@ pub fn run_export_job(job: &ExportJob) -> Result<Vec<PathBuf>, JobError> {
         }
         None => None,
     };
-    let presets: Vec<ExportPreset> = ExportPreset::built_in()
+    // Plugins' presets follow the built-in ones (PROD-07).
+    let presets: Vec<ExportPreset> = substancecraft_core::available_export_presets()
         .into_iter()
         .chain(project.export_presets.iter().cloned())
         .collect();

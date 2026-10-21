@@ -6,6 +6,7 @@
 //! filters, and then blends over the stack beneath through its opacity and
 //! mask.
 
+use crate::math;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -29,7 +30,7 @@ use crate::{
 /// With strength 1, a full 0..1 height step across this fraction of a
 /// 100-texel span tilts the normal by 45 degrees; slopes scale with
 /// resolution so bumps keep their look in UV space.
-const HEIGHT_SLOPE_REFERENCE_TEXELS: f32 = 100.0;
+pub(crate) const HEIGHT_SLOPE_REFERENCE_TEXELS: f32 = 100.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BakedTexture {
@@ -87,6 +88,10 @@ pub enum BakeError {
          flattened on its own"
     )]
     FlattenReadsStack,
+    #[error("plugin `{0}` is not installed")]
+    MissingPlugin(String),
+    #[error("plugin `{id}` failed: {message}")]
+    Plugin { id: String, message: String },
 }
 
 /// Data a texture bake may need: geometry for polygon masks, baked mesh
@@ -448,7 +453,7 @@ fn over(destination: &mut Vec4, value: Vec3, alpha: f32, data: PlaneData) {
 }
 
 /// Uniform value (and alpha) a fill writes to `channel`.
-fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
+pub(crate) fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
     let scalar = |value: f32| Vec4::new(value, value, value, 1.0);
     match channel {
         MaterialChannel::BaseColor => {
@@ -465,7 +470,7 @@ fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
 }
 
 /// Converts a bitmap sample into a channel texel.
-fn texture_texel(sample: Vec4, data: PlaneData, color_space: crate::ColorSpace) -> Vec4 {
+pub(crate) fn texture_texel(sample: Vec4, data: PlaneData, color_space: crate::ColorSpace) -> Vec4 {
     match data {
         // Colour channels store sRGB; convert tagged linear or ACEScg images.
         PlaneData::Color => color_space.to_srgb(sample.truncate()).extend(sample.w),
@@ -583,23 +588,7 @@ impl Compositor<'_> {
                 self.pass_through(layer, children, target)?;
                 continue;
             }
-            let mut local = try_filled(self.region.len(), Vec4::ZERO)?;
-            if let Some(children) = &layer.children {
-                self.composite(children, &mut local)?;
-            } else {
-                if let Some(fill) = &layer.fill {
-                    self.render_fill(fill, layer.graph.as_ref(), &mut local)?;
-                }
-                for stroke in &layer.paint_strokes {
-                    self.render_stroke(stroke, target, &mut local)?;
-                }
-            }
-            filters::apply_to_plane(
-                &mut local,
-                self.grid(),
-                self.data,
-                layer.filters_for(self.channel),
-            );
+            let local = self.layer_local(layer, target)?;
             let mask = self.masks.0.get(&layer.id);
             if let Some(probe) = self.probe {
                 probe.record(layer, &local, mask.map(Vec::as_slice));
@@ -627,6 +616,35 @@ impl Compositor<'_> {
         Ok(())
     }
 
+    /// What `layer` (not a pass-through group) lays over the stack: its
+    /// fill and strokes, or its composited children, after its filters and
+    /// before its mask and opacity. `backdrop` is the stack beneath, which
+    /// clone and smudge strokes read.
+    fn layer_local(
+        &self,
+        layer: &MaterialLayer,
+        backdrop: &[Vec4],
+    ) -> Result<Vec<Vec4>, BakeError> {
+        let mut local = try_filled(self.region.len(), Vec4::ZERO)?;
+        if let Some(children) = &layer.children {
+            self.composite(children, &mut local)?;
+        } else {
+            if let Some(fill) = &layer.fill {
+                self.render_fill(fill, layer.graph.as_ref(), &mut local)?;
+            }
+            for stroke in &layer.paint_strokes {
+                self.render_stroke(stroke, backdrop, &mut local)?;
+            }
+        }
+        filters::apply_to_plane(
+            &mut local,
+            self.grid(),
+            self.data,
+            layer.filters_for(self.channel),
+        )?;
+        Ok(local)
+    }
+
     /// Composites a pass-through group: its children go onto a copy of the
     /// stack, which then fades in over the stack by the group's opacity and
     /// mask.
@@ -644,7 +662,7 @@ impl Compositor<'_> {
             self.grid(),
             self.data,
             layer.filters_for(self.channel),
-        );
+        )?;
         let mask = self.masks.0.get(&layer.id);
         if let Some(probe) = self.probe {
             probe.record(layer, &through, mask.map(Vec::as_slice));
@@ -906,7 +924,9 @@ fn blur_plane(
             Vec2::ZERO
         } else {
             let angle = tap as f32 * GOLDEN_ANGLE;
-            Vec2::new(angle.cos(), angle.sin()) * radius * (tap as f32 / BLUR_TAPS as f32).sqrt()
+            Vec2::new(math::cos(angle), math::sin(angle))
+                * radius
+                * (tap as f32 / BLUR_TAPS as f32).sqrt()
         };
         let texel = sample_plane(plane, region, size, point + offset, data)?;
         sum += (texel.truncate() * texel.w).extend(texel.w);
@@ -1599,6 +1619,36 @@ impl TextureSet {
         Ok(plane)
     }
 
+    /// [`Compositor::layer_local`] of `layer` for `channel` over the whole
+    /// set, for layers whose content cannot be composited elsewhere
+    /// (PERF-06). `layer` must not read the stack beneath it (no clone or
+    /// smudge strokes); `id_map` is the set's, when it has one.
+    pub(crate) fn layer_local_plane(
+        &self,
+        layer: &MaterialLayer,
+        channel: MaterialChannel,
+        context: BakeContext<'_>,
+        id_map: Option<&[u8]>,
+    ) -> Result<Vec<Vec4>, BakeError> {
+        let region = self.texel_rect();
+        let mut masks = BTreeMap::new();
+        if let Some(children) = &layer.children {
+            self.collect_masks(children, &[channel], context, id_map, region, &mut masks)?;
+        }
+        let masks = LayerMasks(masks);
+        Compositor {
+            set: self,
+            channel,
+            data: plane_data(channel),
+            context,
+            masks: &masks,
+            region,
+            probe: None,
+            stencils: RefCell::default(),
+        }
+        .layer_local(layer, &[])
+    }
+
     /// Normal-channel composite over `region` with Height-derived detail
     /// blended on top (whiteout blend), so painted bumps and dents shade in
     /// the viewport. The slope at a texel reads its neighbours, so only
@@ -1690,6 +1740,10 @@ impl TextureSet {
                         });
                 }
             }
+            Some(generator @ MaskGenerator::Plugin(_)) => {
+                let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
+                plugin_mask(generator, maps, region, (width, height), &mut values)?;
+            }
             Some(generator) => {
                 let maps = context.mesh_maps.ok_or(BakeError::MissingMeshMaps)?;
                 parallel_fill_region(&mut values, region, width, height, |uv| {
@@ -1728,7 +1782,7 @@ impl TextureSet {
             width,
             height,
         };
-        filters::apply_to_mask(&mut values, grid, &layer.mask_filters);
+        filters::apply_to_mask(&mut values, grid, &layer.mask_filters)?;
         if let Some(polygon_mask) = &layer.polygon_mask {
             let mesh = context.mesh.ok_or(BakeError::MissingMesh)?;
             let mut selected = try_filled(pixel_count, false)?;
@@ -2224,6 +2278,37 @@ pub(crate) fn parallel_fill_region<T: Send>(
             scope.spawn(move || fill(chunk_index, chunk));
         }
     });
+}
+
+/// Texels a plugin generator is handed at once: enough to keep a call's
+/// overhead small, few enough that the samples stay a few MiB.
+const PLUGIN_CHUNK_TEXELS: usize = 65_536;
+
+/// A plugin generator's mask over `region` (row-major `values`), sampled at
+/// the same UVs [`parallel_fill_region`] uses.
+fn plugin_mask(
+    generator: &MaskGenerator,
+    maps: &crate::MeshMaps,
+    region: TexelRect,
+    (width, height): (u32, u32),
+    values: &mut [f32],
+) -> Result<(), BakeError> {
+    let row_len = region.width as usize;
+    if row_len == 0 {
+        return Ok(());
+    }
+    for (chunk_index, chunk) in values.chunks_mut(PLUGIN_CHUNK_TEXELS).enumerate() {
+        let start = chunk_index * PLUGIN_CHUNK_TEXELS;
+        let samples: Vec<_> = (start..start + chunk.len())
+            .map(|index| {
+                let x = region.x + (index % row_len) as u32;
+                let y = region.y + (index / row_len) as u32;
+                maps.sample(raster::pixel_to_uv(x, y, width, height))
+            })
+            .collect();
+        generator.evaluate_many(&samples, chunk)?;
+    }
+    Ok(())
 }
 
 /// Copies the texels of `region` from `source` (RGBA row-major over

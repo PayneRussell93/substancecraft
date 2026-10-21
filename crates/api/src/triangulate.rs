@@ -1019,6 +1019,7 @@ impl TriangleMesh {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use substancecraft_core::math;
 
     fn total_area(points: &[DVec2], triangles: &[[u32; 3]]) -> f64 {
         triangles
@@ -1057,7 +1058,7 @@ mod tests {
             .map(|index| {
                 let angle = index as f64 / 200.0 * std::f64::consts::TAU;
                 let radius = if index % 2 == 0 { 2.0 } else { 1.0 };
-                DVec2::new(angle.cos(), angle.sin()) * radius
+                DVec2::new(math::cos(angle), math::sin(angle)) * radius
             })
             .collect();
         let triangles = earcut(&points, &[0]);

@@ -2616,7 +2616,10 @@ impl SubstanceCraftApp {
         let mut chosen = current;
         let combo = egui::ComboBox::from_id_salt(("generator_kind", layer.id.0))
             .width(ui.available_width() - 8.0)
-            .selected_text(current.map_or("None", |generator| generator.name()))
+            .selected_text(current.map_or_else(
+                || "None".to_owned(),
+                |generator| generator_label(&generator),
+            ))
             .show_ui(ui, |ui| {
                 if ui.selectable_label(current.is_none(), "None").clicked() {
                     chosen = None;
@@ -2625,6 +2628,24 @@ impl SubstanceCraftApp {
                     let selected = current.is_some_and(|generator| generator.same_kind(&preset));
                     if ui.selectable_label(selected, preset.name()).clicked() && !selected {
                         chosen = Some(preset);
+                    }
+                }
+                let plugins = plugin_choices(PluginItems::Generators);
+                if !plugins.is_empty() {
+                    ui.separator();
+                }
+                for (name, plugin, stage) in plugins {
+                    let selected = matches!(
+                        current,
+                        Some(MaskGenerator::Plugin(used)) if used.id == stage.id
+                    );
+                    if ui
+                        .selectable_label(selected, name)
+                        .on_hover_text(format!("From the {plugin} plugin"))
+                        .clicked()
+                        && !selected
+                    {
+                        chosen = Some(MaskGenerator::Plugin(stage));
                     }
                 }
             });
@@ -3010,9 +3031,88 @@ impl SubstanceCraftApp {
 /// Parameter sliders for one mask generator.
 /// Settings of a mask generator. Returns true when the ID generator asks
 /// to pick its colour from the model.
+/// What plugin stages the pickers offer.
+#[derive(Clone, Copy)]
+enum PluginItems {
+    Generators,
+    Filters,
+}
+
+/// Installed plugins' generators or filters: display name, plugin name, and
+/// the stage at its default parameters.
+fn plugin_choices(kind: PluginItems) -> Vec<(String, String, substancecraft_core::PluginRef)> {
+    let mut choices = Vec::new();
+    for plugin in substancecraft_api::installed_plugins() {
+        let manifest = plugin.manifest();
+        let items = match kind {
+            PluginItems::Generators => &manifest.generators,
+            PluginItems::Filters => &manifest.filters,
+        };
+        for item in items {
+            if let Some(stage) = plugin.default_stage(item) {
+                choices.push((item.name.clone(), manifest.name.clone(), stage));
+            }
+        }
+    }
+    choices
+}
+
+/// A generator's name in pickers and lists: a plugin generator shows its
+/// plugin's name for it.
+pub(super) fn generator_label(generator: &MaskGenerator) -> String {
+    match generator {
+        MaskGenerator::Plugin(stage) => stage.display_name(),
+        other => other.name().to_owned(),
+    }
+}
+
+/// A filter's name, a plugin filter's from its plugin.
+pub(super) fn filter_label(filter: &LayerFilter) -> String {
+    match filter {
+        LayerFilter::Plugin(stage) => stage.display_name(),
+        other => other.name().to_owned(),
+    }
+}
+
+/// Sliders for the parameters a plugin stage's manifest declares, or a
+/// warning when its plugin is not installed (bakes stop until it is).
+fn plugin_stage_controls(ui: &mut Ui, stage: &mut substancecraft_core::PluginRef) {
+    let declared = substancecraft_api::installed_plugins()
+        .into_iter()
+        .find_map(|plugin| {
+            plugin
+                .item_of(stage.id)
+                .map(|item| (plugin.manifest().name.clone(), item.parameters.clone()))
+        });
+    let Some((plugin, parameters)) = declared else {
+        ui.label(
+            RichText::new(format!(
+                "Plugin `{}` is not installed; this layer cannot bake until it is.",
+                stage.id.plugin()
+            ))
+            .size(12.0)
+            .color(WARNING),
+        );
+        return;
+    };
+    for (value, parameter) in stage.parameters.iter_mut().zip(&parameters) {
+        *value = value.clamp(parameter.min, parameter.max);
+        widgets::property_row(ui, &parameter.name, |ui| {
+            let response = ui.add(egui::Slider::new(value, parameter.min..=parameter.max));
+            widgets::label_from_row(ui, &response, egui::WidgetType::Slider);
+        });
+    }
+    ui.label(
+        RichText::new(format!("From the {plugin} plugin"))
+            .size(11.0)
+            .color(theme::TEXT_FAINT),
+    );
+}
+
 pub(super) fn generator_controls(ui: &mut Ui, generator: &mut MaskGenerator) -> bool {
     let mut pick = false;
     match generator {
+        MaskGenerator::Plugin(stage) => plugin_stage_controls(ui, stage),
         MaskGenerator::EdgeWear(settings) => {
             slider_row(ui, "Amount", &mut settings.amount, 0.0..=1.0, false, 2);
             slider_row(ui, "Contrast", &mut settings.contrast, 0.0..=1.0, false, 2);
@@ -3931,7 +4031,7 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
     let count = filters.len();
     for (index, filter) in filters.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(filter.name()).color(theme::TEXT));
+            ui.label(RichText::new(filter_label(filter)).color(theme::TEXT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if widgets::header_action(ui, Icon::Close, true, "Remove filter").clicked() {
@@ -3959,6 +4059,19 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
                     added = Some(preset);
                 }
             }
+            let plugins = plugin_choices(PluginItems::Filters);
+            if !plugins.is_empty() {
+                ui.separator();
+            }
+            for (name, plugin, stage) in plugins {
+                if ui
+                    .selectable_label(false, name)
+                    .on_hover_text(format!("From the {plugin} plugin"))
+                    .clicked()
+                {
+                    added = Some(LayerFilter::Plugin(stage));
+                }
+            }
         });
     widgets::label_from_row(ui, &combo.response, egui::WidgetType::ComboBox);
     if let Some(filter) = added {
@@ -3968,6 +4081,7 @@ fn filter_stack(ui: &mut Ui, id_salt: Id, filters: &mut Vec<LayerFilter>) {
 
 pub(super) fn filter_controls(ui: &mut Ui, filter: &mut LayerFilter) {
     match filter {
+        LayerFilter::Plugin(stage) => plugin_stage_controls(ui, stage),
         LayerFilter::Blur { radius } => {
             slider_row(ui, "Radius", radius, 0.0..=MAX_BLUR_RADIUS, false, 1);
         }

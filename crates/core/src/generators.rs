@@ -6,9 +6,11 @@
 //! Breakup noise is sampled in object space, so masks stay continuous across
 //! UV seams and scale with the mesh rather than with its UV layout.
 
+use crate::math;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+use crate::extensions::PluginRef;
 use crate::mesh_maps::MeshMapSample;
 use crate::noise::{fbm3, gradient_noise3};
 use crate::resources::{MAX_TILE_SIZE, MIN_TILE_SIZE};
@@ -31,6 +33,9 @@ pub enum MaskGenerator {
     /// A procedural pattern or grunge in object space: stripes, checker,
     /// dots, scratches, or ridged grunge.
     Pattern(Pattern),
+    /// A generator from a plugin (PROD-07), run over whole regions by its
+    /// registered host.
+    Plugin(PluginRef),
 }
 
 impl MaskGenerator {
@@ -56,6 +61,7 @@ impl MaskGenerator {
             Self::Thickness(_) => "Thickness",
             Self::IdColor(_) => "ID",
             Self::Pattern(_) => "Pattern",
+            Self::Plugin(_) => "Plugin",
         }
     }
 
@@ -106,12 +112,30 @@ impl MaskGenerator {
                     && unit(settings.softness)
                     && feature_size(settings.feature_size)
             }
+            Self::Plugin(plugin) => plugin.is_valid(),
         }
+    }
+
+    /// Mask values at many samples: [`Self::evaluate`] per sample, except
+    /// that a plugin generator runs once over all of them.
+    pub fn evaluate_many(
+        &self,
+        samples: &[MeshMapSample],
+        values: &mut [f32],
+    ) -> Result<(), crate::BakeError> {
+        if let Self::Plugin(plugin) = self {
+            return crate::extensions::generate(plugin, samples, values);
+        }
+        for (value, sample) in values.iter_mut().zip(samples) {
+            *value = self.evaluate(sample);
+        }
+        Ok(())
     }
 
     /// Mask value at one mesh-map sample. Uncovered samples are always `0`.
     /// The ID generator reads the ID map ([`IdSelection::select`]) and is
-    /// `0` here.
+    /// `0` here; a plugin generator that fails, or is not installed, is `0`
+    /// too (bakes go through [`Self::evaluate_many`], which reports it).
     pub fn evaluate(&self, sample: &MeshMapSample) -> f32 {
         if !sample.covered {
             return 0.0;
@@ -138,12 +162,13 @@ impl MaskGenerator {
                 level(grime * breakup, settings.amount, settings.contrast)
             }
             Self::Orientation(settings) => {
-                let angle = sample
-                    .normal
-                    .dot(settings.direction.vector())
-                    .clamp(-1.0, 1.0)
-                    .acos()
-                    .to_degrees();
+                let angle = math::acos(
+                    sample
+                        .normal
+                        .dot(settings.direction.vector())
+                        .clamp(-1.0, 1.0),
+                )
+                .to_degrees();
                 let half_width = (settings.softness * 45.0).max(0.5);
                 1.0 - smoothstep(
                     settings.spread_degrees - half_width,
@@ -181,6 +206,11 @@ impl MaskGenerator {
             }
             Self::IdColor(_) => 0.0,
             Self::Pattern(settings) => settings.evaluate(sample),
+            Self::Plugin(plugin) => {
+                let mut value = [0.0];
+                crate::extensions::generate(plugin, std::slice::from_ref(sample), &mut value)
+                    .map_or(0.0, |()| value[0])
+            }
         };
         value.clamp(0.0, 1.0)
     }

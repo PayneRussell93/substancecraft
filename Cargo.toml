@@ -13,7 +13,8 @@ license = "MIT OR Apache-2.0"
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 fbxcel = { version = "0.9", features = ["tree", "writer"] }
 fbxcel-dom = "0.0.10"
-glam = { version = "0.30", features = ["serde"] }
+glam = { version = "0.30", features = ["serde", "libm", "scalar-math"] }
+libm = "0.2.16"
 gltf = { version = "1.4.1", default-features = false, features = ["import", "utils", "names"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "hdr", "bmp", "tiff", "webp", "exr"] }
 exr = { version = "1.74", default-features = false }
@@ -29,6 +30,8 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wasmi = { version = "2.0", default-features = false, features = ["std", "stable", "validate", "deterministic", "portable-dispatch"] }
+wat = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -40,3 +43,15 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
+disallowed_methods = "deny"
+
+# The plugin interpreter (PROD-07) is far slower and deeper-stacked
+# unoptimised; tests and debug builds run plugins at release speed.
+[profile.dev.package.wasmi]
+opt-level = 3
+
+[profile.dev.package.wasmi_core]
+opt-level = 3
+
+[profile.dev.package.wasmi_ir]
+opt-level = 3

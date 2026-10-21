@@ -3,6 +3,7 @@
 //! A stroke's footprint is accumulated with `max`, so overlapping segments
 //! and stamps of one stroke never build up beyond the stroke's own opacity.
 
+use crate::math;
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -668,7 +669,7 @@ fn draw_stamps(
             // The path's heading in the stamp frame (V up), so the stamp's
             // x axis runs along it.
             let heading = frame.apply(Vec2::new(direction.x, -direction.y));
-            angle += heading.y.atan2(heading.x);
+            angle += math::atan2(heading.y, heading.x);
         }
         let rotation = Vec2::from_angle(-angle);
         let center = center + scatter;

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use substancecraft_core::math;
 
 use glam::Vec3;
 use substancecraft_core::{CubeLut, MAX_CUBE_LUT_SIZE, color::srgb_to_linear};
@@ -207,9 +208,9 @@ impl Op {
             }
             Self::Power { gamma, mirror } => std::array::from_fn(|i| {
                 if *mirror {
-                    rgb[i].signum() * rgb[i].abs().powf(gamma[i])
+                    rgb[i].signum() * math::powf(rgb[i].abs(), gamma[i])
                 } else {
-                    rgb[i].max(0.0).powf(gamma[i])
+                    math::powf(rgb[i].max(0.0), gamma[i])
                 }
             }),
             Self::MonCurve {
@@ -222,17 +223,17 @@ impl Op {
                 if !*inverse {
                     // Encoded value to linear (OCIO's "forward" moncurve).
                     let break_point = o / (g - 1.0);
-                    let slope = ((g - 1.0) / o) * ((o * g) / ((g - 1.0) * (1.0 + o))).powf(g);
+                    let slope = ((g - 1.0) / o) * math::powf((o * g) / ((g - 1.0) * (1.0 + o)), g);
                     if x > break_point {
-                        ((x + o) / (1.0 + o)).powf(g)
+                        math::powf((x + o) / (1.0 + o), g)
                     } else {
                         x * slope
                     }
                 } else {
-                    let break_point = (o * g / ((g - 1.0) * (1.0 + o))).powf(g);
-                    let slope = ((g - 1.0) / o) * ((o * g) / ((g - 1.0) * (1.0 + o))).powf(g);
+                    let break_point = math::powf(o * g / ((g - 1.0) * (1.0 + o)), g);
+                    let slope = ((g - 1.0) / o) * math::powf((o * g) / ((g - 1.0) * (1.0 + o)), g);
                     if x > break_point {
-                        (1.0 + o) * x.powf(1.0 / g) - o
+                        (1.0 + o) * math::powf(x, 1.0 / g) - o
                     } else {
                         x / slope
                     }
@@ -248,7 +249,7 @@ impl Op {
                 linear_slope,
                 inverse,
             } => std::array::from_fn(|i| {
-                let log_of = |x: f64| x.max(f64::MIN_POSITIVE).ln() / base.ln();
+                let log_of = |x: f64| math::ln(x.max(f64::MIN_POSITIVE)) / math::ln(*base);
                 let linear_segment = lin_break.map(|lin_break| {
                     let lin_break = lin_break[i];
                     let log_break = log_slope[i] * log_of(lin_slope[i] * lin_break + lin_offset[i])
@@ -256,7 +257,7 @@ impl Op {
                     let slope = linear_slope.map_or_else(
                         || {
                             log_slope[i] * lin_slope[i]
-                                / ((lin_slope[i] * lin_break + lin_offset[i]) * base.ln())
+                                / ((lin_slope[i] * lin_break + lin_offset[i]) * math::ln(*base))
                         },
                         |slopes| slopes[i],
                     );
@@ -277,7 +278,7 @@ impl Op {
                             (x - offset) / slope
                         }
                         _ => {
-                            (base.powf((x - log_offset[i]) / log_slope[i]) - lin_offset[i])
+                            (math::powf(*base, (x - log_offset[i]) / log_slope[i]) - lin_offset[i])
                                 / lin_slope[i]
                         }
                     }
@@ -300,7 +301,7 @@ impl Op {
                 if !*inverse {
                     let v: [f64; 3] = std::array::from_fn(|i| {
                         let x = clamp01(rgb[i] * slope[i] + offset[i]);
-                        if x > 0.0 { x.powf(power[i]) } else { x }
+                        if x > 0.0 { math::powf(x, power[i]) } else { x }
                     });
                     let v = saturate(v, *saturation);
                     std::array::from_fn(|i| clamp01(v[i]))
@@ -309,7 +310,11 @@ impl Op {
                     let v = saturate(v, 1.0 / saturation.max(1e-6));
                     std::array::from_fn(|i| {
                         let x = clamp01(v[i]);
-                        let x = if x > 0.0 { x.powf(1.0 / power[i]) } else { x };
+                        let x = if x > 0.0 {
+                            math::powf(x, 1.0 / power[i])
+                        } else {
+                            x
+                        };
                         clamp01((x - offset[i]) / slope[i])
                     })
                 }
@@ -1396,7 +1401,7 @@ impl OcioConfig {
     ) -> Result<CubeLut, OcioError> {
         let processor = self.view_processor(input, display, view)?;
         let size = size.clamp(2, MAX_CUBE_LUT_SIZE);
-        let headroom = f64::from(2.0_f32.powf(OCIO_HEADROOM_STOPS));
+        let headroom = f64::from(math::powf(2.0_f32, OCIO_HEADROOM_STOPS));
         let last = (size - 1) as f32;
         let mut data = Vec::with_capacity(size * size * size);
         for b in 0..size {
@@ -1964,9 +1969,9 @@ pub(crate) mod builtin {
             slope_high,
             knots,
         } = *spline;
-        let (log_min_x, log_min_y) = (min.0.log10(), min.1.log10());
-        let log_mid_x = mid.0.log10();
-        let (log_max_x, log_max_y) = (max.0.log10(), max.1.log10());
+        let (log_min_x, log_min_y) = (math::log10(min.0), math::log10(min.1));
+        let log_mid_x = math::log10(mid.0);
+        let (log_max_x, log_max_y) = (math::log10(max.0), math::log10(max.1));
         let eval = |coefs: &[f64], t: f64| {
             let j = (t.floor() as usize).min(knots - 2);
             let t = t - j as f64;
@@ -1985,19 +1990,19 @@ pub(crate) mod builtin {
         } else {
             log_x * slope_high + (log_max_y - slope_high * log_max_x)
         };
-        10f64.powf(log_y)
+        math::powf(10f64, log_y)
     }
 
     fn c5(x: f64) -> f64 {
-        let log_x = x.max(f64::MIN_POSITIVE).log10();
+        let log_x = math::log10(x.max(f64::MIN_POSITIVE));
         spline(
             log_x,
             &Spline {
                 low: &C5_LOW,
                 high: &C5_HIGH,
-                min: (0.18 * 2f64.powf(-15.0), 0.0001),
+                min: (0.18 * math::powf(2f64, -15.0), 0.0001),
                 mid: (0.18, 4.8),
-                max: (0.18 * 2f64.powf(18.0), 10_000.0),
+                max: (0.18 * math::powf(2f64, 18.0), 10_000.0),
                 slope_low: 0.0,
                 slope_high: 0.0,
                 knots: 4,
@@ -2006,10 +2011,10 @@ pub(crate) mod builtin {
     }
 
     fn c9(x: f64) -> f64 {
-        let min = (c5(0.18 * 2f64.powf(-6.5)), 0.02);
+        let min = (c5(0.18 * math::powf(2f64, -6.5)), 0.02);
         let mid = (c5(0.18), 4.8);
-        let max = (c5(0.18 * 2f64.powf(6.5)), 48.0);
-        let log_x = x.max(f64::MIN_POSITIVE).log10();
+        let max = (c5(0.18 * math::powf(2f64, 6.5)), 48.0);
+        let log_x = math::log10(x.max(f64::MIN_POSITIVE));
         spline(
             log_x,
             &Spline {
@@ -2043,7 +2048,7 @@ pub(crate) mod builtin {
         if r == g && g == b {
             return 0.0;
         }
-        let hue = (3f64.sqrt() * (g - b)).atan2(2.0 * r - g - b).to_degrees();
+        let hue = math::atan2(3f64.sqrt() * (g - b), 2.0 * r - g - b).to_degrees();
         if hue < 0.0 { hue + 360.0 } else { hue }
     }
 
@@ -2129,7 +2134,7 @@ pub(crate) mod builtin {
                 let xyz = mat_mul(&AP1_TO_XYZ, linear);
                 let sum = (xyz[0] + xyz[1] + xyz[2]).max(1e-10);
                 let (x, y) = (xyz[0] / sum, xyz[1] / sum);
-                let luma = xyz[1].max(0.0).powf(0.9811);
+                let luma = math::powf(xyz[1].max(0.0), 0.9811);
                 let adjusted = if y > 0.0 {
                     [x * luma / y, luma, (1.0 - x - y) * luma / y]
                 } else {
@@ -2259,7 +2264,7 @@ display_colorspaces:
         let film = config
             .view_processor("Linear Rec.709", "sRGB", "Film")
             .unwrap();
-        let expected = (0.1 * 0.18_f64.log2() + 0.6) * 0.5;
+        let expected = (0.1 * math::log2(0.18_f64) + 0.6) * 0.5;
         assert!(close(film.apply([0.18; 3]), [expected; 3], 1e-6));
 
         // Data passes through untouched.
@@ -2302,7 +2307,7 @@ display_colorspaces:
             .bake_view("Linear Rec.709", "sRGB", "Standard", 33)
             .unwrap();
         assert_eq!(lut.size, 33);
-        let headroom = 2f32.powf(OCIO_HEADROOM_STOPS);
+        let headroom = math::powf(2f32, OCIO_HEADROOM_STOPS);
         let input = substancecraft_core::color::linear_to_srgb(0.18 / headroom);
         let out = lut.apply(Vec3::splat(input));
         assert!((out.x - 0.4614).abs() < 4e-3, "{out:?}");

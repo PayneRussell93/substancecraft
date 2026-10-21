@@ -1,8 +1,11 @@
 //! Nondestructive filters applied to a layer's content or to its mask.
 
+use crate::math;
 use glam::{Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
+use crate::compositing::BakeError;
+use crate::extensions::{PluginRef, TexelKind};
 use crate::region::TexelRect;
 
 /// Blur radii are given in texels of a 1024-wide texture and scale with the
@@ -60,6 +63,9 @@ pub enum LayerFilter {
         dark: [u8; 3],
         light: [u8; 3],
     },
+    /// A per-texel filter from a plugin (PROD-07), run over whole planes by
+    /// its registered host. Normal maps pass through unchanged.
+    Plugin(PluginRef),
 }
 
 impl LayerFilter {
@@ -108,6 +114,7 @@ impl LayerFilter {
             Self::Posterize { .. } => "Posterize",
             Self::Threshold { .. } => "Threshold",
             Self::GradientMap { .. } => "Gradient map",
+            Self::Plugin(_) => "Plugin",
         }
     }
 
@@ -151,6 +158,7 @@ impl LayerFilter {
                 finite_in(level, 0.0, 1.0) && finite_in(softness, 0.0, 1.0)
             }
             Self::GradientMap { .. } => true,
+            Self::Plugin(plugin) => plugin.is_valid(),
         }
     }
 
@@ -175,7 +183,7 @@ impl LayerFilter {
                 } else {
                     ((value - in_low) / span).clamp(0.0, 1.0)
                 };
-                out_low + (out_high - out_low) * normalized.powf(1.0 / gamma)
+                out_low + (out_high - out_low) * math::powf(normalized, 1.0 / gamma)
             }
             Self::Invert => 1.0 - value,
             Self::HueSaturation { lightness, .. } => (value + lightness).clamp(0.0, 1.0),
@@ -292,15 +300,23 @@ pub(crate) fn spatial_halo(filters: &[LayerFilter], texture_width: u32) -> u32 {
 /// Applies `filters` in order to straight-alpha texels (`xyz` value, `w`
 /// alpha) laid out as `grid`. On a partial region, spatial filters are
 /// exact only at least [`spatial_halo`] texels inside its edges (or at the
-/// texture's own edges).
+/// texture's own edges). Fails only when a plugin filter does.
 pub(crate) fn apply_to_plane(
     texels: &mut [Vec4],
     grid: PlaneGrid,
     data: PlaneData,
     filters: &[LayerFilter],
-) {
+) -> Result<(), BakeError> {
     for filter in filters {
         match *filter {
+            LayerFilter::Plugin(plugin) => {
+                let kind = match data {
+                    PlaneData::Color => TexelKind::Color,
+                    PlaneData::Scalar => TexelKind::Scalar,
+                    PlaneData::Vector => continue,
+                };
+                crate::extensions::filter(&plugin, kind, texels)?;
+            }
             LayerFilter::Blur { radius } => {
                 blur_plane(texels, grid, scaled_radius(radius, grid.width));
             }
@@ -332,21 +348,27 @@ pub(crate) fn apply_to_plane(
             *texel = texel.truncate().normalize_or(Vec3::Z).extend(texel.w);
         }
     }
+    Ok(())
 }
 
 /// Applies `filters` to grayscale mask values.
-pub(crate) fn apply_to_mask(values: &mut [f32], grid: PlaneGrid, filters: &[LayerFilter]) {
+pub(crate) fn apply_to_mask(
+    values: &mut [f32],
+    grid: PlaneGrid,
+    filters: &[LayerFilter],
+) -> Result<(), BakeError> {
     if filters.is_empty() {
-        return;
+        return Ok(());
     }
     let mut texels = values
         .iter()
         .map(|value| Vec4::new(*value, *value, *value, 1.0))
         .collect::<Vec<_>>();
-    apply_to_plane(&mut texels, grid, PlaneData::Scalar, filters);
+    apply_to_plane(&mut texels, grid, PlaneData::Scalar, filters)?;
     for (value, texel) in values.iter_mut().zip(texels) {
         *value = texel.x.clamp(0.0, 1.0);
     }
+    Ok(())
 }
 
 fn scaled_radius(radius: f32, width: u32) -> f32 {
@@ -494,6 +516,7 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> Vec3 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -508,7 +531,8 @@ mod tests {
             PlaneData::Color,
             // 2 texels at 32 wide is radius 64 at the 1024 reference.
             &[LayerFilter::Blur { radius: 64.0 }],
-        );
+        )
+        .unwrap();
         assert!(texels[14].w > 0.0 && texels[14].w < 1.0, "alpha spreads");
         // Colour is unpremultiplied, so it keeps its hue at the fringe.
         assert!((texels[14].x - 1.0).abs() < 1e-4);
@@ -537,7 +561,8 @@ mod tests {
             PlaneGrid::full(width, height),
             PlaneData::Color,
             &filters,
-        );
+        )
+        .unwrap();
         let halo = spatial_halo(&filters, width);
         assert!(halo > 0);
         for inner in [
@@ -572,7 +597,7 @@ mod tests {
                 width,
                 height,
             };
-            apply_to_plane(&mut part, grid, PlaneData::Color, &filters);
+            apply_to_plane(&mut part, grid, PlaneData::Color, &filters).unwrap();
             for y in inner.y..inner.bottom() {
                 for x in inner.x..inner.right() {
                     assert_eq!(
@@ -615,7 +640,7 @@ mod tests {
         assert!((green - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4);
 
         let mut mask = vec![0.2, 0.8];
-        apply_to_mask(&mut mask, PlaneGrid::full(2, 1), &[LayerFilter::Invert]);
+        apply_to_mask(&mut mask, PlaneGrid::full(2, 1), &[LayerFilter::Invert]).unwrap();
         assert!((mask[0] - 0.8).abs() < 1e-6 && (mask[1] - 0.2).abs() < 1e-6);
     }
 

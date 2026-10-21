@@ -29,13 +29,7 @@ impl MissingFiles {
 /// Lists the project's files that do not exist. Relative paths resolve
 /// against `base`.
 pub fn missing_project_files(project: &MaterialProject, base: Option<&Path>) -> MissingFiles {
-    let resolve = |source: &str| {
-        let path = PathBuf::from(source);
-        match base {
-            Some(base) if path.is_relative() => base.join(path),
-            _ => path,
-        }
-    };
+    let resolve = |source: &str| crate::resolve_stored_path(source, base);
     let missing = |source: &str| {
         let path = resolve(source);
         (!path.exists()).then_some(path)

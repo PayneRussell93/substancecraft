@@ -1,8 +1,13 @@
-//! GPU ray tracing for mesh-map bakes (PERF-01): a [`RayTracer`] that runs
-//! a bake's cage rays, ambient occlusion, and thickness as wgpu compute
-//! shaders over the BVH the CPU bake builds. Bakes fall back to the CPU for
-//! any batch this tracer fails on, so it never has to be right about the
-//! hardware it finds.
+//! GPU work for bakes, each with the CPU path behind it.
+//!
+//! - Ray tracing for mesh-map bakes (PERF-01): a [`RayTracer`] that runs a
+//!   bake's cage rays, ambient occlusion, and thickness as wgpu compute
+//!   shaders over the BVH the CPU bake builds. Bakes fall back to the CPU
+//!   for any batch this tracer fails on, so it never has to be right about
+//!   the hardware it finds.
+//! - Layer compositing for previews (PERF-06): [`GpuCompositor`] runs a
+//!   texture set's [`CompositePlan`](substancecraft_core::CompositePlan)
+//!   as compute shaders. Callers bake on the CPU whenever it declines.
 
 use std::sync::OnceLock;
 use std::sync::mpsc::channel;
@@ -11,6 +16,10 @@ use substancecraft_core::{
     CageHit, CageRay, Occlusion, OcclusionParams, OcclusionQuery, PreparedScene, RayTracer,
     TraceScene,
 };
+
+mod composite;
+
+pub use composite::{CompositeError, GpuCompositor};
 
 const SHADER: &str = include_str!("trace.wgsl");
 const WORKGROUP: u32 = 64;
@@ -63,37 +72,7 @@ impl GpuTracer {
     }
 
     async fn open(choice: AdapterChoice) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let mut adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string());
-        if adapter.is_err() && choice == AdapterChoice::Any {
-            adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    force_fallback_adapter: true,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|error| error.to_string());
-        }
-        let adapter = adapter?;
-        let info = adapter.get_info();
-        if choice == AdapterChoice::Hardware && info.device_type == wgpu::DeviceType::Cpu {
-            return Err(format!("{} is a software adapter", info.name));
-        }
-        let limits = adapter.limits();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("mesh-map tracer"),
-                required_limits: limits.clone(),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+        let (device, queue, info, limits) = open_device(choice, "mesh-map tracer").await?;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipelines = STACK_SIZES
             .iter()
@@ -257,6 +236,46 @@ impl GpuTracer {
         readback.unmap();
         Ok(bytes)
     }
+}
+
+/// Opens the highest-performance adapter `choice` allows, with all its
+/// limits, for the tracer and the compositor alike.
+pub(crate) async fn open_device(
+    choice: AdapterChoice,
+    label: &str,
+) -> Result<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo, wgpu::Limits), String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| error.to_string());
+    if adapter.is_err() && choice == AdapterChoice::Any {
+        adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                force_fallback_adapter: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string());
+    }
+    let adapter = adapter?;
+    let info = adapter.get_info();
+    if choice == AdapterChoice::Hardware && info.device_type == wgpu::DeviceType::Cpu {
+        return Err(format!("{} is a software adapter", info.name));
+    }
+    let limits = adapter.limits();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some(label),
+            required_limits: limits.clone(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((device, queue, info, limits))
 }
 
 /// Levels below the root of the deepest leaf; an error for a malformed

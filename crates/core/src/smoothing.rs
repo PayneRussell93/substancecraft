@@ -6,6 +6,7 @@
 //! work the same on welded and unwelded meshes, and both keep edges sharper
 //! than the smoothing angle hard.
 
+use crate::math;
 use std::collections::HashMap;
 
 use glam::{Vec2, Vec3};
@@ -56,7 +57,7 @@ fn smoothing_cosine(angle_degrees: f32) -> f32 {
     if angle_degrees >= 180.0 {
         -1.0 - f32::EPSILON
     } else {
-        angle_degrees.clamp(0.0, 180.0).to_radians().cos()
+        math::cos(angle_degrees.clamp(0.0, 180.0).to_radians())
     }
 }
 

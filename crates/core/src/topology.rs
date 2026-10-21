@@ -1,6 +1,7 @@
 //! Mesh connectivity used for polygon selection: faces, connected mesh
 //! elements, and UV islands.
 
+use crate::math;
 use std::collections::HashMap;
 
 use glam::Vec3;
@@ -289,8 +290,8 @@ pub fn diagnostic_edges(mesh: &MeshGeometry, smoothing_angle_degrees: f32) -> Ve
                 .push((triangle_index as u32, ends));
         }
     }
-    let normal_limit = 1.0_f32.to_radians().cos();
-    let tangent_limit = 5.0_f32.to_radians().cos();
+    let normal_limit = math::cos(1.0_f32.to_radians());
+    let tangent_limit = math::cos(5.0_f32.to_radians());
     let mut found: Vec<((u32, u32), DiagnosticEdge)> = edges
         .into_iter()
         .filter_map(|(key, sides)| {

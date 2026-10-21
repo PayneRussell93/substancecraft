@@ -7,6 +7,7 @@
 //! their own texel (no neighbours), so region and tiled bakes of a graph
 //! are exact without any halo.
 
+use crate::math;
 use std::collections::BTreeMap;
 
 use glam::{Vec2, Vec3};
@@ -118,7 +119,7 @@ impl MathOp {
             Self::Divide => a / b,
             Self::Minimum => a.min(b),
             Self::Maximum => a.max(b),
-            Self::Power => a.max(0.0).powf(b),
+            Self::Power => math::powf(a.max(0.0), b),
         };
         if value.is_finite() {
             value.clamp(-MAX_CONSTANT, MAX_CONSTANT)
@@ -228,13 +229,22 @@ impl GraphNode {
     fn is_valid(&self, index: usize) -> bool {
         let own = match self {
             Self::Generator(generator) => {
-                generator.is_valid() && !matches!(generator, MaskGenerator::IdColor(_))
+                // Graphs evaluate one texel at a time, which plugins do not.
+                generator.is_valid()
+                    && !matches!(
+                        generator,
+                        MaskGenerator::IdColor(_) | MaskGenerator::Plugin(_)
+                    )
             }
             Self::MeshMap(_) | Self::Uv => true,
             Self::Bitmap { projection, .. } => projection.is_valid(),
             Self::Blend { mode, .. } => *mode != BlendMode::PassThrough,
             Self::Math { .. } | Self::Split { .. } => true,
-            Self::Adjust { filter, .. } => filter.is_valid() && filter.is_per_texel(),
+            Self::Adjust { filter, .. } => {
+                filter.is_valid()
+                    && filter.is_per_texel()
+                    && !matches!(filter, LayerFilter::Plugin(_))
+            }
             Self::Ramp { stops, .. } => {
                 (2..=MAX_RAMP_STOPS).contains(&stops.len())
                     && stops.iter().all(|stop| {

@@ -16,6 +16,7 @@ substancecraft-filament = { path = "../../crates/filament" }
 substancecraft-api = { path = "../../crates/api" }
 substancecraft-core = { path = "../../crates/core" }
 substancecraft-gpu-bake = { path = "../../crates/gpu-bake" }
+gilrs = "0.11"
 
 [lints]
 workspace = true

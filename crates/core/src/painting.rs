@@ -2,6 +2,7 @@
 //! lazy-mouse stabilization, straight lines, seam detection, and spline
 //! paths.
 
+use crate::math;
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -204,8 +205,8 @@ impl MeshGeometry {
                 .map(|index| {
                     let angle = index as f32 / segments.max(3) as f32 * std::f32::consts::TAU;
                     center
-                        + along_u * (uv_radius.x * angle.cos())
-                        + along_v * (uv_radius.y * angle.sin())
+                        + along_u * (uv_radius.x * math::cos(angle))
+                        + along_v * (uv_radius.y * math::sin(angle))
                 })
                 .collect(),
         )

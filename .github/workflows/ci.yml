@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # PROD-08: the headless pipeline (core, API, CLI, MCP server) is tested on
+  # each supported OS and CPU. `tests/determinism.rs` in the API crate checks
+  # its exports against digests written on another platform, so any
+  # platform that rounds differently fails here. The desktop app and the GPU
+  # crates need a Filament build and a GPU, which hosted runners lack.
+  pipeline:
+    name: Pipeline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Platform
+        shell: bash
+        run: rustc -vV && uname -m
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: >
+          cargo clippy --all-targets
+          -p substancecraft-core -p substancecraft-api -p substancecraft-cli -p substancecraft-mcp
+          -- -D warnings
+      # PROD-07: the sample plugin is built on its own, outside the
+      # workspace, as a plugin author would; tests/plugins.rs then loads it
+      # (and fails rather than skips when CI has not built it).
+      - name: Build the sample plugin
+        working-directory: examples/plugins/wavy-bands
+        run: cargo build --release --target wasm32-unknown-unknown
+      - name: Test
+        run: >
+          cargo test
+          -p substancecraft-core -p substancecraft-api -p substancecraft-cli -p substancecraft-mcp
+      - name: Cross-platform export digests
+        run: cargo test -p substancecraft-api --test determinism -- --nocapture
+      - name: Sample plugin through the CLI
+        shell: bash
+        run: |
+          mkdir -p staged/wavy-bands
+          cp examples/plugins/wavy-bands/plugin.json staged/wavy-bands/
+          cp examples/plugins/wavy-bands/target/wasm32-unknown-unknown/release/wavy_bands.wasm staged/wavy-bands/
+          cargo run -q -p substancecraft-cli -- --plugins staged plugins | tee plugins.json
+          grep -q '"com.example.wavy-bands/wavy"' plugins.json
+          grep -q '"errors": \[\]' plugins.json
+          cargo run -q -p substancecraft-cli -- --plugins staged presets | grep -q 'Packed RMA'

@@ -10,16 +10,19 @@ use thiserror::Error;
 mod brush;
 mod camera_paint;
 pub mod color;
+mod composite_plan;
 mod compositing;
 pub mod environment;
 mod evolution;
 mod export;
+pub mod extensions;
 mod filters;
 mod generators;
 mod graph;
 mod inspect;
 mod instances;
 pub mod library;
+pub mod math;
 mod mesh_maps;
 pub mod noise;
 pub mod painting;
@@ -41,6 +44,10 @@ pub use brush::{
 };
 pub use camera_paint::{MAX_STROKE_VIEWPORT, StrokeCamera, projected_stroke_texel_rects};
 pub use color::{ColorSpace, CubeLut, MAX_CUBE_LUT_SIZE, ViewTransform};
+pub use composite_plan::{
+    CompositePlan, PLAN_CHANNELS, PlanChannel, PlanContent, PlanError, PlanMask, PlanStep,
+    PlaneKind,
+};
 pub use compositing::{
     BakeContext, BakeError, BakedTexture, BlendMode, FLATTEN_CHANNELS, FlattenedLayer,
     MaterialPlanes, MaterialSample, MaterialTextures,
@@ -55,6 +62,9 @@ pub use export::{
     ExportedTexture, MAX_EXPORT_FILE_NAME_CHARS, MAX_EXPORT_OUTPUTS, MAX_EXPORT_PRESET_NAME_CHARS,
     OutputLayout, PreflightIssue, PreflightSeverity, SourceComponent, SpecGlossMap,
     TEXTURE_SET_TOKEN,
+};
+pub use extensions::{
+    ExtensionId, MAX_PLUGIN_PARAMETERS, PluginHost, PluginRef, TexelKind, available_export_presets,
 };
 pub use filters::{LayerFilter, MAX_BLUR_RADIUS};
 pub use generators::{
@@ -346,7 +356,7 @@ impl ViewportCamera {
 
     pub fn zoom_by(&mut self, scroll_delta: f32) {
         if scroll_delta.is_finite() {
-            self.zoom = (self.zoom * (scroll_delta * 0.002).exp()).clamp(0.1, 20.0);
+            self.zoom = (self.zoom * math::exp(scroll_delta * 0.002)).clamp(0.1, 20.0);
         }
     }
 
@@ -417,8 +427,8 @@ impl ViewportLighting {
         } else {
             0.0
         };
-        let light_direction =
-            Vec3::new(rotation.cos() * 0.8, 0.65, rotation.sin() * 0.8).normalize_or_zero();
+        let light_direction = Vec3::new(math::cos(rotation) * 0.8, 0.65, math::sin(rotation) * 0.8)
+            .normalize_or_zero();
         ambient + (1.0 - ambient) * normal.normalize_or_zero().dot(light_direction).max(0.0)
     }
 }
@@ -550,9 +560,9 @@ fn sphere_mesh() -> MeshGeometry {
             let longitude = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
             mesh.vertices.push(MeshVertex {
                 position: Vec3::new(
-                    latitude.sin() * longitude.cos() * 0.5,
-                    latitude.cos() * 0.5,
-                    latitude.sin() * longitude.sin() * 0.5,
+                    math::sin(latitude) * math::cos(longitude) * 0.5,
+                    math::cos(latitude) * 0.5,
+                    math::sin(latitude) * math::sin(longitude) * 0.5,
                 ),
                 uv: glam::Vec2::new(
                     segment as f32 / SEGMENTS as f32,
@@ -603,8 +613,8 @@ fn cylinder_mesh() -> MeshGeometry {
     };
     for segment in 0..=SEGMENTS {
         let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
-        let x = angle.cos() * 0.5;
-        let z = angle.sin() * 0.5;
+        let x = math::cos(angle) * 0.5;
+        let z = math::sin(angle) * 0.5;
         let u = segment as f32 / SEGMENTS as f32;
         mesh.vertices.push(MeshVertex {
             position: Vec3::new(x, -0.5, z),
@@ -637,7 +647,7 @@ fn cylinder_mesh() -> MeshGeometry {
         let ring = mesh.vertices.len() as u32;
         for segment in 0..SEGMENTS {
             let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
-            let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = math::sin_cos(angle);
             mesh.vertices.push(MeshVertex {
                 position: Vec3::new(cos * 0.5, y, sin * 0.5),
                 uv: uv_center + glam::Vec2::new(cos, sin) * CAP_RADIUS,

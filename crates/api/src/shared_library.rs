@@ -434,12 +434,7 @@ impl SharedLibrary {
 
     /// Resolves a path stored in the library (relative to its folder).
     pub fn resolve(&self, file: &str) -> PathBuf {
-        let path = Path::new(file);
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            self.root.join(path)
-        }
+        crate::resolve_stored_path(file, Some(&self.root))
     }
 
     /// Copies `source` into `files/`, named by its content hash, and
@@ -476,13 +471,7 @@ impl SharedLibrary {
         base: Option<&Path>,
     ) -> Result<PathBuf, SharedLibraryError> {
         asset.validate()?;
-        let resolve = |source: &str| {
-            let path = PathBuf::from(source);
-            match base {
-                Some(base) if path.is_relative() => base.join(path),
-                _ => path,
-            }
-        };
+        let resolve = |source: &str| crate::resolve_stored_path(source, base);
         let mut asset = asset;
         match &mut asset {
             LibraryAsset::Bitmap(bitmap) => {

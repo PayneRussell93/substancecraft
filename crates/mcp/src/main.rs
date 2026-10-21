@@ -966,6 +966,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(root) => PathBuf::from(root),
         None => std::env::current_dir()?,
     };
+    // Plugins (PROD-07) load as for the CLI; stdout carries the protocol, so
+    // load errors go to stderr.
+    let (plugins, errors) =
+        substancecraft_api::load_plugins(&substancecraft_api::default_plugin_folders());
+    for error in errors {
+        eprintln!("warning: plugin not loaded: {error}");
+    }
+    substancecraft_api::install_plugins(plugins);
     SubstanceCraftMcp::new(&root)?
         .serve(stdio())
         .await?

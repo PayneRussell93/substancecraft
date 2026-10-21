@@ -22,7 +22,11 @@ ab_glyph.workspace = true
 quick-xml.workspace = true
 epaint_default_fonts.workspace = true
 gltf.workspace = true
+wasmi.workspace = true
 
 [lints]
 workspace = true
 
+
+[dev-dependencies]
+wat.workspace = true

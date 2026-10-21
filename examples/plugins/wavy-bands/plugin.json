@@ -1,0 +1,54 @@
+{
+  "format": 1,
+  "id": "com.example.wavy-bands",
+  "name": "Wavy Bands (sample)",
+  "version": "1.0.0",
+  "module": "wavy_bands.wasm",
+  "generators": [
+    {
+      "id": "wavy",
+      "name": "Wavy bands",
+      "parameters": [
+        { "name": "Frequency", "default": 8.0, "min": 1.0, "max": 64.0 },
+        { "name": "Wobble", "default": 0.3, "min": 0.0, "max": 2.0 },
+        { "name": "Softness", "default": 0.2, "min": 0.0, "max": 1.0 }
+      ]
+    }
+  ],
+  "filters": [
+    {
+      "id": "sepia",
+      "name": "Sepia",
+      "parameters": [{ "name": "Amount", "default": 1.0, "min": 0.0, "max": 1.0 }]
+    }
+  ],
+  "export_presets": [
+    {
+      "name": "Packed RMA (wavy-bands sample)",
+      "outputs": [
+        {
+          "file_name": "$textureSet_BaseColor",
+          "layout": "Rgb",
+          "slots": [
+            { "Source": { "source": { "Channel": "BaseColor" }, "component": "Red", "invert": false } },
+            { "Source": { "source": { "Channel": "BaseColor" }, "component": "Green", "invert": false } },
+            { "Source": { "source": { "Channel": "BaseColor" }, "component": "Blue", "invert": false } },
+            { "Constant": 1.0 }
+          ],
+          "skip_if_black": false
+        },
+        {
+          "file_name": "$textureSet_RMA",
+          "layout": "Rgb",
+          "slots": [
+            { "Source": { "source": { "Channel": "Roughness" }, "component": "Red", "invert": false } },
+            { "Source": { "source": { "Channel": "Metallic" }, "component": "Red", "invert": false } },
+            { "Source": { "source": { "Channel": "AmbientOcclusion" }, "component": "Red", "invert": false } },
+            { "Constant": 1.0 }
+          ],
+          "skip_if_black": false
+        }
+      ]
+    }
+  ]
+}

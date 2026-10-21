@@ -2,6 +2,7 @@
 //! say) baked onto a sphere and shaded on the CPU, so browsers need no GPU
 //! and every machine draws the same picture.
 
+use crate::math;
 use std::collections::BTreeSet;
 
 use glam::{Vec2, Vec3};
@@ -152,7 +153,7 @@ impl ThumbnailStage {
             let f0 = Vec3::splat(0.04).lerp(albedo, metallic);
             let alpha = (roughness * roughness).max(0.02);
             let shininess = (2.0 / (alpha * alpha) - 2.0).clamp(1.0, 2048.0);
-            let highlight = normal.dot(half).max(0.0).powf(shininess) * (shininess + 8.0)
+            let highlight = math::powf(normal.dot(half).max(0.0), shininess) * (shininess + 8.0)
                 / (8.0 * std::f32::consts::PI)
                 * lit;
             // A soft sky reflection so smooth metals do not read as black.

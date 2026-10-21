@@ -9,6 +9,7 @@
 //! scales it to the viewport's photometric units. The sun is a directional
 //! light rather than a disc in the image, so it is not counted twice.
 
+use crate::math;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
@@ -220,7 +221,7 @@ impl LightingPreset {
     /// Relative linear radiance arriving from `direction` (+Y up).
     pub fn radiance(self, toward: Vec3) -> Vec3 {
         let d = toward.normalize_or_zero();
-        let elevation = d.y.clamp(-1.0, 1.0).asin();
+        let elevation = math::asin(d.y.clamp(-1.0, 1.0));
         match self {
             Self::Studio => {
                 let room = mix(
@@ -242,9 +243,9 @@ impl LightingPreset {
                 let height = (elevation / std::f32::consts::FRAC_PI_2).max(0.0);
                 let zenith = Vec3::new(0.05, 0.08, 0.2);
                 let horizon = Vec3::new(1.2, 0.55, 0.25);
-                let sky = mix(horizon, zenith, height.powf(0.45));
+                let sky = mix(horizon, zenith, math::powf(height, 0.45));
                 let toward_sun = d.dot(direction(6f32.to_radians(), 110f32.to_radians()));
-                let glow = Vec3::new(2.0, 0.9, 0.4) * ((toward_sun - 1.0) * 6.0).exp();
+                let glow = Vec3::new(2.0, 0.9, 0.4) * math::exp((toward_sun - 1.0) * 6.0);
                 let ground = Vec3::new(0.05, 0.035, 0.03);
                 mix(ground, sky + glow, horizon_blend(d.y))
             }
@@ -275,7 +276,7 @@ impl LightingPreset {
                 let sky = mix(
                     Vec3::new(0.75, 0.85, 1.0),
                     Vec3::new(0.25, 0.45, 0.95),
-                    height.powf(0.6),
+                    math::powf(height, 0.6),
                 ) * 1.5;
                 let ground = Vec3::new(0.2, 0.18, 0.13);
                 mix(ground, sky, horizon_blend(d.y))
@@ -289,7 +290,7 @@ impl LightingPreset {
                 );
                 let toward_city = d.dot(direction(0.0, 200f32.to_radians())).max(0.0);
                 let glow = Vec3::new(0.09, 0.05, 0.02)
-                    * toward_city.powi(6)
+                    * math::powi(toward_city, 6)
                     * (1.0 - smoothstep(0.0, 0.35, elevation));
                 let ground = Vec3::splat(0.006);
                 mix(ground, sky + glow, horizon_blend(d.y))
@@ -448,7 +449,7 @@ impl EnvironmentImage {
         for (row, texels) in self.rgb.chunks_exact(width * 3).enumerate() {
             let latitude =
                 std::f64::consts::FRAC_PI_2 * (1.0 - 2.0 * (row as f64 + 0.5) / height as f64);
-            let weight = latitude.cos();
+            let weight = math::cos(latitude);
             let sum: f64 = texels
                 .as_chunks::<3>()
                 .0
@@ -498,9 +499,9 @@ fn box_weights(source: u32, target: u32) -> Vec<Vec<(usize, f32)>> {
 /// from +Z towards +X (radians).
 pub fn direction(elevation: f32, azimuth: f32) -> Vec3 {
     Vec3::new(
-        elevation.cos() * azimuth.sin(),
-        elevation.sin(),
-        elevation.cos() * azimuth.cos(),
+        math::cos(elevation) * math::sin(azimuth),
+        math::sin(elevation),
+        math::cos(elevation) * math::cos(azimuth),
     )
 }
 
@@ -512,7 +513,7 @@ pub fn rotate_about_up(direction: Vec3, angle: f32) -> Vec3 {
 
 /// Signed azimuth of `d` relative to `degrees`, in radians (`-π..π`).
 fn azimuth_from(d: Vec3, degrees: f32) -> f32 {
-    let difference = d.x.atan2(d.z) - degrees.to_radians();
+    let difference = math::atan2(d.x, d.z) - degrees.to_radians();
     (difference + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 

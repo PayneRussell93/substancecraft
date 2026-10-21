@@ -157,8 +157,13 @@ pub fn mask_drivers(layer: &MaterialLayer, set: &TextureSet) -> Vec<String> {
             MaskGenerator::Thickness(_) => "thickness map",
             MaskGenerator::IdColor(_) => "ID map",
             MaskGenerator::Pattern(_) => "position map",
+            MaskGenerator::Plugin(_) => "mesh maps",
         };
-        drivers.push(format!("{} generator ({source})", generator.name()));
+        let name = match generator {
+            MaskGenerator::Plugin(plugin) => plugin.display_name(),
+            other => other.name().to_owned(),
+        };
+        drivers.push(format!("{name} generator ({source})"));
     }
     if layer.mask_bitmap.is_some() {
         drivers.push("Bitmap mask".to_owned());

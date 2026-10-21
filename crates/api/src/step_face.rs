@@ -6,6 +6,7 @@
 //! and packs charts into a UV atlas.
 
 use glam::{DVec2, DVec3, Vec2};
+use substancecraft_core::math;
 
 use crate::step_geom::{Surface, distance_to_segment};
 use crate::triangulate::{TriangleMesh, earcut, orient};
@@ -89,7 +90,7 @@ fn encloses_nothing(ring: &[UvPoint]) -> bool {
     let high = ring
         .iter()
         .fold(DVec2::NEG_INFINITY, |high, point| high.max(point.uv));
-    ring_area(ring).abs() <= 1e-9 * (high - low).max_element().powi(2).max(1e-300)
+    ring_area(ring).abs() <= 1e-9 * math::powi((high - low).max_element(), 2).max(1e-300)
 }
 
 fn mean(ring: &[UvPoint], axis: usize) -> f64 {
@@ -992,7 +993,7 @@ mod tests {
         let mut points: Vec<DVec3> = (0..count)
             .map(|index| {
                 let angle = index as f64 / count as f64 * TAU;
-                DVec3::new(radius * angle.cos(), radius * angle.sin(), z)
+                DVec3::new(radius * math::cos(angle), radius * math::sin(angle), z)
             })
             .collect();
         if reverse {
@@ -1138,15 +1139,19 @@ mod tests {
             (0..48)
                 .map(|index| {
                     let angle = index as f64 / 48.0 * TAU;
-                    let (u, v) = (centre + 0.2 * angle.cos(), 0.2 * angle.sin());
-                    DVec3::new(v.cos() * u.cos(), v.cos() * u.sin(), v.sin())
+                    let (u, v) = (centre + 0.2 * math::cos(angle), 0.2 * math::sin(angle));
+                    DVec3::new(
+                        math::cos(v) * math::cos(u),
+                        math::cos(v) * math::sin(u),
+                        math::sin(v),
+                    )
                 })
                 .collect()
         };
         let loops = [Loop3::Points(small(0.0)), Loop3::Points(small(PI))];
         for sense in [true, false] {
             let patch = tessellate_face(&surface, sense, &loops, 1e-3).unwrap();
-            let caps = 2.0 * TAU * (1.0 - 0.2_f64.cos());
+            let caps = 2.0 * TAU * (1.0 - math::cos(0.2_f64));
             assert!(
                 (area(&patch) - (4.0 * PI - caps)).abs() < 0.05,
                 "{}",

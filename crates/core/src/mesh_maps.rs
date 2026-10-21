@@ -9,6 +9,7 @@
 //! so effects adapt to each mesh. Baking is deterministic for a given mesh,
 //! settings, and seed, runs on all available cores, and can be cancelled.
 
+use crate::math;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -107,7 +108,7 @@ fn default_skew_edge_degrees() -> f32 {
 /// face normal by `skew`, with skew faded out where the two normals differ
 /// by more than `edge_degrees`. Returns the direction and the skew applied.
 pub fn cage_ray_direction(smooth: Vec3, face: Vec3, skew: f32, edge_degrees: f32) -> (Vec3, f32) {
-    let angle = smooth.dot(face).clamp(-1.0, 1.0).acos().to_degrees();
+    let angle = math::acos(smooth.dot(face).clamp(-1.0, 1.0)).to_degrees();
     let fade_start = edge_degrees * 0.75;
     let protection = if angle <= fade_start {
         1.0
@@ -387,6 +388,33 @@ impl MeshMaps {
         (self.bounds_max - self.bounds_min)
             .length()
             .max(f32::EPSILON)
+    }
+
+    /// The bounds [`Self::sample`] measures unit and relative positions in,
+    /// and their diagonal.
+    pub fn sample_bounds(&self) -> (Vec3, Vec3, f32) {
+        (self.bounds_min, self.bounds_max, self.diagonal())
+    }
+
+    /// The baked texels as four planes of four floats, row by row, for a
+    /// compositor on another device (PERF-06) to sample as [`Self::sample`]
+    /// does: position and whether the texel is filled (`1` or `0`), world
+    /// normal and curvature, tangent-space normal and ambient occlusion,
+    /// and thickness and skew.
+    pub fn texel_planes(&self) -> [Vec<[f32; 4]>; 4] {
+        let mut planes: [Vec<[f32; 4]>; 4] =
+            std::array::from_fn(|_| Vec::with_capacity(self.texels.len()));
+        for (index, texel) in self.texels.iter().enumerate() {
+            let filled = f32::from(u8::from(self.filled.get(index).copied().unwrap_or(false)));
+            let [x, y, z] = texel.position.to_array();
+            planes[0].push([x, y, z, filled]);
+            let [x, y, z] = texel.normal.to_array();
+            planes[1].push([x, y, z, texel.curvature]);
+            let [x, y, z] = texel.tangent_normal.to_array();
+            planes[2].push([x, y, z, texel.ambient_occlusion]);
+            planes[3].push([texel.thickness, texel.skew, 0.0, 0.0]);
+        }
+        planes
     }
 
     /// Position bounds of every [`POSITION_BLOCK`]-texel block holding
@@ -1248,7 +1276,7 @@ impl SurfaceGeometry {
             }
         }
 
-        let smooth_cos = settings.smoothing_angle_degrees.to_radians().cos();
+        let smooth_cos = math::cos(settings.smoothing_angle_degrees.to_radians());
         let corner_normals =
             crate::smoothing::corner_normals(mesh, settings.smoothing_angle_degrees);
 
@@ -1287,7 +1315,7 @@ impl SurfaceGeometry {
                     }
                     if count > 0 {
                         let curvature = sum / count as f32;
-                        corners[corner] = (curvature * diagonal * SMOOTH_CURVATURE_SCALE).tanh();
+                        corners[corner] = math::tanh(curvature * diagonal * SMOOTH_CURVATURE_SCALE);
                     }
                 }
                 corners
@@ -1403,11 +1431,7 @@ fn feature_edges(
         }
         let first_normal = face_normals[first as usize];
         let second_normal = face_normals[second as usize];
-        let angle = first_normal
-            .dot(second_normal)
-            .clamp(-1.0, 1.0)
-            .acos()
-            .to_degrees();
+        let angle = math::acos(first_normal.dot(second_normal).clamp(-1.0, 1.0)).to_degrees();
         let strength = ((angle - start_angle) / (full_angle - start_angle)).clamp(0.0, 1.0);
         if strength <= 0.0 {
             continue;
@@ -1557,8 +1581,8 @@ fn cosine_direction(normal: Vec3, face_normal: Vec3, index: u32, count: u32, see
     let radius = u.sqrt();
     let angle = std::f32::consts::TAU * v;
     let (tangent, bitangent) = normal.any_orthonormal_pair();
-    let direction = (tangent * (radius * angle.cos())
-        + bitangent * (radius * angle.sin())
+    let direction = (tangent * (radius * math::cos(angle))
+        + bitangent * (radius * math::sin(angle))
         + normal * (1.0 - u).max(0.0).sqrt())
     .normalize_or(normal);
     let below = direction.dot(face_normal);
@@ -2064,7 +2088,7 @@ mod tests {
     /// A 1.2-unit quad tilted about Z so its normal leans `degrees` toward +X,
     /// raised by `lift`.
     fn tilted_quad(degrees: f32, lift: f32) -> MeshGeometry {
-        let slope = degrees.to_radians().tan();
+        let slope = math::tan(degrees.to_radians());
         let point = |x: f32, z: f32| MeshVertex {
             position: Vec3::new(x, lift - slope * x, z),
             uv: Vec2::new(x, z),
@@ -2086,9 +2110,9 @@ mod tests {
         // Small smoothing deviation: full skew turns the ray to the face.
         let face = Vec3::Z;
         let smooth = Vec3::new(
-            10.0_f32.to_radians().sin(),
+            math::sin(10.0_f32.to_radians()),
             0.0,
-            10.0_f32.to_radians().cos(),
+            math::cos(10.0_f32.to_radians()),
         );
         let (direction, applied) = cage_ray_direction(smooth, face, 1.0, 30.0);
         assert_eq!(applied, 1.0);
@@ -2102,9 +2126,9 @@ mod tests {
         assert_eq!(applied, 0.0);
         assert_eq!(direction, bevel);
         let fading = Vec3::new(
-            26.0_f32.to_radians().sin(),
+            math::sin(26.0_f32.to_radians()),
             0.0,
-            26.0_f32.to_radians().cos(),
+            math::cos(26.0_f32.to_radians()),
         );
         let (_, applied) = cage_ray_direction(fading, face, 1.0, 30.0);
         assert!(applied > 0.0 && applied < 1.0);
@@ -2156,7 +2180,7 @@ mod tests {
 
         assert!(maps.from_high_poly());
         assert_eq!(maps.miss_fraction(), 0.0);
-        let expected = 20.0_f32.to_radians().sin();
+        let expected = math::sin(20.0_f32.to_radians());
         for uv in [Vec2::splat(0.5), Vec2::new(0.8, 0.3)] {
             let sample = maps.sample(uv);
             assert!(

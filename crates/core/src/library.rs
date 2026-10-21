@@ -367,7 +367,8 @@ fn generator_amount(generator: &mut MaskGenerator) -> Option<&mut f32> {
         MaskGenerator::Orientation(_)
         | MaskGenerator::Gradient(_)
         | MaskGenerator::IdColor(_)
-        | MaskGenerator::Pattern(_) => None,
+        | MaskGenerator::Pattern(_)
+        | MaskGenerator::Plugin(_) => None,
     }
 }
 

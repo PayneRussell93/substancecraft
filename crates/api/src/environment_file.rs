@@ -143,6 +143,7 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<f32>), EnvironmentIoError> 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use substancecraft_core::math;
 
     /// An uncompressed Radiance file (flat RGBE scanlines) of `rgb`.
     fn radiance_bytes(width: u32, height: u32, rgb: &[f32]) -> Vec<u8> {
@@ -155,8 +156,8 @@ mod tests {
                 continue;
             }
             // brightest = mantissa * 2^exponent with mantissa in [0.5, 1).
-            let exponent = brightest.log2().floor() as i32 + 1;
-            let scale = 256.0 / 2f32.powi(exponent);
+            let exponent = math::log2(brightest).floor() as i32 + 1;
+            let scale = 256.0 / math::powi(2f32, exponent);
             for value in texel {
                 bytes.push((value * scale).clamp(0.0, 255.0) as u8);
             }

@@ -4,11 +4,13 @@
 //! `substancecraft-cli`: headless jobs for pipelines.
 //!
 //! ```text
+//! substancecraft-cli [--plugins <folder>]... <command>
 //! substancecraft-cli export <project.sproject> --out <dir>
 //!     [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>]
 //!     [--ocio <config.ocio> --colorspace <name>]
 //! substancecraft-cli batch <jobs.txt> [--workers <n>]
 //! substancecraft-cli presets
+//! substancecraft-cli plugins
 //! substancecraft-cli inspect <project.sproject>
 //! substancecraft-cli edit <project.sproject> '<edit as JSON>'
 //! substancecraft-cli ocio <config.ocio>
@@ -32,20 +34,26 @@
 //! config's displays, views, and colour spaces as JSON; `ocio-bake` bakes a
 //! view into the `.cube` display LUT the viewport and renders apply.
 //!
+//! Plugins (generators, filters, and export presets; `docs/plugins.md`)
+//! load from each `--plugins` folder, the folders in
+//! `SUBSTANCECRAFT_PLUGINS`, and the user's plugin folder. `plugins` lists
+//! what loaded, and why anything did not, as JSON.
+//!
 //! Exit status is 0 on success, 1 when the job fails, and 2 for bad
 //! arguments. The same project and options always write the same bytes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use substancecraft_api::{
-    AutomationEdit, ExportJob, OCIO_BAKE_SIZE, OcioConfig, OcioExport, TextureFormat,
-    edit_project_file, list_export_presets, load_project_file_with_report, project_summary,
+    AutomationEdit, ExportJob, OCIO_BAKE_SIZE, OcioConfig, OcioExport, PluginError, TextureFormat,
+    default_plugin_folders, edit_project_file, install_plugins, installed_plugins,
+    list_export_presets, load_plugins, load_project_file_with_report, project_summary,
     run_export_job, run_export_jobs,
 };
 use substancecraft_core::MAX_CUBE_LUT_SIZE;
 
-const USAGE: &str = "usage:\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>] [--ocio <config.ocio> --colorspace <name>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets\n  substancecraft-cli inspect <project.sproject>\n  substancecraft-cli edit <project.sproject> '<edit as JSON>'\n  substancecraft-cli ocio <config.ocio>\n  substancecraft-cli ocio-bake <config.ocio> --display <name> --view <name> --out <file.cube> [--input <colorspace>] [--size <n>]";
+const USAGE: &str = "usage:\n  substancecraft-cli [--plugins <folder>]... <command>\n  substancecraft-cli plugins\n  substancecraft-cli export <project.sproject> --out <dir> [--preset <name>] [--format png|tga|exr] [--udim] [--ao-samples <n>] [--ocio <config.ocio> --colorspace <name>]\n  substancecraft-cli batch <jobs.txt> [--workers <n>]\n  substancecraft-cli presets\n  substancecraft-cli inspect <project.sproject>\n  substancecraft-cli edit <project.sproject> '<edit as JSON>'\n  substancecraft-cli ocio <config.ocio>\n  substancecraft-cli ocio-bake <config.ocio> --display <name> --view <name> --out <file.cube> [--input <colorspace>] [--size <n>]";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -56,6 +64,7 @@ enum Command {
         workers: usize,
     },
     Presets,
+    Plugins,
     Inspect {
         project: String,
     },
@@ -125,6 +134,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
     match args.next().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some("presets") => Ok(Command::Presets),
+        Some("plugins") => Ok(Command::Plugins),
         Some("inspect") => match (args.next(), args.next()) {
             (Some(project), None) => Ok(Command::Inspect {
                 project: project.clone(),
@@ -318,16 +328,15 @@ fn parse_job_file(text: &str, base: &Path) -> Result<Vec<ExportJob>, String> {
         else {
             return Err(format!("line {}: not an export job", number + 1));
         };
-        if job.project.is_relative() {
-            job.project = base.join(&job.project);
-        }
-        if job.output.is_relative() {
-            job.output = base.join(&job.output);
-        }
-        if let Some(ocio) = &mut job.ocio
-            && ocio.config.is_relative()
-        {
-            ocio.config = base.join(&ocio.config);
+        // Job files are shared between machines, so their relative paths
+        // may use either separator.
+        let resolve = |path: &Path| {
+            substancecraft_api::resolve_stored_path(&path.to_string_lossy(), Some(base))
+        };
+        job.project = resolve(&job.project);
+        job.output = resolve(&job.output);
+        if let Some(ocio) = &mut job.ocio {
+            ocio.config = resolve(&ocio.config);
         }
         jobs.push(job);
     }
@@ -392,9 +401,81 @@ fn report(result: Result<String, String>) -> ExitCode {
     }
 }
 
+/// Leading `--plugins <folder>` options, which every command shares, and
+/// the arguments after them.
+fn plugin_options(args: &[String]) -> Result<(Vec<PathBuf>, &[String]), String> {
+    let mut folders = Vec::new();
+    let mut rest = args;
+    while let [flag, tail @ ..] = rest
+        && flag == "--plugins"
+    {
+        let [folder, tail @ ..] = tail else {
+            return Err("--plugins needs a folder".to_owned());
+        };
+        folders.push(PathBuf::from(folder));
+        rest = tail;
+    }
+    Ok((folders, rest))
+}
+
+/// Loads plugins from `folders` and the default ones, and installs them.
+fn load_all_plugins(mut folders: Vec<PathBuf>) -> Vec<PluginError> {
+    folders.extend(default_plugin_folders());
+    let (plugins, errors) = load_plugins(&folders);
+    install_plugins(plugins);
+    errors
+}
+
+/// The installed plugins and the load errors, as JSON.
+fn plugins_summary(errors: &[PluginError]) -> Result<String, String> {
+    let plugins: Vec<serde_json::Value> = installed_plugins()
+        .iter()
+        .map(|plugin| {
+            let manifest = plugin.manifest();
+            let ids = |items: &[substancecraft_api::PluginItem]| {
+                items
+                    .iter()
+                    .map(|item| format!("{}/{}", manifest.id, item.id))
+                    .collect::<Vec<_>>()
+            };
+            serde_json::json!({
+                "id": manifest.id,
+                "name": manifest.name,
+                "version": manifest.version,
+                "folder": plugin.folder(),
+                "generators": ids(&manifest.generators),
+                "filters": ids(&manifest.filters),
+                "export_presets": manifest
+                    .export_presets
+                    .iter()
+                    .map(|preset| preset.name.clone())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "plugins": plugins, "errors": errors }))
+        .map_err(|error| error.to_string())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse(&args) {
+    let (folders, args) = match plugin_options(&args) {
+        Ok(split) => split,
+        Err(error) => {
+            eprintln!("error: {error}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let plugin_errors = load_all_plugins(folders);
+    let command = parse(args);
+    if !matches!(command, Ok(Command::Plugins)) {
+        for error in &plugin_errors {
+            eprintln!("warning: plugin not loaded: {error}");
+        }
+    }
+    match command {
+        Ok(Command::Plugins) => report(plugins_summary(&plugin_errors)),
         Ok(Command::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -441,6 +522,20 @@ mod tests {
 
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn plugin_folders_come_before_the_command() {
+        let line = args("--plugins a --plugins b export p.sproject --out o");
+        let (folders, rest) = plugin_options(&line).unwrap();
+        assert_eq!(folders, [PathBuf::from("a"), PathBuf::from("b")]);
+        assert!(matches!(parse(rest), Ok(Command::Export(_))));
+        assert_eq!(parse(&args("plugins")), Ok(Command::Plugins));
+        assert!(plugin_options(&args("--plugins")).is_err());
+        let plain = args("presets");
+        let (folders, rest) = plugin_options(&plain).unwrap();
+        assert!(folders.is_empty());
+        assert_eq!(rest, plain);
     }
 
     #[test]

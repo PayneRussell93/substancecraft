@@ -4,6 +4,7 @@
 //! a surface's normal is `S_u x S_v` as STEP defines it.
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
+use substancecraft_core::math;
 
 use glam::{DVec2, DVec3, DVec4};
 
@@ -285,14 +286,14 @@ impl Curve {
         match self {
             Self::Line { origin, direction } => (*origin + *direction * t, *direction),
             Self::Circle { frame, radius } => {
-                let (sin, cos) = t.sin_cos();
+                let (sin, cos) = math::sin_cos(t);
                 (
                     frame.origin + (frame.x * cos + frame.y * sin) * *radius,
                     (frame.y * cos - frame.x * sin) * *radius,
                 )
             }
             Self::Ellipse { frame, a, b } => {
-                let (sin, cos) = t.sin_cos();
+                let (sin, cos) = math::sin_cos(t);
                 (
                     frame.origin + frame.x * (a * cos) + frame.y * (b * sin),
                     frame.y * (b * cos) - frame.x * (a * sin),
@@ -343,13 +344,11 @@ impl Curve {
             }
             Self::Circle { frame, .. } => {
                 let local = frame.to_local(point);
-                local.y.atan2(local.x).rem_euclid(TAU)
+                math::atan2(local.y, local.x).rem_euclid(TAU)
             }
             Self::Ellipse { frame, a, b } => {
                 let local = frame.to_local(point);
-                (local.y / b.max(1e-300))
-                    .atan2(local.x / a.max(1e-300))
-                    .rem_euclid(TAU)
+                math::atan2(local.y / b.max(1e-300), local.x / a.max(1e-300)).rem_euclid(TAU)
             }
             Self::Polyline(points) => {
                 let mut best = (f64::INFINITY, 0.0);
@@ -501,7 +500,7 @@ impl Curve {
 /// Segments for an arc of `sweep` radians and `radius`.
 pub(crate) fn arc_segments(radius: f64, sweep: f64, tolerance: f64, max_angle: f64) -> usize {
     let chord_angle = if radius > tolerance {
-        2.0 * (1.0 - tolerance / radius).clamp(-1.0, 1.0).acos()
+        2.0 * math::acos((1.0 - tolerance / radius).clamp(-1.0, 1.0))
     } else {
         max_angle
     };
@@ -673,7 +672,7 @@ pub(crate) enum Surface {
 }
 
 fn rotate(vector: DVec3, axis: DVec3, angle: f64) -> DVec3 {
-    let (sin, cos) = angle.sin_cos();
+    let (sin, cos) = math::sin_cos(angle);
     vector * cos + axis.cross(vector) * sin + axis * axis.dot(vector) * (1.0 - cos)
 }
 
@@ -683,7 +682,7 @@ impl Surface {
         match self {
             Self::Plane(frame) => (frame.origin + frame.x * u + frame.y * v, frame.x, frame.y),
             Self::Cylinder { frame, radius } => {
-                let (sin, cos) = u.sin_cos();
+                let (sin, cos) = math::sin_cos(u);
                 let radial = frame.x * cos + frame.y * sin;
                 (
                     frame.origin + radial * *radius + frame.z * v,
@@ -692,7 +691,7 @@ impl Surface {
                 )
             }
             Self::Cone { frame, radius, tan } => {
-                let (sin, cos) = u.sin_cos();
+                let (sin, cos) = math::sin_cos(u);
                 let radial = frame.x * cos + frame.y * sin;
                 let r = radius + v * tan;
                 (
@@ -702,8 +701,8 @@ impl Surface {
                 )
             }
             Self::Sphere { frame, radius } => {
-                let (sin_u, cos_u) = u.sin_cos();
-                let (sin_v, cos_v) = v.sin_cos();
+                let (sin_u, cos_u) = math::sin_cos(u);
+                let (sin_v, cos_v) = math::sin_cos(v);
                 let radial = frame.x * cos_u + frame.y * sin_u;
                 (
                     frame.origin + (radial * cos_v + frame.z * sin_v) * *radius,
@@ -716,8 +715,8 @@ impl Surface {
                 major,
                 minor,
             } => {
-                let (sin_u, cos_u) = u.sin_cos();
-                let (sin_v, cos_v) = v.sin_cos();
+                let (sin_u, cos_u) = math::sin_cos(u);
+                let (sin_v, cos_v) = math::sin_cos(v);
                 let radial = frame.x * cos_u + frame.y * sin_u;
                 let r = major + minor * cos_v;
                 (
@@ -842,12 +841,12 @@ impl Surface {
             }
             Self::Cylinder { frame, .. } => {
                 let local = frame.to_local(point);
-                DVec2::new(local.y.atan2(local.x), local.z)
+                DVec2::new(math::atan2(local.y, local.x), local.z)
             }
             Self::Cone { frame, radius, tan } => {
                 let local = frame.to_local(point);
-                let rho = local.x.hypot(local.y);
-                let u = local.y.atan2(local.x);
+                let rho = math::hypot(local.x, local.y);
+                let u = math::atan2(local.y, local.x);
                 let along = |rho: f64| ((rho - radius) * tan + local.z) / (1.0 + tan * tan);
                 let near = DVec2::new(u, along(rho));
                 // Past the apex the cone continues as a second nappe, seen
@@ -862,18 +861,18 @@ impl Surface {
             Self::Sphere { frame, .. } => {
                 let local = frame.to_local(point);
                 DVec2::new(
-                    local.y.atan2(local.x),
-                    local.z.atan2(local.x.hypot(local.y)),
+                    math::atan2(local.y, local.x),
+                    math::atan2(local.z, math::hypot(local.x, local.y)),
                 )
             }
             Self::Torus { frame, major, .. } => {
                 let local = frame.to_local(point);
-                let rho = local.x.hypot(local.y);
-                let u = local.y.atan2(local.x);
-                let outer = DVec2::new(u, local.z.atan2(rho - major));
+                let rho = math::hypot(local.x, local.y);
+                let u = math::atan2(local.y, local.x);
+                let outer = DVec2::new(u, math::atan2(local.z, rho - major));
                 // A spindle torus (major < minor) also passes through the
                 // point from the far side of the axis, on its inner sheet.
-                let inner = DVec2::new(u + PI, local.z.atan2(-rho - major));
+                let inner = DVec2::new(u + PI, math::atan2(local.z, -rho - major));
                 if self.point(inner).distance(point) < self.point(outer).distance(point) {
                     inner
                 } else {
@@ -1064,7 +1063,7 @@ fn wrap(t: f64, (start, end): (f64, f64), closed: bool) -> f64 {
 
 /// Angle from `from` to `to` about `axis`, in (-pi, pi].
 fn signed_angle(from: DVec3, to: DVec3, axis: DVec3) -> f64 {
-    from.cross(to).dot(axis).atan2(from.dot(to))
+    math::atan2(from.cross(to).dot(axis), from.dot(to))
 }
 
 #[cfg(test)]
@@ -1211,7 +1210,7 @@ mod tests {
         let ring: Vec<DVec3> = (0..9)
             .map(|i| {
                 let angle = (i % 6) as f64 / 6.0 * TAU;
-                DVec3::new(angle.cos(), angle.sin(), 0.0)
+                DVec3::new(math::cos(angle), math::sin(angle), 0.0)
             })
             .collect();
         let raised: Vec<DVec3> = ring.iter().map(|p| *p + DVec3::Z).collect();

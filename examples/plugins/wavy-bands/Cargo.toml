@@ -1,0 +1,19 @@
+[package]
+name = "wavy-bands"
+version = "1.0.0"
+edition = "2024"
+description = "Sample SubstanceCraft plugin: a wavy-bands mask generator, a sepia filter, and a packed export preset"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Built on its own, outside the SubstanceCraft workspace, as a plugin author
+# would: `cargo build --release --target wasm32-unknown-unknown`.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

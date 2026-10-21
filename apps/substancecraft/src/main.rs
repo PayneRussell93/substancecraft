@@ -43,6 +43,7 @@ mod diagnostics;
 mod disk_cache;
 mod edges;
 mod environments;
+mod gamepad;
 mod geometry_visibility;
 mod gltf_material;
 mod grading;
@@ -128,6 +129,8 @@ fn main() -> eframe::Result {
             if let Some(path) = preferences::Preferences::default_path() {
                 app.load_preferences(path);
             }
+            app.preferences.gamepads = gamepad::Gamepads::start(&creation_context.egui_ctx);
+            app.reload_plugins();
             match FilamentRuntime::new(64, 64) {
                 Ok(renderer) => app.filament_renderer = Some(renderer),
                 Err(error) => app.filament_error = Some(error.to_string()),
@@ -5441,6 +5444,7 @@ impl SubstanceCraftApp {
             .filter(|_| self.selected_set_remembers_export())
         {
             Some(id) => {
+                self.adopt_plugin_preset(&name);
                 self.edit_set_properties(id, |properties| {
                     if let Some(export) = &mut properties.export {
                         export.preset = name;
@@ -5459,6 +5463,9 @@ impl SubstanceCraftApp {
         let Some(id) = self.selected_texture_set else {
             return;
         };
+        if remember {
+            self.adopt_plugin_preset(&preset);
+        }
         self.edit_set_properties(id, |properties| {
             let udim = properties.export.as_ref().is_some_and(|export| export.udim);
             properties.export = remember.then(|| substancecraft_core::TextureSetExport {
@@ -5520,11 +5527,43 @@ impl SubstanceCraftApp {
         self.bake_error = self.export_all_sets_into(&folder).err();
     }
 
-    /// Built-in presets followed by the project's custom ones.
+    /// Built-in presets, the project's custom ones, then installed
+    /// plugins' (PROD-07) that the project has not adopted.
     fn export_presets(&self) -> Vec<ExportPreset> {
         let mut presets = ExportPreset::built_in();
         presets.extend(self.project.export_presets.iter().cloned());
+        for preset in substancecraft_core::extensions::plugin_export_presets() {
+            if !presets.iter().any(|known| known.name == preset.name) {
+                presets.push(preset);
+            }
+        }
         presets
+    }
+
+    /// Copies a plugin's export preset into the project (undoably) when a
+    /// texture set remembers it, so the project still opens and exports
+    /// on machines without the plugin. Other presets are left alone.
+    fn adopt_plugin_preset(&mut self, name: &str) {
+        if self.is_custom_preset(name)
+            || ExportPreset::built_in()
+                .iter()
+                .any(|preset| preset.name == name)
+        {
+            return;
+        }
+        let Some(preset) = substancecraft_core::extensions::plugin_export_presets()
+            .into_iter()
+            .find(|preset| preset.name == name)
+        else {
+            return;
+        };
+        let before = self.project.export_presets.clone();
+        let mut after = before.clone();
+        after.push(preset);
+        self.history.apply(
+            &mut self.project,
+            EditCommand::ExportPresets { before, after },
+        );
     }
 
     fn is_custom_preset(&self, name: &str) -> bool {
@@ -9714,6 +9753,64 @@ mod tests {
         let image = &app.resource_images[&id];
         assert!(image.width > image.height);
         assert!(image.rgba8.chunks(4).any(|texel| texel[3] == 255));
+    }
+
+    #[test]
+    fn tc_0411_plugin_presets_are_offered_and_adopted_when_a_set_keeps_one() {
+        struct Presets;
+        impl substancecraft_core::PluginHost for Presets {
+            fn generate(
+                &self,
+                _: &substancecraft_core::PluginRef,
+                _: &[substancecraft_core::MeshMapSample],
+                _: &mut [f32],
+            ) -> Result<(), String> {
+                Err("none".to_owned())
+            }
+            fn filter(
+                &self,
+                _: &substancecraft_core::PluginRef,
+                _: substancecraft_core::TexelKind,
+                _: &mut [glam::Vec4],
+            ) -> Result<(), String> {
+                Err("none".to_owned())
+            }
+            fn item_name(&self, _: substancecraft_core::ExtensionId) -> Option<String> {
+                None
+            }
+            fn export_presets(&self) -> Vec<ExportPreset> {
+                let mut preset = ExportPreset::built_in().remove(0);
+                preset.name = "App plugin preset".to_owned();
+                vec![preset]
+            }
+        }
+        substancecraft_core::extensions::register_plugin("test.app", std::sync::Arc::new(Presets));
+
+        let mut app = SubstanceCraftApp::default();
+        app.add_fill_layer();
+        let name = "App plugin preset".to_owned();
+        assert!(app.export_presets().iter().any(|preset| preset.name == name));
+
+        // Chosen app-wide, it stays the plugin's.
+        app.set_preset_choice(name.clone());
+        assert!(!app.is_custom_preset(&name));
+
+        // A set that keeps it copies it into the project, which then stands
+        // on its own; undo takes both back.
+        app.remember_export_for_selected(true);
+        assert!(app.is_custom_preset(&name));
+        let saved = app.selected_texture_set_ref().unwrap().export.clone().unwrap();
+        assert_eq!(saved.preset, name);
+        substancecraft_core::extensions::unregister_plugin("test.app");
+        app.project.validate().unwrap();
+        assert_eq!(
+            app.export_presets().iter().filter(|preset| preset.name == name).count(),
+            1
+        );
+        app.undo();
+        app.undo();
+        assert!(!app.is_custom_preset(&name));
+        assert!(app.selected_texture_set_ref().unwrap().export.is_none());
     }
 
     #[test]

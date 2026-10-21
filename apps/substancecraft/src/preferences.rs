@@ -1,14 +1,15 @@
-//! Per-user preferences, kept outside projects: UI scale, keyboard
-//! bindings (including hold-to-override tools), pinned brushes, and the
-//! recent brush materials.
+//! Per-user preferences, kept outside projects: UI scale, input bindings
+//! (keys, mouse side buttons, and gamepad buttons, including
+//! hold-to-override tools), pinned brushes, and the recent brush materials.
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Key, Modifiers, RichText, Ui};
+use eframe::egui::{self, Key, Modifiers, PointerButton, RichText, Ui};
 use serde::{Deserialize, Serialize};
 use substancecraft_core::{BrushShape, BrushTip};
 
 use super::{PaintMode, SubstanceCraftApp};
+use crate::gamepad::{GamepadButton, Gamepads};
 use crate::icons::Icon;
 use crate::{theme, widgets};
 
@@ -76,11 +77,68 @@ impl Action {
     }
 }
 
-/// A key with modifiers, stored by egui key name so the file stays
-/// readable.
+/// What sends a binding's input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputDevice {
+    #[default]
+    Keyboard,
+    /// Mouse side buttons, which pen and tablet drivers often send too.
+    Mouse,
+    Gamepad,
+}
+
+impl InputDevice {
+    fn is_keyboard(&self) -> bool {
+        *self == Self::Keyboard
+    }
+}
+
+/// One physical input a binding listens to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Input {
+    Key(Key),
+    /// Only the side buttons ([`PointerButton::Extra1`] and
+    /// [`PointerButton::Extra2`]); the others already paint and navigate.
+    Mouse(PointerButton),
+    Gamepad(GamepadButton),
+}
+
+impl Input {
+    pub fn label(self) -> String {
+        match self {
+            Self::Key(key) => key.name().to_owned(),
+            Self::Mouse(PointerButton::Extra1) => "Mouse back".to_owned(),
+            Self::Mouse(PointerButton::Extra2) => "Mouse forward".to_owned(),
+            Self::Mouse(button) => format!("Mouse {button:?}"),
+            Self::Gamepad(button) => button.label().to_owned(),
+        }
+    }
+}
+
+/// True for the mouse buttons a binding may use.
+pub fn is_bindable_mouse_button(button: PointerButton) -> bool {
+    matches!(button, PointerButton::Extra1 | PointerButton::Extra2)
+}
+
+fn mouse_button_name(button: PointerButton) -> &'static str {
+    match button {
+        PointerButton::Extra1 => "Extra1",
+        PointerButton::Extra2 => "Extra2",
+        PointerButton::Primary => "Primary",
+        PointerButton::Secondary => "Secondary",
+        PointerButton::Middle => "Middle",
+    }
+}
+
+/// A key or button with modifiers, stored by name so the file stays
+/// readable. Gamepad buttons take no modifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub action: Action,
+    /// Older files hold only keys.
+    #[serde(default, skip_serializing_if = "InputDevice::is_keyboard")]
+    pub device: InputDevice,
+    /// The egui key name, mouse button, or gamepad button.
     pub key: String,
     #[serde(default)]
     pub command: bool,
@@ -92,17 +150,35 @@ pub struct Binding {
 
 impl Binding {
     fn new(action: Action, key: Key, modifiers: Modifiers) -> Self {
+        Self::of(action, Input::Key(key), modifiers)
+    }
+
+    pub fn of(action: Action, input: Input, modifiers: Modifiers) -> Self {
+        let (device, key, modifiers) = match input {
+            Input::Key(key) => (InputDevice::Keyboard, key.name(), modifiers),
+            Input::Mouse(button) => (InputDevice::Mouse, mouse_button_name(button), modifiers),
+            Input::Gamepad(button) => (InputDevice::Gamepad, button.name(), Modifiers::NONE),
+        };
         Self {
             action,
-            key: key.name().to_owned(),
+            device,
+            key: key.to_owned(),
             command: modifiers.command,
             shift: modifiers.shift,
             alt: modifiers.alt,
         }
     }
 
-    pub fn key(&self) -> Option<Key> {
-        Key::from_name(&self.key)
+    /// The input bound, or `None` for a name this build does not know.
+    pub fn input(&self) -> Option<Input> {
+        match self.device {
+            InputDevice::Keyboard => Key::from_name(&self.key).map(Input::Key),
+            InputDevice::Mouse => [PointerButton::Extra1, PointerButton::Extra2]
+                .into_iter()
+                .find(|button| mouse_button_name(*button) == self.key)
+                .map(Input::Mouse),
+            InputDevice::Gamepad => GamepadButton::from_name(&self.key).map(Input::Gamepad),
+        }
     }
 
     pub fn modifiers(&self) -> Modifiers {
@@ -130,7 +206,8 @@ impl Binding {
         if self.alt {
             parts.push("Alt");
         }
-        parts.push(&self.key);
+        let input = self.input().map_or_else(|| self.key.clone(), Input::label);
+        parts.push(&input);
         parts.join("+")
     }
 }
@@ -378,7 +455,7 @@ impl Preferences {
         } else {
             1.0
         };
-        self.bindings.retain(|binding| binding.key().is_some());
+        self.bindings.retain(|binding| binding.input().is_some());
         self.favorites.truncate(MAX_FAVORITES);
         // Raw data is not a colour space to pick colours in.
         if self.picker_color_space == substancecraft_core::ColorSpace::Raw {
@@ -402,13 +479,13 @@ impl Preferences {
             .find(|binding| binding.action == action)
     }
 
-    /// Binds `action` to one key, dropping its other keys and any other
-    /// action that key had.
-    pub fn rebind(&mut self, action: Action, key: Key, modifiers: Modifiers) {
-        let binding = Binding::new(action, key, modifiers);
+    /// Binds `action` to one key or button, dropping its other bindings
+    /// and any other action that input had.
+    pub fn rebind(&mut self, action: Action, input: Input, modifiers: Modifiers) {
+        let binding = Binding::of(action, input, modifiers);
         self.bindings.retain(|existing| {
             existing.action != action
-                && !(existing.key == binding.key && existing.modifiers() == binding.modifiers())
+                && !(existing.input() == Some(input) && existing.modifiers() == binding.modifiers())
         });
         self.bindings.push(binding);
     }
@@ -421,9 +498,10 @@ impl Preferences {
     }
 }
 
-/// A tool switched on by holding a key, and what to restore on release.
+/// A tool switched on by holding a key or button, and what to restore on
+/// release.
 pub struct HeldOverride {
-    pub key: Key,
+    pub input: Input,
     previous_mode: PaintMode,
     previous_picking: bool,
 }
@@ -437,6 +515,9 @@ pub struct PreferenceState {
     pub held: Option<HeldOverride>,
     /// The action waiting for its new key in the bindings list.
     pub rebinding: Option<Action>,
+    pub gamepads: Gamepads,
+    /// Why plugins in the plugin folders did not load (PROD-07).
+    pub plugin_errors: Vec<String>,
 }
 
 impl SubstanceCraftApp {
@@ -632,15 +713,32 @@ impl SubstanceCraftApp {
     }
 
     /// Runs bound actions: tap bindings fire once on press; hold bindings
-    /// switch tool while the key is down and restore it on release.
+    /// switch tool while the key or button is down and restore it on
+    /// release.
     pub(super) fn handle_bindings(&mut self, context: &egui::Context) {
+        self.preferences.gamepads.poll();
+        let mouse_pressed: Vec<(PointerButton, Modifiers)> = context.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if is_bindable_mouse_button(*button) => Some((*button, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
         if self.preferences.rebinding.is_some() {
-            self.capture_rebinding(context);
+            self.capture_rebinding(context, &mouse_pressed);
             return;
         }
         if let Some(held) = &self.preferences.held {
-            let key = held.key;
-            if !context.input(|input| input.key_down(key)) {
+            let input = held.input;
+            if !self.input_down(context, input) {
                 self.release_override();
             }
         }
@@ -658,26 +756,49 @@ impl SubstanceCraftApp {
             )
         });
         for binding in ordered {
-            let Some(key) = binding.key() else {
+            let Some(input) = binding.input() else {
                 continue;
             };
-            let shortcut = egui::KeyboardShortcut::new(binding.modifiers(), key);
-            if binding.action.is_hold() {
-                let pressed = context.input(|input| {
+            let pressed = match input {
+                Input::Key(key) if binding.action.is_hold() => context.input(|input| {
                     input.key_pressed(key)
                         && !input.modifiers.command
                         && !input.modifiers.alt
                         && input.modifiers.shift == binding.shift
-                });
-                if pressed && self.preferences.held.is_none() {
-                    self.begin_override(binding.action, key);
+                }),
+                Input::Key(key) => {
+                    let shortcut = egui::KeyboardShortcut::new(binding.modifiers(), key);
+                    context.input_mut(|input| input.consume_shortcut(&shortcut))
+                }
+                Input::Mouse(button) => mouse_pressed.iter().any(|(pressed, modifiers)| {
+                    *pressed == button
+                        && modifiers.shift == binding.shift
+                        && (binding.action.is_hold()
+                            || (modifiers.command == binding.command
+                                && modifiers.alt == binding.alt))
+                }),
+                Input::Gamepad(button) => self.preferences.gamepads.pressed().contains(&button),
+            };
+            if !pressed {
+                continue;
+            }
+            if binding.action.is_hold() {
+                if self.preferences.held.is_none() {
+                    self.begin_override(binding.action, input);
                 }
                 continue;
             }
-            if context.input_mut(|input| input.consume_shortcut(&shortcut)) {
-                self.run_action(binding.action);
-                return;
-            }
+            self.run_action(binding.action);
+            return;
+        }
+    }
+
+    /// True while `input` is held.
+    fn input_down(&self, context: &egui::Context, input: Input) -> bool {
+        match input {
+            Input::Key(key) => context.input(|state| state.key_down(key)),
+            Input::Mouse(button) => context.input(|state| state.pointer.button_down(button)),
+            Input::Gamepad(button) => self.preferences.gamepads.is_down(button),
         }
     }
 
@@ -695,9 +816,9 @@ impl SubstanceCraftApp {
         }
     }
 
-    pub(super) fn begin_override(&mut self, action: Action, key: Key) {
+    pub(super) fn begin_override(&mut self, action: Action, input: Input) {
         let held = HeldOverride {
-            key,
+            input,
             previous_mode: self.paint_mode,
             previous_picking: self.picking_material,
         };
@@ -718,30 +839,49 @@ impl SubstanceCraftApp {
         self.picking_material = held.previous_picking;
     }
 
-    fn capture_rebinding(&mut self, context: &egui::Context) {
+    /// Binds the action waiting in the list to the first key, mouse side
+    /// button, or gamepad button pressed; Escape cancels.
+    fn capture_rebinding(
+        &mut self,
+        context: &egui::Context,
+        mouse_pressed: &[(PointerButton, Modifiers)],
+    ) {
         let Some(action) = self.preferences.rebinding else {
             return;
         };
-        let pressed = context.input(|input| {
+        let key = context.input(|input| {
             input.events.iter().find_map(|event| match event {
                 egui::Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } => Some((Input::Key(*key), *modifiers)),
                 _ => None,
             })
         });
-        let Some((key, modifiers)) = pressed else {
+        let pressed = key
+            .or_else(|| {
+                mouse_pressed
+                    .first()
+                    .map(|(button, modifiers)| (Input::Mouse(*button), *modifiers))
+            })
+            .or_else(|| {
+                self.preferences
+                    .gamepads
+                    .pressed()
+                    .first()
+                    .map(|button| (Input::Gamepad(*button), Modifiers::NONE))
+            });
+        let Some((input, modifiers)) = pressed else {
             return;
         };
         self.preferences.rebinding = None;
-        if key == Key::Escape {
+        if input == Input::Key(Key::Escape) {
             return;
         }
         let modifiers = if action.is_hold() {
-            // Hold keys work alone or with Shift.
+            // Hold inputs work alone or with Shift.
             Modifiers {
                 shift: modifiers.shift,
                 ..Modifiers::NONE
@@ -749,8 +889,66 @@ impl SubstanceCraftApp {
         } else {
             modifiers
         };
-        self.preferences.values.rebind(action, key, modifiers);
+        self.preferences.values.rebind(action, input, modifiers);
         self.save_preferences();
+    }
+
+    /// Loads the plugins in the plugin folders again, replacing those
+    /// installed, and rebakes so layers using them pick the change up.
+    pub(super) fn reload_plugins(&mut self) {
+        let (plugins, errors) =
+            substancecraft_api::load_plugins(&substancecraft_api::default_plugin_folders());
+        substancecraft_api::install_plugins(plugins);
+        self.preferences.plugin_errors = errors.iter().map(ToString::to_string).collect();
+        self.invalidate_preview();
+    }
+
+    /// The Preferences drawer's plugin list.
+    fn plugins_section(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Plugins");
+        let plugins = substancecraft_api::installed_plugins();
+        if plugins.is_empty() {
+            ui.label(
+                RichText::new("No plugins installed.")
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+        for plugin in &plugins {
+            let manifest = plugin.manifest();
+            let counts = format!(
+                "{} generators, {} filters, {} export presets",
+                manifest.generators.len(),
+                manifest.filters.len(),
+                manifest.export_presets.len()
+            );
+            widgets::property_row(ui, &manifest.name, |ui| {
+                ui.label(
+                    RichText::new(format!("{} · {counts}", manifest.version))
+                        .size(11.5)
+                        .color(theme::TEXT),
+                )
+                .on_hover_text(plugin.folder().display().to_string());
+            });
+        }
+        for error in &self.preferences.plugin_errors {
+            ui.label(RichText::new(error).size(11.5).color(theme::DANGER));
+        }
+        if widgets::pill_button(ui, Some(Icon::Undo), "Reload plugins", false, true).clicked() {
+            self.reload_plugins();
+        }
+        let folders: Vec<String> = substancecraft_api::default_plugin_folders()
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect();
+        ui.label(
+            RichText::new(format!(
+                "Each plugin is a folder with a plugin.json, placed in {}.",
+                folders.join(" or ")
+            ))
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
+        );
     }
 
     /// Keeps egui's zoom at the preferred UI scale.
@@ -825,12 +1023,12 @@ impl SubstanceCraftApp {
             self.invalidate_preview();
         }
 
-        widgets::caption(ui, "Keyboard");
+        widgets::caption(ui, "Keys and buttons");
         let waiting = self.preferences.rebinding;
         let mut start_rebind = None;
         for action in Action::ALL {
             let label = if waiting == Some(action) {
-                "Press a key… (Esc cancels)".to_owned()
+                "Press a key or button… (Esc cancels)".to_owned()
             } else {
                 let keys: Vec<String> = self
                     .preferences
@@ -848,7 +1046,9 @@ impl SubstanceCraftApp {
             };
             widgets::property_row(ui, action.label(), |ui| {
                 if widgets::chip(ui, &label, waiting == Some(action))
-                    .on_hover_text("Click, then press the new key")
+                    .on_hover_text(
+                        "Click, then press the new key, mouse side button, or gamepad button",
+                    )
                     .clicked()
                 {
                     start_rebind = Some(action);
@@ -864,10 +1064,12 @@ impl SubstanceCraftApp {
             self.preferences.values.bindings = default_bindings();
             self.save_preferences();
         }
+        self.plugins_section(ui);
         ui.label(
             RichText::new(
-                "Hold keys switch tool only while held. Every control is also reachable \
-                 with Tab and Enter.",
+                "Hold bindings switch tool only while held. Mouse side buttons (which pen \
+                 and tablet buttons often send) and gamepad buttons bind like keys. Every \
+                 control is also reachable with Tab and Enter.",
             )
             .size(11.5)
             .color(theme::TEXT_FAINT),
@@ -1021,7 +1223,7 @@ mod tests {
             ui_scale: 9.0,
             ..Preferences::default()
         };
-        preferences.rebind(Action::HoldErase, Key::E, Modifiers::NONE);
+        preferences.rebind(Action::HoldErase, Input::Key(Key::E), Modifiers::NONE);
         // E was the Erase tool; it now only holds the eraser.
         assert!(preferences.binding_of(Action::EraseMode).is_none());
         assert_eq!(preferences.binding_of(Action::HoldErase).unwrap().key, "E");
@@ -1060,15 +1262,15 @@ mod tests {
         app.set_paint_mode(PaintMode::Paint);
 
         // Holding the eraser key switches tool; releasing restores Paint.
-        app.begin_override(Action::HoldErase, Key::X);
+        app.begin_override(Action::HoldErase, Input::Key(Key::X));
         assert_eq!(app.paint_mode, PaintMode::Erase);
         app.release_override();
         assert_eq!(app.paint_mode, PaintMode::Paint);
-        app.begin_override(Action::HoldPick, Key::I);
+        app.begin_override(Action::HoldPick, Input::Key(Key::I));
         assert!(app.picking_material);
         app.release_override();
         assert!(!app.picking_material);
-        app.begin_override(Action::HoldView, Key::Space);
+        app.begin_override(Action::HoldView, Input::Key(Key::Space));
         assert_eq!(app.paint_mode, PaintMode::View);
         app.release_override();
         assert_eq!(app.paint_mode, PaintMode::Paint);
@@ -1102,6 +1304,122 @@ mod tests {
         assert_eq!(app.brush_radius, 42.0);
         app.unpin_brush(0);
         assert!(app.preferences.values.favorites.is_empty());
+    }
+
+    #[test]
+    fn tc_0407_mouse_side_and_gamepad_buttons_bind_like_keys() {
+        use crate::gamepad::PadEvent;
+
+        let (pad, events) = std::sync::mpsc::channel();
+        let mut app = SubstanceCraftApp::default();
+        app.preferences.gamepads = Gamepads::from_events(events);
+        app.add_texture_set();
+        app.add_paint_layer();
+        app.set_paint_mode(PaintMode::Paint);
+        let context = egui::Context::default();
+        let frame = |app: &mut SubstanceCraftApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut output = context.run_ui(input, |ui| app.handle_bindings(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        let side = |pressed: bool| egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: PointerButton::Extra1,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+
+        // A gamepad press while rebinding becomes the binding.
+        app.preferences.rebinding = Some(Action::MaskMode);
+        pad.send(PadEvent::Pressed(GamepadButton::North)).unwrap();
+        frame(&mut app, Vec::new());
+        assert_eq!(app.preferences.rebinding, None);
+        let binding = app.preferences.values.binding_of(Action::MaskMode).unwrap();
+        assert_eq!(binding.device, InputDevice::Gamepad);
+        assert_eq!(binding.label(), "Pad North (Y / Triangle)");
+        assert_eq!(app.paint_mode, PaintMode::Paint, "rebinding runs nothing");
+        pad.send(PadEvent::Released(GamepadButton::North)).unwrap();
+        frame(&mut app, Vec::new());
+
+        // Pressing it runs the action once, not again while held.
+        pad.send(PadEvent::Pressed(GamepadButton::North)).unwrap();
+        frame(&mut app, Vec::new());
+        assert_eq!(app.paint_mode, PaintMode::Mask);
+        app.set_paint_mode(PaintMode::Paint);
+        pad.send(PadEvent::Pressed(GamepadButton::North)).unwrap();
+        frame(&mut app, Vec::new());
+        assert_eq!(app.paint_mode, PaintMode::Paint, "a repeat is no new press");
+        pad.send(PadEvent::Released(GamepadButton::North)).unwrap();
+        frame(&mut app, Vec::new());
+
+        // A mouse side button holds the eraser while down.
+        app.preferences.rebinding = Some(Action::HoldErase);
+        frame(&mut app, vec![side(true)]);
+        frame(&mut app, vec![side(false)]);
+        assert_eq!(
+            app.preferences
+                .values
+                .binding_of(Action::HoldErase)
+                .unwrap()
+                .label(),
+            "Mouse back"
+        );
+        frame(&mut app, vec![side(true)]);
+        assert_eq!(app.paint_mode, PaintMode::Erase);
+        frame(&mut app, Vec::new());
+        assert_eq!(app.paint_mode, PaintMode::Erase, "still held");
+        frame(&mut app, vec![side(false)]);
+        assert_eq!(app.paint_mode, PaintMode::Paint);
+
+        // A held gamepad button lets go when its pad disconnects.
+        app.preferences.values.rebind(
+            Action::HoldView,
+            Input::Gamepad(GamepadButton::LeftBumper),
+            Modifiers::NONE,
+        );
+        pad.send(PadEvent::Pressed(GamepadButton::LeftBumper))
+            .unwrap();
+        frame(&mut app, Vec::new());
+        assert_eq!(app.paint_mode, PaintMode::View);
+        pad.send(PadEvent::Disconnected).unwrap();
+        frame(&mut app, Vec::new());
+        assert_eq!(app.paint_mode, PaintMode::Paint);
+
+        // Escape still cancels a rebind, whatever device it waits for.
+        app.preferences.rebinding = Some(Action::Undo);
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, vec![escape]);
+        assert_eq!(app.preferences.rebinding, None);
+        assert_eq!(
+            app.preferences.values.binding_of(Action::Undo).unwrap().key,
+            "Z"
+        );
+
+        // Every device persists; key bindings keep their old shape, and a
+        // button this build does not know is dropped on load.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("preferences.json");
+        app.preferences.values.save(&path).unwrap();
+        assert_eq!(
+            Preferences::load(&path).bindings,
+            app.preferences.values.bindings
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"device\"").count(), 3, "{text}");
+        let unknown = text.replace("\"LeftBumper\"", "\"Paddle9\"");
+        std::fs::write(&path, unknown).unwrap();
+        let loaded = Preferences::load(&path);
+        assert!(loaded.binding_of(Action::HoldView).is_none());
+        assert!(loaded.binding_of(Action::MaskMode).is_some());
     }
 
     #[test]

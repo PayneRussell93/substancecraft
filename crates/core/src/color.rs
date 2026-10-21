@@ -5,6 +5,7 @@
 //! another colour space are converted to that encoding when a colour
 //! channel samples them; data maps (roughness, normals, masks) are read raw.
 
+use crate::math;
 use glam::{Mat3, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +42,7 @@ pub fn srgb_to_linear(value: f32) -> f32 {
     if value <= 0.040_45 {
         value / 12.92
     } else {
-        ((value + 0.055) / 1.055).powf(2.4)
+        math::powf((value + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -51,7 +52,7 @@ pub fn linear_to_srgb(value: f32) -> f32 {
     if value <= 0.003_130_8 {
         value * 12.92
     } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
+        1.055 * math::powf(value, 1.0 / 2.4) - 0.055
     }
 }
 

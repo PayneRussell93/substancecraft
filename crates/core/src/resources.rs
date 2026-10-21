@@ -1,6 +1,7 @@
 //! Bitmap resources (imported textures) and how layers project them onto
 //! the mesh.
 
+use crate::math;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -492,11 +493,7 @@ impl DecalPlacement {
         let flatten = |vector: Vec3| (vector - normal * vector.dot(normal)).normalize_or_zero();
         let reference = flatten(Self::default_up(normal));
         let up = flatten(self.up);
-        reference
-            .cross(up)
-            .dot(normal)
-            .atan2(reference.dot(up))
-            .to_degrees()
+        math::atan2(reference.cross(up).dot(normal), reference.dot(up)).to_degrees()
     }
 
     /// Turns the image about its normal to `degrees` from its default up.
@@ -640,7 +637,7 @@ impl TextureProjection {
     }
 
     fn transform(self, coordinate: Vec2) -> Vec2 {
-        let (sin, cos) = self.rotation_degrees.to_radians().sin_cos();
+        let (sin, cos) = math::sin_cos(self.rotation_degrees.to_radians());
         let centered = coordinate - Vec2::splat(0.5);
         let rotated = Vec2::new(
             centered.x * cos - centered.y * sin,
@@ -717,15 +714,15 @@ impl TextureProjection {
             ProjectionMode::Cylindrical => {
                 let centered = sample.unit_position - Vec3::splat(0.5);
                 let around = across(centered, self.axis);
-                let angle = around.y.atan2(around.x) / std::f32::consts::TAU + 0.5;
+                let angle = math::atan2(around.y, around.x) / std::f32::consts::TAU + 0.5;
                 let height = along(self.object_coordinates(sample), self.axis);
                 image.sample(self.transform(Vec2::new(angle, height)), true)
             }
             ProjectionMode::Spherical => {
                 let direction = (sample.unit_position - Vec3::splat(0.5)).normalize_or(Vec3::Y);
                 let around = across(direction, self.axis);
-                let longitude = around.y.atan2(around.x) / std::f32::consts::TAU + 0.5;
-                let latitude = along(direction, self.axis).clamp(-1.0, 1.0).asin()
+                let longitude = math::atan2(around.y, around.x) / std::f32::consts::TAU + 0.5;
+                let latitude = math::asin(along(direction, self.axis).clamp(-1.0, 1.0))
                     / std::f32::consts::PI
                     + 0.5;
                 image.sample(self.transform(Vec2::new(longitude, latitude)), true)
