@@ -4,6 +4,23 @@ SubstanceCraft is a clean-room, Rust-native 3D material authoring project. Its t
 
 The project is in early development. It imports FBX (binary or ASCII), glTF, and STEP CAD meshes, with smoothing and subdivision. It paints Base Color, Roughness, Metallic, and ID channels in nondestructive paint and fill layers, masked by painted, procedural (Edge Wear, Dirt, ...), polygon-selection, and ID masks. It bakes geometry-derived mesh maps, renders with Filament, supports undo/redo, and exports TGA textures. See the roadmap for what remains.
 
+## Install on Windows
+
+Download the latest build from [Releases](https://github.com/PayneRussell93/substancecraft/releases):
+
+- `SubstanceCraft-<version>-windows-x64-setup.exe` installs for the current user without admin rights. It adds a Start Menu shortcut and can optionally add a desktop icon, open `.sproject` files with SubstanceCraft, put the command-line tools on `PATH`, and install the sample plugin. Uninstall it from Windows Settings > Apps.
+- `SubstanceCraft-<version>-windows-x64.zip` is portable: extract it anywhere and run `substancecraft.exe`.
+
+Both include the desktop app, `substancecraft-cli`, the `substancecraft-mcp` server, and the VC++ runtime, and need 64-bit Windows 10 or later with an OpenGL 4.1 GPU driver.
+
+To build the packages yourself, after building Filament (below) and installing [Inno Setup 6](https://jrsoftware.org/isdl.php):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1
+```
+
+The zip, installer, and `SHA256SUMS.txt` are written to `target/dist`.
+
 ## Build
 
 Install Rust with rustup and the stable toolchain. This repository requests the stable toolchain and the `rustfmt` and `clippy` components through `rust-toolchain.toml`.
