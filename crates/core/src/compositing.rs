@@ -452,6 +452,67 @@ fn over(destination: &mut Vec4, value: Vec3, alpha: f32, data: PlaneData) {
     *destination = blended.extend(out_alpha);
 }
 
+/// Straight-alpha `from` moved `amount` of the way to `to`, colour weighted
+/// by alpha, so mixing a texel with itself leaves it as it is.
+fn mix(from: Vec4, to: Vec4, amount: f32, data: PlaneData) -> Vec4 {
+    let amount = amount.clamp(0.0, 1.0);
+    let alpha = from.w + (to.w - from.w) * amount;
+    if alpha <= 1e-6 {
+        // Nothing left to weigh: keep `from`'s colour for whoever raises it.
+        return from.truncate().extend(0.0);
+    }
+    let mut value =
+        (from.truncate() * from.w * (1.0 - amount) + to.truncate() * to.w * amount) / alpha;
+    if data == PlaneData::Vector {
+        value = value.normalize_or(Vec3::Z);
+    }
+    value.extend(alpha)
+}
+
+/// What a normal layer at full opacity holds so that it [`over`] `below`
+/// shows `target`, staying as close to its `current` content as it can:
+/// the inverse of compositing it. A layer cannot thin what is beneath it,
+/// so a `target` less opaque than `below` comes out as opaque as `below`.
+fn unover(below: Vec4, target: Vec4, current: Vec4, data: PlaneData) -> Vec4 {
+    let opaque = below.w >= 1.0 - 1e-6;
+    if data == PlaneData::Vector {
+        // Normals are not mixed by premultiplying; cover what must change.
+        let alpha = if opaque {
+            1.0
+        } else {
+            ((target.w - below.w) / (1.0 - below.w)).clamp(0.0, 1.0)
+        };
+        return target.truncate().normalize_or(Vec3::Z).extend(alpha);
+    }
+    let (below_value, target_value) = (below.truncate(), target.truncate());
+    let alpha = if opaque {
+        // Any alpha leaves the stack opaque: keep the layer's own, unless
+        // reaching the target colour needs more.
+        let needed = |t: f32, b: f32| {
+            if t > b {
+                (t - b) / (1.0 - b).max(1e-6)
+            } else {
+                (b - t) / b.max(1e-6)
+            }
+        };
+        needed(target_value.x, below_value.x)
+            .max(needed(target_value.y, below_value.y))
+            .max(needed(target_value.z, below_value.z))
+            .max(current.w)
+            .clamp(0.0, 1.0)
+    } else {
+        ((target.w - below.w) / (1.0 - below.w)).clamp(0.0, 1.0)
+    };
+    if alpha <= 1e-6 {
+        return Vec4::ZERO;
+    }
+    let below_weight = below.w * (1.0 - alpha);
+    let out_alpha = alpha + below_weight;
+    // From over(): value·α + below·w_b = target·out_alpha.
+    let value = (target_value * out_alpha - below_value * below_weight) / alpha;
+    value.clamp(Vec3::ZERO, Vec3::ONE).extend(alpha)
+}
+
 /// Uniform value (and alpha) a fill writes to `channel`.
 pub(crate) fn fill_texel(fill: &LayerFill, channel: MaterialChannel) -> Vec4 {
     let scalar = |value: f32| Vec4::new(value, value, value, 1.0);
@@ -817,7 +878,9 @@ impl Compositor<'_> {
     /// Clone and smudge: each texel the stroke covers takes the stack as
     /// composited so far (`backdrop` with the layer's `local` content over
     /// it) from where `source` points. What the stroke reads is fixed
-    /// before it writes, so stamps never read each other.
+    /// before it writes, so stamps never read each other. The result is
+    /// exact for a normal layer at full opacity; a layer's mask, opacity,
+    /// or blend mode then applies to it as to any of its content.
     fn render_sampled_stroke(
         &self,
         stroke: &PaintStroke,
@@ -880,12 +943,15 @@ impl Compositor<'_> {
                     return;
                 };
                 let amount = (coverage * stroke.opacity * limit(index)).clamp(0.0, 1.0);
-                over(
-                    &mut local[index],
-                    sample.truncate(),
-                    amount * sample.w,
-                    self.data,
-                );
+                // The stack moves toward the sample; the layer takes what
+                // shows that over the backdrop, rather than laying the
+                // sample (which already holds the backdrop) on top again.
+                // Sampled strokes move colour but never thin the stack, so
+                // empty samples leave it be.
+                let view = view[index];
+                let mut target = mix(view, sample, amount, data);
+                target.w = target.w.max(view.w);
+                local[index] = unover(backdrop[index], target, local[index], data);
             },
         );
         Ok(())

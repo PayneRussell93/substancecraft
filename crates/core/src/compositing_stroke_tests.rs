@@ -8,8 +8,8 @@ use glam::Vec2;
 
 use super::*;
 use crate::{
-    DEFAULT_HEIGHT_STRENGTH, LayerId, MaskStroke, MaterialProject, ProjectError, StampFrame,
-    Stencil, StencilId, StrokeCamera, StrokeSource, TextureSetId,
+    BrushTip, DEFAULT_HEIGHT_STRENGTH, LayerId, MaskStroke, MaterialProject, ProjectError,
+    StampFrame, Stencil, StencilId, StrokeCamera, StrokeSource, TextureSetId,
 };
 
 const SIZE: u32 = 64;
@@ -73,8 +73,9 @@ fn tc_0354_clone_strokes_copy_the_stack_from_an_offset() {
     let color = set.bake_base_color().unwrap();
     assert_eq!(color_at(&color, 0.25, 0.5), RED);
     assert_eq!(color_at(&color, 0.75, 0.5), RED, "cloned, not blue");
-    // Where the source was empty the clone adds nothing.
-    assert_eq!(color_at(&color, 0.75 + 6.0 / 63.0, 0.5)[3], 0);
+    // Where the source was empty (past the dab's antialiased rim) the clone
+    // adds nothing.
+    assert_eq!(color_at(&color, 0.75 + 6.5 / 63.0, 0.5)[3], 0);
     // Every enabled channel is copied: roughness too.
     let roughness = set
         .bake_channel(MaterialChannel::Roughness, BakeContext::default())
@@ -114,8 +115,10 @@ fn tc_0355_smudge_strokes_drag_the_stack_along_their_path() {
     assert_eq!(at(&before, 27)[3], 0);
     assert_eq!(at(&after, 27), RED, "dragged forward");
     assert_eq!(at(&after, 34)[3], 0, "no further than a radius");
-    // Behind the stroke's start the dab is untouched.
-    assert_eq!(at(&after, 14), RED);
+    // Behind the stroke's start the dab is untouched (its antialiased rim
+    // included).
+    assert_eq!(at(&after, 14), at(&before, 14));
+    assert_eq!(at(&after, 16), RED);
 
     // A single dab has no direction, so it leaves the stack as it is.
     let still = PaintStroke {
@@ -129,6 +132,66 @@ fn tc_0355_smudge_strokes_drag_the_stack_along_their_path() {
             .unwrap(),
         before
     );
+}
+
+#[test]
+fn sampled_strokes_do_not_thicken_semi_transparent_texels() {
+    // A soft dab is semi-transparent over most of its disc.
+    let soft = |points: &[(f32, f32)], radius: f32| PaintStroke {
+        tip: BrushTip::ROUND,
+        ..dab(points, radius, RED)
+    };
+    let red = || paint_layer(1, vec![soft(&[(0.3, 0.5)], 8.0)]);
+    let before = set(vec![red()]).bake_base_color().unwrap();
+    let sampled = |source: StrokeSource, points: &[(f32, f32)]| {
+        set(vec![
+            red(),
+            paint_layer(
+                2,
+                vec![PaintStroke {
+                    source: Some(source),
+                    ..soft(points, 10.0)
+                }],
+            ),
+        ])
+        .bake_base_color()
+        .unwrap()
+    };
+    // Copying the stack onto itself, or smudging without moving, changes
+    // nothing.
+    let onto_itself = StrokeSource::Clone { offset: Vec2::ZERO };
+    assert_eq!(sampled(onto_itself, &[(0.3, 0.5)]), before);
+    let still = StrokeSource::Smudge { strength: 1.0 };
+    assert_eq!(sampled(still, &[(0.3, 0.5)]), before);
+    // A hard, whole-texel copy into empty space carries the soft dab's
+    // alpha exactly, edge included.
+    let shift = 25.0 / 63.0;
+    let cloned = set(vec![
+        red(),
+        paint_layer(
+            2,
+            vec![PaintStroke {
+                source: Some(StrokeSource::Clone {
+                    offset: Vec2::new(-shift, 0.0),
+                }),
+                ..dab(&[(0.3 + shift, 0.5)], 12.0, RED)
+            }],
+        ),
+    ])
+    .bake_base_color()
+    .unwrap();
+    let alpha = |texture: &BakedTexture, x: u32| i32::from(texture.pixel(x, 31).unwrap()[3]);
+    let mut partial = 0;
+    for x in 10..28 {
+        let source = alpha(&before, x);
+        partial += usize::from(source > 0 && source < 255);
+        let copied = alpha(&cloned, x + 25);
+        assert!(
+            (copied - source).abs() <= 1,
+            "pixel {x}: {copied} for {source}"
+        );
+    }
+    assert!(partial > 4, "the dab has a soft edge to copy");
 }
 
 #[test]

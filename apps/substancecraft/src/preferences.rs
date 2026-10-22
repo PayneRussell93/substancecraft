@@ -370,6 +370,102 @@ pub struct Preferences {
     pub layouts: Vec<crate::layouts::PanelLayout>,
     /// The panel arrangement in use, restored next session.
     pub window_layout: Option<crate::layouts::PanelLayout>,
+    /// Shape of the 3D view inside its panel.
+    pub viewport_aspect: ViewportAspect,
+    /// Fraction of native pixels the 3D view renders at, upscaled to fit.
+    pub viewport_resolution: f32,
+    /// How often the 3D view redraws.
+    pub viewport_frame_rate: ViewportFrameRate,
+}
+
+/// Least [`Preferences::viewport_resolution`].
+pub const MIN_VIEWPORT_RESOLUTION: f32 = 0.25;
+
+/// Shape the 3D view keeps; the panel letterboxes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewportAspect {
+    /// Fills the panel.
+    #[default]
+    Free,
+    Square,
+    Classic,
+    Wide,
+    Ultrawide,
+}
+
+impl ViewportAspect {
+    pub const ALL: [Self; 5] = [
+        Self::Free,
+        Self::Square,
+        Self::Classic,
+        Self::Wide,
+        Self::Ultrawide,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Free => "Free",
+            Self::Square => "1:1",
+            Self::Classic => "4:3",
+            Self::Wide => "16:9",
+            Self::Ultrawide => "21:9",
+        }
+    }
+
+    /// Width over height, or `None` to fill the panel.
+    pub fn ratio(self) -> Option<f32> {
+        match self {
+            Self::Free => None,
+            Self::Square => Some(1.0),
+            Self::Classic => Some(4.0 / 3.0),
+            Self::Wide => Some(16.0 / 9.0),
+            Self::Ultrawide => Some(21.0 / 9.0),
+        }
+    }
+
+    /// The largest rect of this shape centred in `area`.
+    pub fn fit(self, area: egui::Rect) -> egui::Rect {
+        let Some(ratio) = self.ratio() else {
+            return area;
+        };
+        let width = area.width().min(area.height() * ratio);
+        egui::Rect::from_center_size(area.center(), egui::vec2(width, width / ratio))
+    }
+}
+
+/// Redraw rate of the 3D view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewportFrameRate {
+    Fps30,
+    #[default]
+    Fps60,
+    Fps120,
+    /// Every display refresh (vsync paces it).
+    Display,
+}
+
+impl ViewportFrameRate {
+    pub const ALL: [Self; 4] = [Self::Fps30, Self::Fps60, Self::Fps120, Self::Display];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fps30 => "30",
+            Self::Fps60 => "60",
+            Self::Fps120 => "120",
+            Self::Display => "Display",
+        }
+    }
+
+    /// Time to wait before the next redraw.
+    pub fn interval(self) -> std::time::Duration {
+        let frames = match self {
+            Self::Fps30 => 30,
+            Self::Fps60 => 60,
+            Self::Fps120 => 120,
+            Self::Display => return std::time::Duration::ZERO,
+        };
+        std::time::Duration::from_secs(1) / frames
+    }
 }
 
 impl Default for Preferences {
@@ -402,6 +498,9 @@ impl Default for Preferences {
             ocio: None,
             layouts: Vec::new(),
             window_layout: None,
+            viewport_aspect: ViewportAspect::Free,
+            viewport_resolution: 1.0,
+            viewport_frame_rate: ViewportFrameRate::Fps60,
         }
     }
 }
@@ -454,6 +553,11 @@ impl Preferences {
             self.background_blur.clamp(0.0, 1.0)
         } else {
             0.0
+        };
+        self.viewport_resolution = if self.viewport_resolution.is_finite() {
+            self.viewport_resolution.clamp(MIN_VIEWPORT_RESOLUTION, 1.0)
+        } else {
+            1.0
         };
         self.ui_scale = if self.ui_scale.is_finite() {
             self.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
@@ -964,11 +1068,85 @@ impl SubstanceCraftApp {
         }
     }
 
+    /// The Viewport section of the Light drawer: the 3D view's aspect,
+    /// render resolution, and frame rate.
+    pub(super) fn viewport_section(&mut self, ui: &mut Ui) {
+        widgets::caption(ui, "Viewport");
+        let before = (
+            self.preferences.values.viewport_aspect,
+            self.preferences.values.viewport_resolution,
+            self.preferences.values.viewport_frame_rate,
+        );
+        let values = &mut self.preferences.values;
+        widgets::property_row(ui, "Aspect", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for aspect in ViewportAspect::ALL {
+                    let hover = match aspect.ratio() {
+                        None => "Fill the panel".to_owned(),
+                        Some(_) => format!(
+                            "Letterbox the 3D view to {}; renders keep it",
+                            aspect.name()
+                        ),
+                    };
+                    if widgets::chip(ui, aspect.name(), values.viewport_aspect == aspect)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        values.viewport_aspect = aspect;
+                    }
+                }
+            });
+        });
+        widgets::property_row(ui, "Resolution", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (fraction, label) in [(0.5, "50%"), (0.75, "75%"), (1.0, "100%")] {
+                if widgets::chip(
+                    ui,
+                    label,
+                    (values.viewport_resolution - fraction).abs() < 0.001,
+                )
+                .on_hover_text("Share of display pixels the 3D view renders; lower is faster")
+                .clicked()
+                {
+                    values.viewport_resolution = fraction;
+                }
+            }
+        });
+        widgets::property_row(ui, "Frame rate", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for rate in ViewportFrameRate::ALL {
+                let hover = match rate {
+                    ViewportFrameRate::Display => "Redraw at the display's refresh rate".to_owned(),
+                    _ => format!("Redraw at most {} times a second", rate.name()),
+                };
+                if widgets::chip(ui, rate.name(), values.viewport_frame_rate == rate)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    values.viewport_frame_rate = rate;
+                }
+            }
+        });
+        let after = (
+            values.viewport_aspect,
+            values.viewport_resolution,
+            values.viewport_frame_rate,
+        );
+        if after != before {
+            self.save_preferences();
+        }
+    }
+
     /// The Preferences drawer: UI scale and key bindings.
     pub(super) fn preferences_drawer(&mut self, ui: &mut Ui) {
         self.layouts_section(ui);
         widgets::caption(ui, "Interface scale");
-        let mut scale = self.preferences.values.ui_scale;
+        // A drag in progress is held here, and only applied on release:
+        // rescaling the interface under the pointer moves the slider itself.
+        let dragging = ui.id().with("ui_scale_drag");
+        let held = ui.data(|data| data.get_temp::<f32>(dragging));
+        let mut scale = held.unwrap_or(self.preferences.values.ui_scale);
         widgets::property_row(ui, "Scale", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (value, label) in [
@@ -983,7 +1161,6 @@ impl SubstanceCraftApp {
                 }
             }
         });
-        let mut save = (scale - self.preferences.values.ui_scale).abs() > f32::EPSILON;
         let slider = widgets::property_row(ui, "Custom", |ui| {
             ui.add(
                 egui::Slider::new(&mut scale, MIN_UI_SCALE..=MAX_UI_SCALE)
@@ -991,11 +1168,18 @@ impl SubstanceCraftApp {
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
             )
         });
-        self.preferences.values.ui_scale = scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
-        // Written to disk when a drag ends rather than on every frame of it.
-        save |= slider.drag_stopped() || (slider.changed() && !slider.dragged());
-        if save {
-            self.save_preferences();
+        let scale = scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        if slider.dragged() {
+            ui.data_mut(|data| data.insert_temp(dragging, scale));
+        } else {
+            if held.is_some() {
+                ui.data_mut(|data| data.remove::<f32>(dragging));
+            }
+            // Chips, clicks, keys, and the end of a drag apply at once.
+            if (scale - self.preferences.values.ui_scale).abs() > f32::EPSILON {
+                self.preferences.values.ui_scale = scale;
+                self.save_preferences();
+            }
         }
 
         widgets::caption(ui, "Colour vision");
@@ -1213,6 +1397,42 @@ fn shape_name(shape: BrushShape) -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_settings_letterbox_pace_and_clamp() {
+        let area = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1000.0, 400.0));
+        assert_eq!(ViewportAspect::Free.fit(area), area);
+        // A panel wider than the shape: pillarboxed, full height, centred.
+        let wide = ViewportAspect::Wide.fit(area);
+        assert!((wide.height() - 400.0).abs() < 1e-3);
+        assert!((wide.width() / wide.height() - 16.0 / 9.0).abs() < 1e-4);
+        assert_eq!(wide.center(), area.center());
+        // A panel taller than the shape: full width.
+        let tall = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 900.0));
+        assert_eq!(
+            ViewportAspect::Square.fit(tall).size(),
+            egui::vec2(300.0, 300.0)
+        );
+
+        assert_eq!(
+            ViewportFrameRate::Fps30.interval(),
+            std::time::Duration::from_secs(1) / 30
+        );
+        assert_eq!(
+            ViewportFrameRate::Display.interval(),
+            std::time::Duration::ZERO
+        );
+
+        let mut preferences = Preferences {
+            viewport_resolution: 0.01,
+            ..Preferences::default()
+        };
+        preferences.sanitize();
+        assert_eq!(preferences.viewport_resolution, MIN_VIEWPORT_RESOLUTION);
+        preferences.viewport_resolution = f32::NAN;
+        preferences.sanitize();
+        assert_eq!(preferences.viewport_resolution, 1.0);
+    }
 
     #[test]
     fn tc_0239_preferences_round_trip_clamp_and_rebind() {

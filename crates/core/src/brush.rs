@@ -22,6 +22,8 @@ pub enum BrushShape {
     /// Soft disc; without jitter it is drawn as a continuous capsule.
     #[default]
     Round,
+    /// Without jitter or path-following it is swept continuously too, so
+    /// diagonal strokes keep straight edges rather than stamp staircases.
     Square,
     /// Clustered speckles, for grime and chipped paint.
     Splatter,
@@ -134,45 +136,50 @@ impl BrushTip {
                     ((index / cells) as f32 + 0.5) / size * 2.0 - 1.0,
                 );
                 let local = rotation.rotate(Vec2::new(offset.x, -offset.y));
-                self.stamp_coverage(local, self.seed, resources)
+                self.stamp_coverage(local, 2.0 / size, self.seed, resources)
             })
             .collect()
     }
 
-    /// Continuous capsules reproduce the classic smooth round stroke; any
-    /// other shape or randomness needs discrete stamps.
+    /// Continuous sweeps reproduce the classic smooth round stroke, and give
+    /// an unrotating square straight edges; any other shape or randomness
+    /// needs discrete stamps.
     fn continuous(self) -> bool {
-        self.shape == BrushShape::Round
-            && self.size_jitter == 0.0
-            && self.angle_jitter == 0.0
-            && self.scatter == 0.0
+        let swept = match self.shape {
+            BrushShape::Round => true,
+            BrushShape::Square => !self.follow_path,
+            _ => false,
+        };
+        swept && self.size_jitter == 0.0 && self.angle_jitter == 0.0 && self.scatter == 0.0
     }
 
-    fn falloff(self, distance: f32) -> f32 {
-        if distance >= 1.0 {
-            return 0.0;
-        }
+    /// Coverage `distance` radii from the centre, where `pixel` is one pixel
+    /// in radii.
+    fn falloff(self, distance: f32, pixel: f32) -> f32 {
         let hardness = self.hardness.clamp(0.0, 0.999);
-        if distance <= hardness {
-            1.0
-        } else {
-            (1.0 - distance) / (1.0 - hardness)
-        }
+        // The ramp runs from `hardness` out to the edge; one narrower than a
+        // pixel widens to a pixel about the same middle, so hard edges are
+        // antialiased without the brush shrinking.
+        let width = (1.0 - hardness).max(pixel);
+        let middle = (1.0 + hardness) * 0.5;
+        ((middle + width * 0.5 - distance) / width).clamp(0.0, 1.0)
     }
 
     /// Coverage of one stamp at `local`, the offset from its centre divided
-    /// by its radius and rotated into the stamp frame.
+    /// by its radius and rotated into the stamp frame; `pixel` is one pixel
+    /// in the same units.
     fn stamp_coverage(
         self,
         local: Vec2,
+        pixel: f32,
         stamp_seed: u32,
         resources: Option<&ResourceImages>,
     ) -> f32 {
         match self.shape {
-            BrushShape::Round => self.falloff(local.length()),
-            BrushShape::Square => self.falloff(local.x.abs().max(local.y.abs())),
+            BrushShape::Round => self.falloff(local.length(), pixel),
+            BrushShape::Square => self.falloff(local.x.abs().max(local.y.abs()), pixel),
             BrushShape::Splatter => {
-                let disc = self.falloff(local.length());
+                let disc = self.falloff(local.length(), pixel);
                 if disc <= 0.0 {
                     return 0.0;
                 }
@@ -188,14 +195,14 @@ impl BrushTip {
                 if half_width <= 0.0 {
                     return 0.0;
                 }
-                self.falloff((local.y.abs() / half_width).min(1.0)) * taper.sqrt()
+                self.falloff(local.y.abs() / half_width, pixel / half_width) * taper.sqrt()
             }
             BrushShape::Ring => {
                 // A band around 0.75 of the radius, a quarter radius wide.
-                self.falloff(((local.length() - 0.75).abs() / 0.25).min(1.0))
+                self.falloff((local.length() - 0.75).abs() / 0.25, pixel / 0.25)
             }
             BrushShape::Cloud => {
-                let disc = self.falloff(local.length());
+                let disc = self.falloff(local.length(), pixel);
                 if disc <= 0.0 {
                     return 0.0;
                 }
@@ -593,8 +600,18 @@ fn draw_tile(
 }
 
 /// Smooth round stroke: capsules between consecutive points whose radius
-/// and strength follow the interpolated pressure.
+/// and strength follow the interpolated pressure. A square tip is swept the
+/// same way, keeping its angle.
 fn draw_capsules(path: &StrokePath<'_>, pixels: &[Vec2], tile: &mut CoverageTile) {
+    let square = path.tip.shape == BrushShape::Square;
+    let rotation = Vec2::from_angle(-path.tip.angle_degrees.to_radians());
+    // Pixel rows run downward; stamps are upright with V up, then turned.
+    let to_stamp = |offset: Vec2| rotation.rotate(Vec2::new(offset.x, -offset.y));
+    let corner = if square {
+        std::f32::consts::SQRT_2
+    } else {
+        1.0
+    };
     let segment_count = pixels.len().saturating_sub(1).max(1);
     for segment in 0..segment_count {
         let (start_index, end_index) = if pixels.len() == 1 {
@@ -606,7 +623,8 @@ fn draw_capsules(path: &StrokePath<'_>, pixels: &[Vec2], tile: &mut CoverageTile
         let (pressure_start, pressure_end) = (path.pressure(start_index), path.pressure(end_index));
         let (radius_start, radius_end) =
             (path.radius_at(pressure_start), path.radius_at(pressure_end));
-        let reach = radius_start.max(radius_end);
+        // Antialiased edges spill half a pixel past the radius.
+        let reach = radius_start.max(radius_end) * corner + 1.0;
         let lower = start.min(end) - Vec2::splat(reach);
         let upper = start.max(end) + Vec2::splat(reach);
         let span = end - start;
@@ -619,25 +637,69 @@ fn draw_capsules(path: &StrokePath<'_>, pixels: &[Vec2], tile: &mut CoverageTile
                 ..=(upper.x.ceil() as i64).min(tile.min_x + tile.width - 1)
             {
                 let pixel = Vec2::new(x as f32, y as f32);
-                let amount = if length_squared > f32::EPSILON {
-                    ((pixel - start).dot(span) / length_squared).clamp(0.0, 1.0)
+                let (amount, distance) = if square {
+                    swept_square(
+                        to_stamp(pixel - start),
+                        to_stamp(span),
+                        radius_start,
+                        radius_end,
+                    )
                 } else {
-                    0.0
+                    let amount = if length_squared > f32::EPSILON {
+                        ((pixel - start).dot(span) / length_squared).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let radius = radius_start + (radius_end - radius_start) * amount;
+                    (amount, pixel.distance(start + span * amount) / radius)
                 };
                 let radius = radius_start + (radius_end - radius_start) * amount;
-                if radius <= 0.0 {
+                if radius <= 0.0 || !distance.is_finite() {
                     continue;
                 }
-                let distance = pixel.distance(start + span * amount) / radius;
                 let strength =
                     path.strength_at(pressure_start + (pressure_end - pressure_start) * amount);
-                let coverage = path.tip.falloff(distance) * strength;
+                let coverage = path.tip.falloff(distance, 1.0 / radius) * strength;
                 if coverage > 0.0 {
                     tile.deposit(x, y, coverage, direction);
                 }
             }
         }
     }
+}
+
+/// The square tip swept from the origin along `span` (both in the stamp
+/// frame), its radius running from `radius_start` to `radius_end`: the
+/// nearest it comes to `offset` in radii (the square's own distance), and
+/// where along the span. Between the breakpoints where an axis term turns
+/// or the two terms cross, the ratio is monotonic, so the least sits at a
+/// breakpoint or an end.
+fn swept_square(offset: Vec2, span: Vec2, radius_start: f32, radius_end: f32) -> (f32, f32) {
+    let ratio = |numerator: f32, denominator: f32| {
+        (denominator.abs() > f32::EPSILON).then(|| (numerator / denominator).clamp(0.0, 1.0))
+    };
+    let candidates = [
+        Some(0.0),
+        Some(1.0),
+        ratio(offset.x, span.x),
+        ratio(offset.y, span.y),
+        ratio(offset.x - offset.y, span.x - span.y),
+        ratio(offset.x + offset.y, span.x + span.y),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|amount| {
+            let radius = radius_start + (radius_end - radius_start) * amount;
+            let distance = if radius > 0.0 {
+                (offset - span * amount).abs().max_element() / radius
+            } else {
+                f32::INFINITY
+            };
+            (amount, distance)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap_or((0.0, f32::INFINITY))
 }
 
 /// Discrete stamps placed every `spacing` diameters along the path.
@@ -675,7 +737,7 @@ fn draw_stamps(
         let center = center + scatter;
         let strength = path.strength_at(pressure);
         let stamp_seed = hash3(index as i32, 7, 0, tip.seed);
-        let reach = radius * std::f32::consts::SQRT_2 * frame.stretch().max(1.0);
+        let reach = radius * std::f32::consts::SQRT_2 * frame.stretch().max(1.0) + 1.0;
         for y in ((center.y - reach).floor() as i64).max(tile.min_y)
             ..=((center.y + reach).ceil() as i64).min(tile.min_y + tile.height - 1)
         {
@@ -686,7 +748,8 @@ fn draw_stamps(
                 // Pixel rows run downward; flip so stamps keep their upright
                 // orientation in UV space (or on the surface, when aligned).
                 let local = rotation.rotate(frame.apply(Vec2::new(offset.x, -offset.y)));
-                let coverage = tip.stamp_coverage(local, stamp_seed, resources) * strength;
+                let coverage =
+                    tip.stamp_coverage(local, 1.0 / radius, stamp_seed, resources) * strength;
                 if coverage > 0.0 {
                     tile.deposit(x, y, coverage, direction);
                 }
@@ -866,6 +929,41 @@ mod tests {
     }
 
     #[test]
+    fn square_tips_sweep_diagonals_with_straight_antialiased_edges() {
+        // Wide spacing used to leave a staircase a stamp step tall.
+        let points = [Vec2::splat(0.2), Vec2::splat(0.8)];
+        let path = StrokePath {
+            frames: Default::default(),
+            points: &points,
+            pressures: &[],
+            radius_pixels: 10.0,
+            tip: BrushTip {
+                shape: BrushShape::Square,
+                hardness: 1.0,
+                spacing: 0.5,
+                ..BrushTip::ROUND
+            },
+        };
+        let values = coverage(&path, 129, None);
+        let at = |x: usize, y: usize| values[y * 129 + x];
+        // The stroke runs up-right in pixels; across it, every step along it
+        // reads the same, which a staircase would not.
+        for across in -12_i32..=12 {
+            let (x, y) = ((56 + across) as usize, (72 + across) as usize);
+            for along in 1..=15 {
+                assert!(
+                    (at(x + along, y - along) - at(x, y)).abs() < 1e-4,
+                    "{across} across, {along} along"
+                );
+            }
+        }
+        // The hard edge ramps over a pixel rather than stepping.
+        assert!(values.iter().any(|value| (0.05..0.95).contains(value)));
+        // The centre line is fully covered.
+        assert_eq!(at(64, 64), 1.0);
+    }
+
+    #[test]
     fn tc_0291_streak_ring_and_cloud_alphas_have_their_shapes() {
         let tip = |shape| BrushTip {
             shape,
@@ -873,25 +971,28 @@ mod tests {
             ..BrushTip::ROUND
         };
         let streak = tip(BrushShape::Streak);
-        assert!(streak.stamp_coverage(Vec2::new(0.0, 0.0), 0, None) > 0.9);
+        assert!(streak.stamp_coverage(Vec2::new(0.0, 0.0), 0.0, 0, None) > 0.9);
         assert!(
-            streak.stamp_coverage(Vec2::new(0.6, 0.0), 0, None) > 0.3,
+            streak.stamp_coverage(Vec2::new(0.6, 0.0), 0.0, 0, None) > 0.3,
             "long"
         );
         assert_eq!(
-            streak.stamp_coverage(Vec2::new(0.0, 0.3), 0, None),
+            streak.stamp_coverage(Vec2::new(0.0, 0.3), 0.0, 0, None),
             0.0,
             "thin"
         );
-        assert_eq!(streak.stamp_coverage(Vec2::new(1.0, 0.0), 0, None), 0.0);
+        assert_eq!(
+            streak.stamp_coverage(Vec2::new(1.0, 0.0), 0.0, 0, None),
+            0.0
+        );
         let ring = tip(BrushShape::Ring);
         assert_eq!(
-            ring.stamp_coverage(Vec2::new(0.0, 0.0), 0, None),
+            ring.stamp_coverage(Vec2::new(0.0, 0.0), 0.0, 0, None),
             0.0,
             "hollow"
         );
-        assert!(ring.stamp_coverage(Vec2::new(0.75, 0.0), 0, None) > 0.9);
-        assert!(ring.stamp_coverage(Vec2::new(0.0, -0.75), 0, None) > 0.9);
+        assert!(ring.stamp_coverage(Vec2::new(0.75, 0.0), 0.0, 0, None) > 0.9);
+        assert!(ring.stamp_coverage(Vec2::new(0.0, -0.75), 0.0, 0, None) > 0.9);
         let cloud = tip(BrushShape::Cloud);
         let samples: Vec<f32> = (0..64)
             .map(|index| {
@@ -899,7 +1000,7 @@ mod tests {
                     (index % 8) as f32 / 8.0 - 0.45,
                     (index / 8) as f32 / 8.0 - 0.45,
                 );
-                cloud.stamp_coverage(point, 3, None)
+                cloud.stamp_coverage(point, 0.0, 3, None)
             })
             .collect();
         assert!(samples.iter().any(|value| *value > 0.5), "dense parts");
@@ -912,7 +1013,7 @@ mod tests {
                         (index % 8) as f32 / 8.0 - 0.45,
                         (index / 8) as f32 / 8.0 - 0.45,
                     );
-                    cloud.stamp_coverage(point, 3, None)
+                    cloud.stamp_coverage(point, 0.0, 3, None)
                 })
                 .collect::<Vec<_>>(),
             "deterministic"

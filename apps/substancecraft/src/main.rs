@@ -269,6 +269,8 @@ struct SubstanceCraftApp {
     filament_renderer: Option<FilamentRuntime>,
     filament_error: Option<String>,
     filament_frame_texture: Option<egui::TextureHandle>,
+    /// [`FilamentFrame::points`] of the frame in `filament_frame_texture`.
+    filament_frame_points: egui::Vec2,
     filament_frames_tx: SyncSender<FilamentFrame>,
     filament_frames_rx: Receiver<FilamentFrame>,
     filament_render_pending: Arc<AtomicBool>,
@@ -437,6 +439,9 @@ struct SubstanceCraftApp {
 struct FilamentFrame {
     width: u32,
     height: u32,
+    /// Viewport size in points the frame was framed for; readback lags a
+    /// resize, so this, not the current viewport, gives its aspect.
+    points: egui::Vec2,
     rgba8: Vec<u8>,
 }
 
@@ -464,6 +469,33 @@ fn render_size(viewport_width: f32, viewport_height: f32, long_edge: u32) -> (u3
         ((width * factor).round() as u32).clamp(1, MAX_RENDER_EDGE),
         ((height * factor).round() as u32).clamp(1, MAX_RENDER_EDGE),
         factor,
+    )
+}
+
+/// Pixel size of the live viewport frame for a viewport of `pixels`, and
+/// the factor (at most 1) by which it shrinks both edges to fit the
+/// renderer's limit, keeping the viewport's aspect.
+fn viewport_render_size(pixels: egui::Vec2) -> (u32, u32, f32) {
+    let (width, height) = (pixels.x.max(1.0), pixels.y.max(1.0));
+    let factor = (MAX_RENDER_EDGE as f32 / width.max(height)).min(1.0);
+    (
+        ((width * factor).ceil() as u32).clamp(1, MAX_RENDER_EDGE),
+        ((height * factor).ceil() as u32).clamp(1, MAX_RENDER_EDGE),
+        factor,
+    )
+}
+
+/// Where a frame framed for a viewport of `points` lands in `viewport`:
+/// centred, at its own aspect, and scaled with the shorter edge as the
+/// camera is, so a frame that lags a resize lines up instead of stretching.
+fn frame_rect(viewport: egui::Rect, points: egui::Vec2) -> egui::Rect {
+    let framed = points.min_elem();
+    if framed <= 0.0 {
+        return viewport;
+    }
+    egui::Rect::from_center_size(
+        viewport.center(),
+        points * (viewport.size().min_elem() / framed),
     )
 }
 
@@ -1105,6 +1137,7 @@ impl Default for SubstanceCraftApp {
             filament_renderer: None,
             filament_error: None,
             filament_frame_texture: None,
+            filament_frame_points: egui::Vec2::ZERO,
             filament_frames_tx,
             filament_frames_rx,
             filament_render_pending: Arc::new(AtomicBool::new(false)),
@@ -1560,6 +1593,8 @@ impl SubstanceCraftApp {
     }
 
     fn update_filament_frame(&mut self, context: &egui::Context, viewport: egui::Rect) {
+        let frame_interval = self.preferences.values.viewport_frame_rate.interval();
+        let resolution = self.preferences.values.viewport_resolution;
         if let Some(renderer) = self.filament_renderer.as_mut() {
             renderer.poll();
         }
@@ -1570,6 +1605,7 @@ impl SubstanceCraftApp {
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba8,
             );
+            self.filament_frame_points = frame.points;
             if let Some(texture) = self.filament_frame_texture.as_mut() {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -1778,7 +1814,7 @@ impl SubstanceCraftApp {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            context.request_repaint_after(Duration::from_millis(16));
+            context.request_repaint_after(frame_interval);
             return;
         }
         let scale = context.pixels_per_point();
@@ -1807,6 +1843,7 @@ impl SubstanceCraftApp {
                         *slot = Some(FilamentFrame {
                             width,
                             height,
+                            points: viewport.size(),
                             rgba8,
                         });
                     }
@@ -1822,28 +1859,39 @@ impl SubstanceCraftApp {
                     self.turntable = None;
                 }
             }
-            context.request_repaint_after(Duration::from_millis(16));
+            context.request_repaint_after(frame_interval);
             return;
         }
-        let width = (viewport.width() * scale).ceil().clamp(1.0, 2048.0) as u32;
-        let height = (viewport.height() * scale).ceil().clamp(1.0, 2048.0) as u32;
+        // Past the renderer's limit both edges shrink by one factor, so a
+        // large or high-DPI viewport keeps its aspect instead of stretching.
+        // The resolution preference renders fewer pixels, upscaled to fit.
+        let pixels_per_point = scale * resolution;
+        let (width, height, factor) = viewport_render_size(viewport.size() * pixels_per_point);
+        let points = viewport.size();
         let sender = self.filament_frames_tx.clone();
         let pending = Arc::clone(&self.filament_render_pending);
-        match renderer.render(self.viewport_camera, width, height, scale, move |rgba8| {
-            pending.store(false, Ordering::Release);
-            let _ = sender.try_send(FilamentFrame {
-                width,
-                height,
-                rgba8,
-            });
-        }) {
+        match renderer.render(
+            self.viewport_camera,
+            width,
+            height,
+            pixels_per_point * factor,
+            move |rgba8| {
+                pending.store(false, Ordering::Release);
+                let _ = sender.try_send(FilamentFrame {
+                    width,
+                    height,
+                    points,
+                    rgba8,
+                });
+            },
+        ) {
             Ok(true) => {
                 self.filament_error = None;
-                context.request_repaint_after(Duration::from_millis(16));
+                context.request_repaint_after(frame_interval);
             }
             Ok(false) => {
                 self.filament_render_pending.store(false, Ordering::Release);
-                context.request_repaint_after(Duration::from_millis(16));
+                context.request_repaint_after(frame_interval);
             }
             Err(error) => {
                 self.filament_render_pending.store(false, Ordering::Release);
@@ -6649,7 +6697,19 @@ impl SubstanceCraftApp {
                 // stroke in progress shows up live.
                 self.refresh_baked_preview();
                 if let Some(rect) = model {
-                    self.model_viewport(ui, rect);
+                    // A fixed aspect letterboxes the view; picking, painting,
+                    // and still renders all follow the fitted rect.
+                    let aspect = self.preferences.values.viewport_aspect;
+                    let fitted = aspect.fit(rect);
+                    self.model_viewport(ui, fitted);
+                    if fitted != rect {
+                        ui.painter().rect_stroke(
+                            fitted,
+                            0.0,
+                            egui::Stroke::new(1.0, theme::TEXT_FAINT.gamma_multiply(0.4)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
                 }
                 if let Some(rect) = uv {
                     self.uv_viewport(ui, rect);
@@ -6747,7 +6807,7 @@ impl SubstanceCraftApp {
         {
             painter.image(
                 texture.id(),
-                viewport,
+                frame_rect(viewport, self.filament_frame_points),
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
@@ -10001,6 +10061,27 @@ mod tests {
         assert_eq!(render_size(1000.0, 1000.0, 9000).0, MAX_RENDER_EDGE);
     }
 
+    #[test]
+    fn viewport_frames_keep_the_viewport_aspect() {
+        // Within the limit the frame is the viewport, unscaled.
+        assert_eq!(
+            viewport_render_size(egui::vec2(1200.0, 700.0)),
+            (1200, 700, 1.0)
+        );
+        // A wide high-DPI viewport shrinks both edges, not just the long one.
+        let (width, height, factor) = viewport_render_size(egui::vec2(3840.0, 1600.0));
+        assert_eq!((width, height), (2048, 854));
+        assert!((factor - 2048.0 / 3840.0).abs() < 1e-6);
+        // A frame that lags a resize keeps its aspect, centred, scaled with
+        // the shorter edge.
+        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 400.0));
+        assert_eq!(frame_rect(viewport, viewport.size()), viewport);
+        let lagging = frame_rect(viewport, egui::vec2(600.0, 600.0));
+        assert_eq!(lagging.size(), egui::vec2(400.0, 400.0));
+        assert_eq!(lagging.center(), viewport.center());
+        assert_eq!(frame_rect(viewport, egui::Vec2::ZERO), viewport);
+    }
+
     /// Needs a GPU: run with `cargo test -p substancecraft -- --ignored`.
     #[test]
     #[ignore]
@@ -10314,6 +10395,7 @@ mod tests {
         *app.render_result.lock().unwrap() = Some(FilamentFrame {
             width: 2,
             height: 2,
+            points: egui::vec2(2.0, 2.0),
             rgba8: vec![90; 16],
         });
         app.save_finished_render();
