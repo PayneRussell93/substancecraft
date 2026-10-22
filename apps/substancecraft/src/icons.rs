@@ -30,6 +30,7 @@ pub enum Icon {
     Trash,
     Bake,
     Image,
+    Book,
 }
 
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -63,6 +64,25 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     };
 
     match icon {
+        Icon::Book => {
+            closed(&[
+                (12.0, 6.5),
+                (7.5, 4.5),
+                (3.0, 5.0),
+                (3.0, 18.5),
+                (7.5, 18.0),
+                (12.0, 20.0),
+            ]);
+            closed(&[
+                (12.0, 6.5),
+                (16.5, 4.5),
+                (21.0, 5.0),
+                (21.0, 18.5),
+                (16.5, 18.0),
+                (12.0, 20.0),
+            ]);
+            line(&[(12.0, 6.5), (12.0, 20.0)]);
+        }
         Icon::Image => {
             closed(&[(3.5, 5.0), (20.5, 5.0), (20.5, 19.0), (3.5, 19.0)]);
             line(&[

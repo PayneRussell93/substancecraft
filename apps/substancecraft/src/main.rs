@@ -1,3 +1,5 @@
+// Release builds are launched from shortcuts; no console window behind them.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
@@ -41,6 +43,7 @@ mod cache;
 mod cameras;
 mod diagnostics;
 mod disk_cache;
+mod docs;
 mod edges;
 mod environments;
 mod gamepad;
@@ -428,6 +431,7 @@ struct SubstanceCraftApp {
     /// A project being read in the background, and where from.
     opening: Option<(std::path::PathBuf, Receiver<Result<LoadedProject, String>>)>,
     library: library_panel::LibraryState,
+    docs: docs::DocsState,
 }
 
 struct FilamentFrame {
@@ -1219,6 +1223,7 @@ impl Default for SubstanceCraftApp {
             saving: saving::Saving::default(),
             opening: None,
             library: library_panel::LibraryState::default(),
+            docs: docs::DocsState::default(),
         };
         app.set_base_geometry(Some(PrimitivePreset::Cube.build_mesh()));
         app.loaded_mesh = app.project.mesh.clone();

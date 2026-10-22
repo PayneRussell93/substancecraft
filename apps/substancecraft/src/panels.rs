@@ -150,6 +150,14 @@ impl SubstanceCraftApp {
         let content_top = self.show_top_bars(context, screen);
         self.show_dock(context, screen, content_top);
         self.show_drawer(context, screen, content_top);
+        self.handle_docs_key(context);
+        let docs_left = screen.left()
+            + theme::EDGE
+            + self.layout.dock_width
+            + theme::GAP
+            + DRAWER_WIDTH
+            + theme::GAP;
+        self.show_docs(context, screen, content_top, docs_left);
         if self.show_inspector {
             self.show_inspector_column(context, screen);
         }
@@ -598,6 +606,20 @@ impl SubstanceCraftApp {
                             if dock_item(ui, drawer.icon(), drawer.label(), selected).clicked() {
                                 self.drawer = (!selected).then_some(drawer);
                             }
+                        }
+                        ui.add_space(2.0);
+                        let (line, _) = ui.allocate_exact_size(vec2(54.0, 1.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            line.shrink2(vec2(10.0, 0.0)),
+                            0.0,
+                            theme::TEXT_FAINT,
+                        );
+                        ui.add_space(2.0);
+                        if dock_item(ui, Icon::Book, "Docs", self.docs.open)
+                            .on_hover_text("How to use SubstanceCraft (F1)")
+                            .clicked()
+                        {
+                            self.toggle_docs();
                         }
                     });
             })
